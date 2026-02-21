@@ -59,6 +59,12 @@ isort --check-only .
 pydoclint .
 ```
 
+Or run the same checks via pre-commit:
+
+```bash
+pre-commit run --all-files
+```
+
 Coverage is enforced via `pytest-cov`:
 
 ```bash

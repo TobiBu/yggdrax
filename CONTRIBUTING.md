@@ -19,6 +19,21 @@ pydoclint .
 pytest
 ```
 
+## Pre-commit
+
+Install and enable hooks once:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+Run all hooks on demand:
+
+```bash
+pre-commit run --all-files
+```
+
 ## Testing and coverage
 
 CI enforces test coverage through `pytest-cov`.

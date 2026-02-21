@@ -43,6 +43,9 @@ packages = ["yggdrasil"]
 [tool.setuptools.package-dir]
 yggdrasil = "."
 
+[tool.setuptools.package-data]
+yggdrasil = ["py.typed"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310", "py311", "py312"]
