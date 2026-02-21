@@ -134,9 +134,9 @@ def compute_tree_geometry(
 
     Parameters
     ----------
-    tree:
+    tree : RadixTree
         Radix tree constructed by :func:`yggdrasil.tree.build_tree`.
-    positions_sorted:
+    positions_sorted : Array
         Particle positions reordered into Morton order. This should be the
         ``positions`` output from ``build_tree(..., return_reordered=True)``.
 

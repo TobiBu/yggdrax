@@ -2,7 +2,6 @@
 
 import jax.numpy as jnp
 
-from yggdrasil.tree import build_tree
 from yggdrasil.geometry import compute_tree_geometry
 from yggdrasil.interactions import (
     _compute_effective_extents,
@@ -13,6 +12,7 @@ from yggdrasil.interactions import (
     interactions_for_node,
     neighbors_for_leaf,
 )
+from yggdrasil.tree import build_tree
 
 DEFAULT_TEST_LEAF_SIZE = 1
 

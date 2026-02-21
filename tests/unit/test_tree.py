@@ -3,6 +3,7 @@
 import jax.numpy as jnp
 import numpy as np
 
+from yggdrasil.geometry import compute_tree_geometry
 from yggdrasil.tree import (
     RadixTreeWorkspace,
     build_fixed_depth_tree,
@@ -11,7 +12,6 @@ from yggdrasil.tree import (
     build_tree_jit,
     reorder_particles_by_indices,
 )
-from yggdrasil.geometry import compute_tree_geometry
 
 DEFAULT_TEST_LEAF_SIZE = 1
 

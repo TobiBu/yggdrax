@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from .dtypes import INDEX_DTYPE
-from .tree import RadixTree
 from .geometry import TreeGeometry
+from .tree import RadixTree
 
 
 class GroupedInteractionBuffers(NamedTuple):
@@ -127,7 +127,9 @@ def build_grouped_interactions_from_pairs(
     for class_i, key in enumerate(class_keys):
         tgt_lev = int(key[0])
         disp = key[2:5].astype(np.float64)
-        class_cell = _safe_cell_size(root_extent, np.asarray([tgt_lev], dtype=np.int32))[0]
+        class_cell = _safe_cell_size(
+            root_extent, np.asarray([tgt_lev], dtype=np.int32)
+        )[0]
         class_disp[class_i] = disp * class_cell
 
     inv_order = np.empty_like(order)

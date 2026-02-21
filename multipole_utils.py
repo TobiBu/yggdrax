@@ -120,9 +120,9 @@ def pack_tensor(level: int, tensor: Array) -> Array:
 
     Parameters
     ----------
-    level:
+    level : int
         Tensor order ``l``.
-    tensor:
+    tensor : Array
         Array of shape ``(l + 1, l + 1, l + 1)`` containing Cartesian
         components.  Only entries with ``i + j + k = l`` are read.
 
@@ -130,6 +130,11 @@ def pack_tensor(level: int, tensor: Array) -> Array:
     -------
     Array
         1-D flattened packed representation with length ``level_size(level)``.
+
+    Raises
+    ------
+    ValueError
+        If ``tensor`` does not match shape ``(level + 1, level + 1, level + 1)``.
     """
 
     lvl = int(level)

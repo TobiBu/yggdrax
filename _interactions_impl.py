@@ -24,12 +24,12 @@ from jax import lax
 from jaxtyping import Array, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index
+from .geometry import TreeGeometry
 from .grouped_interactions import (
     GroupedInteractionBuffers,
     build_grouped_interactions_from_pairs,
 )
 from .tree import RadixTree
-from .geometry import TreeGeometry
 
 # Each node only needs to interact with a bounded number of well-separated
 # partners (189 in the classic 3D MAC stencil). Keeping the default well above
@@ -1721,7 +1721,7 @@ def _dual_tree_walk_count_impl(
     right_child_full = jnp.concatenate([right_child, leaf_fill], axis=0)
 
     def cond_fun(state):
-        (_stk_t, _stk_s, current_size, _far_c, _near_c, _max_s) = state
+        _stk_t, _stk_s, current_size, _far_c, _near_c, _max_s = state
         return current_size > 0
 
     def body_fun(state):

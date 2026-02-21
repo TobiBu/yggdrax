@@ -8,13 +8,74 @@ version = "0.0.1"
 description = "Tree generation and traversal package for hierarchical solvers"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 dependencies = [
   "jax>=0.4.0",
   "jaxlib>=0.4.0",
   "jaxtyping>=0.2.23",
   "beartype>=0.14.0",
 ]
+authors = [{ name = "AstroAI Lab" }]
+keywords = ["fmm", "hierarchical", "n-body", "jax", "treecode"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Physics",
+]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["yggdrasil*"]
+[project.optional-dependencies]
+dev = [
+  "black>=24.8.0",
+  "isort>=5.13.2",
+  "pydoclint>=0.6.0",
+  "pytest>=8.3.0",
+  "pytest-cov>=5.0.0",
+]
+
+[tool.setuptools]
+packages = ["yggdrasil"]
+
+[tool.setuptools.package-dir]
+yggdrasil = "."
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312"]
+include = "\\.pyi?$"
+exclude = '''
+/(
+  \.git
+ |\.venv
+ |build
+ |dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_gitignore = true
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --cov=yggdrasil --cov-report=term-missing --cov-report=xml --cov-fail-under=85"
+
+[tool.coverage.run]
+source = ["yggdrasil"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 85
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]

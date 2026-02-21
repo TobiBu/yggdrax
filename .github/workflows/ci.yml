@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Black
+        run: black --check .
+
+      - name: isort
+        run: isort --check-only .
+
+      - name: pydoclint (public API surface)
+        run: |
+          pydoclint \
+            __init__.py \
+            bounds.py \
+            dense_interactions.py \
+            dtypes.py \
+            geometry.py \
+            grouped_interactions.py \
+            interactions.py \
+            morton.py \
+            multipole_utils.py \
+            policies.py \
+            traversal.py \
+            tree.py \
+            tree_moments.py \
+            types.py
+
+      - name: Unit tests with coverage
+        run: pytest
+
+      - name: Upload coverage XML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: coverage.xml

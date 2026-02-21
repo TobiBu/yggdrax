@@ -28,9 +28,10 @@ from .morton import (
     morton_encode,
     sort_by_morton,
 )
+from .traversal import build_prepared_tree_artifacts
 from .tree import (
-    FixedDepthTreeBuildConfig,
     MAX_TREE_LEVELS,
+    FixedDepthTreeBuildConfig,
     RadixTree,
     RadixTreeWorkspace,
     TreeBuildConfig,
@@ -39,7 +40,6 @@ from .tree import (
     build_tree,
     build_tree_jit,
 )
-from .traversal import build_prepared_tree_artifacts
 from .types import PreparedTreeArtifacts, TraversalArtifacts, TraversalResult
 
 __all__ = [

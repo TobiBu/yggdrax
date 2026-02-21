@@ -667,18 +667,29 @@ def compute_tree_multipole_moments(
 
     Parameters
     ----------
-    tree:
+    tree : RadixTree
         Radix tree produced by :func:`yggdrasil.tree.build_tree`.
-    positions_sorted:
+    positions_sorted : Array
         Particle positions in Morton order.
-    masses_sorted:
+    masses_sorted : Array
         Particle masses reordered identically to ``positions_sorted``.
-    expansion_centers:
+    expansion_centers : Optional[Array]
         Optional array ``(num_nodes, 3)`` specifying the expansion center for
         each node. When omitted, the node center-of-mass is used, which yields
         zero dipole moments.
-    max_order:
+    max_order : int
         Highest multipole order to accumulate (``0`` ≤ ``max_order`` ≤ ``4``).
+
+    Returns
+    -------
+    TreeMultipoleMoments
+        Packed multipole moments for each node through ``max_order``.
+
+    Raises
+    ------
+    ValueError
+        If ``expansion_centers`` has an incompatible shape or ``max_order`` is
+        outside the supported range.
     """
 
     mass_moments = compute_tree_mass_moments(

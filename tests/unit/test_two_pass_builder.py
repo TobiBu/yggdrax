@@ -7,9 +7,9 @@ against the automatic two-pass sizing path to ensure equivalence.
 import jax
 import jax.numpy as jnp
 
-from yggdrasil.tree import build_tree
 from yggdrasil.geometry import compute_tree_geometry
 from yggdrasil.interactions import build_interactions_and_neighbors
+from yggdrasil.tree import build_tree
 
 
 def _build_random_tree(n=1024, leaf_size=8, seed=0):

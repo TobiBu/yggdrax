@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 from jaxtyping import Array
 
 from . import _tree_impl
-
 from .bounds import infer_bounds
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS

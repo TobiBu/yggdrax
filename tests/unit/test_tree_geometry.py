@@ -2,8 +2,8 @@
 
 import jax.numpy as jnp
 
-from yggdrasil.tree import build_tree
 from yggdrasil.geometry import compute_tree_geometry
+from yggdrasil.tree import build_tree
 
 DEFAULT_TEST_LEAF_SIZE = 1
 

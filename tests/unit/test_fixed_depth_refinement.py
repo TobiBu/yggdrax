@@ -1,10 +1,10 @@
 import jax.numpy as jnp
 import numpy as np
 
-from yggdrasil.morton import _compact3_u64
-from yggdrasil.tree import build_fixed_depth_tree
 from yggdrasil.geometry import _MAX_MORTON_LEVEL, compute_tree_geometry
 from yggdrasil.interactions import build_leaf_neighbor_lists
+from yggdrasil.morton import _compact3_u64
+from yggdrasil.tree import build_fixed_depth_tree
 
 
 def make_thin_slab(N=2000, length=1.0, thickness=1e-3):

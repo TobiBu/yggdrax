@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 
-from yggdrasil.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
 from yggdrasil import (
     DualTreeTraversalConfig,
     NodeInteractionList,
@@ -13,6 +12,7 @@ from yggdrasil import (
     compute_tree_geometry,
     infer_bounds,
 )
+from yggdrasil.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
 
 
 def _sample_problem(n: int = 64):
