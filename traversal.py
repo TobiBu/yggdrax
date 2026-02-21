@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import jax.numpy as jnp
-from jaxtyping import Array
+from beartype import beartype
+from jaxtyping import Array, jaxtyped
 
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE
@@ -19,10 +20,11 @@ from .tree import build_tree
 from .types import PreparedTreeArtifacts, traversal_result_from_expanse
 
 
+@jaxtyped(typechecker=beartype)
 def build_prepared_tree_artifacts(
     positions: Array,
     masses: Array,
-    bounds: Optional[Tuple[Array, Array]] = None,
+    bounds: Optional[tuple[Array, Array]] = None,
     *,
     leaf_size: int = 16,
     theta: float = 0.6,

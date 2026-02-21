@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-from jaxtyping import Array
+from beartype import beartype
+from jaxtyping import Array, jaxtyped
 
 
+@jaxtyped(typechecker=beartype)
 def infer_bounds(positions: Array) -> tuple[Array, Array]:
     """Infer generous tree bounds from particle positions."""
 

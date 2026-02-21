@@ -493,6 +493,7 @@ def _tree_moments_from_raw(
     )
 
 
+@jaxtyped(typechecker=beartype)
 def tree_moments_from_raw(
     packed: Array,
     centers: Array,
@@ -514,6 +515,7 @@ def tree_moments_from_raw(
     return _tree_moments_from_raw(packed, centers, order)
 
 
+@jaxtyped(typechecker=beartype)
 def multipole_from_packed(
     packed: Array,
     centers: Array,
@@ -558,6 +560,7 @@ def multipole_from_packed(
     )
 
 
+@jaxtyped(typechecker=beartype)
 def translate_packed_moments(
     packed_child: Array,
     delta: Array,

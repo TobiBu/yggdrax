@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from jaxtyping import Array
+from beartype import beartype
+from jaxtyping import Array, jaxtyped
 
 from . import _tree_impl
 from .bounds import infer_bounds
@@ -41,10 +42,11 @@ class FixedDepthTreeBuildConfig:
     min_refined_leaf_particles: int = 2
 
 
+@jaxtyped(typechecker=beartype)
 def build_tree(
     positions: Array,
     masses: Array,
-    bounds: Optional[Tuple[Array, Array]] = None,
+    bounds: Optional[tuple[Array, Array]] = None,
     *,
     return_reordered: bool = False,
     leaf_size: int = 8,
@@ -67,10 +69,11 @@ def build_tree(
     )
 
 
+@jaxtyped(typechecker=beartype)
 def build_tree_jit(
     positions: Array,
     masses: Array,
-    bounds: Optional[Tuple[Array, Array]] = None,
+    bounds: Optional[tuple[Array, Array]] = None,
     *,
     return_reordered: bool = False,
     leaf_size: int = 8,
@@ -93,10 +96,11 @@ def build_tree_jit(
     )
 
 
+@jaxtyped(typechecker=beartype)
 def build_fixed_depth_tree(
     positions: Array,
     masses: Array,
-    bounds: Optional[Tuple[Array, Array]] = None,
+    bounds: Optional[tuple[Array, Array]] = None,
     *,
     target_leaf_particles: int = 32,
     return_reordered: bool = False,
@@ -133,10 +137,11 @@ def build_fixed_depth_tree(
     )
 
 
+@jaxtyped(typechecker=beartype)
 def build_fixed_depth_tree_jit(
     positions: Array,
     masses: Array,
-    bounds: Optional[Tuple[Array, Array]] = None,
+    bounds: Optional[tuple[Array, Array]] = None,
     *,
     target_leaf_particles: int = 32,
     return_reordered: bool = False,

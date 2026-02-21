@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from jaxtyping import Array
+from beartype import beartype
+from jaxtyping import Array, jaxtyped
 
 from . import _geometry_impl
 from .tree import RadixTree
@@ -12,6 +13,7 @@ LevelMajorTreeGeometry = _geometry_impl.LevelMajorTreeGeometry
 _MAX_MORTON_LEVEL = _geometry_impl._MAX_MORTON_LEVEL
 
 
+@jaxtyped(typechecker=beartype)
 def compute_tree_geometry(
     tree: RadixTree,
     positions_sorted: Array,
@@ -21,6 +23,7 @@ def compute_tree_geometry(
     return _geometry_impl.compute_tree_geometry(tree, positions_sorted)
 
 
+@jaxtyped(typechecker=beartype)
 def geometry_to_level_major(
     tree: RadixTree,
     geometry: TreeGeometry,
