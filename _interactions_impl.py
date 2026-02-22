@@ -2011,6 +2011,10 @@ def _run_dual_tree_walk(
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> DualTreeWalkResult:
+    # Public APIs may pass the wrapper ``yggdrasil.tree.RadixTree``.
+    # Jitted kernels require the underlying topology pytree.
+    tree = tree.topology if hasattr(tree, "topology") else tree
+
     theta_val = float(theta)
     dehnen_scale_val = float(dehnen_radius_scale)
     if dehnen_scale_val <= 0.0:
