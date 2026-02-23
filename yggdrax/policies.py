@@ -1,4 +1,4 @@
-"""Traversal policy helpers for Yggdrasil."""
+"""Traversal policy helpers for Yggdrax."""
 
 from __future__ import annotations
 

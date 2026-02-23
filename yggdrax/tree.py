@@ -1,4 +1,4 @@
-"""Public tree-building API for Yggdrasil."""
+"""Public tree-building API for Yggdrax."""
 
 from __future__ import annotations
 

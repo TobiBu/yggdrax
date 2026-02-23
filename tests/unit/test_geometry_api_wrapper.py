@@ -1,9 +1,9 @@
-"""Coverage for yggdrasil geometry API wrappers."""
+"""Coverage for yggdrax geometry API wrappers."""
 
 import jax
 import jax.numpy as jnp
 
-from yggdrasil import build_tree, compute_tree_geometry, geometry_to_level_major
+from yggdrax import build_tree, compute_tree_geometry, geometry_to_level_major
 
 
 def _sample_problem(n: int = 64):

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from yggdrasil import Tree
+from yggdrax import Tree
 
 
 def _sample_problem(n: int = 64):

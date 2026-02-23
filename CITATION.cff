@@ -1,10 +1,10 @@
 cff-version: 1.2.0
-title: "Yggdrasil"
+title: "Yggdrax"
 message: "If you use this software, please cite it using this metadata."
 type: software
 authors:
   - name: AstroAI Lab
 version: 0.0.1
 date-released: 2026-02-21
-repository-code: "https://github.com/AstroAI-Lab/yggdrasil"
+repository-code: "https://github.com/AstroAI-Lab/yggdrax"
 license: MIT

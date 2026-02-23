@@ -1,7 +1,7 @@
 """Tests for traversal policy contracts."""
 
-from yggdrasil.interactions import DualTreeTraversalConfig
-from yggdrasil.policies import TraversalPolicy
+from yggdrax.interactions import DualTreeTraversalConfig
+from yggdrax.policies import TraversalPolicy
 
 
 def test_traversal_policy_defaults_description():

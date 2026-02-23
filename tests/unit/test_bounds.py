@@ -1,8 +1,8 @@
-"""Unit coverage for yggdrasil bounds inference."""
+"""Unit coverage for yggdrax bounds inference."""
 
 import jax.numpy as jnp
 
-from yggdrasil import infer_bounds
+from yggdrax import infer_bounds
 
 
 def test_infer_bounds_adds_positive_padding_for_non_degenerate_cloud():

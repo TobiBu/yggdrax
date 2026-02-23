@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import pytest
 
-from yggdrasil.morton import get_common_prefix_length, morton_decode, morton_encode
+from yggdrax.morton import get_common_prefix_length, morton_decode, morton_encode
 
 
 def test_morton_encode_decode():

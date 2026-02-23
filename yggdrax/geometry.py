@@ -1,4 +1,4 @@
-"""Public geometry API for Yggdrasil."""
+"""Public geometry API for Yggdrax."""
 
 from __future__ import annotations
 

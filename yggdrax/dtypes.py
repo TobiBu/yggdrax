@@ -1,13 +1,13 @@
-"""Local dtype policy for Yggdrasil contracts."""
+"""Local dtype policy for Yggdrax contracts."""
 
 import jax.numpy as jnp
 
-# Keep tree/index contracts consistent across yggdrasil artifacts.
+# Keep tree/index contracts consistent across yggdrax artifacts.
 INDEX_DTYPE = jnp.int64
 
 
 def as_index(x):
-    """Convert a scalar/array to yggdrasil index dtype."""
+    """Convert a scalar/array to yggdrax index dtype."""
     return jnp.asarray(x, dtype=INDEX_DTYPE)
 
 

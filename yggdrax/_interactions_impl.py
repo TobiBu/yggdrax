@@ -2011,7 +2011,7 @@ def _run_dual_tree_walk(
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> DualTreeWalkResult:
-    # Public APIs may pass the wrapper ``yggdrasil.tree.RadixTree``.
+    # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
     tree = tree.topology if hasattr(tree, "topology") else tree
 

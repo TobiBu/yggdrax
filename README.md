@@ -1,6 +1,12 @@
-# Yggdrasil
+# Yggdrax
 
-Yggdrasil is a JAX-first tree toolkit for hierarchical N-body solvers. It
+![Black](https://img.shields.io/badge/code%20style-black-000000.svg)
+![isort](https://img.shields.io/badge/imports-isort-1674b1.svg)
+![pydoclint](https://img.shields.io/badge/docstrings-pydoclint-2ea44f.svg)
+
+![Yggdrax Logo](./yggdrax.png)
+
+Yggdrax is a JAX-first tree toolkit for hierarchical N-body solvers. It
 provides Morton ordering, radix tree builders, per-node geometry, and dual-tree
 interaction traversal primitives designed for downstream FMM and treecode
 pipelines.
@@ -34,7 +40,7 @@ pip install -e ".[dev]"
 import jax
 import jax.numpy as jnp
 
-from yggdrasil import build_tree, compute_tree_geometry, build_interactions_and_neighbors
+from yggdrax import build_tree, compute_tree_geometry, build_interactions_and_neighbors
 
 key = jax.random.PRNGKey(0)
 key_pos, key_mass = jax.random.split(key)
@@ -68,15 +74,15 @@ pre-commit run --all-files
 Coverage is enforced via `pytest-cov`:
 
 ```bash
-pytest --cov=yggdrasil --cov-report=term-missing
+pytest --cov=yggdrax --cov-report=term-missing
 ```
 
 ## Project Structure
 
-- `tree.py`, `_tree_impl.py`: tree building and radix internals
-- `geometry.py`, `_geometry_impl.py`: geometry wrappers and implementations
-- `interactions.py`, `_interactions_impl.py`: traversal and interaction generation
-- `dense_interactions.py`, `grouped_interactions.py`: interaction layout utilities
+- `yggdrax/tree.py`, `yggdrax/_tree_impl.py`: tree building and radix internals
+- `yggdrax/geometry.py`, `yggdrax/_geometry_impl.py`: geometry wrappers and implementations
+- `yggdrax/interactions.py`, `yggdrax/_interactions_impl.py`: traversal and interaction generation
+- `yggdrax/dense_interactions.py`, `yggdrax/grouped_interactions.py`: interaction layout utilities
 - `tests/unit`: unit test suite for API and implementation behavior
 - `examples`: runnable examples and notebooks
 

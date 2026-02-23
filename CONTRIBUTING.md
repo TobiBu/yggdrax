@@ -39,7 +39,7 @@ pre-commit run --all-files
 CI enforces test coverage through `pytest-cov`.
 
 ```bash
-pytest --cov=yggdrasil --cov-report=term-missing
+pytest --cov=yggdrax --cov-report=term-missing
 ```
 
 ## Docstrings

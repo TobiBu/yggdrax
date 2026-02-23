@@ -3,14 +3,14 @@
 import jax.numpy as jnp
 import numpy as np
 
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.grouped_interactions import (
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.grouped_interactions import (
     _safe_cell_size,
     build_grouped_interactions,
     build_grouped_interactions_from_pairs,
 )
-from yggdrasil.interactions import build_interactions_and_neighbors
-from yggdrasil.tree import build_fixed_depth_tree
+from yggdrax.interactions import build_interactions_and_neighbors
+from yggdrax.tree import build_fixed_depth_tree
 
 
 def _sample_tree_state():

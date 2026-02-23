@@ -37,20 +37,20 @@ jobs:
       - name: pydoclint (public API surface)
         run: |
           pydoclint \
-            __init__.py \
-            bounds.py \
-            dense_interactions.py \
-            dtypes.py \
-            geometry.py \
-            grouped_interactions.py \
-            interactions.py \
-            morton.py \
-            multipole_utils.py \
-            policies.py \
-            traversal.py \
-            tree.py \
-            tree_moments.py \
-            types.py
+            yggdrax/__init__.py \
+            yggdrax/bounds.py \
+            yggdrax/dense_interactions.py \
+            yggdrax/dtypes.py \
+            yggdrax/geometry.py \
+            yggdrax/grouped_interactions.py \
+            yggdrax/interactions.py \
+            yggdrax/morton.py \
+            yggdrax/multipole_utils.py \
+            yggdrax/policies.py \
+            yggdrax/traversal.py \
+            yggdrax/tree.py \
+            yggdrax/tree_moments.py \
+            yggdrax/types.py
 
       - name: Unit tests with coverage
         run: pytest

@@ -3,11 +3,11 @@
 import jax.numpy as jnp
 import pytest
 
-from yggdrasil.dtypes import INDEX_DTYPE
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.multipole_utils import level_offset, total_coefficients
-from yggdrasil.tree import build_tree
-from yggdrasil.tree_moments import (
+from yggdrax.dtypes import INDEX_DTYPE
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.multipole_utils import level_offset, total_coefficients
+from yggdrax.tree import build_tree
+from yggdrax.tree_moments import (
     compute_tree_mass_moments,
     compute_tree_multipole_moments,
     pack_multipole_expansions,

@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yggdrasil"
+name = "yggdrax"
 version = "0.0.1"
 description = "Tree generation and traversal package for hierarchical solvers"
 readme = "README.md"
@@ -38,13 +38,13 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["yggdrasil"]
+packages = ["yggdrax"]
 
 [tool.setuptools.package-dir]
-yggdrasil = "."
+yggdrax = "yggdrax"
 
 [tool.setuptools.package-data]
-yggdrasil = ["py.typed"]
+yggdrax = ["py.typed"]
 
 [tool.black]
 line-length = 88
@@ -67,10 +67,10 @@ skip_gitignore = true
 [tool.pytest.ini_options]
 minversion = "7.4"
 testpaths = ["tests"]
-addopts = "-q --strict-markers --cov=yggdrasil --cov-report=term-missing --cov-report=xml --cov-fail-under=85"
+addopts = "-q --strict-markers --cov=yggdrax --cov-report=term-missing --cov-report=xml --cov-fail-under=85"
 
 [tool.coverage.run]
-source = ["yggdrasil"]
+source = ["yggdrax"]
 branch = true
 
 [tool.coverage.report]

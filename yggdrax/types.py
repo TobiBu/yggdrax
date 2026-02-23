@@ -1,4 +1,4 @@
-"""Shared prepared artifact contracts for Yggdrasil consumers."""
+"""Shared prepared artifact contracts for Yggdrax consumers."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from .tree import RadixTree
 
 @dataclass(frozen=True)
 class TraversalResult:
-    """Local yggdrasil view of dual-tree traversal outputs."""
+    """Local yggdrax view of dual-tree traversal outputs."""
 
     interaction_offsets: Array
     interaction_sources: Array
@@ -35,7 +35,7 @@ class TraversalResult:
 
 
 def traversal_result_from_expanse(result: DualTreeWalkResult) -> TraversalResult:
-    """Convert expanse traversal result into yggdrasil local contract."""
+    """Convert expanse traversal result into yggdrax local contract."""
 
     return TraversalResult(
         interaction_offsets=result.interaction_offsets,

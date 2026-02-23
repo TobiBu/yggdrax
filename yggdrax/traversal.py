@@ -1,4 +1,4 @@
-"""Prepared tree artifact construction for Yggdrasil."""
+"""Prepared tree artifact construction for Yggdrax."""
 
 from __future__ import annotations
 

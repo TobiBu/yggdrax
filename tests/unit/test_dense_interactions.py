@@ -2,10 +2,10 @@
 
 import jax.numpy as jnp
 
-from yggdrasil.dense_interactions import build_dense_interactions, densify_interactions
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.interactions import build_interactions_and_neighbors
-from yggdrasil.tree import build_fixed_depth_tree
+from yggdrax.dense_interactions import build_dense_interactions, densify_interactions
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.interactions import build_interactions_and_neighbors
+from yggdrax.tree import build_fixed_depth_tree
 
 
 def _build_fixed_depth_state(theta: float = 0.6):

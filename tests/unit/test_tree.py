@@ -3,8 +3,8 @@
 import jax.numpy as jnp
 import numpy as np
 
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.tree import (
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.tree import (
     RadixTreeWorkspace,
     build_fixed_depth_tree,
     build_fixed_depth_tree_jit,
@@ -199,7 +199,7 @@ def test_duplicate_codes_stability():
     )
 
     # lexsort by (idx, codes) should return [0,1,...,n-1]
-    from yggdrasil.dtypes import INDEX_DTYPE
+    from yggdrax.dtypes import INDEX_DTYPE
 
     expected = jnp.arange(n, dtype=INDEX_DTYPE)
     assert jnp.array_equal(tree.particle_indices, expected)

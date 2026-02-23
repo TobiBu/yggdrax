@@ -2,7 +2,7 @@
 
 ## Scope
 
-Yggdrasil is scientific research software intended for numerical experiments and
+Yggdrax is scientific research software intended for numerical experiments and
 method development.
 
 ## Security Expectations

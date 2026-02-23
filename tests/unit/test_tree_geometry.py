@@ -2,8 +2,8 @@
 
 import jax.numpy as jnp
 
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.tree import build_tree
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.tree import build_tree
 
 DEFAULT_TEST_LEAF_SIZE = 1
 
@@ -72,7 +72,7 @@ def test_root_geometry_spans_all_points():
     parents = tree.parent[:num_internal]
     root_mask = parents == -1
     assert int(root_mask.sum()) == 1
-    from yggdrasil.dtypes import INDEX_DTYPE
+    from yggdrax.dtypes import INDEX_DTYPE
 
     root_index = int(jnp.argmax(root_mask.astype(INDEX_DTYPE)))
 

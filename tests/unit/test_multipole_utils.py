@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import pytest
 
-from yggdrasil.multipole_utils import (
+from yggdrax.multipole_utils import (
     level_offset,
     level_size,
     multi_index_factorial,

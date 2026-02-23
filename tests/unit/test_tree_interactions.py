@@ -2,8 +2,8 @@
 
 import jax.numpy as jnp
 
-from yggdrasil.geometry import compute_tree_geometry
-from yggdrasil.interactions import (
+from yggdrax.geometry import compute_tree_geometry
+from yggdrax.interactions import (
     _compute_effective_extents,
     _compute_leaf_effective_extents,
     _interaction_capacity_candidates,
@@ -12,7 +12,7 @@ from yggdrasil.interactions import (
     interactions_for_node,
     neighbors_for_leaf,
 )
-from yggdrasil.tree import build_tree
+from yggdrax.tree import build_tree
 
 DEFAULT_TEST_LEAF_SIZE = 1
 
@@ -54,7 +54,7 @@ def _mac_accept_fn(tree, geometry, theta):
         extents,
         num_internal,
     )
-    from yggdrasil.dtypes import INDEX_DTYPE
+    from yggdrax.dtypes import INDEX_DTYPE
 
     indices = jnp.arange(parent.shape[0], dtype=INDEX_DTYPE)
     mac_extents = jnp.where(
@@ -89,7 +89,7 @@ def _mac_accept_fn_engblom(tree, geometry, theta):
         extents,
         num_internal,
     )
-    from yggdrasil.dtypes import INDEX_DTYPE
+    from yggdrax.dtypes import INDEX_DTYPE
 
     indices = jnp.arange(parent.shape[0], dtype=INDEX_DTYPE)
     mac_extents = jnp.where(
@@ -137,7 +137,7 @@ def _mac_accept_fn_dehnen(tree, geometry, theta):
         extents,
         num_internal,
     )
-    from yggdrasil.dtypes import INDEX_DTYPE
+    from yggdrax.dtypes import INDEX_DTYPE
 
     indices = jnp.arange(parent.shape[0], dtype=INDEX_DTYPE)
     mac_extents = jnp.where(

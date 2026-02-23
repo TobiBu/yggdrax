@@ -1,9 +1,9 @@
-"""Coverage for yggdrasil tree API wrappers."""
+"""Coverage for yggdrax tree API wrappers."""
 
 import jax
 import jax.numpy as jnp
 
-from yggdrasil import (
+from yggdrax import (
     FixedDepthTreeBuildConfig,
     TreeBuildConfig,
     build_fixed_depth_tree,

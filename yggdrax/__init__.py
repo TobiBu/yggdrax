@@ -1,4 +1,4 @@
-"""Yggdrasil: tree generation, geometry, traversal, and interaction APIs."""
+"""Yggdrax: tree generation, geometry, traversal, and interaction APIs."""
 
 from jax import config as _jax_config
 

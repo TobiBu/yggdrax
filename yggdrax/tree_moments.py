@@ -1,7 +1,7 @@
 """Mass moments for radix tree nodes.
 
 This module accumulates per-node total masses and centres of mass from
-particles that were reordered into Morton order by :mod:`yggdrasil.tree`.
+particles that were reordered into Morton order by :mod:`yggdrax.tree`.
 These summaries are useful when building multipole expansions during the
 upward FMM sweep.
 """
@@ -671,7 +671,7 @@ def compute_tree_multipole_moments(
     Parameters
     ----------
     tree : RadixTree
-        Radix tree produced by :func:`yggdrasil.tree.build_tree`.
+        Radix tree produced by :func:`yggdrax.tree.build_tree`.
     positions_sorted : Array
         Particle positions in Morton order.
     masses_sorted : Array

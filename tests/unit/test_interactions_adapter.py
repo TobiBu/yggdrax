@@ -1,9 +1,9 @@
-"""Coverage for yggdrasil interaction config adapters."""
+"""Coverage for yggdrax interaction config adapters."""
 
 import jax
 import jax.numpy as jnp
 
-from yggdrasil import (
+from yggdrax import (
     DualTreeTraversalConfig,
     NodeInteractionList,
     NodeNeighborList,
@@ -12,7 +12,7 @@ from yggdrasil import (
     compute_tree_geometry,
     infer_bounds,
 )
-from yggdrasil.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
+from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
 
 
 def _sample_problem(n: int = 64):
@@ -35,7 +35,7 @@ def _sample_problem(n: int = 64):
     return positions, masses
 
 
-def test_interactions_accepts_yggdrasil_traversal_config():
+def test_interactions_accepts_yggdrax_traversal_config():
     positions, masses = _sample_problem(n=64)
     tree, pos_sorted, _, _ = build_tree(
         positions,

@@ -1,9 +1,9 @@
-"""Yggdrasil package-local regression tests."""
+"""Yggdrax package-local regression tests."""
 
 import jax
 import jax.numpy as jnp
 
-from yggdrasil import TraversalResult, build_prepared_tree_artifacts
+from yggdrax import TraversalResult, build_prepared_tree_artifacts
 
 
 def _sample_problem(n: int = 64):
