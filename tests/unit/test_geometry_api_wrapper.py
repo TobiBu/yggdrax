@@ -108,6 +108,13 @@ def test_geometry_to_level_major_accepts_topology_carrier():
     assert level_major.centers.ndim == 3
 
 
+def test_compute_tree_geometry_supports_outer_jit():
+    jitted = jax.jit(lambda t, ps: compute_tree_geometry(t, ps))
+    geometry = jitted(tree, pos_sorted)
+    total_nodes = int(tree.parent.shape[0])
+    assert geometry.center.shape == (total_nodes, 3)
+
+
 def test_geometry_level_views_can_derive_missing_level_fields():
     positions, masses = _sample_problem(n=64)
     tree, pos_sorted, _, _ = build_tree(
