@@ -28,6 +28,11 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Physics",
 ]
 
+[project.urls]
+Homepage = "https://github.com/AstroAI-Lab/yggdrax"
+Repository = "https://github.com/AstroAI-Lab/yggdrax"
+Issues = "https://github.com/AstroAI-Lab/yggdrax/issues"
+
 [project.optional-dependencies]
 dev = [
   "black>=24.8.0",
