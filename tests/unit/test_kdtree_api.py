@@ -146,6 +146,24 @@ def test_tree_backend_queries_support_jit():
     assert dist.shape == (21, 6)
 
 
+def test_query_neighbors_return_squared_matches_distance_square():
+    points = _sample_points(n=72, dim=3)
+    queries = _sample_points(n=15, dim=3)
+    tree = build_kdtree(points, leaf_size=8)
+
+    idx_d, d = query_neighbors(tree, queries, k=5, backend="tree")
+    idx_s, d2 = query_neighbors(
+        tree,
+        queries,
+        k=5,
+        backend="tree",
+        return_squared=True,
+    )
+
+    assert jnp.array_equal(idx_d, idx_s)
+    assert jnp.allclose(d2, d * d, atol=1e-6, rtol=1e-6)
+
+
 def test_tree_backend_matches_tiled_radius_counts():
     points = _sample_points(n=96, dim=3)
     queries = _sample_points(n=23, dim=3)
@@ -157,6 +175,20 @@ def test_tree_backend_matches_tiled_radius_counts():
     assert jnp.array_equal(counts_tiled, counts_tree)
 
 
+def test_count_neighbors_supports_vector_radii():
+    points = _sample_points(n=96, dim=3)
+    queries = _sample_points(n=23, dim=3)
+    tree = build_kdtree(points, leaf_size=8)
+    radii = jnp.asarray([0.25, 0.4, 0.6], dtype=jnp.float32)
+
+    counts_tiled = count_neighbors(tree, queries, radius=radii, backend="tiled")
+    counts_tree = count_neighbors(tree, queries, radius=radii, backend="tree")
+
+    assert counts_tiled.shape == (23, 3)
+    assert counts_tree.shape == (23, 3)
+    assert jnp.array_equal(counts_tiled, counts_tree)
+
+
 def test_tree_backend_counts_support_jit():
     points = _sample_points(n=96, dim=3)
     queries = _sample_points(n=23, dim=3)
@@ -164,6 +196,18 @@ def test_tree_backend_counts_support_jit():
     jitted = jax.jit(lambda q: count_neighbors(tree, q, radius=0.4, backend="tree"))
     counts = jitted(queries)
     assert counts.shape == (23,)
+
+
+def test_tree_backend_matches_dense_across_leaf_sizes():
+    points = _sample_points(n=128, dim=3)
+    queries = _sample_points(n=19, dim=3)
+
+    for leaf_size in (1, 4, 16, 32):
+        tree = build_kdtree(points, leaf_size=leaf_size)
+        idx_dense, d_dense = query_neighbors(tree, queries, k=6, backend="dense")
+        idx_tree, d_tree = query_neighbors(tree, queries, k=6, backend="tree")
+        assert jnp.array_equal(idx_dense, idx_tree)
+        assert jnp.allclose(d_dense, d_tree, atol=1e-6, rtol=1e-6)
 
 
 def test_auto_backend_matches_dense_for_small_problem():
