@@ -73,6 +73,27 @@ class TreeBuildRequest:
 
 TreeBuilder = Callable[[TreeBuildRequest], "Tree"]
 
+FMM_CORE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "parent",
+    "left_child",
+    "right_child",
+    "node_ranges",
+    "num_particles",
+    "use_morton_geometry",
+)
+
+MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
+    "bounds_min",
+    "bounds_max",
+    "leaf_codes",
+    "leaf_depths",
+)
+
+# Backward-compatible alias used by previous checks.
+FMM_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
+    FMM_CORE_REQUIRED_FIELDS + MORTON_TOPOLOGY_REQUIRED_FIELDS
+)
+
 
 @dataclass(frozen=True)
 class Tree:
@@ -115,6 +136,23 @@ class Tree:
         """Delegate missing attributes to the concrete topology object."""
 
         return getattr(self.topology, name)
+
+    @property
+    def missing_fmm_topology_fields(self) -> tuple[str, ...]:
+        """Return missing topology fields required by FMM core APIs."""
+
+        return missing_fmm_topology_fields(self)
+
+    @property
+    def supports_fmm_topology(self) -> bool:
+        """Whether this tree exposes topology needed by FMM core routines."""
+
+        return len(self.missing_fmm_topology_fields) == 0
+
+    def require_fmm_topology(self) -> None:
+        """Raise when this tree cannot satisfy FMM core topology requirements."""
+
+        require_fmm_topology(self)
 
     @classmethod
     @jaxtyped(typechecker=beartype)
@@ -461,6 +499,85 @@ def resolve_tree_topology(tree_or_topology: object) -> object:
     return tree_or_topology if topology is None else topology
 
 
+def missing_fmm_core_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return FMM-core required topology fields missing on the provided object."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name for name in FMM_CORE_REQUIRED_FIELDS if not hasattr(topology, name)
+    )
+
+
+def missing_morton_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return Morton-geometry required fields missing on the provided object."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name
+        for name in MORTON_TOPOLOGY_REQUIRED_FIELDS
+        if not hasattr(topology, name)
+    )
+
+
+def has_fmm_core_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when all FMM-core fields are available."""
+
+    return len(missing_fmm_core_topology_fields(tree_or_topology)) == 0
+
+
+def has_morton_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when all Morton-geometry fields are available."""
+
+    return len(missing_morton_topology_fields(tree_or_topology)) == 0
+
+
+def require_fmm_core_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when FMM-core topology fields are missing."""
+
+    missing = missing_fmm_core_topology_fields(tree_or_topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(
+        f"{prefix}topology is missing FMM-core-required fields: {missing_txt}"
+    )
+
+
+def require_morton_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when Morton-geometry fields are missing."""
+
+    missing = missing_morton_topology_fields(tree_or_topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(
+        f"{prefix}topology is missing Morton-geometry-required fields: {missing_txt}"
+    )
+
+
+# Backward-compatible aliases
+def missing_fmm_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Alias of ``missing_fmm_core_topology_fields`` for compatibility."""
+
+    return missing_fmm_core_topology_fields(tree_or_topology)
+
+
+def has_fmm_topology(tree_or_topology: object) -> bool:
+    """Alias of ``has_fmm_core_topology`` for compatibility."""
+
+    return has_fmm_core_topology(tree_or_topology)
+
+
+def require_fmm_topology(tree_or_topology: object) -> None:
+    """Alias of ``require_fmm_core_topology`` for compatibility."""
+
+    require_fmm_core_topology(tree_or_topology)
+
+
 def get_num_internal_nodes(tree: object) -> int:
     """Return number of internal nodes, deriving it from child buffers when needed."""
 
@@ -761,6 +878,9 @@ def build_fixed_depth_tree_jit(
 
 __all__ = [
     "MAX_TREE_LEVELS",
+    "FMM_CORE_REQUIRED_FIELDS",
+    "MORTON_TOPOLOGY_REQUIRED_FIELDS",
+    "FMM_TOPOLOGY_REQUIRED_FIELDS",
     "Tree",
     "TreeBuilder",
     "TreeBuildRequest",
@@ -781,7 +901,16 @@ __all__ = [
     "get_nodes_by_level",
     "get_num_internal_nodes",
     "get_num_levels",
+    "has_fmm_core_topology",
+    "has_fmm_topology",
+    "has_morton_topology",
+    "missing_fmm_core_topology_fields",
+    "missing_fmm_topology_fields",
+    "missing_morton_topology_fields",
     "resolve_tree_topology",
+    "require_fmm_core_topology",
+    "require_fmm_topology",
+    "require_morton_topology",
     "register_tree_builder",
     "reorder_particles_by_indices",
 ]

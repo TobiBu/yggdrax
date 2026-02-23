@@ -45,6 +45,9 @@ from .protocols import (
 )
 from .traversal import build_prepared_tree_artifacts
 from .tree import (
+    FMM_CORE_REQUIRED_FIELDS,
+    MORTON_TOPOLOGY_REQUIRED_FIELDS,
+    FMM_TOPOLOGY_REQUIRED_FIELDS,
     MAX_TREE_LEVELS,
     FixedDepthTreeBuildConfig,
     KDParticleTree,
@@ -66,13 +69,25 @@ from .tree import (
     get_nodes_by_level,
     get_num_internal_nodes,
     get_num_levels,
+    has_fmm_core_topology,
+    has_fmm_topology,
+    has_morton_topology,
+    missing_fmm_core_topology_fields,
+    missing_fmm_topology_fields,
+    missing_morton_topology_fields,
     register_tree_builder,
+    require_fmm_core_topology,
+    require_fmm_topology,
+    require_morton_topology,
     resolve_tree_topology,
 )
 from .types import PreparedTreeArtifacts, TraversalArtifacts, TraversalResult
 
 __all__ = [
     "MAX_TREE_LEVELS",
+    "FMM_CORE_REQUIRED_FIELDS",
+    "MORTON_TOPOLOGY_REQUIRED_FIELDS",
+    "FMM_TOPOLOGY_REQUIRED_FIELDS",
     "MACType",
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
@@ -115,6 +130,12 @@ __all__ = [
     "get_nodes_by_level",
     "get_num_internal_nodes",
     "get_num_levels",
+    "has_fmm_core_topology",
+    "has_fmm_topology",
+    "has_morton_topology",
+    "missing_fmm_core_topology_fields",
+    "missing_fmm_topology_fields",
+    "missing_morton_topology_fields",
     "compute_tree_geometry",
     "geometry_to_level_major",
     "get_common_prefix_length",
@@ -122,6 +143,9 @@ __all__ = [
     "morton_decode",
     "morton_encode",
     "resolve_tree_topology",
+    "require_fmm_core_topology",
+    "require_fmm_topology",
+    "require_morton_topology",
     "register_tree_builder",
     "TreeLevelIndexProtocol",
     "TreeRangesProtocol",
