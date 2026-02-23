@@ -132,7 +132,7 @@ def test_radix_tree_reports_fmm_topology_support():
     require_morton_topology(tree)
 
 
-def test_kdtree_reports_missing_fmm_topology_fields():
+def test_kdtree_reports_core_fmm_support_and_missing_morton_fields():
     positions, masses = _sample_problem(n=64)
     tree = Tree.from_particles(
         positions,
@@ -142,24 +142,19 @@ def test_kdtree_reports_missing_fmm_topology_fields():
         leaf_size=8,
         return_reordered=True,
     )
-    assert not tree.supports_fmm_topology
+    assert tree.supports_fmm_topology
     missing = set(tree.missing_fmm_topology_fields)
-    assert "parent" in missing
-    assert "node_ranges" in missing
+    assert len(missing) == 0
     core_missing = set(missing_fmm_core_topology_fields(tree))
     morton_missing = set(missing_morton_topology_fields(tree))
-    assert "parent" in core_missing
-    assert "node_ranges" in core_missing
+    assert len(core_missing) == 0
     assert "leaf_codes" in morton_missing
-    assert not has_fmm_core_topology(tree)
-    assert not has_fmm_topology(tree)
+    assert has_fmm_core_topology(tree)
+    assert has_fmm_topology(tree)
     assert not has_morton_topology(tree)
-    with pytest.raises(ValueError, match="missing FMM-core-required fields"):
-        require_fmm_core_topology(tree)
-    with pytest.raises(ValueError, match="missing FMM-core-required fields"):
-        tree.require_fmm_topology()
-    with pytest.raises(ValueError, match="missing FMM-core-required fields"):
-        require_fmm_topology(tree)
+    require_fmm_core_topology(tree)
+    tree.require_fmm_topology()
+    require_fmm_topology(tree)
     with pytest.raises(ValueError, match="missing Morton-geometry-required fields"):
         require_morton_topology(tree)
 

@@ -89,14 +89,20 @@ def test_kdtree_topology_fields_are_well_formed():
     tree = build_kdtree(points, leaf_size=4)
 
     num_nodes = int(tree.node_start.shape[0])
+    num_internal = int(tree.num_internal_nodes)
     assert tree.indices.shape == (33,)
+    assert tree.particle_indices.shape == (33,)
     assert tree.node_end.shape == (num_nodes,)
-    assert tree.left_child.shape == (num_nodes,)
-    assert tree.right_child.shape == (num_nodes,)
+    assert tree.node_ranges.shape == (num_nodes, 2)
+    assert tree.parent.shape == (num_nodes,)
+    assert tree.left_child.shape == (num_internal,)
+    assert tree.right_child.shape == (num_internal,)
     assert tree.split_dim.shape == (num_nodes,)
     assert tree.split_value.shape == (num_nodes,)
     assert tree.bbox_min.shape == (num_nodes, 3)
     assert tree.bbox_max.shape == (num_nodes, 3)
+    assert int(tree.num_particles) == 33
+    assert bool(tree.use_morton_geometry) is False
     assert tree.leaf_nodes.ndim == 1
     assert tree.leaf_start.shape == tree.leaf_nodes.shape
     assert tree.leaf_end.shape == tree.leaf_nodes.shape

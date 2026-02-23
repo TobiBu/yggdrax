@@ -17,10 +17,16 @@ class KDTree:
 
     points: Array
     indices: Array
+    particle_indices: Array
     node_start: Array
     node_end: Array
+    node_ranges: Array
+    parent: Array
     left_child: Array
     right_child: Array
+    num_internal_nodes: int
+    num_particles: Array
+    use_morton_geometry: Array
     split_dim: Array
     split_value: Array
     bbox_min: Array
@@ -54,10 +60,15 @@ def _register_kdtree_pytree() -> None:
         children = (
             tree.points,
             tree.indices,
+            tree.particle_indices,
             tree.node_start,
             tree.node_end,
+            tree.node_ranges,
+            tree.parent,
             tree.left_child,
             tree.right_child,
+            tree.num_particles,
+            tree.use_morton_geometry,
             tree.split_dim,
             tree.split_value,
             tree.bbox_min,
@@ -69,18 +80,23 @@ def _register_kdtree_pytree() -> None:
             tree.leaf_valid_mask,
             tree.node_to_leaf,
         )
-        aux = (tree.leaf_size,)
+        aux = (tree.leaf_size, tree.num_internal_nodes)
         return children, aux
 
     def unflatten(aux, children):
-        (leaf_size,) = aux
+        leaf_size, num_internal_nodes = aux
         (
             points,
             indices,
+            particle_indices,
             node_start,
             node_end,
+            node_ranges,
+            parent,
             left_child,
             right_child,
+            num_particles,
+            use_morton_geometry,
             split_dim,
             split_value,
             bbox_min,
@@ -95,10 +111,16 @@ def _register_kdtree_pytree() -> None:
         return KDTree(
             points=points,
             indices=indices,
+            particle_indices=particle_indices,
             node_start=node_start,
             node_end=node_end,
+            node_ranges=node_ranges,
+            parent=parent,
             left_child=left_child,
             right_child=right_child,
+            num_internal_nodes=num_internal_nodes,
+            num_particles=num_particles,
+            use_morton_geometry=use_morton_geometry,
             split_dim=split_dim,
             split_value=split_value,
             bbox_min=bbox_min,
@@ -153,6 +175,52 @@ def _validate_queries(tree: KDTree, queries: Array) -> Array:
             f"received {queries_arr.shape[1]} and {tree.dimension}"
         )
     return queries_arr
+
+
+def _heap_inorder_and_ranges(n: int) -> tuple[Array, Array]:
+    """Return inorder node order and inclusive subtree ranges for heap nodes."""
+
+    left = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
+    right = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
+
+    inorder_nodes: list[int] = []
+    stack: list[int] = []
+    cur = 0 if n > 0 else -1
+    while stack or (cur >= 0):
+        while cur >= 0:
+            stack.append(cur)
+            cur = left[cur]
+        cur = stack.pop()
+        inorder_nodes.append(cur)
+        cur = right[cur]
+
+    inorder_pos = [0] * n
+    for pos, node in enumerate(inorder_nodes):
+        inorder_pos[node] = pos
+
+    subtree_sizes = [1] * n
+    for i in range(n - 1, -1, -1):
+        l = left[i]
+        r = right[i]
+        size = 1
+        if l >= 0:
+            size += subtree_sizes[l]
+        if r >= 0:
+            size += subtree_sizes[r]
+        subtree_sizes[i] = size
+
+    ranges = []
+    for i in range(n):
+        l = left[i]
+        l_size = subtree_sizes[l] if l >= 0 else 0
+        start = inorder_pos[i] - l_size
+        end = start + subtree_sizes[i] - 1
+        ranges.append((start, end))
+
+    return (
+        jnp.asarray(inorder_nodes, dtype=jnp.int32),
+        jnp.asarray(ranges, dtype=jnp.int32),
+    )
 
 
 def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
@@ -226,8 +294,17 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     node_ids = jnp.arange(n, dtype=jnp.int32)
     left_raw = 2 * node_ids + 1
     right_raw = left_raw + 1
-    left_child = jnp.where(left_raw < n, left_raw, -1).astype(jnp.int32)
-    right_child = jnp.where(right_raw < n, right_raw, -1).astype(jnp.int32)
+    left_child_full = jnp.where(left_raw < n, left_raw, -1).astype(jnp.int32)
+    right_child_full = jnp.where(right_raw < n, right_raw, -1).astype(jnp.int32)
+
+    num_internal = n // 2
+    left_child = left_child_full[:num_internal]
+    right_child = right_child_full[:num_internal]
+    parent = jnp.where(
+        node_ids == 0,
+        jnp.asarray(-1, dtype=jnp.int32),
+        (node_ids - 1) // 2,
+    ).astype(jnp.int32)
 
     safe_dim = jnp.clip(split_dim_arr, 0, dim - 1)
     safe_idx = order
@@ -241,8 +318,8 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
 
     def size_body(t, sizes):
         i = n - 1 - t
-        l = left_child[i]
-        r = right_child[i]
+        l = left_child_full[i]
+        r = right_child_full[i]
         l_size = jnp.where(l >= 0, sizes[l], jnp.asarray(0, dtype=sizes.dtype))
         r_size = jnp.where(r >= 0, sizes[r], jnp.asarray(0, dtype=sizes.dtype))
         return sizes.at[i].set(1 + l_size + r_size)
@@ -264,8 +341,8 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         mins, maxs = state
         i = n - 1 - t
         p = point_for_node[i]
-        l = left_child[i]
-        r = right_child[i]
+        l = left_child_full[i]
+        r = right_child_full[i]
         l_min = jnp.where(l >= 0, mins[l], p)
         l_max = jnp.where(l >= 0, maxs[l], p)
         r_min = jnp.where(r >= 0, mins[r], p)
@@ -340,12 +417,23 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
 
     node_to_leaf = jax.lax.fori_loop(0, n, node_to_leaf_body, node_to_leaf)
 
+    inorder_nodes, node_ranges = _heap_inorder_and_ranges(n)
+    particle_indices = order[inorder_nodes]
+    num_particles = jnp.asarray(n, dtype=jnp.int32)
+    use_morton_geometry = jnp.asarray(False)
+
     return (
         order.astype(jnp.int32),
+        particle_indices.astype(jnp.int32),
         node_start,
         node_end,
+        node_ranges,
+        parent,
         left_child,
         right_child,
+        num_internal,
+        num_particles,
+        use_morton_geometry,
         split_dim_arr.astype(jnp.int32),
         split_value_arr,
         bbox_min,
@@ -371,20 +459,26 @@ def build_kdtree(points: Array, *, leaf_size: int = 32) -> KDTree:
     return KDTree(
         points=points_arr,
         indices=topology[0],
-        node_start=topology[1],
-        node_end=topology[2],
-        left_child=topology[3],
-        right_child=topology[4],
-        split_dim=topology[5],
-        split_value=topology[6],
-        bbox_min=topology[7],
-        bbox_max=topology[8],
-        leaf_nodes=topology[9],
-        leaf_start=topology[10],
-        leaf_end=topology[11],
-        leaf_point_ids=topology[12],
-        leaf_valid_mask=topology[13],
-        node_to_leaf=topology[14],
+        particle_indices=topology[1],
+        node_start=topology[2],
+        node_end=topology[3],
+        node_ranges=topology[4],
+        parent=topology[5],
+        left_child=topology[6],
+        right_child=topology[7],
+        num_internal_nodes=int(topology[8]),
+        num_particles=topology[9],
+        use_morton_geometry=topology[10],
+        split_dim=topology[11],
+        split_value=topology[12],
+        bbox_min=topology[13],
+        bbox_max=topology[14],
+        leaf_nodes=topology[15],
+        leaf_start=topology[16],
+        leaf_end=topology[17],
+        leaf_point_ids=topology[18],
+        leaf_valid_mask=topology[19],
+        node_to_leaf=topology[20],
         leaf_size=int(leaf_size),
     )
 

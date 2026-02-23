@@ -432,11 +432,13 @@ def _propagate_extents(parent: Array, extents: Array) -> Array:
         def cond_fun(state):
             node, value = state
             parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
+            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
             return (value <= 0.0) & (parent_idx >= 0)
 
         def body_fun(state):
             node, _value = state
             parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
+            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
             new_value = lax.dynamic_index_in_dim(
                 extents, parent_idx, axis=0, keepdims=False
             )

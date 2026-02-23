@@ -373,7 +373,7 @@ class KDParticleTree(Tree):
 
         topology = build_kdtree(positions, leaf_size=leaf_size)
         if return_reordered:
-            idx = jnp.asarray(topology.indices, dtype=INDEX_DTYPE)
+            idx = jnp.asarray(topology.particle_indices, dtype=INDEX_DTYPE)
             pos_sorted = positions[idx]
             mass_sorted = masses[idx]
             inv = jnp.empty_like(idx)

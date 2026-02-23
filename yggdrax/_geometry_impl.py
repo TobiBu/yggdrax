@@ -170,6 +170,10 @@ def compute_tree_geometry(
     num_nodes = ranges.shape[0]
 
     use_morton_bounds = jnp.asarray(tree.use_morton_geometry, dtype=jnp.bool_)
+    has_morton_fields = all(
+        hasattr(tree, name)
+        for name in ("bounds_min", "bounds_max", "leaf_codes", "leaf_depths")
+    )
 
     def _leaf_bounds_from_ranges(_):
         leaf_ranges = ranges[num_internal:]
@@ -181,12 +185,15 @@ def compute_tree_geometry(
             leaf_counts,
         )
 
-    leaf_min, leaf_max = lax.cond(
-        use_morton_bounds,
-        lambda _: _compute_leaf_bounds_from_morton(tree),
-        _leaf_bounds_from_ranges,
-        operand=None,
-    )
+    if has_morton_fields:
+        leaf_min, leaf_max = lax.cond(
+            use_morton_bounds,
+            lambda _: _compute_leaf_bounds_from_morton(tree),
+            _leaf_bounds_from_ranges,
+            operand=None,
+        )
+    else:
+        leaf_min, leaf_max = _leaf_bounds_from_ranges(None)
 
     mins = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
     maxs = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
