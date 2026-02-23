@@ -644,20 +644,6 @@ def compute_tree_mass_moments(
     return TreeMassMoments(mass=total_mass, center_of_mass=center)
 
 
-def _prefix_1d(values: Array) -> Array:
-    pad = jnp.zeros((1,), dtype=values.dtype)
-    return jnp.concatenate([pad, jnp.cumsum(values)])
-
-
-def _prefix_2d(values: Array) -> Array:
-    pad = jnp.zeros((1, values.shape[1]), dtype=values.dtype)
-    return jnp.concatenate([pad, jnp.cumsum(values, axis=0)], axis=0)
-
-
-def _segment_sum(prefix: Array, starts: Array, ends: Array) -> Array:
-    return prefix[ends] - prefix[starts]
-
-
 @jaxtyped(typechecker=beartype)
 def compute_tree_multipole_moments(
     tree: RadixTree,

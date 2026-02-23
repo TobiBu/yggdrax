@@ -48,7 +48,8 @@ positions = jax.random.uniform(key_pos, (512, 3), minval=-1.0, maxval=1.0)
 masses = jax.random.uniform(key_mass, (512,), minval=0.5, maxval=1.5)
 
 tree = build_tree(positions, masses, leaf_size=16)
-geom = compute_tree_geometry(tree, positions[tree.sorted_indices])
+positions_sorted = positions[tree.particle_indices]
+geom = compute_tree_geometry(tree, positions_sorted)
 interactions, neighbors = build_interactions_and_neighbors(tree, geom)
 ```
 

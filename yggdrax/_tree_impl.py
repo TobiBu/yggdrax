@@ -6,6 +6,7 @@ hierarchical octree structure implicitly through the Morton code ordering.
 """
 
 import math
+from collections import deque
 from functools import partial
 from typing import NamedTuple, Optional
 
@@ -139,32 +140,6 @@ def _lcp_codes_only(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """
     xor = jnp.bitwise_xor(a, b)
     return jnp.where(xor == jnp.uint64(0), as_index(64), _clz_u64(xor))
-
-
-def _delta_with_tie(
-    codes: jnp.ndarray,
-    i: jnp.ndarray,
-    j: jnp.ndarray,
-) -> jnp.ndarray:
-    """
-    Karras delta(i,j): common-prefix length with tie-break using indices.
-
-    - Out-of-bounds j returns -1.
-    - If codes[i] == codes[j], return 64 + clz(i ^ j),
-      else clz(code_i ^ code_j).
-    Returns int32.
-    """
-    n = codes.shape[0]
-
-    def _in_bounds(jj):
-        ci = codes[i]
-        cj = codes[jj]
-        same = ci == cj
-        clz_code = _clz_u64(jnp.bitwise_xor(ci, cj))
-        clz_idx = _clz_u64((jnp.uint64(i) ^ jnp.uint64(jj)))
-        return jnp.where(same, as_index(64) + clz_idx, clz_code)
-
-    return lax.cond((j >= 0) & (j < n), _in_bounds, lambda _: as_index(-1), j)
 
 
 # ---------------------------------------------
@@ -334,7 +309,7 @@ def build_fixed_depth_tree(
         new_depths: list[int] = []
 
         # Queue items are tuples (s, e, base_code, depth)
-        queue: list[tuple[int, int, np.uint64, int]] = []
+        queue = deque[tuple[int, int, np.uint64, int]]()
         for i in range(leaf_starts_np.shape[0]):
             s = int(leaf_starts_np[i])
             e = int(leaf_ends_np[i])
@@ -348,7 +323,7 @@ def build_fixed_depth_tree(
 
         eps = 1e-12
         while queue:
-            s, e, base_code, depth_level = queue.pop(0)
+            s, e, base_code, depth_level = queue.popleft()
             if e <= s:
                 # Keep zero-particle leaves so downstream consumers retain
                 # the original Morton layout and near-field neighbour lists
@@ -451,19 +426,13 @@ def build_fixed_depth_tree(
     # function is being traced by JAX (e.g., when JIT-compiling). In traced
     # contexts we simply skip refinement to keep the function JAX-traceable.
     if refine_local:
-        try:
-            # Detect whether `positions` is a JAX Tracer; if so, skip host
-            # NumPy conversion and refinement.
-            from jax.core import Tracer as _JaxTracer
-
-            _is_tracing = isinstance(positions, _JaxTracer)
-        except Exception:
-            _is_tracing = False
+        # Detect whether `positions` is a JAX Tracer; if so, skip host
+        # NumPy conversion and refinement.
+        _is_tracing = isinstance(positions, jax.core.Tracer)
 
         if _is_tracing:
             # Under tracing/JIT we cannot call np.asarray on traced arrays.
             # Skip the local refinement and use the original JAX partitions.
-            # the local refinement and use the original JAX partitions.
             refined_starts_np, refined_ends_np, refined_codes_np = (
                 leaf_starts_jax,
                 leaf_ends_jax,
@@ -471,6 +440,17 @@ def build_fixed_depth_tree(
             )
             refined_depths_np = leaf_depths_jax
         else:
+            (
+                refined_starts_np,
+                refined_ends_np,
+                refined_codes_np,
+                refined_depths_np,
+            ) = (
+                leaf_starts_jax,
+                leaf_ends_jax,
+                leaf_codes_jax,
+                leaf_depths_jax,
+            )
             try:
                 # Convert required arrays to host NumPy and run the refinement
                 pos_sorted = np.asarray(pos_sorted_jax)
@@ -497,20 +477,10 @@ def build_fixed_depth_tree(
                     aspect_threshold=aspect_threshold,
                     min_leaf_particles=min_refined_leaf_particles,
                 )
-            except Exception:
+            except (TypeError, ValueError):
                 # If any unexpected failure occurs, fall back to original
                 # partitions
-                (
-                    refined_starts_np,
-                    refined_ends_np,
-                    refined_codes_np,
-                    refined_depths_np,
-                ) = (
-                    leaf_starts_np,
-                    leaf_ends_np,
-                    leaf_codes_np,
-                    leaf_depths_np,
-                )
+                pass
     else:
         # No refinement requested; use the original JAX-side partitions so
         # later conversions to JAX arrays work consistently whether we ran

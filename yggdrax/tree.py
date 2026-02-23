@@ -63,6 +63,14 @@ class Tree:
 
         return int(self.topology.num_particles)
 
+    @property
+    def num_leaves(self) -> int:
+        """Return number of leaf nodes represented by this tree."""
+
+        return int(self.topology.parent.shape[0]) - int(
+            self.topology.num_internal_nodes
+        )
+
     def __getattr__(self, name):
         """Delegate missing attributes to the concrete topology object."""
 
