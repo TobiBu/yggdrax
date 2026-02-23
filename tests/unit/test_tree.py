@@ -1,5 +1,6 @@
 """Tests for radix tree construction."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -676,3 +677,33 @@ def test_fixed_depth_tree_jit_matches_eager():
     assert jnp.array_equal(pos_eager, pos_jit)
     assert jnp.array_equal(mass_eager, mass_jit)
     assert jnp.array_equal(inv_eager, inv_jit)
+
+
+def test_radix_tree_is_jittable_pytree():
+    positions = jnp.array(
+        [
+            [0.1, -0.2, 0.3],
+            [0.4, 0.5, -0.6],
+            [-0.7, 0.8, 0.9],
+            [-0.4, -0.3, 0.2],
+        ]
+    )
+    masses = jnp.array([1.0, 2.0, 3.0, 4.0])
+
+    bounds = (
+        jnp.array([-1.0, -1.0, -1.0]),
+        jnp.array([1.0, 1.0, 1.0]),
+    )
+    tree = build_tree(
+        positions,
+        masses,
+        bounds,
+        return_reordered=True,
+        leaf_size=DEFAULT_TEST_LEAF_SIZE,
+    )[0]
+
+    @jax.jit
+    def count_nodes(t):
+        return t.parent.shape[0]
+
+    assert int(count_nodes(tree)) == int(tree.parent.shape[0])

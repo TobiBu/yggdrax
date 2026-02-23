@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+import jax
 from beartype import beartype
 from jaxtyping import Array, jaxtyped
 
@@ -226,6 +227,43 @@ class RadixTree(Tree):
                 workspace=workspace,
             )
         return cls(topology=result, build_mode=build_mode)  # type: ignore[arg-type]
+
+
+def _register_radix_tree_pytree() -> None:
+    if getattr(RadixTree, "_yggdrax_pytree_registered", False):
+        return
+
+    def flatten(tree: RadixTree):
+        topology = tree.topology
+        topology_fields = tuple(getattr(topology, name) for name in topology._fields)
+        children = topology_fields + (
+            tree.positions_sorted,
+            tree.masses_sorted,
+            tree.inverse_permutation,
+        )
+        aux = (type(topology), topology._fields, tree.build_mode)
+        return children, aux
+
+    def unflatten(aux, children):
+        topology_type, topology_fields, build_mode = aux
+        n_topo = len(topology_fields)
+        topology_values = children[:n_topo]
+        positions_sorted, masses_sorted, inverse_permutation = children[n_topo:]
+        topology = topology_type(*topology_values)
+        return RadixTree(
+            topology=topology,
+            build_mode=build_mode,
+            positions_sorted=positions_sorted,
+            masses_sorted=masses_sorted,
+            inverse_permutation=inverse_permutation,
+            workspace=None,
+        )
+
+    jax.tree_util.register_pytree_node(RadixTree, flatten, unflatten)
+    setattr(RadixTree, "_yggdrax_pytree_registered", True)
+
+
+_register_radix_tree_pytree()
 
 
 def _wrap_radix_public_result(
