@@ -21,6 +21,7 @@ from .interactions import (
     NodeInteractionList,
     NodeNeighborList,
     build_interactions_and_neighbors,
+    build_leaf_neighbor_lists,
 )
 from .kdtree import (
     KDTree,
@@ -105,6 +106,7 @@ __all__ = [
     "build_fixed_depth_tree_jit",
     "available_tree_types",
     "build_interactions_and_neighbors",
+    "build_leaf_neighbor_lists",
     "build_prepared_tree_artifacts",
     "build_tree",
     "build_tree_jit",
