@@ -79,8 +79,39 @@ def test_tree_from_particles_rejects_unknown_build_mode():
         Tree.from_particles(positions, masses, build_mode="kdtree")
 
 
+def test_tree_from_particles_builds_kdtree():
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="kdtree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+    assert tree.tree_type == "kdtree"
+    assert tree.num_particles == 64
+    assert tree.num_nodes > 0
+    assert tree.num_leaves > 0
+    assert tree.positions_sorted is not None
+    assert tree.masses_sorted is not None
+    assert tree.inverse_permutation is not None
+
+
+def test_tree_from_particles_kdtree_rejects_fixed_depth():
+    positions, masses = _sample_problem(n=32)
+    with pytest.raises(ValueError, match="Unsupported build_mode"):
+        Tree.from_particles(
+            positions,
+            masses,
+            tree_type="kdtree",
+            build_mode="fixed_depth",
+        )
+
+
 def test_available_tree_types_includes_radix():
     assert "radix" in tree_api.available_tree_types()
+    assert "kdtree" in tree_api.available_tree_types()
 
 
 def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):

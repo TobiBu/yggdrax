@@ -46,6 +46,7 @@ from .traversal import build_prepared_tree_artifacts
 from .tree import (
     MAX_TREE_LEVELS,
     FixedDepthTreeBuildConfig,
+    KDParticleTree,
     RadixTree,
     RadixTreeWorkspace,
     Tree,
@@ -82,6 +83,7 @@ __all__ = [
     "NodeNeighborList",
     "MortonLeafBoundsProtocol",
     "PreparedTreeArtifacts",
+    "KDParticleTree",
     "RadixTree",
     "RadixTreeWorkspace",
     "Tree",

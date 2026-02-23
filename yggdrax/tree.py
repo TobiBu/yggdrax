@@ -13,6 +13,8 @@ from jaxtyping import Array, jaxtyped
 from . import _tree_impl
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
+from .kdtree import KDTree as KDTreeTopology
+from .kdtree import build_kdtree
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -45,7 +47,7 @@ class FixedDepthTreeBuildConfig:
     min_refined_leaf_particles: int = 2
 
 
-TreeType = Literal["radix"]
+TreeType = Literal["radix", "kdtree"]
 TreeBuildMode = Literal["adaptive", "fixed_depth"]
 
 
@@ -80,21 +82,34 @@ class Tree:
     def num_nodes(self) -> int:
         """Return number of nodes in the concrete topology."""
 
-        return int(self.topology.parent.shape[0])
+        topology = self.topology
+        if hasattr(topology, "parent"):
+            return int(topology.parent.shape[0])
+        if hasattr(topology, "node_start"):
+            return int(topology.node_start.shape[0])
+        raise AttributeError("topology does not expose parent or node_start")
 
     @property
     def num_particles(self) -> int:
         """Return number of particles represented by this tree."""
 
-        return int(self.topology.num_particles)
+        topology = self.topology
+        if hasattr(topology, "num_particles"):
+            return int(topology.num_particles)
+        if hasattr(topology, "points"):
+            return int(topology.points.shape[0])
+        raise AttributeError("topology does not expose num_particles or points")
 
     @property
     def num_leaves(self) -> int:
         """Return number of leaf nodes represented by this tree."""
 
-        return int(self.topology.parent.shape[0]) - int(
-            self.topology.num_internal_nodes
-        )
+        topology = self.topology
+        if hasattr(topology, "leaf_nodes"):
+            return int(topology.leaf_nodes.shape[0])
+        if hasattr(topology, "parent") and hasattr(topology, "num_internal_nodes"):
+            return int(topology.parent.shape[0]) - int(topology.num_internal_nodes)
+        raise AttributeError("topology does not expose leaf metadata")
 
     def __getattr__(self, name):
         """Delegate missing attributes to the concrete topology object."""
@@ -266,6 +281,74 @@ class RadixTree(Tree):
         return cls(topology=result, build_mode=build_mode)  # type: ignore[arg-type]
 
 
+@dataclass(frozen=True)
+class KDParticleTree(Tree):
+    """Concrete KD-tree container implementing the generic Tree contract."""
+
+    topology: KDTreeTopology
+    build_mode: Literal["adaptive"] = "adaptive"
+    positions_sorted: Optional[Array] = None
+    masses_sorted: Optional[Array] = None
+    inverse_permutation: Optional[Array] = None
+    workspace: Optional[RadixTreeWorkspace] = None
+
+    @property
+    def tree_type(self) -> TreeType:
+        return "kdtree"
+
+    @classmethod
+    @jaxtyped(typechecker=beartype)
+    def from_particles(
+        cls,
+        positions: Array,
+        masses: Array,
+        *,
+        build_mode: str = "adaptive",
+        bounds: Optional[tuple[Array, Array]] = None,
+        return_reordered: bool = True,
+        workspace: Optional[RadixTreeWorkspace] = None,
+        return_workspace: bool = False,
+        leaf_size: int = 8,
+        target_leaf_particles: int = 32,
+        max_depth: Optional[int] = None,
+        refine_local: bool = True,
+        max_refine_levels: int = 2,
+        aspect_threshold: float = 8.0,
+        min_refined_leaf_particles: int = 2,
+    ) -> "KDParticleTree":
+        del (
+            bounds,
+            workspace,
+            return_workspace,
+            target_leaf_particles,
+            max_depth,
+            refine_local,
+            max_refine_levels,
+            aspect_threshold,
+            min_refined_leaf_particles,
+        )
+        if build_mode != "adaptive":
+            raise ValueError(
+                "Unsupported build_mode "
+                f"'{build_mode}' for kdtree. Supported: ('adaptive',)"
+            )
+
+        topology = build_kdtree(positions, leaf_size=leaf_size)
+        if return_reordered:
+            idx = jnp.asarray(topology.indices, dtype=INDEX_DTYPE)
+            pos_sorted = positions[idx]
+            mass_sorted = masses[idx]
+            inv = jnp.empty_like(idx)
+            inv = inv.at[idx].set(jnp.arange(idx.shape[0], dtype=idx.dtype))
+            return cls(
+                topology=topology,
+                positions_sorted=pos_sorted,
+                masses_sorted=mass_sorted,
+                inverse_permutation=inv,
+            )
+        return cls(topology=topology)
+
+
 def _register_radix_tree_pytree() -> None:
     if getattr(RadixTree, "_yggdrax_pytree_registered", False):
         return
@@ -303,6 +386,39 @@ def _register_radix_tree_pytree() -> None:
 _register_radix_tree_pytree()
 
 
+def _register_kdtree_tree_pytree() -> None:
+    if getattr(KDParticleTree, "_yggdrax_pytree_registered", False):
+        return
+
+    def flatten(tree: KDParticleTree):
+        children = (
+            tree.topology,
+            tree.positions_sorted,
+            tree.masses_sorted,
+            tree.inverse_permutation,
+        )
+        aux = ("adaptive",)
+        return children, aux
+
+    def unflatten(aux, children):
+        (build_mode,) = aux
+        topology, positions_sorted, masses_sorted, inverse_permutation = children
+        return KDParticleTree(
+            topology=topology,
+            build_mode=build_mode,
+            positions_sorted=positions_sorted,
+            masses_sorted=masses_sorted,
+            inverse_permutation=inverse_permutation,
+            workspace=None,
+        )
+
+    jax.tree_util.register_pytree_node(KDParticleTree, flatten, unflatten)
+    setattr(KDParticleTree, "_yggdrax_pytree_registered", True)
+
+
+_register_kdtree_tree_pytree()
+
+
 def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
     return RadixTree.from_particles(
         request.positions,
@@ -322,8 +438,19 @@ def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
     )
 
 
+def _build_kdtree_from_request(request: TreeBuildRequest) -> Tree:
+    return KDParticleTree.from_particles(
+        request.positions,
+        request.masses,
+        build_mode=request.build_mode,
+        return_reordered=request.return_reordered,
+        leaf_size=request.leaf_size,
+    )
+
+
 _TREE_BUILDERS: dict[str, TreeBuilder] = {
     "radix": _build_radix_tree_from_request,
+    "kdtree": _build_kdtree_from_request,
 }
 
 
@@ -640,6 +767,7 @@ __all__ = [
     "TreeType",
     "TreeBuildMode",
     "RadixTree",
+    "KDParticleTree",
     "RadixTreeWorkspace",
     "TreeBuildConfig",
     "FixedDepthTreeBuildConfig",
