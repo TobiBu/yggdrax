@@ -1791,9 +1791,14 @@ def _result_to_interactions(
     node_levels_all = get_node_levels(tree)
     if hasattr(tree, "level_offsets"):
         level_offsets_all = jnp.asarray(tree.level_offsets, dtype=INDEX_DTYPE)
+        if hasattr(tree, "num_levels"):
+            num_levels = int(tree.num_levels)
+            level_offsets_all = level_offsets_all[: num_levels + 1]
+        else:
+            num_levels = int(level_offsets_all.shape[0] - 1)
     else:
         level_offsets_all = get_level_offsets(tree, node_levels=node_levels_all)
-    num_levels = int(level_offsets_all.shape[0] - 1)
+        num_levels = int(level_offsets_all.shape[0] - 1)
     level_indices = jnp.asarray(level_offsets_all[: num_levels + 1])
 
     if traced_total:
