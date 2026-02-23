@@ -9,12 +9,8 @@ repos:
     hooks:
       - id: isort
 
-  - repo: local
+  - repo: https://github.com/jsh9/pydoclint
+    rev: 0.6.1
     hooks:
       - id: pydoclint
-        name: pydoclint
-        entry: pydoclint
-        language: python
-        additional_dependencies: [pydoclint]
-        pass_filenames: false
-        args: ["."]
+        args: ["--style", "numpy"]
