@@ -23,6 +23,7 @@ from .tree import (
     get_node_levels,
     get_nodes_by_level,
     get_num_levels,
+    require_morton_topology,
 )
 
 
@@ -103,6 +104,8 @@ _MAX_MORTON_LEVEL = 21
 
 
 def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
+    require_morton_topology(tree)
+
     bounds_min = jnp.asarray(tree.bounds_min)
     bounds_max = jnp.asarray(tree.bounds_max)
     domain = bounds_max - bounds_min
@@ -169,11 +172,15 @@ def compute_tree_geometry(
     num_internal = tree.left_child.shape[0]
     num_nodes = ranges.shape[0]
 
-    use_morton_bounds = jnp.asarray(tree.use_morton_geometry, dtype=jnp.bool_)
+    use_morton_raw = getattr(tree, "use_morton_geometry", False)
+    use_morton_bounds = jnp.asarray(use_morton_raw, dtype=jnp.bool_)
     has_morton_fields = all(
         hasattr(tree, name)
         for name in ("bounds_min", "bounds_max", "leaf_codes", "leaf_depths")
     )
+    if (not has_morton_fields) and (not isinstance(use_morton_raw, jax_core.Tracer)):
+        if bool(jnp.asarray(use_morton_raw)):
+            require_morton_topology(tree)
 
     def _leaf_bounds_from_ranges(_):
         leaf_ranges = ranges[num_internal:]

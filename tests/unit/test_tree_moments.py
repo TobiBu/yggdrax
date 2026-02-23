@@ -6,7 +6,7 @@ import pytest
 from yggdrax.dtypes import INDEX_DTYPE
 from yggdrax.geometry import compute_tree_geometry
 from yggdrax.multipole_utils import level_offset, total_coefficients
-from yggdrax.tree import build_tree
+from yggdrax.tree import Tree, build_tree
 from yggdrax.tree_moments import (
     compute_tree_mass_moments,
     compute_tree_multipole_moments,
@@ -87,6 +87,50 @@ def test_leaf_masses_and_centers_match_particles():
     assert jnp.allclose(multipole.octupole[num_internal:], 0.0)
     assert jnp.allclose(multipole.fourth_moment[num_internal:], 0.0)
     assert jnp.allclose(multipole.hexadecapole[num_internal:], 0.0)
+
+
+@pytest.mark.parametrize("tree_type", ["radix", "kdtree"])
+def test_tree_wrapper_supports_mass_and_multipole_moments(tree_type: str):
+    positions = jnp.array(
+        [
+            [-0.6, -0.3, -0.2],
+            [-0.2, 0.4, -0.1],
+            [0.1, -0.5, 0.3],
+            [0.5, 0.2, -0.4],
+            [0.8, 0.7, 0.6],
+        ],
+        dtype=jnp.float64,
+    )
+    masses = jnp.array([1.0, 2.0, 1.5, 0.5, 3.0], dtype=jnp.float64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type=tree_type,
+        return_reordered=True,
+        leaf_size=2,
+    )
+
+    moments = compute_tree_mass_moments(
+        tree,
+        tree.positions_sorted,
+        tree.masses_sorted,
+    )
+    multipole = compute_tree_multipole_moments(
+        tree,
+        tree.positions_sorted,
+        tree.masses_sorted,
+        max_order=3,
+    )
+
+    assert moments.mass.shape[0] == int(tree.num_nodes)
+    assert multipole.raw_packed.shape == (
+        int(tree.num_nodes),
+        total_coefficients(3),
+    )
+    assert jnp.all(jnp.isfinite(moments.mass))
+    assert jnp.all(jnp.isfinite(moments.center_of_mass))
+    assert jnp.all(jnp.isfinite(multipole.raw_packed))
+    assert jnp.isclose(jnp.max(moments.mass), jnp.sum(tree.masses_sorted))
 
 
 def test_root_mass_and_com():

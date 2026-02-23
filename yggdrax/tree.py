@@ -615,8 +615,14 @@ def get_num_levels(tree: object, *, node_levels: Optional[Array] = None) -> int:
     if hasattr(tree, "num_levels"):
         return int(getattr(tree, "num_levels"))
     levels = get_node_levels(tree) if node_levels is None else jnp.asarray(node_levels)
-    if int(levels.shape[0]) == 0:
+    num_nodes = int(levels.shape[0])
+    if num_nodes == 0:
         return 0
+
+    # Under jit/grad tracing, converting jnp.max(levels) to a Python int
+    # raises a concretization error. Use the static node-count upper bound.
+    if isinstance(levels, jax.core.Tracer):
+        return num_nodes
     return int(jnp.max(levels)) + 1
 
 

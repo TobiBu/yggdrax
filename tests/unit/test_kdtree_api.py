@@ -88,24 +88,25 @@ def test_kdtree_topology_fields_are_well_formed():
     points = _sample_points(n=33, dim=3)
     tree = build_kdtree(points, leaf_size=4)
 
-    num_nodes = int(tree.node_start.shape[0])
+    num_query_nodes = int(tree.node_start.shape[0])
+    num_nodes = int(tree.parent.shape[0])
     num_internal = int(tree.num_internal_nodes)
     assert tree.indices.shape == (33,)
     assert tree.particle_indices.shape == (33,)
-    assert tree.node_end.shape == (num_nodes,)
+    assert tree.node_end.shape == (num_query_nodes,)
     assert tree.node_ranges.shape == (num_nodes, 2)
     assert tree.parent.shape == (num_nodes,)
     assert tree.left_child.shape == (num_internal,)
     assert tree.right_child.shape == (num_internal,)
-    assert tree.split_dim.shape == (num_nodes,)
-    assert tree.split_value.shape == (num_nodes,)
-    assert tree.bbox_min.shape == (num_nodes, 3)
-    assert tree.bbox_max.shape == (num_nodes, 3)
+    assert tree.split_dim.shape == (num_query_nodes,)
+    assert tree.split_value.shape == (num_query_nodes,)
+    assert tree.bbox_min.shape == (num_query_nodes, 3)
+    assert tree.bbox_max.shape == (num_query_nodes, 3)
     assert int(tree.num_particles) == 33
     assert bool(tree.use_morton_geometry) is False
-    assert tree.leaf_nodes.ndim == 1
-    assert tree.leaf_start.shape == tree.leaf_nodes.shape
-    assert tree.leaf_end.shape == tree.leaf_nodes.shape
+    assert tree.leaf_nodes.shape == (num_nodes - num_internal,)
+    assert tree.leaf_start.shape[0] == num_query_nodes
+    assert tree.leaf_end.shape[0] == num_query_nodes
     assert tree.leaf_point_ids.ndim == 2
     assert tree.leaf_valid_mask.shape == tree.leaf_point_ids.shape
     assert int(tree.node_start[0]) == 0

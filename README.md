@@ -72,6 +72,19 @@ interactions, neighbors = build_interactions_and_neighbors(
 
 See `examples/getting_started.ipynb` for a runnable walkthrough.
 
+## KD-Tree MAC Note
+
+When comparing Radix vs KD-tree traversal outputs, use the same MAC settings as
+your downstream solver.
+
+- For FMM-style runs (e.g. jaccpot), `mac_type="dehnen"` is the recommended
+  path for apples-to-apples parity checks.
+- KD-tree traversal uses a calibrated default effective radius scale for
+  Dehnen MAC (`dehnen_radius_scale=1.2`) to match near-field/far-field split
+  behavior more closely with radix trees.
+- If you benchmark with `mac_type="bh"`, expect different KD/Radix split
+  behavior unless you tune parameters explicitly.
+
 ## Backend Extensibility
 
 Yggdrax now supports backend-oriented tree dispatch and capability-based

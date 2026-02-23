@@ -223,6 +223,40 @@ def _heap_inorder_and_ranges(n: int) -> tuple[Array, Array]:
     )
 
 
+def _heap_subtree_sizes(n: int) -> list[int]:
+    """Return subtree sizes for each heap node index."""
+
+    left = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
+    right = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
+    sizes = [1] * n
+    for i in range(n - 1, -1, -1):
+        total = 1
+        if left[i] >= 0:
+            total += sizes[left[i]]
+        if right[i] >= 0:
+            total += sizes[right[i]]
+        sizes[i] = total
+    return sizes
+
+
+def _heap_inorder_nodes(n: int) -> list[int]:
+    """Return heap node indices in inorder traversal."""
+
+    left = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
+    right = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
+    inorder: list[int] = []
+    stack: list[int] = []
+    cur = 0 if n > 0 else -1
+    while stack or (cur >= 0):
+        while cur >= 0:
+            stack.append(cur)
+            cur = left[cur]
+        cur = stack.pop()
+        inorder.append(cur)
+        cur = right[cur]
+    return inorder
+
+
 def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     """Build KD-tree topology in heap order using JAX primitives.
 
@@ -289,22 +323,13 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         (nodes0, indices0, split_dims0),
         jnp.arange(n_levels, dtype=jnp.int32),
     )
-    split_dim_arr = split_dim_arr.at[n // 2 :].set(jnp.asarray(-1, dtype=jnp.int32))
-
     node_ids = jnp.arange(n, dtype=jnp.int32)
     left_raw = 2 * node_ids + 1
     right_raw = left_raw + 1
     left_child_full = jnp.where(left_raw < n, left_raw, -1).astype(jnp.int32)
     right_child_full = jnp.where(right_raw < n, right_raw, -1).astype(jnp.int32)
 
-    num_internal = n // 2
-    left_child = left_child_full[:num_internal]
-    right_child = right_child_full[:num_internal]
-    parent = jnp.where(
-        node_ids == 0,
-        jnp.asarray(-1, dtype=jnp.int32),
-        (node_ids - 1) // 2,
-    ).astype(jnp.int32)
+    subtree_sizes_host = _heap_subtree_sizes(n)
 
     safe_dim = jnp.clip(split_dim_arr, 0, dim - 1)
     safe_idx = order
@@ -325,8 +350,9 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         return sizes.at[i].set(1 + l_size + r_size)
 
     subtree_size = jax.lax.fori_loop(0, n, size_body, subtree_size)
+    leaf_mask = subtree_size <= leaf_size_int
     split_dim_arr = jnp.where(
-        subtree_size <= leaf_size_int,
+        leaf_mask,
         jnp.asarray(-1, dtype=jnp.int32),
         split_dim_arr,
     )
@@ -355,15 +381,22 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
 
     bbox_min, bbox_max = jax.lax.fori_loop(0, n, bbox_body, (bbox_min, bbox_max))
 
-    leaf_mask = split_dim_arr < 0
-    leaf_nodes = jnp.nonzero(leaf_mask, size=n, fill_value=-1)[0]
-    num_leaves = jnp.sum(leaf_mask, dtype=jnp.int32)
-    valid_leaf_rows = jnp.arange(n, dtype=jnp.int32) < num_leaves
-    leaf_nodes = jnp.where(valid_leaf_rows, leaf_nodes, -1)
-    safe_leaf_nodes = jnp.clip(leaf_nodes, 0, n - 1)
+    leaf_nodes_query = jnp.nonzero(leaf_mask, size=n, fill_value=-1)[0]
+    num_leaves_query = jnp.sum(leaf_mask, dtype=jnp.int32)
+    valid_leaf_rows = jnp.arange(n, dtype=jnp.int32) < num_leaves_query
+    leaf_nodes_query = jnp.where(valid_leaf_rows, leaf_nodes_query, -1)
+    safe_leaf_nodes_query = jnp.clip(leaf_nodes_query, 0, n - 1)
 
-    leaf_start = jnp.where(valid_leaf_rows, node_start[safe_leaf_nodes], 0).astype(jnp.int32)
-    leaf_end = jnp.where(valid_leaf_rows, node_end[safe_leaf_nodes], 0).astype(jnp.int32)
+    leaf_start = jnp.where(
+        valid_leaf_rows,
+        node_start[safe_leaf_nodes_query],
+        0,
+    ).astype(jnp.int32)
+    leaf_end = jnp.where(
+        valid_leaf_rows,
+        node_end[safe_leaf_nodes_query],
+        0,
+    ).astype(jnp.int32)
 
     max_leaf_points = leaf_size_int
     leaf_point_ids = -jnp.ones((n, max_leaf_points), dtype=jnp.int32)
@@ -372,8 +405,8 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     def leaf_body(i, state):
         i32 = jnp.asarray(i, dtype=jnp.int32)
         ids_arr, valid_arr = state
-        is_valid_row = i32 < num_leaves
-        root = safe_leaf_nodes[i32]
+        is_valid_row = i32 < num_leaves_query
+        root = safe_leaf_nodes_query[i32]
 
         def fill_row(_):
             ids, valid = _collect_subtree_points(
@@ -409,16 +442,89 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     def node_to_leaf_body(i, arr):
         i32 = jnp.asarray(i, dtype=jnp.int32)
         return jax.lax.cond(
-            i32 < num_leaves,
-            lambda _: arr.at[safe_leaf_nodes[i32]].set(i32),
+            i32 < num_leaves_query,
+            lambda _: arr.at[safe_leaf_nodes_query[i32]].set(i32),
             lambda _: arr,
             operand=None,
         )
 
     node_to_leaf = jax.lax.fori_loop(0, n, node_to_leaf_body, node_to_leaf)
 
-    inorder_nodes, node_ranges = _heap_inorder_and_ranges(n)
+    # Build compact FMM topology: internal nodes are subtree roots with
+    # size > leaf_size; leaves are the frontier nodes where traversal stops.
+    left_host = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
+    right_host = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
+
+    internal_nodes_host: list[int] = []
+    leaf_nodes_host: list[int] = []
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        if (
+            subtree_sizes_host[node] <= leaf_size_int
+            or left_host[node] < 0
+            or right_host[node] < 0
+        ):
+            leaf_nodes_host.append(node)
+            continue
+        internal_nodes_host.append(node)
+        r = right_host[node]
+        l = left_host[node]
+        if r >= 0:
+            stack.append(r)
+        if l >= 0:
+            stack.append(l)
+
+    num_internal = len(internal_nodes_host)
+    num_leaves = len(leaf_nodes_host)
+    compact_old = internal_nodes_host + leaf_nodes_host
+    old_to_new = {old: new for new, old in enumerate(compact_old)}
+
+    parent_compact = [-1] * (num_internal + num_leaves)
+    left_compact = [-1] * num_internal
+    right_compact = [-1] * num_internal
+
+    for old in internal_nodes_host:
+        new = old_to_new[old]
+        old_l = left_host[old]
+        old_r = right_host[old]
+        new_l = old_to_new[old_l]
+        new_r = old_to_new[old_r]
+        left_compact[new] = new_l
+        right_compact[new] = new_r
+        parent_compact[new_l] = new
+        parent_compact[new_r] = new
+
+    left_child = jnp.asarray(left_compact, dtype=jnp.int32)
+    right_child = jnp.asarray(right_compact, dtype=jnp.int32)
+    parent = jnp.asarray(parent_compact, dtype=jnp.int32)
+
+    leaf_nodes = jnp.arange(num_internal, num_internal + num_leaves, dtype=jnp.int32)
+
+    inorder_nodes_host = _heap_inorder_nodes(n)
+    inorder_nodes = jnp.asarray(inorder_nodes_host, dtype=jnp.int32)
     particle_indices = order[inorder_nodes]
+
+    inorder_pos_host = [0] * n
+    for pos, old in enumerate(inorder_nodes_host):
+        inorder_pos_host[old] = pos
+
+    node_ranges_host = [(-1, -1)] * (num_internal + num_leaves)
+    stack_ranges: list[tuple[int, int, int]] = [(0, 0, n - 1)]
+    while stack_ranges:
+        old, start, end = stack_ranges.pop()
+        new = old_to_new[old]
+        node_ranges_host[new] = (start, end)
+        if new >= num_internal:
+            continue
+        pivot = inorder_pos_host[old]
+        left_old = left_host[old]
+        right_old = right_host[old]
+        stack_ranges.append((right_old, pivot, end))
+        stack_ranges.append((left_old, start, pivot - 1))
+
+    node_ranges = jnp.asarray(node_ranges_host, dtype=jnp.int32)
+
     num_particles = jnp.asarray(n, dtype=jnp.int32)
     use_morton_geometry = jnp.asarray(False)
 
@@ -427,7 +533,7 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         particle_indices.astype(jnp.int32),
         node_start,
         node_end,
-        node_ranges,
+        node_ranges.astype(jnp.int32),
         parent,
         left_child,
         right_child,

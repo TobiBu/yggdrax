@@ -26,7 +26,7 @@ from .multipole_utils import (
     multi_power,
     total_coefficients,
 )
-from .tree import RadixTree
+from .tree import require_fmm_core_topology, resolve_tree_topology
 
 
 class TreeMassMoments(NamedTuple):
@@ -587,32 +587,37 @@ def translate_packed_moments(
 
 
 def _validate_inputs(
-    tree: RadixTree,
+    tree: object,
     positions_sorted: Array,
     masses_sorted: Array,
 ) -> None:
-    total_nodes = tree.parent.shape[0]
-    if tree.node_ranges.shape[0] != total_nodes:
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+
+    total_nodes = topology.parent.shape[0]
+    if topology.node_ranges.shape[0] != total_nodes:
         raise ValueError("tree.node_ranges must align with tree.parent shape")
-    if positions_sorted.shape[0] != tree.num_particles:
+    num_particles = int(jnp.asarray(topology.num_particles))
+    if positions_sorted.shape[0] != num_particles:
         raise ValueError("positions_sorted must match tree.num_particles")
-    if masses_sorted.shape[0] != tree.num_particles:
+    if masses_sorted.shape[0] != num_particles:
         raise ValueError("masses_sorted must match tree.num_particles")
     if positions_sorted.shape[1] != 3:
         raise ValueError("positions must have shape (N, 3)")
 
 
-@jaxtyped(typechecker=beartype)
 def compute_tree_mass_moments(
-    tree: RadixTree,
+    tree: object,
     positions_sorted: Array,
     masses_sorted: Array,
 ) -> TreeMassMoments:
     """Compute total mass and centre of mass for every tree node."""
 
-    _validate_inputs(tree, positions_sorted, masses_sorted)
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+    _validate_inputs(topology, positions_sorted, masses_sorted)
 
-    ranges = tree.node_ranges.astype(INDEX_DTYPE)
+    ranges = topology.node_ranges.astype(INDEX_DTYPE)
     starts = ranges[:, 0]
     ends = ranges[:, 1] + as_index(1)  # make end exclusive for prefix sums
 
@@ -644,9 +649,8 @@ def compute_tree_mass_moments(
     return TreeMassMoments(mass=total_mass, center_of_mass=center)
 
 
-@jaxtyped(typechecker=beartype)
 def compute_tree_multipole_moments(
-    tree: RadixTree,
+    tree: object,
     positions_sorted: Array,
     masses_sorted: Array,
     expansion_centers: Optional[Array] = None,
@@ -656,8 +660,8 @@ def compute_tree_multipole_moments(
 
     Parameters
     ----------
-    tree : RadixTree
-        Radix tree produced by :func:`yggdrax.tree.build_tree`.
+    tree : object
+        Tree/topology exposing the FMM-core topology contract.
     positions_sorted : Array
         Particle positions in Morton order.
     masses_sorted : Array
@@ -681,8 +685,11 @@ def compute_tree_multipole_moments(
         outside the supported range.
     """
 
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+
     mass_moments = compute_tree_mass_moments(
-        tree,
+        topology,
         positions_sorted,
         masses_sorted,
     )
@@ -701,7 +708,7 @@ def compute_tree_multipole_moments(
     masses = masses_sorted.astype(dtype)
     center = center.astype(dtype)
 
-    ranges = tree.node_ranges.astype(INDEX_DTYPE)
+    ranges = topology.node_ranges.astype(INDEX_DTYPE)
     starts = ranges[:, 0]
     ends = ranges[:, 1] + as_index(1)
 

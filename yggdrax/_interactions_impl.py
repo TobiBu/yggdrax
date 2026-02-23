@@ -44,6 +44,7 @@ _DEFAULT_MAX_NEIGHBORS = 2048
 DEFAULT_PAIR_QUEUE_MULTIPLIER = 32
 _DEFAULT_PAIR_BATCH = 32
 _MAX_REFINEMENT_PAIRS = 4
+_DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE = 1.2
 
 _AUTO_INTERACTION_MIN = 2048
 _AUTO_INTERACTION_MAX = 65536
@@ -1879,6 +1880,17 @@ def _run_dual_tree_walk(
 
     theta_val = float(theta)
     dehnen_scale_val = float(dehnen_radius_scale)
+    is_kdtree_topology = (
+        hasattr(tree, "split_dim")
+        and hasattr(tree, "points")
+        and hasattr(tree, "leaf_size")
+    )
+    if (
+        mac_type == "dehnen"
+        and is_kdtree_topology
+        and abs(dehnen_scale_val - 1.0) <= 1e-12
+    ):
+        dehnen_scale_val = _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE
     if dehnen_scale_val <= 0.0:
         raise ValueError("dehnen_radius_scale must be > 0")
     total_nodes = int(tree.parent.shape[0])

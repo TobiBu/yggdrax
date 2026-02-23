@@ -1,11 +1,13 @@
 """Tests for dense interaction builder."""
 
 import jax.numpy as jnp
+import pytest
 
 from yggdrax.dense_interactions import build_dense_interactions, densify_interactions
 from yggdrax.geometry import compute_tree_geometry
-from yggdrax.interactions import build_interactions_and_neighbors
+from yggdrax.interactions import DualTreeTraversalConfig, build_interactions_and_neighbors
 from yggdrax.tree import build_fixed_depth_tree
+from yggdrax.tree import Tree
 
 
 def _build_fixed_depth_state(theta: float = 0.6):
@@ -113,3 +115,54 @@ def test_build_dense_interactions_matches_manual_result():
         jnp.asarray(dense_built.sparse_interactions.sources),
         jnp.asarray(interactions.sources),
     )
+
+
+@pytest.mark.parametrize("tree_type", ["radix", "kdtree"])
+def test_dense_interactions_accept_tree_wrappers(tree_type: str):
+    positions = jnp.array(
+        [
+            [-0.7, -0.3, 0.2],
+            [-0.5, 0.4, -0.1],
+            [-0.2, -0.5, -0.4],
+            [0.0, 0.0, 0.0],
+            [0.2, 0.3, 0.4],
+            [0.5, -0.2, 0.6],
+            [0.7, 0.6, -0.3],
+            [0.9, -0.7, 0.8],
+        ],
+        dtype=jnp.float64,
+    )
+    masses = jnp.ones((positions.shape[0],), dtype=jnp.float64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type=tree_type,
+        return_reordered=True,
+        leaf_size=2,
+    )
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+    traversal_cfg = DualTreeTraversalConfig(
+        max_pair_queue=4096,
+        process_block=64,
+        max_interactions_per_node=512,
+        max_neighbors_per_leaf=512,
+    )
+    interactions, _ = build_interactions_and_neighbors(
+        tree,
+        geometry,
+        theta=0.6,
+        traversal_config=traversal_cfg,
+    )
+    dense = densify_interactions(tree, geometry, interactions)
+    dense_built = build_dense_interactions(
+        tree,
+        geometry,
+        theta=0.6,
+        traversal_config=traversal_cfg,
+    )
+
+    assert dense.m2l_sources.ndim == 3
+    assert dense.m2l_displacements.ndim == 4
+    assert dense.m2l_counts.ndim == 2
+    assert dense_built.m2l_sources.shape == dense.m2l_sources.shape
+    assert jnp.all(jnp.isfinite(dense.m2l_displacements))

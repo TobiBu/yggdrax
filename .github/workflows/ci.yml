@@ -55,6 +55,9 @@ jobs:
       - name: Unit tests with coverage
         run: pytest
 
+      - name: Tree backend smoke script
+        run: python examples/kdtree_jaccpot_smoke.py --n-points 512 --leaf-size 16 --seed 0
+
       - name: Upload coverage XML artifact
         uses: actions/upload-artifact@v4
         with:
