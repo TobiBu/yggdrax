@@ -1830,9 +1830,7 @@ def _result_to_interactions(
 
     node_offsets = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
     node_offsets = node_offsets.at[nodes_by_level].set(offsets_by_level[:-1])
-    node_offsets = jnp.concatenate(
-        [node_offsets, far_pair_count[None]]
-    )
+    node_offsets = jnp.concatenate([node_offsets, far_pair_count[None]])
 
     level_offsets = offsets_by_level[level_indices]
 

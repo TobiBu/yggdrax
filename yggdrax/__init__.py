@@ -46,9 +46,9 @@ from .protocols import (
 from .traversal import build_prepared_tree_artifacts
 from .tree import (
     FMM_CORE_REQUIRED_FIELDS,
-    MORTON_TOPOLOGY_REQUIRED_FIELDS,
     FMM_TOPOLOGY_REQUIRED_FIELDS,
     MAX_TREE_LEVELS,
+    MORTON_TOPOLOGY_REQUIRED_FIELDS,
     FixedDepthTreeBuildConfig,
     KDParticleTree,
     RadixTree,

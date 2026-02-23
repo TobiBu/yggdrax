@@ -276,8 +276,12 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         pts_sorted = points[indices]
         dim_max = jax.ops.segment_max(pts_sorted, nodes, num_segments=n)
         dim_min = jax.ops.segment_min(pts_sorted, nodes, num_segments=n)
-        new_split_dims = jnp.asarray(jnp.argmax(dim_max - dim_min, axis=-1), dtype=jnp.int32)
-        split_dims = jnp.where(array_index < (1 << level) - 1, split_dims, new_split_dims)
+        new_split_dims = jnp.asarray(
+            jnp.argmax(dim_max - dim_min, axis=-1), dtype=jnp.int32
+        )
+        split_dims = jnp.where(
+            array_index < (1 << level) - 1, split_dims, new_split_dims
+        )
         points_along_dim = jnp.take_along_axis(
             pts_sorted,
             split_dims[nodes][:, None],
@@ -295,7 +299,9 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         branch_start = (
             ((1 << level) - 1)
             + n_left_siblings * ((1 << height) - 1)
-            + jnp.minimum(n_left_siblings * (1 << height), n - ((1 << (n_levels - 1)) - 1))
+            + jnp.minimum(
+                n_left_siblings * (1 << height), n - ((1 << (n_levels - 1)) - 1)
+            )
         )
 
         left_child = 2 * nodes + 1
@@ -736,13 +742,19 @@ def _collect_subtree_points(
 
         stk, stk_size = jax.lax.cond(
             has_right & (stk_size < max_points),
-            lambda _: (stk.at[stk_size].set(right), stk_size + jnp.asarray(1, dtype=jnp.int32)),
+            lambda _: (
+                stk.at[stk_size].set(right),
+                stk_size + jnp.asarray(1, dtype=jnp.int32),
+            ),
             lambda _: (stk, stk_size),
             operand=None,
         )
         stk, stk_size = jax.lax.cond(
             has_left & (stk_size < max_points),
-            lambda _: (stk.at[stk_size].set(left), stk_size + jnp.asarray(1, dtype=jnp.int32)),
+            lambda _: (
+                stk.at[stk_size].set(left),
+                stk_size + jnp.asarray(1, dtype=jnp.int32),
+            ),
             lambda _: (stk, stk_size),
             operand=None,
         )
@@ -801,7 +813,9 @@ def _query_neighbors_tree(
                     point_d2 = jnp.where(point_id == query_id, jnp.inf, point_d2)
                 worst_slot = jnp.argmax(d2_state)
                 better = point_d2 < d2_state[worst_slot]
-                next_d2 = jnp.where(better, d2_state.at[worst_slot].set(point_d2), d2_state)
+                next_d2 = jnp.where(
+                    better, d2_state.at[worst_slot].set(point_d2), d2_state
+                )
                 next_idx = jnp.where(
                     better,
                     idx_state.at[worst_slot].set(point_id),
@@ -851,8 +865,11 @@ def _query_neighbors_tree(
                 far_child = 2 * current + 2 - near_side
                 far_in_range = (split_distance * split_distance) <= radius_state
                 return jax.lax.select(
-                    (previous == near_child) | ((previous == parent) & (near_child >= num_nodes)),
-                    jax.lax.select((far_child < num_nodes) & far_in_range, far_child, parent),
+                    (previous == near_child)
+                    | ((previous == parent) & (near_child >= num_nodes)),
+                    jax.lax.select(
+                        (far_child < num_nodes) & far_in_range, far_child, parent
+                    ),
                     jax.lax.select(previous == parent, near_child, parent),
                 )
 
@@ -871,18 +888,24 @@ def _query_neighbors_tree(
         )
         best_d2 = jnp.maximum(best_d2, 0.0)
         if return_squared:
-            best_d2, best_idx = jax.lax.sort((best_d2, best_idx), dimension=0, num_keys=2)
+            best_d2, best_idx = jax.lax.sort(
+                (best_d2, best_idx), dimension=0, num_keys=2
+            )
             return best_idx, best_d2
         safe_idx = jnp.clip(best_idx, 0, num_points - 1)
         distances = jnp.linalg.norm(points[safe_idx] - query[None, :], axis=-1)
         distances = jnp.where(best_idx >= 0, distances, jnp.inf)
-        distances, best_idx = jax.lax.sort((distances, best_idx), dimension=0, num_keys=2)
+        distances, best_idx = jax.lax.sort(
+            (distances, best_idx), dimension=0, num_keys=2
+        )
         return best_idx, distances
 
     return jax.vmap(single_query, in_axes=(0, 0))(queries_arr, query_ids)
 
 
-def _resolve_query_backend(tree: KDTree, queries_arr: Array, backend: str, *, k: int) -> str:
+def _resolve_query_backend(
+    tree: KDTree, queries_arr: Array, backend: str, *, k: int
+) -> str:
     if backend != "auto":
         return backend
     n = int(tree.num_points)
@@ -969,7 +992,9 @@ def query_neighbors(
     )
 
 
-def _prepare_radius_inputs(queries_arr: Array, radius: float | Array) -> tuple[Array, int]:
+def _prepare_radius_inputs(
+    queries_arr: Array, radius: float | Array
+) -> tuple[Array, int]:
     radius_arr = jnp.asarray(radius, dtype=queries_arr.dtype)
     if not isinstance(radius_arr, jax.core.Tracer):
         if bool(jnp.any(radius_arr < 0.0)):
@@ -978,7 +1003,9 @@ def _prepare_radius_inputs(queries_arr: Array, radius: float | Array) -> tuple[A
         radius_qr = jnp.broadcast_to(radius_arr[None, None], (queries_arr.shape[0], 1))
         return radius_qr * radius_qr, 0
     if radius_arr.ndim == 1:
-        radius_qr = jnp.broadcast_to(radius_arr[None, :], (queries_arr.shape[0], radius_arr.shape[0]))
+        radius_qr = jnp.broadcast_to(
+            radius_arr[None, :], (queries_arr.shape[0], radius_arr.shape[0])
+        )
         return radius_qr * radius_qr, 1
     if radius_arr.ndim == 2:
         if radius_arr.shape[0] != queries_arr.shape[0]:
@@ -987,7 +1014,9 @@ def _prepare_radius_inputs(queries_arr: Array, radius: float | Array) -> tuple[A
                 f"received {radius_arr.shape} for n_queries={queries_arr.shape[0]}"
             )
         return radius_arr * radius_arr, 2
-    raise ValueError(f"radius must be a scalar, 1D, or 2D array; received ndim={radius_arr.ndim}")
+    raise ValueError(
+        f"radius must be a scalar, 1D, or 2D array; received ndim={radius_arr.ndim}"
+    )
 
 
 def _count_neighbors_tiled(
@@ -1126,7 +1155,9 @@ def _count_neighbors_tree(
                 return jax.lax.select(
                     (previous == near_child)
                     | ((previous == parent) & (near_child >= num_nodes)),
-                    jax.lax.select((far_child < num_nodes) & far_in_range, far_child, parent),
+                    jax.lax.select(
+                        (far_child < num_nodes) & far_in_range, far_child, parent
+                    ),
                     jax.lax.select(previous == parent, near_child, parent),
                 )
 
@@ -1227,7 +1258,9 @@ def build_and_query(
     """Convenience function to build a tree and run nearest-neighbor queries."""
 
     tree = build_kdtree(points, leaf_size=leaf_size)
-    return query_neighbors(tree, queries, k=k, backend=backend, return_squared=return_squared)
+    return query_neighbors(
+        tree, queries, k=k, backend=backend, return_squared=return_squared
+    )
 
 
 __all__ = [

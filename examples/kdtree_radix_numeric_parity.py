@@ -61,8 +61,12 @@ def _restore_original_order(
 ) -> jax.Array:
     # yggdrax currently exposes inverse permutation with backend-dependent
     # conventions in a few paths. Pick the mapping that reconstructs positions.
-    cand_scatter = jnp.zeros_like(values_sorted).at[inverse_permutation].set(values_sorted)
-    pos_scatter = jnp.zeros_like(positions_sorted).at[inverse_permutation].set(positions_sorted)
+    cand_scatter = (
+        jnp.zeros_like(values_sorted).at[inverse_permutation].set(values_sorted)
+    )
+    pos_scatter = (
+        jnp.zeros_like(positions_sorted).at[inverse_permutation].set(positions_sorted)
+    )
     err_scatter = jnp.linalg.norm(pos_scatter - positions_original)
 
     cand_gather = values_sorted[inverse_permutation]
@@ -217,11 +221,19 @@ def main() -> None:
     print("config:", vars(args))
     print(
         "radix_nearfield_edges:",
-        {"pairs": int(rt.shape[0]), "valid_pairs": int(jnp.sum(rv)), "nodes": int(radix_tree.num_nodes)},
+        {
+            "pairs": int(rt.shape[0]),
+            "valid_pairs": int(jnp.sum(rv)),
+            "nodes": int(radix_tree.num_nodes),
+        },
     )
     print(
         "kdtree_nearfield_edges:",
-        {"pairs": int(kt.shape[0]), "valid_pairs": int(jnp.sum(kv)), "nodes": int(kd_tree.num_nodes)},
+        {
+            "pairs": int(kt.shape[0]),
+            "valid_pairs": int(jnp.sum(kv)),
+            "nodes": int(kd_tree.num_nodes),
+        },
     )
     print(
         "nearfield_error_vs_dense:",
@@ -237,10 +249,7 @@ def main() -> None:
             "max_abs_diff": float(jnp.max(jnp.abs(a_kd - a_radix))),
             "cosine_similarity": float(
                 jnp.vdot(a_radix.reshape(-1), a_kd.reshape(-1))
-                / (
-                    (jnp.linalg.norm(a_radix) * jnp.linalg.norm(a_kd))
-                    + 1e-12
-                )
+                / ((jnp.linalg.norm(a_radix) * jnp.linalg.norm(a_kd)) + 1e-12)
             ),
         },
     )

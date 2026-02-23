@@ -513,9 +513,7 @@ def missing_morton_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
 
     topology = resolve_tree_topology(tree_or_topology)
     return tuple(
-        name
-        for name in MORTON_TOPOLOGY_REQUIRED_FIELDS
-        if not hasattr(topology, name)
+        name for name in MORTON_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
     )
 
 

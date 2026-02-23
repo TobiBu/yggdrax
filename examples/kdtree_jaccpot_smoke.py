@@ -170,7 +170,9 @@ def main() -> None:
             print(f"[jit][{label}] dual-tree walk: ok")
             return neighbors
         except Exception as exc:  # pragma: no cover - dependent on backend state
-            print(f"[jit][{label}] dual-tree walk: FAILED -> {type(exc).__name__}: {exc}")
+            print(
+                f"[jit][{label}] dual-tree walk: FAILED -> {type(exc).__name__}: {exc}"
+            )
             return None
 
     radix_neighbors = _jit_dual_tree_run(radix, "radix")

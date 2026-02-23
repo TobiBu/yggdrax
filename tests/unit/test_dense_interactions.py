@@ -5,9 +5,11 @@ import pytest
 
 from yggdrax.dense_interactions import build_dense_interactions, densify_interactions
 from yggdrax.geometry import compute_tree_geometry
-from yggdrax.interactions import DualTreeTraversalConfig, build_interactions_and_neighbors
-from yggdrax.tree import build_fixed_depth_tree
-from yggdrax.tree import Tree
+from yggdrax.interactions import (
+    DualTreeTraversalConfig,
+    build_interactions_and_neighbors,
+)
+from yggdrax.tree import Tree, build_fixed_depth_tree
 
 
 def _build_fixed_depth_state(theta: float = 0.6):
