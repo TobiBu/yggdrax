@@ -7,12 +7,12 @@ when deciding whether a multipole expansion is admissible.
 
 from __future__ import annotations
 
-from functools import partial
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from beartype import beartype
+from jax import core as jax_core
 from jax import lax
 from jaxtyping import Array, jaxtyped
 
@@ -22,7 +22,6 @@ from .tree import (
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
-    get_num_internal_nodes,
     get_num_levels,
 )
 
@@ -51,38 +50,50 @@ def _validate_inputs(tree: object, positions_sorted: Array) -> None:
     total_nodes = tree.parent.shape[0]
     if tree.node_ranges.shape[0] != total_nodes:
         raise ValueError("tree.node_ranges must align with tree.parent shape")
-    if positions_sorted.shape[0] != tree.num_particles:
-        raise ValueError("positions_sorted must match tree.num_particles")
+    num_particles = jnp.asarray(tree.num_particles)
+    if not isinstance(num_particles, jax_core.Tracer):
+        if positions_sorted.shape[0] != int(num_particles):
+            raise ValueError("positions_sorted must match tree.num_particles")
     if positions_sorted.shape[1] != 3:
         raise ValueError("positions must have shape (N, 3)")
 
 
-@partial(jax.jit, static_argnames=("max_leaf_size",))
 @jaxtyped(typechecker=beartype)
 def _compute_leaf_bounds(
-    padded_positions: Array,
+    positions_sorted: Array,
     leaf_starts: Array,
     leaf_counts: Array,
-    *,
-    max_leaf_size: int,
 ) -> tuple[Array, Array]:
-    max_leaf = int(max_leaf_size)
-
     index_dtype = leaf_starts.dtype
+    dtype = positions_sorted.dtype
+    dim = positions_sorted.shape[1]
+    one = as_index(1)
+    zero = as_index(0)
+    inf_vec = jnp.full((dim,), jnp.inf, dtype=dtype)
+    neg_inf_vec = jnp.full((dim,), -jnp.inf, dtype=dtype)
 
     def single(start, count):
         row_start = lax.convert_element_type(start, index_dtype)
-        zero = jnp.asarray(0, dtype=index_dtype)
-        segment = lax.dynamic_slice(
-            padded_positions,
-            (row_start, zero),
-            (max_leaf, padded_positions.shape[1]),
+        row_count = lax.convert_element_type(count, index_dtype)
+
+        def cond_fun(state):
+            i, _mn, _mx = state
+            return i < row_count
+
+        def body_fun(state):
+            i, mn, mx = state
+            idx = row_start + i
+            point = lax.dynamic_index_in_dim(
+                positions_sorted, idx, axis=0, keepdims=False
+            )
+            return i + one, jnp.minimum(mn, point), jnp.maximum(mx, point)
+
+        _, mins, maxs = lax.while_loop(
+            cond_fun,
+            body_fun,
+            (zero, inf_vec, neg_inf_vec),
         )
-        idx = jnp.arange(max_leaf, dtype=index_dtype)
-        mask = (idx < count)[:, None]
-        min_mask = jnp.where(mask, segment, jnp.inf)
-        max_mask = jnp.where(mask, segment, -jnp.inf)
-        return jnp.min(min_mask, axis=0), jnp.max(max_mask, axis=0)
+        return mins, maxs
 
     mins, maxs = jax.vmap(single)(leaf_starts, leaf_counts)
     return mins, maxs
@@ -155,41 +166,27 @@ def compute_tree_geometry(
     _validate_inputs(tree, positions_sorted)
 
     ranges = tree.node_ranges.astype(INDEX_DTYPE)
-    num_internal = get_num_internal_nodes(tree)
+    num_internal = tree.left_child.shape[0]
     num_nodes = ranges.shape[0]
 
-    use_morton_bounds = bool(
-        jnp.asarray(tree.use_morton_geometry, dtype=jnp.bool_).item()
-    )
+    use_morton_bounds = jnp.asarray(tree.use_morton_geometry, dtype=jnp.bool_)
 
-    if use_morton_bounds:
-        leaf_min, leaf_max = _compute_leaf_bounds_from_morton(tree)
-    else:
+    def _leaf_bounds_from_ranges(_):
         leaf_ranges = ranges[num_internal:]
         leaf_starts = leaf_ranges[:, 0]
         leaf_counts = leaf_ranges[:, 1] - leaf_ranges[:, 0] + as_index(1)
-
-        max_leaf_size = int(jnp.max(leaf_counts))
-
-        pad_rows = max(max_leaf_size - 1, 0)
-        if pad_rows > 0:
-            padding = jnp.zeros(
-                (pad_rows, positions_sorted.shape[1]),
-                dtype=positions_sorted.dtype,
-            )
-            padded_positions = jnp.concatenate(
-                [positions_sorted, padding],
-                axis=0,
-            )
-        else:
-            padded_positions = positions_sorted
-
-        leaf_min, leaf_max = _compute_leaf_bounds(
-            padded_positions,
+        return _compute_leaf_bounds(
+            positions_sorted,
             leaf_starts,
             leaf_counts,
-            max_leaf_size=max_leaf_size,
         )
+
+    leaf_min, leaf_max = lax.cond(
+        use_morton_bounds,
+        lambda _: _compute_leaf_bounds_from_morton(tree),
+        _leaf_bounds_from_ranges,
+        operand=None,
+    )
 
     mins = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
     maxs = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
