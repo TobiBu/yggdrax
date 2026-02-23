@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from yggdrax import (
+    DualTreeTraversalConfig,
     build_interactions_and_neighbors,
     build_tree,
     compute_tree_geometry,
@@ -31,7 +32,19 @@ def test_quickstart_pipeline_smoke():
     tree = build_tree(positions, masses, leaf_size=16)
     positions_sorted = positions[tree.particle_indices]
     geometry = compute_tree_geometry(tree, positions_sorted)
-    interactions, neighbors = build_interactions_and_neighbors(tree, geometry)
+    traversal_cfg = DualTreeTraversalConfig(
+        max_pair_queue=8192,
+        process_block=256,
+        max_interactions_per_node=2048,
+        max_neighbors_per_leaf=2048,
+    )
+    interactions, neighbors = build_interactions_and_neighbors(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=traversal_cfg,
+    )
 
     assert int(tree.num_particles) == 128
     assert int(tree.num_nodes) > 0

@@ -40,7 +40,12 @@ pip install -e ".[dev]"
 import jax
 import jax.numpy as jnp
 
-from yggdrax import build_tree, compute_tree_geometry, build_interactions_and_neighbors
+from yggdrax import (
+    DualTreeTraversalConfig,
+    build_interactions_and_neighbors,
+    build_tree,
+    compute_tree_geometry,
+)
 
 key = jax.random.PRNGKey(0)
 key_pos, key_mass = jax.random.split(key)
@@ -50,7 +55,19 @@ masses = jax.random.uniform(key_mass, (512,), minval=0.5, maxval=1.5)
 tree = build_tree(positions, masses, leaf_size=16)
 positions_sorted = positions[tree.particle_indices]
 geom = compute_tree_geometry(tree, positions_sorted)
-interactions, neighbors = build_interactions_and_neighbors(tree, geom)
+traversal_cfg = DualTreeTraversalConfig(
+    max_pair_queue=8192,
+    process_block=256,
+    max_interactions_per_node=2048,
+    max_neighbors_per_leaf=2048,
+)
+interactions, neighbors = build_interactions_and_neighbors(
+    tree,
+    geom,
+    theta=0.6,
+    mac_type="dehnen",
+    traversal_config=traversal_cfg,
+)
 ```
 
 See `examples/getting_started.ipynb` for a runnable walkthrough.
