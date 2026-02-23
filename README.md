@@ -72,6 +72,26 @@ interactions, neighbors = build_interactions_and_neighbors(
 
 See `examples/getting_started.ipynb` for a runnable walkthrough.
 
+## Backend Extensibility
+
+Yggdrax now supports backend-oriented tree dispatch and capability-based
+topology contracts:
+
+- Register builders via `register_tree_builder(...)`
+- Inspect available builders via `available_tree_types()`
+- Use `resolve_tree_topology(...)` for container/topology adapters
+- Use derivation helpers (`get_node_levels`, `get_level_offsets`,
+  `get_nodes_by_level`) when a backend does not precompute level metadata
+
+Contract details and required/optional fields are documented in
+`docs/backend_contract.md`.
+
+Conformance tests:
+
+```bash
+pytest -q --no-cov tests/unit/test_backend_conformance.py
+```
+
 ## Development
 
 Local quality gates:
@@ -98,6 +118,7 @@ pytest --cov=yggdrax --cov-report=term-missing
 ## Project Structure
 
 - `yggdrax/tree.py`, `yggdrax/_tree_impl.py`: tree building and radix internals
+- `yggdrax/protocols.py`: backend capability protocols
 - `yggdrax/geometry.py`, `yggdrax/_geometry_impl.py`: geometry wrappers and implementations
 - `yggdrax/interactions.py`, `yggdrax/_interactions_impl.py`: traversal and interaction generation
 - `yggdrax/dense_interactions.py`, `yggdrax/grouped_interactions.py`: interaction layout utilities

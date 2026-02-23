@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import jax
+import jax.numpy as jnp
 from beartype import beartype
 from jaxtyping import Array, jaxtyped
 
 from . import _tree_impl
 from .bounds import infer_bounds
+from .dtypes import INDEX_DTYPE, as_index
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -45,6 +47,29 @@ class FixedDepthTreeBuildConfig:
 
 TreeType = Literal["radix"]
 TreeBuildMode = Literal["adaptive", "fixed_depth"]
+
+
+@dataclass(frozen=True)
+class TreeBuildRequest:
+    """Common request object passed to registered tree builders."""
+
+    positions: Array
+    masses: Array
+    build_mode: str
+    bounds: Optional[tuple[Array, Array]]
+    return_reordered: bool
+    workspace: Optional[RadixTreeWorkspace]
+    return_workspace: bool
+    leaf_size: int
+    target_leaf_particles: int
+    max_depth: Optional[int]
+    refine_local: bool
+    max_refine_levels: int
+    aspect_threshold: float
+    min_refined_leaf_particles: int
+
+
+TreeBuilder = Callable[[TreeBuildRequest], "Tree"]
 
 
 @dataclass(frozen=True)
@@ -99,13 +124,9 @@ class Tree:
     ) -> "Tree":
         """Build and return a concrete tree instance selected by keywords."""
 
-        if tree_type != "radix":
-            raise ValueError(
-                f"Unsupported tree_type '{tree_type}'. Supported: ('radix',)"
-            )
-        return RadixTree.from_particles(
-            positions,
-            masses,
+        request = TreeBuildRequest(
+            positions=positions,
+            masses=masses,
             build_mode=build_mode,
             bounds=bounds,
             return_reordered=return_reordered,
@@ -119,6 +140,14 @@ class Tree:
             aspect_threshold=aspect_threshold,
             min_refined_leaf_particles=min_refined_leaf_particles,
         )
+
+        builder = _TREE_BUILDERS.get(tree_type)
+        if builder is None:
+            supported = ", ".join(f"'{name}'" for name in sorted(_TREE_BUILDERS))
+            raise ValueError(
+                f"Unsupported tree_type '{tree_type}'. Supported: ({supported})"
+            )
+        return builder(request)
 
 
 @dataclass(frozen=True)
@@ -272,6 +301,131 @@ def _register_radix_tree_pytree() -> None:
 
 
 _register_radix_tree_pytree()
+
+
+def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
+    return RadixTree.from_particles(
+        request.positions,
+        request.masses,
+        build_mode=request.build_mode,
+        bounds=request.bounds,
+        return_reordered=request.return_reordered,
+        workspace=request.workspace,
+        return_workspace=request.return_workspace,
+        leaf_size=request.leaf_size,
+        target_leaf_particles=request.target_leaf_particles,
+        max_depth=request.max_depth,
+        refine_local=request.refine_local,
+        max_refine_levels=request.max_refine_levels,
+        aspect_threshold=request.aspect_threshold,
+        min_refined_leaf_particles=request.min_refined_leaf_particles,
+    )
+
+
+_TREE_BUILDERS: dict[str, TreeBuilder] = {
+    "radix": _build_radix_tree_from_request,
+}
+
+
+def resolve_tree_topology(tree_or_topology: object) -> object:
+    """Return a topology payload from a tree container or topology object."""
+
+    topology = getattr(tree_or_topology, "topology", None)
+    return tree_or_topology if topology is None else topology
+
+
+def get_num_internal_nodes(tree: object) -> int:
+    """Return number of internal nodes, deriving it from child buffers when needed."""
+
+    if hasattr(tree, "num_internal_nodes"):
+        return int(getattr(tree, "num_internal_nodes"))
+    return int(jnp.asarray(tree.left_child).shape[0])
+
+
+def get_node_levels(tree: object) -> Array:
+    """Return per-node depth levels, deriving from parent links when missing."""
+
+    if hasattr(tree, "node_level"):
+        return jnp.asarray(getattr(tree, "node_level"), dtype=INDEX_DTYPE)
+
+    parent = jnp.asarray(tree.parent, dtype=INDEX_DTYPE)
+    num_nodes = int(parent.shape[0])
+    if num_nodes == 0:
+        return jnp.zeros((0,), dtype=INDEX_DTYPE)
+
+    levels = jnp.zeros((num_nodes,), dtype=INDEX_DTYPE)
+    parent_safe = jnp.where(parent >= 0, parent, as_index(0))
+    for _ in range(max(num_nodes - 1, 0)):
+        candidate = jnp.where(
+            parent >= 0,
+            levels[parent_safe] + as_index(1),
+            as_index(0),
+        )
+        levels = jnp.maximum(levels, candidate)
+    return levels
+
+
+def get_num_levels(tree: object, *, node_levels: Optional[Array] = None) -> int:
+    """Return tree depth count, deriving from node levels when needed."""
+
+    if hasattr(tree, "num_levels"):
+        return int(getattr(tree, "num_levels"))
+    levels = get_node_levels(tree) if node_levels is None else jnp.asarray(node_levels)
+    if int(levels.shape[0]) == 0:
+        return 0
+    return int(jnp.max(levels)) + 1
+
+
+def get_level_offsets(tree: object, *, node_levels: Optional[Array] = None) -> Array:
+    """Return level offsets, deriving compact level partitions when absent."""
+
+    if hasattr(tree, "level_offsets"):
+        return jnp.asarray(getattr(tree, "level_offsets"), dtype=INDEX_DTYPE)
+
+    levels = get_node_levels(tree) if node_levels is None else jnp.asarray(node_levels)
+    num_levels = get_num_levels(tree, node_levels=levels)
+    counts = jnp.bincount(levels, length=num_levels)
+    return jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=INDEX_DTYPE),
+            jnp.cumsum(counts, dtype=INDEX_DTYPE),
+        ],
+        axis=0,
+    )
+
+
+def get_nodes_by_level(tree: object, *, node_levels: Optional[Array] = None) -> Array:
+    """Return nodes sorted by level (stable by node index within each level)."""
+
+    if hasattr(tree, "nodes_by_level"):
+        return jnp.asarray(getattr(tree, "nodes_by_level"), dtype=INDEX_DTYPE)
+
+    levels = get_node_levels(tree) if node_levels is None else jnp.asarray(node_levels)
+    node_ids = jnp.arange(levels.shape[0], dtype=INDEX_DTYPE)
+    order = jnp.lexsort((node_ids, levels))
+    return jnp.asarray(order, dtype=INDEX_DTYPE)
+
+
+def available_tree_types() -> tuple[str, ...]:
+    """Return registered public tree-type identifiers."""
+
+    return tuple(sorted(_TREE_BUILDERS.keys()))
+
+
+def register_tree_builder(
+    tree_type: str, builder: TreeBuilder, *, overwrite: bool = False
+) -> None:
+    """Register a new tree builder for ``Tree.from_particles`` dispatch."""
+
+    normalized = tree_type.strip()
+    if not normalized:
+        raise ValueError("tree_type must be a non-empty string")
+    if (normalized in _TREE_BUILDERS) and (not overwrite):
+        raise ValueError(
+            f"tree_type '{normalized}' is already registered; "
+            "pass overwrite=True to replace it"
+        )
+    _TREE_BUILDERS[normalized] = builder
 
 
 def _wrap_radix_public_result(
@@ -481,6 +635,8 @@ def build_fixed_depth_tree_jit(
 __all__ = [
     "MAX_TREE_LEVELS",
     "Tree",
+    "TreeBuilder",
+    "TreeBuildRequest",
     "TreeType",
     "TreeBuildMode",
     "RadixTree",
@@ -491,5 +647,13 @@ __all__ = [
     "build_fixed_depth_tree_jit",
     "build_tree",
     "build_tree_jit",
+    "available_tree_types",
+    "get_level_offsets",
+    "get_node_levels",
+    "get_nodes_by_level",
+    "get_num_internal_nodes",
+    "get_num_levels",
+    "resolve_tree_topology",
+    "register_tree_builder",
     "reorder_particles_by_indices",
 ]

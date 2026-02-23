@@ -29,7 +29,13 @@ from .grouped_interactions import (
     GroupedInteractionBuffers,
     build_grouped_interactions_from_pairs,
 )
-from .tree import RadixTree
+from .tree import (
+    get_level_offsets,
+    get_node_levels,
+    get_nodes_by_level,
+    get_num_internal_nodes,
+    get_num_levels,
+)
 
 # Each node only needs to interact with a bounded number of well-separated
 # partners (189 in the classic 3D MAC stencil). Keeping the default well above
@@ -733,8 +739,9 @@ def _add_neighbor_entry(
     ),
 )
 def _dual_tree_walk_impl(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
+    nodes_by_level: Array,
     theta: float,
     *,
     mac_type: MACType = "bh",
@@ -1348,7 +1355,7 @@ def _dual_tree_walk_impl(
     interaction_offsets = _exclusive_cumsum(far_counts)
     neighbor_offsets = _exclusive_cumsum(near_counts)
 
-    nodes_by_level = jnp.asarray(tree.nodes_by_level, dtype=INDEX_DTYPE)
+    nodes_by_level = jnp.asarray(nodes_by_level, dtype=INDEX_DTYPE)
     num_nodes_level = nodes_by_level.shape[0]
 
     if collect_far:
@@ -1456,7 +1463,7 @@ def _dual_tree_walk_impl(
     static_argnames=("mac_type", "collect_far", "collect_near", "process_block"),
 )
 def _dual_tree_walk_count_impl(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float,
     *,
@@ -1773,14 +1780,16 @@ def _dual_tree_walk_count_impl(
 
 def _result_to_interactions(
     result: DualTreeWalkResult,
-    tree: RadixTree,
+    tree: object,
 ) -> NodeInteractionList:
     total_nodes = int(tree.parent.shape[0])
     counts = jnp.asarray(result.interaction_counts)
     far_total = int(result.far_pair_count)
 
-    num_levels = int(tree.num_levels)
-    level_indices = jnp.asarray(tree.level_offsets[: num_levels + 1])
+    node_levels_all = get_node_levels(tree)
+    num_levels = get_num_levels(tree, node_levels=node_levels_all)
+    level_offsets_all = get_level_offsets(tree, node_levels=node_levels_all)
+    level_indices = jnp.asarray(level_offsets_all[: num_levels + 1])
 
     if far_total == 0:
         zero_offsets = jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE)
@@ -1796,9 +1805,9 @@ def _result_to_interactions(
 
     sources_sorted = jax.device_put(result.interaction_sources[:far_total])
     targets_sorted = jax.device_put(result.interaction_targets[:far_total])
-    levels_sorted = tree.node_level[targets_sorted]
+    levels_sorted = node_levels_all[targets_sorted]
 
-    nodes_by_level = jnp.asarray(tree.nodes_by_level)
+    nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels_all)
     counts_by_level = counts[nodes_by_level]
     cumulative_counts = jnp.cumsum(counts_by_level, dtype=INDEX_DTYPE)
     offsets_by_level = jnp.concatenate(
@@ -1837,7 +1846,7 @@ def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
 
 
 def _run_dual_tree_walk(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float,
     mac_type: MACType = "bh",
@@ -1861,7 +1870,8 @@ def _run_dual_tree_walk(
     if dehnen_scale_val <= 0.0:
         raise ValueError("dehnen_radius_scale must be > 0")
     total_nodes = int(tree.parent.shape[0])
-    num_internal = int(tree.left_child.shape[0])
+    num_internal = get_num_internal_nodes(tree)
+    nodes_by_level = get_nodes_by_level(tree)
 
     config = _resolve_dual_tree_config(traversal_config)
 
@@ -2032,6 +2042,7 @@ def _run_dual_tree_walk(
             result = _dual_tree_walk_impl(
                 tree,
                 geometry,
+                nodes_by_level,
                 theta_val,
                 mac_type=mac_type,
                 dehnen_radius_scale=dehnen_scale_val,
@@ -2131,7 +2142,7 @@ def _run_dual_tree_walk(
 
 @jaxtyped(typechecker=beartype)
 def build_well_separated_interactions(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float = 0.5,
     max_interactions_per_node: Optional[int] = None,
@@ -2171,7 +2182,7 @@ def build_well_separated_interactions(
 
 @jaxtyped(typechecker=beartype)
 def build_leaf_neighbor_lists(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float = 0.5,
     max_neighbors_per_leaf: int = _DEFAULT_MAX_NEIGHBORS,
@@ -2206,7 +2217,7 @@ def build_leaf_neighbor_lists(
 
 @jaxtyped(typechecker=beartype)
 def build_interactions_and_neighbors(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float = 0.5,
     max_interactions_per_node: Optional[int] = None,
@@ -2304,7 +2315,7 @@ def neighbors_for_leaf(data: NodeNeighborList, leaf_node: int) -> Array:
 
 
 def diagnose_leaf_neighbor_growth(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float = 0.5,
     *,

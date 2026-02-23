@@ -10,7 +10,7 @@ import numpy as np
 
 from .dtypes import INDEX_DTYPE
 from .geometry import TreeGeometry
-from .tree import RadixTree
+from .tree import get_node_levels, get_nodes_by_level
 
 
 class GroupedInteractionBuffers(NamedTuple):
@@ -34,7 +34,7 @@ def _safe_cell_size(root_extent: np.ndarray, level: np.ndarray) -> np.ndarray:
 
 
 def build_grouped_interactions(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     interactions,
 ) -> GroupedInteractionBuffers:
@@ -49,7 +49,7 @@ def build_grouped_interactions(
 
 
 def build_grouped_interactions_from_pairs(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     sources: jnp.ndarray,
     targets: jnp.ndarray,
@@ -76,11 +76,11 @@ def build_grouped_interactions_from_pairs(
             class_targets=empty_i,
             class_ids=empty_i,
             level_offsets=level_offsets_out,
-            level_nodes=jnp.asarray(tree.nodes_by_level, dtype=INDEX_DTYPE),
+            level_nodes=get_nodes_by_level(tree),
         )
 
     centers = np.asarray(jax.device_get(geometry.center), dtype=np.float64)
-    levels = np.asarray(jax.device_get(tree.node_level), dtype=np.int32)
+    levels = np.asarray(jax.device_get(get_node_levels(tree)), dtype=np.int32)
 
     delta = centers[tgt] - centers[src]
     tgt_level = levels[tgt]
@@ -148,7 +148,7 @@ def build_grouped_interactions_from_pairs(
             if level_offsets is not None
             else jnp.zeros((1,), dtype=INDEX_DTYPE)
         ),
-        level_nodes=jnp.asarray(tree.nodes_by_level, dtype=INDEX_DTYPE),
+        level_nodes=get_nodes_by_level(tree),
     )
 
 
