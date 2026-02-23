@@ -14,13 +14,7 @@ repos:
       - id: pydoclint
         name: pydoclint
         entry: pydoclint
-        language: system
+        language: python
+        additional_dependencies: [pydoclint]
         pass_filenames: false
         args: ["."]
-
-      - id: pytest
-        name: pytest
-        entry: pytest
-        language: system
-        pass_filenames: false
-        args: ["-q"]
