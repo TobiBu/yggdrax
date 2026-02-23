@@ -9,7 +9,7 @@ from jaxtyping import Array
 
 from .geometry import TreeGeometry
 from .interactions import DualTreeWalkResult, NodeInteractionList, NodeNeighborList
-from .tree import RadixTree
+from .tree import Tree
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ def traversal_result_from_expanse(result: DualTreeWalkResult) -> TraversalResult
 class PreparedTreeArtifacts:
     """Canonical prepared tree/traversal bundle."""
 
-    tree: RadixTree
+    tree: Tree
     positions_sorted: Array
     masses_sorted: Array
     inverse_permutation: Array
