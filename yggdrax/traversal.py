@@ -16,7 +16,7 @@ from .interactions import (
     MACType,
     build_interactions_and_neighbors,
 )
-from .tree import build_tree
+from .tree import Tree, TreeType
 from .types import PreparedTreeArtifacts, traversal_result_from_expanse
 
 
@@ -26,6 +26,7 @@ def build_prepared_tree_artifacts(
     masses: Array,
     bounds: Optional[tuple[Array, Array]] = None,
     *,
+    tree_type: TreeType = "radix",
     leaf_size: int = 16,
     theta: float = 0.6,
     mac_type: MACType = "bh",
@@ -35,19 +36,36 @@ def build_prepared_tree_artifacts(
     """Build a prepared tree + traversal bundle with stable public fields."""
 
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    tree, pos_sorted, mass_sorted, inverse = build_tree(
+    tree = Tree.from_particles(
         positions,
         masses,
-        bounds_resolved,
-        leaf_size=int(leaf_size),
+        tree_type=tree_type,
+        bounds=bounds_resolved,
         return_reordered=True,
+        leaf_size=int(leaf_size),
     )
-    geometry = compute_tree_geometry(tree, pos_sorted)
+    if (
+        tree.positions_sorted is None
+        or tree.masses_sorted is None
+        or tree.inverse_permutation is None
+    ):
+        raise RuntimeError("tree build did not return reordered particle buffers")
+
+    traversal_cfg = traversal_config
+    if traversal_cfg is None and getattr(tree, "tree_type", "radix") == "kdtree":
+        traversal_cfg = DualTreeTraversalConfig(
+            max_interactions_per_node=512,
+            max_neighbors_per_leaf=2048,
+            max_pair_queue=max(4096, int(16 * tree.num_nodes)),
+            process_block=64,
+        )
+
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
     interactions, neighbors, traversal_result_raw = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=float(theta),
-        traversal_config=traversal_config,
+        traversal_config=traversal_cfg,
         mac_type=mac_type,
         dehnen_radius_scale=float(dehnen_radius_scale),
         return_result=True,
@@ -59,9 +77,9 @@ def build_prepared_tree_artifacts(
     )
     return PreparedTreeArtifacts(
         tree=tree,
-        positions_sorted=pos_sorted,
-        masses_sorted=mass_sorted,
-        inverse_permutation=jnp.asarray(inverse, dtype=INDEX_DTYPE),
+        positions_sorted=tree.positions_sorted,
+        masses_sorted=tree.masses_sorted,
+        inverse_permutation=jnp.asarray(tree.inverse_permutation, dtype=INDEX_DTYPE),
         geometry=geometry,
         interactions=interactions,
         neighbors=neighbors,

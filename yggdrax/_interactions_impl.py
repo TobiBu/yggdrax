@@ -33,8 +33,6 @@ from .tree import (
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
-    get_num_internal_nodes,
-    get_num_levels,
 )
 
 # Each node only needs to interact with a bounded number of well-separated
@@ -46,6 +44,7 @@ _DEFAULT_MAX_NEIGHBORS = 2048
 DEFAULT_PAIR_QUEUE_MULTIPLIER = 32
 _DEFAULT_PAIR_BATCH = 32
 _MAX_REFINEMENT_PAIRS = 4
+_DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE = 1.2
 
 _AUTO_INTERACTION_MIN = 2048
 _AUTO_INTERACTION_MAX = 65536
@@ -434,11 +433,13 @@ def _propagate_extents(parent: Array, extents: Array) -> Array:
         def cond_fun(state):
             node, value = state
             parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
+            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
             return (value <= 0.0) & (parent_idx >= 0)
 
         def body_fun(state):
             node, _value = state
             parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
+            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
             new_value = lax.dynamic_index_in_dim(
                 extents, parent_idx, axis=0, keepdims=False
             )
@@ -1784,27 +1785,40 @@ def _result_to_interactions(
 ) -> NodeInteractionList:
     total_nodes = int(tree.parent.shape[0])
     counts = jnp.asarray(result.interaction_counts)
-    far_total = int(result.far_pair_count)
+    far_pair_count = jnp.asarray(result.far_pair_count, dtype=INDEX_DTYPE)
+    traced_total = isinstance(result.far_pair_count, jax_core.Tracer)
 
     node_levels_all = get_node_levels(tree)
-    num_levels = get_num_levels(tree, node_levels=node_levels_all)
-    level_offsets_all = get_level_offsets(tree, node_levels=node_levels_all)
+    if hasattr(tree, "level_offsets"):
+        level_offsets_all = jnp.asarray(tree.level_offsets, dtype=INDEX_DTYPE)
+        if hasattr(tree, "num_levels"):
+            num_levels = int(tree.num_levels)
+            level_offsets_all = level_offsets_all[: num_levels + 1]
+        else:
+            num_levels = int(level_offsets_all.shape[0] - 1)
+    else:
+        level_offsets_all = get_level_offsets(tree, node_levels=node_levels_all)
+        num_levels = int(level_offsets_all.shape[0] - 1)
     level_indices = jnp.asarray(level_offsets_all[: num_levels + 1])
 
-    if far_total == 0:
-        zero_offsets = jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE)
-        zero_levels = jnp.zeros((num_levels + 1,), dtype=INDEX_DTYPE)
-        return NodeInteractionList(
-            offsets=zero_offsets,
-            sources=jnp.zeros((0,), dtype=INDEX_DTYPE),
-            targets=jnp.zeros((0,), dtype=INDEX_DTYPE),
-            counts=counts,
-            level_offsets=zero_levels,
-            target_levels=jnp.zeros((0,), dtype=INDEX_DTYPE),
-        )
-
-    sources_sorted = jax.device_put(result.interaction_sources[:far_total])
-    targets_sorted = jax.device_put(result.interaction_targets[:far_total])
+    if traced_total:
+        sources_sorted = jnp.asarray(result.interaction_sources)
+        targets_sorted = jnp.asarray(result.interaction_targets)
+    else:
+        far_total = int(far_pair_count)
+        if far_total == 0:
+            zero_offsets = jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE)
+            zero_levels = jnp.zeros((num_levels + 1,), dtype=INDEX_DTYPE)
+            return NodeInteractionList(
+                offsets=zero_offsets,
+                sources=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                targets=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                counts=counts,
+                level_offsets=zero_levels,
+                target_levels=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            )
+        sources_sorted = jax.device_put(result.interaction_sources[:far_total])
+        targets_sorted = jax.device_put(result.interaction_targets[:far_total])
     levels_sorted = node_levels_all[targets_sorted]
 
     nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels_all)
@@ -1816,9 +1830,7 @@ def _result_to_interactions(
 
     node_offsets = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
     node_offsets = node_offsets.at[nodes_by_level].set(offsets_by_level[:-1])
-    node_offsets = jnp.concatenate(
-        [node_offsets, jnp.asarray([far_total], dtype=INDEX_DTYPE)]
-    )
+    node_offsets = jnp.concatenate([node_offsets, far_pair_count[None]])
 
     level_offsets = offsets_by_level[level_indices]
 
@@ -1833,10 +1845,14 @@ def _result_to_interactions(
 
 
 def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
-    near_total = int(result.near_pair_count)
+    traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
     neighbor_counts = jnp.asarray(result.neighbor_counts)
-    neighbor_indices = jax.device_put(result.neighbor_indices[:near_total])
+    if traced_total:
+        neighbor_indices = jnp.asarray(result.neighbor_indices)
+    else:
+        near_total = int(result.near_pair_count)
+        neighbor_indices = jax.device_put(result.neighbor_indices[:near_total])
     return NodeNeighborList(
         offsets=neighbor_offsets,
         neighbors=neighbor_indices,
@@ -1867,10 +1883,21 @@ def _run_dual_tree_walk(
 
     theta_val = float(theta)
     dehnen_scale_val = float(dehnen_radius_scale)
+    is_kdtree_topology = (
+        hasattr(tree, "split_dim")
+        and hasattr(tree, "points")
+        and hasattr(tree, "leaf_size")
+    )
+    if (
+        mac_type == "dehnen"
+        and is_kdtree_topology
+        and abs(dehnen_scale_val - 1.0) <= 1e-12
+    ):
+        dehnen_scale_val = _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE
     if dehnen_scale_val <= 0.0:
         raise ValueError("dehnen_radius_scale must be > 0")
     total_nodes = int(tree.parent.shape[0])
-    num_internal = get_num_internal_nodes(tree)
+    num_internal = int(jnp.asarray(tree.left_child).shape[0])
     nodes_by_level = get_nodes_by_level(tree)
 
     config = _resolve_dual_tree_config(traversal_config)

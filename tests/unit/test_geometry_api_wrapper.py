@@ -76,6 +76,24 @@ def test_compute_tree_geometry_accepts_topology_carrier():
     assert geometry.center.shape[0] == int(tree.parent.shape[0])
 
 
+def test_compute_tree_geometry_supports_outer_jit():
+    positions, masses = _sample_problem(n=64)
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        leaf_size=16,
+        return_reordered=True,
+    )
+
+    @jax.jit
+    def call(tree_arg, pos_arg):
+        geom = compute_tree_geometry(tree_arg, pos_arg)
+        return jnp.sum(geom.radius)
+
+    value = call(tree, pos_sorted)
+    assert jnp.isfinite(value)
+
+
 def test_geometry_to_level_major_wrapper_shapes():
     positions, masses = _sample_problem(n=64)
     tree, pos_sorted, _, _ = build_tree(

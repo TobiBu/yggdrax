@@ -5,10 +5,9 @@ from __future__ import annotations
 from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
-from beartype import beartype
 from beartype.typing import Callable
 from jax import lax
-from jaxtyping import Array, jaxtyped
+from jaxtyping import Array
 
 from .dtypes import INDEX_DTYPE, as_index
 from .geometry import LevelMajorTreeGeometry, TreeGeometry, geometry_to_level_major
@@ -18,7 +17,7 @@ from .interactions import (
     NodeInteractionList,
     build_interactions_and_neighbors,
 )
-from .tree import RadixTree
+from .tree import require_fmm_core_topology, resolve_tree_topology
 
 
 class DenseInteractionBuffers(NamedTuple):
@@ -147,15 +146,16 @@ def _dense_m2l_buffers(
     return result
 
 
-@jaxtyped(typechecker=beartype)
 def densify_interactions(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     interactions: NodeInteractionList,
 ) -> DenseInteractionBuffers:
     """Convert sparse far-field interactions into dense level-major tensors."""
 
-    level_geometry = geometry_to_level_major(tree, geometry)
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+    level_geometry = geometry_to_level_major(topology, geometry)
     level_nodes = level_geometry.node_indices
     level_centers = level_geometry.centers
     geometry_centers = jnp.asarray(geometry.center)
@@ -177,9 +177,8 @@ def densify_interactions(
     )
 
 
-@jaxtyped(typechecker=beartype)
 def build_dense_interactions(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
     theta: float = 0.5,
     *,

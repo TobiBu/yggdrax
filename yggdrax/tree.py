@@ -13,6 +13,8 @@ from jaxtyping import Array, jaxtyped
 from . import _tree_impl
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
+from .kdtree import KDTree as KDTreeTopology
+from .kdtree import build_kdtree
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -45,7 +47,7 @@ class FixedDepthTreeBuildConfig:
     min_refined_leaf_particles: int = 2
 
 
-TreeType = Literal["radix"]
+TreeType = Literal["radix", "kdtree"]
 TreeBuildMode = Literal["adaptive", "fixed_depth"]
 
 
@@ -71,6 +73,27 @@ class TreeBuildRequest:
 
 TreeBuilder = Callable[[TreeBuildRequest], "Tree"]
 
+FMM_CORE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "parent",
+    "left_child",
+    "right_child",
+    "node_ranges",
+    "num_particles",
+    "use_morton_geometry",
+)
+
+MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
+    "bounds_min",
+    "bounds_max",
+    "leaf_codes",
+    "leaf_depths",
+)
+
+# Backward-compatible alias used by previous checks.
+FMM_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
+    FMM_CORE_REQUIRED_FIELDS + MORTON_TOPOLOGY_REQUIRED_FIELDS
+)
+
 
 @dataclass(frozen=True)
 class Tree:
@@ -80,26 +103,56 @@ class Tree:
     def num_nodes(self) -> int:
         """Return number of nodes in the concrete topology."""
 
-        return int(self.topology.parent.shape[0])
+        topology = self.topology
+        if hasattr(topology, "parent"):
+            return int(topology.parent.shape[0])
+        if hasattr(topology, "node_start"):
+            return int(topology.node_start.shape[0])
+        raise AttributeError("topology does not expose parent or node_start")
 
     @property
     def num_particles(self) -> int:
         """Return number of particles represented by this tree."""
 
-        return int(self.topology.num_particles)
+        topology = self.topology
+        if hasattr(topology, "num_particles"):
+            return int(topology.num_particles)
+        if hasattr(topology, "points"):
+            return int(topology.points.shape[0])
+        raise AttributeError("topology does not expose num_particles or points")
 
     @property
     def num_leaves(self) -> int:
         """Return number of leaf nodes represented by this tree."""
 
-        return int(self.topology.parent.shape[0]) - int(
-            self.topology.num_internal_nodes
-        )
+        topology = self.topology
+        if hasattr(topology, "leaf_nodes"):
+            return int(topology.leaf_nodes.shape[0])
+        if hasattr(topology, "parent") and hasattr(topology, "num_internal_nodes"):
+            return int(topology.parent.shape[0]) - int(topology.num_internal_nodes)
+        raise AttributeError("topology does not expose leaf metadata")
 
     def __getattr__(self, name):
         """Delegate missing attributes to the concrete topology object."""
 
         return getattr(self.topology, name)
+
+    @property
+    def missing_fmm_topology_fields(self) -> tuple[str, ...]:
+        """Return missing topology fields required by FMM core APIs."""
+
+        return missing_fmm_topology_fields(self)
+
+    @property
+    def supports_fmm_topology(self) -> bool:
+        """Whether this tree exposes topology needed by FMM core routines."""
+
+        return len(self.missing_fmm_topology_fields) == 0
+
+    def require_fmm_topology(self) -> None:
+        """Raise when this tree cannot satisfy FMM core topology requirements."""
+
+        require_fmm_topology(self)
 
     @classmethod
     @jaxtyped(typechecker=beartype)
@@ -266,6 +319,74 @@ class RadixTree(Tree):
         return cls(topology=result, build_mode=build_mode)  # type: ignore[arg-type]
 
 
+@dataclass(frozen=True)
+class KDParticleTree(Tree):
+    """Concrete KD-tree container implementing the generic Tree contract."""
+
+    topology: KDTreeTopology
+    build_mode: Literal["adaptive"] = "adaptive"
+    positions_sorted: Optional[Array] = None
+    masses_sorted: Optional[Array] = None
+    inverse_permutation: Optional[Array] = None
+    workspace: Optional[RadixTreeWorkspace] = None
+
+    @property
+    def tree_type(self) -> TreeType:
+        return "kdtree"
+
+    @classmethod
+    @jaxtyped(typechecker=beartype)
+    def from_particles(
+        cls,
+        positions: Array,
+        masses: Array,
+        *,
+        build_mode: str = "adaptive",
+        bounds: Optional[tuple[Array, Array]] = None,
+        return_reordered: bool = True,
+        workspace: Optional[RadixTreeWorkspace] = None,
+        return_workspace: bool = False,
+        leaf_size: int = 8,
+        target_leaf_particles: int = 32,
+        max_depth: Optional[int] = None,
+        refine_local: bool = True,
+        max_refine_levels: int = 2,
+        aspect_threshold: float = 8.0,
+        min_refined_leaf_particles: int = 2,
+    ) -> "KDParticleTree":
+        del (
+            bounds,
+            workspace,
+            return_workspace,
+            target_leaf_particles,
+            max_depth,
+            refine_local,
+            max_refine_levels,
+            aspect_threshold,
+            min_refined_leaf_particles,
+        )
+        if build_mode != "adaptive":
+            raise ValueError(
+                "Unsupported build_mode "
+                f"'{build_mode}' for kdtree. Supported: ('adaptive',)"
+            )
+
+        topology = build_kdtree(positions, leaf_size=leaf_size)
+        if return_reordered:
+            idx = jnp.asarray(topology.particle_indices, dtype=INDEX_DTYPE)
+            pos_sorted = positions[idx]
+            mass_sorted = masses[idx]
+            inv = jnp.empty_like(idx)
+            inv = inv.at[idx].set(jnp.arange(idx.shape[0], dtype=idx.dtype))
+            return cls(
+                topology=topology,
+                positions_sorted=pos_sorted,
+                masses_sorted=mass_sorted,
+                inverse_permutation=inv,
+            )
+        return cls(topology=topology)
+
+
 def _register_radix_tree_pytree() -> None:
     if getattr(RadixTree, "_yggdrax_pytree_registered", False):
         return
@@ -303,6 +424,39 @@ def _register_radix_tree_pytree() -> None:
 _register_radix_tree_pytree()
 
 
+def _register_kdtree_tree_pytree() -> None:
+    if getattr(KDParticleTree, "_yggdrax_pytree_registered", False):
+        return
+
+    def flatten(tree: KDParticleTree):
+        children = (
+            tree.topology,
+            tree.positions_sorted,
+            tree.masses_sorted,
+            tree.inverse_permutation,
+        )
+        aux = ("adaptive",)
+        return children, aux
+
+    def unflatten(aux, children):
+        (build_mode,) = aux
+        topology, positions_sorted, masses_sorted, inverse_permutation = children
+        return KDParticleTree(
+            topology=topology,
+            build_mode=build_mode,
+            positions_sorted=positions_sorted,
+            masses_sorted=masses_sorted,
+            inverse_permutation=inverse_permutation,
+            workspace=None,
+        )
+
+    jax.tree_util.register_pytree_node(KDParticleTree, flatten, unflatten)
+    setattr(KDParticleTree, "_yggdrax_pytree_registered", True)
+
+
+_register_kdtree_tree_pytree()
+
+
 def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
     return RadixTree.from_particles(
         request.positions,
@@ -322,8 +476,19 @@ def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
     )
 
 
+def _build_kdtree_from_request(request: TreeBuildRequest) -> Tree:
+    return KDParticleTree.from_particles(
+        request.positions,
+        request.masses,
+        build_mode=request.build_mode,
+        return_reordered=request.return_reordered,
+        leaf_size=request.leaf_size,
+    )
+
+
 _TREE_BUILDERS: dict[str, TreeBuilder] = {
     "radix": _build_radix_tree_from_request,
+    "kdtree": _build_kdtree_from_request,
 }
 
 
@@ -332,6 +497,83 @@ def resolve_tree_topology(tree_or_topology: object) -> object:
 
     topology = getattr(tree_or_topology, "topology", None)
     return tree_or_topology if topology is None else topology
+
+
+def missing_fmm_core_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return FMM-core required topology fields missing on the provided object."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name for name in FMM_CORE_REQUIRED_FIELDS if not hasattr(topology, name)
+    )
+
+
+def missing_morton_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return Morton-geometry required fields missing on the provided object."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name for name in MORTON_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
+    )
+
+
+def has_fmm_core_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when all FMM-core fields are available."""
+
+    return len(missing_fmm_core_topology_fields(tree_or_topology)) == 0
+
+
+def has_morton_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when all Morton-geometry fields are available."""
+
+    return len(missing_morton_topology_fields(tree_or_topology)) == 0
+
+
+def require_fmm_core_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when FMM-core topology fields are missing."""
+
+    missing = missing_fmm_core_topology_fields(tree_or_topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(
+        f"{prefix}topology is missing FMM-core-required fields: {missing_txt}"
+    )
+
+
+def require_morton_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when Morton-geometry fields are missing."""
+
+    missing = missing_morton_topology_fields(tree_or_topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(
+        f"{prefix}topology is missing Morton-geometry-required fields: {missing_txt}"
+    )
+
+
+# Backward-compatible aliases
+def missing_fmm_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Alias of ``missing_fmm_core_topology_fields`` for compatibility."""
+
+    return missing_fmm_core_topology_fields(tree_or_topology)
+
+
+def has_fmm_topology(tree_or_topology: object) -> bool:
+    """Alias of ``has_fmm_core_topology`` for compatibility."""
+
+    return has_fmm_core_topology(tree_or_topology)
+
+
+def require_fmm_topology(tree_or_topology: object) -> None:
+    """Alias of ``require_fmm_core_topology`` for compatibility."""
+
+    require_fmm_core_topology(tree_or_topology)
 
 
 def get_num_internal_nodes(tree: object) -> int:
@@ -371,8 +613,14 @@ def get_num_levels(tree: object, *, node_levels: Optional[Array] = None) -> int:
     if hasattr(tree, "num_levels"):
         return int(getattr(tree, "num_levels"))
     levels = get_node_levels(tree) if node_levels is None else jnp.asarray(node_levels)
-    if int(levels.shape[0]) == 0:
+    num_nodes = int(levels.shape[0])
+    if num_nodes == 0:
         return 0
+
+    # Under jit/grad tracing, converting jnp.max(levels) to a Python int
+    # raises a concretization error. Use the static node-count upper bound.
+    if isinstance(levels, jax.core.Tracer):
+        return num_nodes
     return int(jnp.max(levels)) + 1
 
 
@@ -634,12 +882,16 @@ def build_fixed_depth_tree_jit(
 
 __all__ = [
     "MAX_TREE_LEVELS",
+    "FMM_CORE_REQUIRED_FIELDS",
+    "MORTON_TOPOLOGY_REQUIRED_FIELDS",
+    "FMM_TOPOLOGY_REQUIRED_FIELDS",
     "Tree",
     "TreeBuilder",
     "TreeBuildRequest",
     "TreeType",
     "TreeBuildMode",
     "RadixTree",
+    "KDParticleTree",
     "RadixTreeWorkspace",
     "TreeBuildConfig",
     "FixedDepthTreeBuildConfig",
@@ -653,7 +905,16 @@ __all__ = [
     "get_nodes_by_level",
     "get_num_internal_nodes",
     "get_num_levels",
+    "has_fmm_core_topology",
+    "has_fmm_topology",
+    "has_morton_topology",
+    "missing_fmm_core_topology_fields",
+    "missing_fmm_topology_fields",
+    "missing_morton_topology_fields",
     "resolve_tree_topology",
+    "require_fmm_core_topology",
+    "require_fmm_topology",
+    "require_morton_topology",
     "register_tree_builder",
     "reorder_particles_by_indices",
 ]

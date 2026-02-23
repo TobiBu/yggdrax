@@ -5,7 +5,18 @@ import jax.numpy as jnp
 import pytest
 
 import yggdrax.tree as tree_api
-from yggdrax import Tree
+from yggdrax import (
+    Tree,
+    has_fmm_core_topology,
+    has_fmm_topology,
+    has_morton_topology,
+    missing_fmm_core_topology_fields,
+    missing_fmm_topology_fields,
+    missing_morton_topology_fields,
+    require_fmm_core_topology,
+    require_fmm_topology,
+    require_morton_topology,
+)
 
 
 def _sample_problem(n: int = 64):
@@ -79,8 +90,89 @@ def test_tree_from_particles_rejects_unknown_build_mode():
         Tree.from_particles(positions, masses, build_mode="kdtree")
 
 
+def test_tree_from_particles_builds_kdtree():
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="kdtree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+    assert tree.tree_type == "kdtree"
+    assert tree.num_particles == 64
+    assert tree.num_nodes > 0
+    assert tree.num_leaves > 0
+    assert tree.positions_sorted is not None
+    assert tree.masses_sorted is not None
+    assert tree.inverse_permutation is not None
+
+
+def test_radix_tree_reports_fmm_topology_support():
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="radix",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+    assert tree.supports_fmm_topology
+    assert tree.missing_fmm_topology_fields == ()
+    assert missing_fmm_core_topology_fields(tree) == ()
+    assert missing_morton_topology_fields(tree) == ()
+    assert has_fmm_core_topology(tree)
+    assert has_fmm_topology(tree)
+    assert has_morton_topology(tree)
+    assert missing_fmm_topology_fields(tree) == ()
+    require_fmm_core_topology(tree)
+    require_fmm_topology(tree)
+    require_morton_topology(tree)
+
+
+def test_kdtree_reports_core_fmm_support_and_missing_morton_fields():
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="kdtree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+    assert tree.supports_fmm_topology
+    missing = set(tree.missing_fmm_topology_fields)
+    assert len(missing) == 0
+    core_missing = set(missing_fmm_core_topology_fields(tree))
+    morton_missing = set(missing_morton_topology_fields(tree))
+    assert len(core_missing) == 0
+    assert "leaf_codes" in morton_missing
+    assert has_fmm_core_topology(tree)
+    assert has_fmm_topology(tree)
+    assert not has_morton_topology(tree)
+    require_fmm_core_topology(tree)
+    tree.require_fmm_topology()
+    require_fmm_topology(tree)
+    with pytest.raises(ValueError, match="missing Morton-geometry-required fields"):
+        require_morton_topology(tree)
+
+
+def test_tree_from_particles_kdtree_rejects_fixed_depth():
+    positions, masses = _sample_problem(n=32)
+    with pytest.raises(ValueError, match="Unsupported build_mode"):
+        Tree.from_particles(
+            positions,
+            masses,
+            tree_type="kdtree",
+            build_mode="fixed_depth",
+        )
+
+
 def test_available_tree_types_includes_radix():
     assert "radix" in tree_api.available_tree_types()
+    assert "kdtree" in tree_api.available_tree_types()
 
 
 def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):

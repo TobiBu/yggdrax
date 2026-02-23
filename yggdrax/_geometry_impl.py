@@ -22,8 +22,8 @@ from .tree import (
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
-    get_num_internal_nodes,
     get_num_levels,
+    require_morton_topology,
 )
 
 
@@ -51,7 +51,7 @@ def _validate_inputs(tree: object, positions_sorted: Array) -> None:
     total_nodes = tree.parent.shape[0]
     if tree.node_ranges.shape[0] != total_nodes:
         raise ValueError("tree.node_ranges must align with tree.parent shape")
-    num_particles = jnp.asarray(tree.topology.num_particles)
+    num_particles = jnp.asarray(tree.num_particles)
     if not isinstance(num_particles, jax_core.Tracer):
         if positions_sorted.shape[0] != int(num_particles):
             raise ValueError("positions_sorted must match tree.num_particles")
@@ -104,6 +104,8 @@ _MAX_MORTON_LEVEL = 21
 
 
 def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
+    require_morton_topology(tree)
+
     bounds_min = jnp.asarray(tree.bounds_min)
     bounds_max = jnp.asarray(tree.bounds_max)
     domain = bounds_max - bounds_min
@@ -170,7 +172,15 @@ def compute_tree_geometry(
     num_internal = tree.left_child.shape[0]
     num_nodes = ranges.shape[0]
 
-    use_morton_bounds = jnp.asarray(tree.use_morton_geometry, dtype=jnp.bool_)
+    use_morton_raw = getattr(tree, "use_morton_geometry", False)
+    use_morton_bounds = jnp.asarray(use_morton_raw, dtype=jnp.bool_)
+    has_morton_fields = all(
+        hasattr(tree, name)
+        for name in ("bounds_min", "bounds_max", "leaf_codes", "leaf_depths")
+    )
+    if (not has_morton_fields) and (not isinstance(use_morton_raw, jax_core.Tracer)):
+        if bool(jnp.asarray(use_morton_raw)):
+            require_morton_topology(tree)
 
     def _leaf_bounds_from_ranges(_):
         leaf_ranges = ranges[num_internal:]
@@ -182,12 +192,15 @@ def compute_tree_geometry(
             leaf_counts,
         )
 
-    leaf_min, leaf_max = lax.cond(
-        use_morton_bounds,
-        lambda _: _compute_leaf_bounds_from_morton(tree),
-        _leaf_bounds_from_ranges,
-        operand=None,
-    )
+    if has_morton_fields:
+        leaf_min, leaf_max = lax.cond(
+            use_morton_bounds,
+            lambda _: _compute_leaf_bounds_from_morton(tree),
+            _leaf_bounds_from_ranges,
+            operand=None,
+        )
+    else:
+        leaf_min, leaf_max = _leaf_bounds_from_ranges(None)
 
     mins = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
     maxs = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)

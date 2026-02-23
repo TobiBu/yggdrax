@@ -2,6 +2,7 @@
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from yggdrax import TraversalResult, build_prepared_tree_artifacts
 
@@ -26,7 +27,8 @@ def _sample_problem(n: int = 64):
     return positions, masses
 
 
-def test_prepared_tree_artifacts_smoke():
+@pytest.mark.parametrize("tree_type", ["radix", "kdtree"])
+def test_prepared_tree_artifacts_smoke(tree_type: str):
     positions, masses = _sample_problem(n=48)
     bounds = (
         jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32),
@@ -36,6 +38,7 @@ def test_prepared_tree_artifacts_smoke():
         positions,
         masses,
         bounds,
+        tree_type=tree_type,
         leaf_size=16,
         theta=0.6,
         mac_type="dehnen",
@@ -45,5 +48,6 @@ def test_prepared_tree_artifacts_smoke():
     assert artifacts.tree.node_ranges.shape[0] == artifacts.geometry.center.shape[0]
     assert artifacts.interactions.sources.ndim == 1
     assert artifacts.neighbors.neighbors.ndim == 1
+    assert artifacts.tree.tree_type == tree_type
     assert isinstance(artifacts.traversal_result, TraversalResult)
     assert artifacts.traversal_result.far_pair_count.ndim == 0
