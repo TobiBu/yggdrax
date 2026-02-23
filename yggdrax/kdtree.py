@@ -28,6 +28,9 @@ class KDTree:
     leaf_nodes: Array
     leaf_start: Array
     leaf_end: Array
+    leaf_point_ids: Array
+    leaf_valid_mask: Array
+    node_to_leaf: Array
     leaf_size: int
 
     @property
@@ -62,6 +65,9 @@ def _register_kdtree_pytree() -> None:
             tree.leaf_nodes,
             tree.leaf_start,
             tree.leaf_end,
+            tree.leaf_point_ids,
+            tree.leaf_valid_mask,
+            tree.node_to_leaf,
         )
         aux = (tree.leaf_size,)
         return children, aux
@@ -82,6 +88,9 @@ def _register_kdtree_pytree() -> None:
             leaf_nodes,
             leaf_start,
             leaf_end,
+            leaf_point_ids,
+            leaf_valid_mask,
+            node_to_leaf,
         ) = children
         return KDTree(
             points=points,
@@ -97,6 +106,9 @@ def _register_kdtree_pytree() -> None:
             leaf_nodes=leaf_nodes,
             leaf_start=leaf_start,
             leaf_end=leaf_end,
+            leaf_point_ids=leaf_point_ids,
+            leaf_valid_mask=leaf_valid_mask,
+            node_to_leaf=node_to_leaf,
             leaf_size=leaf_size,
         )
 
@@ -217,6 +229,24 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     gathered = points[safe_point_idx, safe_dim]
     split_value_arr = jnp.where(split_dim_arr >= 0, gathered, jnp.nan)
 
+    leaf_counts_py = [node_end[x] - node_start[x] for x in leaf_nodes]
+    max_leaf_points = max(leaf_counts_py) if leaf_counts_py else 1
+    leaf_point_ids_rows = []
+    leaf_valid_rows = []
+    for node, count in zip(leaf_nodes, leaf_counts_py):
+        start = node_start[node]
+        end = node_end[node]
+        row_ids = order[start:end]
+        if count < max_leaf_points:
+            pad = jnp.full((max_leaf_points - count,), -1, dtype=jnp.int32)
+            row_ids = jnp.concatenate([row_ids, pad], axis=0)
+        leaf_point_ids_rows.append(row_ids)
+        valid_row = jnp.arange(max_leaf_points, dtype=jnp.int32) < count
+        leaf_valid_rows.append(valid_row)
+    node_to_leaf = [-1] * len(node_start)
+    for leaf_ord, node in enumerate(leaf_nodes):
+        node_to_leaf[node] = leaf_ord
+
     return (
         order,
         node_start_arr,
@@ -230,6 +260,9 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         jnp.asarray(leaf_nodes, dtype=jnp.int32),
         jnp.asarray([node_start[x] for x in leaf_nodes], dtype=jnp.int32),
         jnp.asarray([node_end[x] for x in leaf_nodes], dtype=jnp.int32),
+        jnp.stack(leaf_point_ids_rows, axis=0),
+        jnp.stack(leaf_valid_rows, axis=0),
+        jnp.asarray(node_to_leaf, dtype=jnp.int32),
     )
 
 
@@ -256,6 +289,9 @@ def build_kdtree(points: Array, *, leaf_size: int = 32) -> KDTree:
         leaf_nodes=topology[9],
         leaf_start=topology[10],
         leaf_end=topology[11],
+        leaf_point_ids=topology[12],
+        leaf_valid_mask=topology[13],
+        node_to_leaf=topology[14],
         leaf_size=int(leaf_size),
     )
 
@@ -344,6 +380,28 @@ def _point_to_bbox_distance_sq(query: Array, bbox_min: Array, bbox_max: Array) -
     return jnp.sum(delta * delta, axis=1)
 
 
+def _point_to_bbox_distance_sq_single(
+    query: Array,
+    bbox_min: Array,
+    bbox_max: Array,
+) -> Array:
+    clipped = jnp.clip(query, bbox_min, bbox_max)
+    delta = query - clipped
+    return jnp.sum(delta * delta)
+
+
+def _topk_merge(
+    best_d2: Array, best_idx: Array, cand_d2: Array, cand_idx: Array
+) -> tuple[Array, Array]:
+    k = best_d2.shape[0]
+    merged_d2 = jnp.concatenate([best_d2, cand_d2], axis=0)
+    merged_idx = jnp.concatenate([best_idx, cand_idx], axis=0)
+    top_scores, top_cols = jax.lax.top_k(-merged_d2, k)
+    new_d2 = -top_scores
+    new_idx = jnp.take_along_axis(merged_idx, top_cols, axis=0)
+    return new_d2, new_idx
+
+
 def _query_neighbors_tree(
     tree: KDTree,
     queries_arr: Array,
@@ -351,87 +409,126 @@ def _query_neighbors_tree(
     k: int,
     exclude_self: bool,
 ) -> tuple[Array, Array]:
-    points_sorted = tree.points[tree.indices]
-    ids_sorted = jnp.asarray(tree.indices, dtype=jnp.int32)
-    leaf_bbox_min = tree.bbox_min[tree.leaf_nodes]
-    leaf_bbox_max = tree.bbox_max[tree.leaf_nodes]
-    leaf_start = jnp.asarray(tree.leaf_start, dtype=jnp.int32)
-    leaf_end = jnp.asarray(tree.leaf_end, dtype=jnp.int32)
-    leaf_sizes = leaf_end - leaf_start
-    max_leaf_points = max(int(jnp.max(leaf_sizes)), 1)
+    points = tree.points
+    bbox_min = tree.bbox_min
+    bbox_max = tree.bbox_max
+    left_child = jnp.asarray(tree.left_child, dtype=jnp.int32)
+    right_child = jnp.asarray(tree.right_child, dtype=jnp.int32)
+    leaf_point_ids = jnp.asarray(tree.leaf_point_ids, dtype=jnp.int32)
+    leaf_valid = jnp.asarray(tree.leaf_valid_mask, dtype=jnp.bool_)
+    node_to_leaf = jnp.asarray(tree.node_to_leaf, dtype=jnp.int32)
 
-    pad = max_leaf_points - 1
-    if pad > 0:
-        points_pad = jnp.zeros((pad, tree.dimension), dtype=tree.points.dtype)
-        ids_pad = jnp.full((pad,), -1, dtype=jnp.int32)
-        points_sorted_padded = jnp.concatenate([points_sorted, points_pad], axis=0)
-        ids_sorted_padded = jnp.concatenate([ids_sorted, ids_pad], axis=0)
-    else:
-        points_sorted_padded = points_sorted
-        ids_sorted_padded = ids_sorted
-
-    num_leaves = int(leaf_start.shape[0])
+    num_nodes = int(tree.node_start.shape[0])
+    max_leaf_points = int(leaf_point_ids.shape[1])
     n_queries = int(queries_arr.shape[0])
     num_points = tree.num_points
     use_self_mask = bool(exclude_self and (n_queries == num_points))
     query_ids = jnp.arange(n_queries, dtype=jnp.int32)
 
     def single_query(query: Array, query_id: Array) -> tuple[Array, Array]:
-        lower_bounds = _point_to_bbox_distance_sq(query, leaf_bbox_min, leaf_bbox_max)
-        order = jnp.argsort(lower_bounds)
-
         best_d2 = jnp.full((k,), jnp.inf, dtype=queries_arr.dtype)
         best_idx = jnp.full((k,), -1, dtype=jnp.int32)
+        stack = (
+            jnp.full((num_nodes,), -1, dtype=jnp.int32)
+            .at[0]
+            .set(jnp.asarray(0, dtype=jnp.int32))
+        )
+        stack_size = jnp.asarray(1, dtype=jnp.int32)
 
         def cond_fun(state):
-            i, _d2, _idx, done = state
-            return (i < num_leaves) & (~done)
+            _best_d2, _best_idx, _stack, size = state
+            return size > 0
 
         def body_fun(state):
-            i, d2_best, idx_best, _done = state
-            leaf_ord = order[i]
-            lb = lower_bounds[leaf_ord]
+            d2_best, idx_best, stk, size = state
+            size = size - jnp.asarray(1, dtype=size.dtype)
+            node = stk[size]
+
+            lb = _point_to_bbox_distance_sq_single(
+                query, bbox_min[node], bbox_max[node]
+            )
             have_k = idx_best[k - 1] >= 0
             worst = d2_best[k - 1]
             should_stop = have_k & (lb > worst)
 
-            start = leaf_start[leaf_ord]
-            end = leaf_end[leaf_ord]
-            count = end - start
-            zero = jnp.asarray(0, dtype=start.dtype)
-            block_points = jax.lax.dynamic_slice(
-                points_sorted_padded,
-                (start, zero),
-                (max_leaf_points, tree.dimension),
-            )
-            block_ids = jax.lax.dynamic_slice(
-                ids_sorted_padded, (start,), (max_leaf_points,)
-            )
-            valid = jnp.arange(max_leaf_points, dtype=jnp.int32) < count
-            d2 = jnp.sum((block_points - query[None, :]) ** 2, axis=1)
-            d2 = jnp.where(valid, d2, jnp.inf)
+            def when_pruned(_):
+                return d2_best, idx_best, stk, size
 
-            if use_self_mask:
-                d2 = jnp.where(block_ids == query_id, jnp.inf, d2)
+            def when_active(_):
+                l = left_child[node]
+                r = right_child[node]
+                is_leaf = l < 0
 
-            candidate_d2 = jnp.concatenate([d2_best, d2], axis=0)
-            candidate_idx = jnp.concatenate([idx_best, block_ids], axis=0)
-            top_scores, top_cols = jax.lax.top_k(-candidate_d2, k)
-            next_d2 = -top_scores
-            next_idx = jnp.take_along_axis(candidate_idx, top_cols, axis=0)
+                def visit_leaf(_):
+                    leaf_ord = node_to_leaf[node]
+                    block_ids = leaf_point_ids[leaf_ord]
+                    valid = leaf_valid[leaf_ord]
+                    safe_ids = jnp.clip(block_ids, min=0, max=num_points - 1)
+                    block_points = points[safe_ids]
+                    d2 = jnp.sum((block_points - query[None, :]) ** 2, axis=1)
+                    d2 = jnp.where(valid, d2, jnp.inf)
+                    if use_self_mask:
+                        d2 = jnp.where(block_ids == query_id, jnp.inf, d2)
+                    next_d2, next_idx = _topk_merge(d2_best, idx_best, d2, block_ids)
+                    return next_d2, next_idx, stk, size
 
-            d2_best = jnp.where(should_stop, d2_best, next_d2)
-            idx_best = jnp.where(should_stop, idx_best, next_idx)
-            return i + 1, d2_best, idx_best, should_stop
+                def visit_internal(_):
+                    lb_l = _point_to_bbox_distance_sq_single(
+                        query, bbox_min[l], bbox_max[l]
+                    )
+                    lb_r = _point_to_bbox_distance_sq_single(
+                        query, bbox_min[r], bbox_max[r]
+                    )
+                    near = jnp.where(lb_l <= lb_r, l, r)
+                    far = jnp.where(lb_l <= lb_r, r, l)
+                    lb_near = jnp.minimum(lb_l, lb_r)
+                    lb_far = jnp.maximum(lb_l, lb_r)
+                    have_k_now = idx_best[k - 1] >= 0
+                    worst_now = d2_best[k - 1]
+                    can_near = (~have_k_now) | (lb_near <= worst_now)
+                    can_far = (~have_k_now) | (lb_far <= worst_now)
 
-        _, best_d2, best_idx, _ = jax.lax.while_loop(
+                    stk_next, size_next = jax.lax.cond(
+                        can_far,
+                        lambda _: (
+                            stk.at[size].set(far),
+                            size + jnp.asarray(1, dtype=size.dtype),
+                        ),
+                        lambda _: (stk, size),
+                        operand=None,
+                    )
+                    stk_next, size_next = jax.lax.cond(
+                        can_near,
+                        lambda _: (
+                            stk_next.at[size_next].set(near),
+                            size_next + jnp.asarray(1, dtype=size.dtype),
+                        ),
+                        lambda _: (stk_next, size_next),
+                        operand=None,
+                    )
+                    return d2_best, idx_best, stk_next, size_next
+
+                return jax.lax.cond(is_leaf, visit_leaf, visit_internal, operand=None)
+
+            return jax.lax.cond(should_stop, when_pruned, when_active, operand=None)
+
+        best_d2, best_idx, _stack_out, _size_out = jax.lax.while_loop(
             cond_fun,
             body_fun,
-            (0, best_d2, best_idx, False),
+            (best_d2, best_idx, stack, stack_size),
         )
         return best_idx, jnp.sqrt(jnp.maximum(best_d2, 0.0))
 
     return jax.vmap(single_query, in_axes=(0, 0))(queries_arr, query_ids)
+
+
+def _resolve_query_backend(tree: KDTree, queries_arr: Array, backend: str) -> str:
+    if backend != "auto":
+        return backend
+    work = int(tree.num_points) * int(queries_arr.shape[0])
+    if work <= 2_000_000:
+        return "dense"
+    return "tree"
 
 
 @jaxtyped(typechecker=beartype)
@@ -441,7 +538,7 @@ def query_neighbors(
     *,
     k: int = 1,
     exclude_self: bool = False,
-    backend: Literal["dense", "tiled", "tree"] = "tiled",
+    backend: Literal["dense", "tiled", "tree", "auto"] = "tiled",
     point_block_size: int = 2048,
 ) -> tuple[Array, Array]:
     """Return nearest-neighbor indices and distances for each query point.
@@ -454,7 +551,8 @@ def query_neighbors(
             masks diagonal elements so self-matches are not returned.
         backend: Query backend. ``dense`` builds a full pairwise matrix;
             ``tiled`` computes exact neighbors blockwise with lower memory;
-            ``tree`` uses KD leaf bounding boxes to prune exact search.
+            ``tree`` uses KD leaf bounding boxes to prune exact search;
+            ``auto`` selects a backend by problem size.
         point_block_size: Block size used by the tiled backend.
 
     Returns:
@@ -466,12 +564,14 @@ def query_neighbors(
         raise ValueError(f"k must be >= 1, received {k}")
     if k > tree.num_points:
         raise ValueError(f"k must be <= num_points={tree.num_points}, received {k}")
-    if backend not in {"dense", "tiled", "tree"}:
-        raise ValueError("backend must be one of: 'dense', 'tiled', 'tree'")
+    if backend not in {"dense", "tiled", "tree", "auto"}:
+        raise ValueError("backend must be one of: 'dense', 'tiled', 'tree', 'auto'")
 
-    if backend == "dense":
+    resolved_backend = _resolve_query_backend(tree, queries_arr, backend)
+
+    if resolved_backend == "dense":
         return _query_neighbors_dense(tree, queries_arr, k=k, exclude_self=exclude_self)
-    if backend == "tree":
+    if resolved_backend == "tree":
         return _query_neighbors_tree(tree, queries_arr, k=k, exclude_self=exclude_self)
     return _query_neighbors_tiled(
         tree,
@@ -540,69 +640,114 @@ def _count_neighbors_tree(
     include_self: bool,
 ) -> Array:
     radius_sq = jnp.asarray(radius, dtype=queries_arr.dtype) ** 2
-    points_sorted = tree.points[tree.indices]
-    ids_sorted = jnp.asarray(tree.indices, dtype=jnp.int32)
-    leaf_bbox_min = tree.bbox_min[tree.leaf_nodes]
-    leaf_bbox_max = tree.bbox_max[tree.leaf_nodes]
-    leaf_start = jnp.asarray(tree.leaf_start, dtype=jnp.int32)
-    leaf_end = jnp.asarray(tree.leaf_end, dtype=jnp.int32)
-    leaf_sizes = leaf_end - leaf_start
-    max_leaf_points = max(int(jnp.max(leaf_sizes)), 1)
+    points = tree.points
+    bbox_min = tree.bbox_min
+    bbox_max = tree.bbox_max
+    left_child = jnp.asarray(tree.left_child, dtype=jnp.int32)
+    right_child = jnp.asarray(tree.right_child, dtype=jnp.int32)
+    leaf_point_ids = jnp.asarray(tree.leaf_point_ids, dtype=jnp.int32)
+    leaf_valid = jnp.asarray(tree.leaf_valid_mask, dtype=jnp.bool_)
+    node_to_leaf = jnp.asarray(tree.node_to_leaf, dtype=jnp.int32)
 
-    pad = max_leaf_points - 1
-    if pad > 0:
-        points_pad = jnp.zeros((pad, tree.dimension), dtype=tree.points.dtype)
-        ids_pad = jnp.full((pad,), -1, dtype=jnp.int32)
-        points_sorted_padded = jnp.concatenate([points_sorted, points_pad], axis=0)
-        ids_sorted_padded = jnp.concatenate([ids_sorted, ids_pad], axis=0)
-    else:
-        points_sorted_padded = points_sorted
-        ids_sorted_padded = ids_sorted
-
-    num_leaves = int(leaf_start.shape[0])
+    num_nodes = int(tree.node_start.shape[0])
     n_queries = int(queries_arr.shape[0])
     num_points = tree.num_points
     use_self_mask = bool((not include_self) and (n_queries == num_points))
     query_ids = jnp.arange(n_queries, dtype=jnp.int32)
 
     def single_query(query: Array, query_id: Array) -> Array:
-        lower_bounds = _point_to_bbox_distance_sq(query, leaf_bbox_min, leaf_bbox_max)
-        order = jnp.argsort(lower_bounds)
-
         def cond_fun(state):
-            i, _count = state
-            return (i < num_leaves) & (lower_bounds[order[i]] <= radius_sq)
+            _count, _stack, size = state
+            return size > 0
 
         def body_fun(state):
-            i, count_acc = state
-            leaf_ord = order[i]
-            start = leaf_start[leaf_ord]
-            end = leaf_end[leaf_ord]
-            count = end - start
-            zero = jnp.asarray(0, dtype=start.dtype)
-            block_points = jax.lax.dynamic_slice(
-                points_sorted_padded,
-                (start, zero),
-                (max_leaf_points, tree.dimension),
+            count_acc, stk, size = state
+            size = size - jnp.asarray(1, dtype=size.dtype)
+            node = stk[size]
+            lb = _point_to_bbox_distance_sq_single(
+                query, bbox_min[node], bbox_max[node]
             )
-            block_ids = jax.lax.dynamic_slice(
-                ids_sorted_padded, (start,), (max_leaf_points,)
-            )
-            valid = jnp.arange(max_leaf_points, dtype=jnp.int32) < count
-            d2 = jnp.sum((block_points - query[None, :]) ** 2, axis=1)
-            within = (d2 <= radius_sq) & valid
-            if use_self_mask:
-                within = within & (block_ids != query_id)
-            return i + 1, count_acc + jnp.sum(within, dtype=count_acc.dtype)
+            should_prune = lb > radius_sq
 
-        _, total = jax.lax.while_loop(
+            def when_pruned(_):
+                return count_acc, stk, size
+
+            def when_active(_):
+                l = left_child[node]
+                r = right_child[node]
+                is_leaf = l < 0
+
+                def visit_leaf(_):
+                    leaf_ord = node_to_leaf[node]
+                    block_ids = leaf_point_ids[leaf_ord]
+                    valid = leaf_valid[leaf_ord]
+                    safe_ids = jnp.clip(block_ids, min=0, max=num_points - 1)
+                    block_points = points[safe_ids]
+                    d2 = jnp.sum((block_points - query[None, :]) ** 2, axis=1)
+                    within = (d2 <= radius_sq) & valid
+                    if use_self_mask:
+                        within = within & (block_ids != query_id)
+                    return count_acc + jnp.sum(within, dtype=count_acc.dtype), stk, size
+
+                def visit_internal(_):
+                    lb_l = _point_to_bbox_distance_sq_single(
+                        query, bbox_min[l], bbox_max[l]
+                    )
+                    lb_r = _point_to_bbox_distance_sq_single(
+                        query, bbox_min[r], bbox_max[r]
+                    )
+                    can_l = lb_l <= radius_sq
+                    can_r = lb_r <= radius_sq
+                    stk_next, size_next = jax.lax.cond(
+                        can_r,
+                        lambda _: (
+                            stk.at[size].set(r),
+                            size + jnp.asarray(1, dtype=size.dtype),
+                        ),
+                        lambda _: (stk, size),
+                        operand=None,
+                    )
+                    stk_next, size_next = jax.lax.cond(
+                        can_l,
+                        lambda _: (
+                            stk_next.at[size_next].set(l),
+                            size_next + jnp.asarray(1, dtype=size.dtype),
+                        ),
+                        lambda _: (stk_next, size_next),
+                        operand=None,
+                    )
+                    return count_acc, stk_next, size_next
+
+                return jax.lax.cond(is_leaf, visit_leaf, visit_internal, operand=None)
+
+            return jax.lax.cond(should_prune, when_pruned, when_active, operand=None)
+
+        init_stack = (
+            jnp.full((num_nodes,), -1, dtype=jnp.int32)
+            .at[0]
+            .set(jnp.asarray(0, dtype=jnp.int32))
+        )
+        total, _stack, _size = jax.lax.while_loop(
             cond_fun,
             body_fun,
-            (0, jnp.asarray(0, dtype=jnp.int32)),
+            (
+                jnp.asarray(0, dtype=jnp.int32),
+                init_stack,
+                jnp.asarray(1, dtype=jnp.int32),
+            ),
         )
         return total
 
     return jax.vmap(single_query, in_axes=(0, 0))(queries_arr, query_ids)
+
+
+def _resolve_count_backend(tree: KDTree, queries_arr: Array, backend: str) -> str:
+    if backend != "auto":
+        return backend
+    work = int(tree.num_points) * int(queries_arr.shape[0])
+    if work <= 2_000_000:
+        return "tiled"
+    return "tree"
 
 
 @jaxtyped(typechecker=beartype)
@@ -612,7 +757,7 @@ def count_neighbors(
     *,
     radius: float,
     include_self: bool = True,
-    backend: Literal["tiled", "tree"] = "tiled",
+    backend: Literal["tiled", "tree", "auto"] = "tiled",
     point_block_size: int = 2048,
 ) -> Array:
     """Count reference points within ``radius`` for each query point."""
@@ -620,9 +765,10 @@ def count_neighbors(
     queries_arr = _validate_queries(tree, queries)
     if radius < 0.0:
         raise ValueError(f"radius must be >= 0, received {radius}")
-    if backend not in {"tiled", "tree"}:
-        raise ValueError("backend must be one of: 'tiled', 'tree'")
-    if backend == "tree":
+    if backend not in {"tiled", "tree", "auto"}:
+        raise ValueError("backend must be one of: 'tiled', 'tree', 'auto'")
+    resolved_backend = _resolve_count_backend(tree, queries_arr, backend)
+    if resolved_backend == "tree":
         return _count_neighbors_tree(
             tree,
             queries_arr,

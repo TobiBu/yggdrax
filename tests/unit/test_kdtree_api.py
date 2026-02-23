@@ -100,6 +100,8 @@ def test_kdtree_topology_fields_are_well_formed():
     assert tree.leaf_nodes.ndim == 1
     assert tree.leaf_start.shape == tree.leaf_nodes.shape
     assert tree.leaf_end.shape == tree.leaf_nodes.shape
+    assert tree.leaf_point_ids.ndim == 2
+    assert tree.leaf_valid_mask.shape == tree.leaf_point_ids.shape
     assert int(tree.node_start[0]) == 0
     assert int(tree.node_end[0]) == 33
 
@@ -134,6 +136,16 @@ def test_tree_backend_matches_dense_queries():
     assert jnp.allclose(d_dense, d_tree, atol=1e-6, rtol=1e-6)
 
 
+def test_tree_backend_queries_support_jit():
+    points = _sample_points(n=96, dim=3)
+    queries = _sample_points(n=21, dim=3)
+    tree = build_kdtree(points, leaf_size=8)
+    jitted = jax.jit(lambda q: query_neighbors(tree, q, k=6, backend="tree"))
+    idx, dist = jitted(queries)
+    assert idx.shape == (21, 6)
+    assert dist.shape == (21, 6)
+
+
 def test_tree_backend_matches_tiled_radius_counts():
     points = _sample_points(n=96, dim=3)
     queries = _sample_points(n=23, dim=3)
@@ -143,3 +155,24 @@ def test_tree_backend_matches_tiled_radius_counts():
     counts_tree = count_neighbors(tree, queries, radius=0.4, backend="tree")
 
     assert jnp.array_equal(counts_tiled, counts_tree)
+
+
+def test_tree_backend_counts_support_jit():
+    points = _sample_points(n=96, dim=3)
+    queries = _sample_points(n=23, dim=3)
+    tree = build_kdtree(points, leaf_size=8)
+    jitted = jax.jit(lambda q: count_neighbors(tree, q, radius=0.4, backend="tree"))
+    counts = jitted(queries)
+    assert counts.shape == (23,)
+
+
+def test_auto_backend_matches_dense_for_small_problem():
+    points = _sample_points(n=48, dim=3)
+    queries = _sample_points(n=11, dim=3)
+    tree = build_kdtree(points, leaf_size=8)
+
+    idx_dense, d_dense = query_neighbors(tree, queries, k=4, backend="dense")
+    idx_auto, d_auto = query_neighbors(tree, queries, k=4, backend="auto")
+
+    assert jnp.array_equal(idx_dense, idx_auto)
+    assert jnp.allclose(d_dense, d_auto, atol=1e-6, rtol=1e-6)
