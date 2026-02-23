@@ -18,7 +18,13 @@ from jaxtyping import Array, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index
 from .morton import _compact3_u64
-from .tree import RadixTree
+from .tree import (
+    get_level_offsets,
+    get_node_levels,
+    get_nodes_by_level,
+    get_num_internal_nodes,
+    get_num_levels,
+)
 
 
 class TreeGeometry(NamedTuple):
@@ -41,7 +47,7 @@ class LevelMajorTreeGeometry(NamedTuple):
     node_indices: Array
 
 
-def _validate_inputs(tree: RadixTree, positions_sorted: Array) -> None:
+def _validate_inputs(tree: object, positions_sorted: Array) -> None:
     total_nodes = tree.parent.shape[0]
     if tree.node_ranges.shape[0] != total_nodes:
         raise ValueError("tree.node_ranges must align with tree.parent shape")
@@ -97,7 +103,7 @@ def _compute_leaf_bounds(
 _MAX_MORTON_LEVEL = 21
 
 
-def _compute_leaf_bounds_from_morton(tree: RadixTree) -> tuple[Array, Array]:
+def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
     bounds_min = jnp.asarray(tree.bounds_min)
     bounds_max = jnp.asarray(tree.bounds_max)
     domain = bounds_max - bounds_min
@@ -139,15 +145,15 @@ def _compute_leaf_bounds_from_morton(tree: RadixTree) -> tuple[Array, Array]:
 
 @jaxtyped(typechecker=beartype)
 def compute_tree_geometry(
-    tree: RadixTree,
+    tree: object,
     positions_sorted: Array,
 ) -> TreeGeometry:
     """Compute per-node bounding boxes and helper radii.
 
     Parameters
     ----------
-    tree : RadixTree
-        Radix tree constructed by :func:`yggdrax.tree.build_tree`.
+    tree : object
+        Topology object exposing tree-structure arrays.
     positions_sorted : Array
         Particle positions reordered into Morton order. This should be the
         ``positions`` output from ``build_tree(..., return_reordered=True)``.
@@ -245,16 +251,17 @@ def compute_tree_geometry(
 
 @jaxtyped(typechecker=beartype)
 def geometry_to_level_major(
-    tree: RadixTree,
+    tree: object,
     geometry: TreeGeometry,
 ) -> LevelMajorTreeGeometry:
     """Materialise padded, level-major views of node geometry."""
 
-    num_levels = int(tree.num_levels)
+    node_levels = get_node_levels(tree)
+    num_levels = get_num_levels(tree, node_levels=node_levels)
     if num_levels <= 0:
         raise ValueError("tree must contain at least one populated level")
 
-    level_offsets = jnp.asarray(tree.level_offsets, dtype=INDEX_DTYPE)
+    level_offsets = get_level_offsets(tree, node_levels=node_levels)
     level_counts_full = level_offsets[1:] - level_offsets[:-1]
     level_counts = level_counts_full[:num_levels]
     max_nodes = int(jnp.max(jnp.maximum(level_counts, 1)))
@@ -269,7 +276,7 @@ def geometry_to_level_major(
     max_extents_buf = _make_buffer(geometry.max_extent)
     node_idx_buf = jnp.full((num_levels, max_nodes), -1, dtype=INDEX_DTYPE)
 
-    nodes_by_level = jnp.asarray(tree.nodes_by_level, dtype=INDEX_DTYPE)
+    nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels)
 
     total_nodes = geometry.center.shape[0]
     node_indices = jnp.asarray(nodes_by_level, dtype=INDEX_DTYPE)
