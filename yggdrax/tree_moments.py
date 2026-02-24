@@ -12,6 +12,7 @@ import itertools
 import math
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from beartype import beartype
@@ -597,7 +598,12 @@ def _validate_inputs(
     total_nodes = topology.parent.shape[0]
     if topology.node_ranges.shape[0] != total_nodes:
         raise ValueError("tree.node_ranges must align with tree.parent shape")
-    num_particles = int(jnp.asarray(topology.num_particles))
+    try:
+        num_particles = int(jnp.asarray(topology.num_particles))
+    except jax.errors.ConcretizationTypeError:
+        # Under outer jit, tree.num_particles can be traced. Fall back to
+        # shape-based validation, which remains static and trace-safe.
+        num_particles = int(positions_sorted.shape[0])
     if positions_sorted.shape[0] != num_particles:
         raise ValueError("positions_sorted must match tree.num_particles")
     if masses_sorted.shape[0] != num_particles:
