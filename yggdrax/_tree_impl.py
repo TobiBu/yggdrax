@@ -503,6 +503,20 @@ def build_fixed_depth_tree(
     leaf_codes = jnp.asarray(refined_codes_np, dtype=jnp.uint64)
     leaf_depths = jnp.asarray(refined_depths_np, dtype=INDEX_DTYPE)
 
+    # Enforce fixed-depth leaf occupancy contract whenever host values are
+    # available (non-traced path).
+    try:
+        max_leaf_particles = int(jnp.max(leaf_ends - leaf_starts).item())
+        if max_leaf_particles > int(target_leaf_particles):
+            raise ValueError(
+                "fixed-depth tree exceeded target_leaf_particles: "
+                f"max_leaf_particles={max_leaf_particles} > "
+                f"target_leaf_particles={int(target_leaf_particles)}"
+            )
+    except TypeError:
+        # Under tracing/JIT we may not be able to materialize host scalars.
+        pass
+
     return _build_tree_from_leaf_partitions(
         positions,
         masses,
