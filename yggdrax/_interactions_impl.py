@@ -175,6 +175,9 @@ _ACTION_NEAR = 1
 _ACTION_REFINE = 2
 
 
+PairPolicy = Callable[..., tuple[Array, Array]]
+
+
 # -----------------------------------------------------------------------------
 # Multipole acceptance criteria (MAC)
 # -----------------------------------------------------------------------------
@@ -409,6 +412,7 @@ class DualTreeWalkResult(NamedTuple):
     interaction_offsets: Array
     interaction_sources: Array
     interaction_targets: Array
+    interaction_tags: Array
     interaction_counts: Array
     neighbor_offsets: Array
     neighbor_indices: Array
@@ -422,6 +426,77 @@ class DualTreeWalkResult(NamedTuple):
     accept_decisions: Array
     near_decisions: Array
     refine_decisions: Array
+
+
+def _default_pair_actions(
+    *,
+    mac_ok: Array,
+    valid_pairs: Array,
+    different_nodes: Array,
+    target_leaf: Array,
+    source_leaf: Array,
+) -> tuple[Array, Array]:
+    """Return default traversal actions and placeholder tags."""
+
+    should_accept = mac_ok
+    should_near = valid_pairs & (~mac_ok) & target_leaf & source_leaf & different_nodes
+    actions = jnp.full(valid_pairs.shape, _ACTION_REFINE, dtype=INDEX_DTYPE)
+    actions = jnp.where(should_accept, as_index(_ACTION_ACCEPT), actions)
+    actions = jnp.where(should_near, as_index(_ACTION_NEAR), actions)
+    tags = jnp.full(valid_pairs.shape, -1, dtype=INDEX_DTYPE)
+    return actions, tags
+
+
+def _resolve_pair_actions(
+    *,
+    pair_policy: Optional[PairPolicy],
+    policy_state: object,
+    valid_pairs: Array,
+    mac_ok: Array,
+    different_nodes: Array,
+    target_leaf: Array,
+    source_leaf: Array,
+    same_node: Array,
+    target_nodes: Array,
+    source_nodes: Array,
+    center_target: Array,
+    center_source: Array,
+    dist_sq: Array,
+    extent_target: Array,
+    extent_source: Array,
+) -> tuple[Array, Array]:
+    """Resolve per-pair traversal actions and optional integer tags."""
+
+    if pair_policy is None:
+        return _default_pair_actions(
+            mac_ok=mac_ok,
+            valid_pairs=valid_pairs,
+            different_nodes=different_nodes,
+            target_leaf=target_leaf,
+            source_leaf=source_leaf,
+        )
+
+    actions, tags = pair_policy(
+        policy_state,
+        valid_pairs=valid_pairs,
+        mac_ok=mac_ok,
+        different_nodes=different_nodes,
+        target_leaf=target_leaf,
+        source_leaf=source_leaf,
+        same_node=same_node,
+        target_nodes=target_nodes,
+        source_nodes=source_nodes,
+        center_target=center_target,
+        center_source=center_source,
+        dist_sq=dist_sq,
+        extent_target=extent_target,
+        extent_source=extent_source,
+    )
+    actions = jnp.asarray(actions, dtype=INDEX_DTYPE)
+    tags = jnp.asarray(tags, dtype=INDEX_DTYPE)
+    actions = jnp.where(valid_pairs, actions, as_index(_ACTION_REFINE))
+    tags = jnp.where(valid_pairs, tags, as_index(-1))
+    return actions, tags
 
 
 def _propagate_extents(parent: Array, extents: Array) -> Array:
@@ -734,6 +809,7 @@ def _add_neighbor_entry(
         "max_neighbors_per_leaf",
         "max_pair_queue",
         "mac_type",
+        "pair_policy",
         "collect_far",
         "collect_near",
         "process_block",
@@ -746,6 +822,8 @@ def _dual_tree_walk_impl(
     theta: float,
     *,
     mac_type: MACType = "bh",
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
@@ -769,6 +847,7 @@ def _dual_tree_walk_impl(
             interaction_offsets=jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE),
             interaction_sources=jnp.zeros((0,), dtype=INDEX_DTYPE),
             interaction_targets=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            interaction_tags=jnp.zeros((0,), dtype=INDEX_DTYPE),
             interaction_counts=zero_nodes,
             neighbor_offsets=jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
             neighbor_indices=jnp.zeros((0,), dtype=INDEX_DTYPE),
@@ -837,9 +916,15 @@ def _dual_tree_walk_impl(
             -1,
             dtype=INDEX_DTYPE,
         )
+        far_tag_buffer = jnp.full(
+            (total_nodes, max_interactions_per_node),
+            -1,
+            dtype=INDEX_DTYPE,
+        )
     else:
         max_total_far_pairs = 0
         far_buffer = jnp.zeros((0, 0), dtype=INDEX_DTYPE)
+        far_tag_buffer = jnp.zeros((0, 0), dtype=INDEX_DTYPE)
     far_pair_total = as_index(0)
 
     near_counts = jnp.zeros((num_leaves,), dtype=INDEX_DTYPE)
@@ -972,6 +1057,7 @@ def _dual_tree_walk_impl(
             _stack_source,
             current_size,
             _far_buf,
+            _far_tag_buf,
             _far_cnts,
             _far_ptr,
             _nbr_buf,
@@ -992,6 +1078,7 @@ def _dual_tree_walk_impl(
             stack_source,
             stack_sz,
             far_buffer,
+            far_tag_buffer,
             far_counts,
             far_pair_total,
             neighbor_buffer,
@@ -1048,12 +1135,27 @@ def _dual_tree_walk_impl(
         target_leaf = valid_pairs_bool & (~target_internal)
         source_leaf = valid_pairs_bool & (~source_internal)
         same_node = valid_pairs_bool & (targets == sources)
-
-        should_accept = mac_ok
-        should_near = (
-            valid_pairs_bool & (~mac_ok) & target_leaf & source_leaf & different_nodes
+        pair_actions, pair_tags = _resolve_pair_actions(
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            valid_pairs=valid_pairs_bool,
+            mac_ok=mac_ok,
+            different_nodes=different_nodes,
+            target_leaf=target_leaf,
+            source_leaf=source_leaf,
+            same_node=same_node,
+            target_nodes=targets,
+            source_nodes=sources,
+            center_target=center_target,
+            center_source=center_source,
+            dist_sq=dist_sq,
+            extent_target=extent_mac_target,
+            extent_source=extent_mac_source,
         )
-        do_refine = valid_pairs_bool & (~should_accept) & (~should_near)
+
+        should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
+        should_near = valid_pairs_bool & (pair_actions == as_index(_ACTION_NEAR))
+        do_refine = valid_pairs_bool & (pair_actions == as_index(_ACTION_REFINE))
 
         batch_accept = jnp.sum(should_accept.astype(INDEX_DTYPE))
         batch_near = jnp.sum(should_near.astype(INDEX_DTYPE))
@@ -1090,14 +1192,15 @@ def _dual_tree_walk_impl(
             _, accept_perm = lax.top_k(accept_scores, process_block_int)
             accept_targets = targets[accept_perm]
             accept_sources = sources[accept_perm]
+            accept_tags = pair_tags[accept_perm]
             accept_count = jnp.sum(should_accept.astype(INDEX_DTYPE))
 
             def accept_cond(state):
-                idx, _buf, _cnts, _ptr, overflow = state
+                idx, _buf, _tag_buf, _cnts, _ptr, overflow = state
                 return (idx < accept_count) & (~overflow)
 
             def accept_loop(state):
-                idx, buf, cnts, ptr, overflow = state
+                idx, buf, tag_buf, cnts, ptr, overflow = state
                 tgt = lax.dynamic_index_in_dim(
                     accept_targets,
                     idx,
@@ -1110,6 +1213,13 @@ def _dual_tree_walk_impl(
                     axis=0,
                     keepdims=False,
                 )
+                tag = lax.dynamic_index_in_dim(
+                    accept_tags,
+                    idx,
+                    axis=0,
+                    keepdims=False,
+                )
+                current = lax.dynamic_index_in_dim(cnts, tgt, axis=0, keepdims=False)
                 buf, cnts, ptr, overflow = _add_far_entry(
                     buf,
                     cnts,
@@ -1119,6 +1229,13 @@ def _dual_tree_walk_impl(
                     src,
                     max_interactions_per_node=max_interactions_per_node,
                     max_total_pairs=max_total_far_pairs,
+                )
+                tag_buf = tag_buf.at[tgt, current].set(tag)
+                current_rev = lax.dynamic_index_in_dim(
+                    cnts,
+                    src,
+                    axis=0,
+                    keepdims=False,
                 )
                 buf, cnts, ptr, overflow = _add_far_entry(
                     buf,
@@ -1130,9 +1247,11 @@ def _dual_tree_walk_impl(
                     max_interactions_per_node=max_interactions_per_node,
                     max_total_pairs=max_total_far_pairs,
                 )
+                tag_buf = tag_buf.at[src, current_rev].set(tag)
                 return (
                     idx + as_index(1),
                     buf,
+                    tag_buf,
                     cnts,
                     ptr,
                     overflow,
@@ -1141,6 +1260,7 @@ def _dual_tree_walk_impl(
             (
                 _,
                 far_buffer,
+                far_tag_buffer,
                 far_counts,
                 far_pair_total,
                 far_overflow,
@@ -1150,6 +1270,7 @@ def _dual_tree_walk_impl(
                 (
                     as_index(0),
                     far_buffer,
+                    far_tag_buffer,
                     far_counts,
                     far_pair_total,
                     far_overflow,
@@ -1302,6 +1423,7 @@ def _dual_tree_walk_impl(
             stack_source,
             stack_sz,
             far_buffer,
+            far_tag_buffer,
             far_counts,
             far_pair_total,
             neighbor_buffer,
@@ -1320,6 +1442,7 @@ def _dual_tree_walk_impl(
         pair_stack_source,
         stack_size,
         far_buffer,
+        far_tag_buffer,
         far_counts,
         far_pair_total,
         neighbor_buffer,
@@ -1339,6 +1462,7 @@ def _dual_tree_walk_impl(
             pair_stack_source,
             stack_size,
             far_buffer,
+            far_tag_buffer,
             far_counts,
             far_pair_total,
             neighbor_buffer,
@@ -1362,44 +1486,67 @@ def _dual_tree_walk_impl(
     if collect_far:
         interaction_sources = jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
         interaction_targets = jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
+        interaction_tags = jnp.full((max_total_far_pairs,), -1, dtype=INDEX_DTYPE)
 
         def compress_far(idx, carry):
-            sources_out, targets_out, ptr = carry
+            sources_out, targets_out, tags_out, ptr = carry
             node = lax.dynamic_index_in_dim(nodes_by_level, idx, axis=0, keepdims=False)
             count = lax.dynamic_index_in_dim(far_counts, node, axis=0, keepdims=False)
             row = lax.dynamic_index_in_dim(far_buffer, node, axis=0, keepdims=False)
+            row_tags = lax.dynamic_index_in_dim(
+                far_tag_buffer,
+                node,
+                axis=0,
+                keepdims=False,
+            )
 
             def write_pairs(state):
                 def cond_fun(loop_state):
-                    j, _src_out, _tgt_out, _ptr_val = loop_state
+                    j, _src_out, _tgt_out, _tag_out, _ptr_val = loop_state
                     return j < count
 
                 def body_fun(loop_state):
-                    j, s_out, t_out, ptr_val = loop_state
+                    j, s_out, t_out, tag_out, ptr_val = loop_state
                     value = lax.dynamic_index_in_dim(row, j, axis=0, keepdims=False)
+                    tag = lax.dynamic_index_in_dim(
+                        row_tags,
+                        j,
+                        axis=0,
+                        keepdims=False,
+                    )
                     s_out = s_out.at[ptr_val].set(value)
                     t_out = t_out.at[ptr_val].set(node)
-                    return j + as_index(1), s_out, t_out, ptr_val + as_index(1)
+                    tag_out = tag_out.at[ptr_val].set(tag)
+                    return (
+                        j + as_index(1),
+                        s_out,
+                        t_out,
+                        tag_out,
+                        ptr_val + as_index(1),
+                    )
 
-                _, new_sources, new_targets, new_ptr = lax.while_loop(
-                    cond_fun, body_fun, (as_index(0), sources_out, targets_out, ptr)
+                _, new_sources, new_targets, new_tags, new_ptr = lax.while_loop(
+                    cond_fun,
+                    body_fun,
+                    (as_index(0), sources_out, targets_out, tags_out, ptr),
                 )
-                return new_sources, new_targets, new_ptr
+                return new_sources, new_targets, new_tags, new_ptr
 
             def skip_pairs(_):
-                return sources_out, targets_out, ptr
+                return sources_out, targets_out, tags_out, ptr
 
             return lax.cond(count > 0, write_pairs, skip_pairs, operand=None)
 
-        interaction_sources, interaction_targets, _ = lax.fori_loop(
+        interaction_sources, interaction_targets, interaction_tags, _ = lax.fori_loop(
             0,
             num_nodes_level,
             compress_far,
-            (interaction_sources, interaction_targets, as_index(0)),
+            (interaction_sources, interaction_targets, interaction_tags, as_index(0)),
         )
     else:
         interaction_sources = jnp.zeros((0,), dtype=INDEX_DTYPE)
         interaction_targets = jnp.zeros((0,), dtype=INDEX_DTYPE)
+        interaction_tags = jnp.zeros((0,), dtype=INDEX_DTYPE)
 
     if collect_near:
         neighbor_indices = jnp.zeros((max_total_near_pairs,), dtype=INDEX_DTYPE)
@@ -1443,6 +1590,7 @@ def _dual_tree_walk_impl(
         interaction_offsets=interaction_offsets,
         interaction_sources=interaction_sources,
         interaction_targets=interaction_targets,
+        interaction_tags=interaction_tags,
         interaction_counts=far_counts,
         neighbor_offsets=neighbor_offsets,
         neighbor_indices=neighbor_indices,
@@ -1461,7 +1609,13 @@ def _dual_tree_walk_impl(
 
 @partial(
     jax.jit,
-    static_argnames=("mac_type", "collect_far", "collect_near", "process_block"),
+    static_argnames=(
+        "mac_type",
+        "pair_policy",
+        "collect_far",
+        "collect_near",
+        "process_block",
+    ),
 )
 def _dual_tree_walk_count_impl(
     tree: object,
@@ -1469,6 +1623,8 @@ def _dual_tree_walk_count_impl(
     theta: float,
     *,
     mac_type: MACType = "bh",
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
     collect_far: bool = True,
     collect_near: bool = True,
@@ -1626,12 +1782,27 @@ def _dual_tree_walk_count_impl(
         target_leaf = valid_pairs_bool & (~target_internal)
         source_leaf = valid_pairs_bool & (~source_internal)
         same_node = valid_pairs_bool & (targets == sources)
-
-        should_accept = mac_ok
-        should_near = (
-            valid_pairs_bool & (~mac_ok) & target_leaf & source_leaf & different_nodes
+        pair_actions, _pair_tags = _resolve_pair_actions(
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            valid_pairs=valid_pairs_bool,
+            mac_ok=mac_ok,
+            different_nodes=different_nodes,
+            target_leaf=target_leaf,
+            source_leaf=source_leaf,
+            same_node=same_node,
+            target_nodes=targets,
+            source_nodes=sources,
+            center_target=center_target,
+            center_source=center_source,
+            dist_sq=dist_sq,
+            extent_target=extent_mac_target,
+            extent_source=extent_mac_source,
         )
-        do_refine = valid_pairs_bool & (~should_accept) & (~should_near)
+
+        should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
+        should_near = valid_pairs_bool & (pair_actions == as_index(_ACTION_NEAR))
+        do_refine = valid_pairs_bool & (pair_actions == as_index(_ACTION_REFINE))
 
         extent_target = extents_leaf[safe_targets]
         extent_source = extents_leaf[safe_sources]
@@ -1871,6 +2042,8 @@ def _run_dual_tree_walk(
     theta: float,
     mac_type: MACType = "bh",
     *,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     max_interactions_per_node: Optional[int],
     max_neighbors_per_leaf: int,
     max_pair_queue: Optional[int],
@@ -1960,6 +2133,8 @@ def _run_dual_tree_walk(
             geometry,
             theta_val,
             mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
             dehnen_radius_scale=dehnen_scale_val,
             collect_far=collect_far,
             collect_near=collect_near,
@@ -2076,6 +2251,8 @@ def _run_dual_tree_walk(
                 nodes_by_level,
                 theta_val,
                 mac_type=mac_type,
+                pair_policy=pair_policy,
+                policy_state=policy_state,
                 dehnen_radius_scale=dehnen_scale_val,
                 max_interactions_per_node=interaction_capacity,
                 max_neighbors_per_leaf=neighbors_limit,
@@ -2179,6 +2356,8 @@ def build_well_separated_interactions(
     max_interactions_per_node: Optional[int] = None,
     mac_type: MACType = "bh",
     *,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     max_pair_queue: Optional[int] = None,
     process_block: Optional[int] = None,
     traversal_config: Optional[DualTreeTraversalConfig] = None,
@@ -2198,6 +2377,8 @@ def build_well_separated_interactions(
         geometry,
         theta,
         mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         max_interactions_per_node=max_interactions_per_node,
         max_neighbors_per_leaf=_DEFAULT_MAX_NEIGHBORS,
         max_pair_queue=max_pair_queue,
@@ -2220,6 +2401,8 @@ def build_leaf_neighbor_lists(
     max_interactions_per_node: Optional[int] = None,
     mac_type: MACType = "bh",
     *,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     max_pair_queue: Optional[int] = None,
     process_block: Optional[int] = None,
     traversal_config: Optional[DualTreeTraversalConfig] = None,
@@ -2233,6 +2416,8 @@ def build_leaf_neighbor_lists(
         geometry,
         theta,
         mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         max_interactions_per_node=max_interactions_per_node,
         max_neighbors_per_leaf=max_neighbors_per_leaf,
         max_pair_queue=max_pair_queue,
@@ -2259,6 +2444,8 @@ def build_interactions_and_neighbors(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
     *,
     return_result: bool = False,
     return_grouped: bool = False,
@@ -2287,6 +2474,8 @@ def build_interactions_and_neighbors(
         geometry,
         theta,
         mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         max_interactions_per_node=max_interactions_per_node,
         max_neighbors_per_leaf=max_neighbors_per_leaf,
         max_pair_queue=max_pair_queue,

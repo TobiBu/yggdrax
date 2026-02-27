@@ -20,6 +20,7 @@ from .interactions import (
     MACType,
     NodeInteractionList,
     NodeNeighborList,
+    PairPolicy,
     build_interactions_and_neighbors,
     build_leaf_neighbor_lists,
 )
@@ -97,6 +98,7 @@ __all__ = [
     "LevelMajorTreeGeometry",
     "NodeInteractionList",
     "NodeNeighborList",
+    "PairPolicy",
     "MortonLeafBoundsProtocol",
     "PreparedTreeArtifacts",
     "KDParticleTree",
