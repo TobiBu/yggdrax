@@ -126,8 +126,15 @@ def test_geometry_to_level_major_accepts_topology_carrier():
     assert level_major.centers.ndim == 3
 
 
-def test_compute_tree_geometry_supports_outer_jit():
+def test_compute_tree_geometry_supports_outer_jit_wrapper():
     jitted = jax.jit(lambda t, ps: compute_tree_geometry(t, ps))
+    positions, masses = _sample_problem(n=64)
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        leaf_size=16,
+        return_reordered=True,
+    )
     geometry = jitted(tree, pos_sorted)
     total_nodes = int(tree.parent.shape[0])
     assert geometry.center.shape == (total_nodes, 3)
