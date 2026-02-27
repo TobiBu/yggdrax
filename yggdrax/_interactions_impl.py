@@ -1792,7 +1792,11 @@ def _result_to_interactions(
     if hasattr(tree, "level_offsets"):
         level_offsets_all = jnp.asarray(tree.level_offsets, dtype=INDEX_DTYPE)
         if hasattr(tree, "num_levels"):
-            num_levels = int(tree.num_levels)
+            num_levels_raw = tree.num_levels
+            if isinstance(num_levels_raw, jax_core.Tracer):
+                num_levels = int(level_offsets_all.shape[0] - 1)
+            else:
+                num_levels = int(num_levels_raw)
             level_offsets_all = level_offsets_all[: num_levels + 1]
         else:
             num_levels = int(level_offsets_all.shape[0] - 1)
