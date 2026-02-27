@@ -70,6 +70,32 @@ interactions, neighbors = build_interactions_and_neighbors(
 )
 ```
 
+Advanced users can override the built-in MAC with a JAX-traceable pair policy:
+
+```python
+def pair_policy(policy_state, **pair_data):
+    action = ...
+    tag = ...
+    return action, tag
+
+interactions, neighbors, result = build_interactions_and_neighbors(
+    tree,
+    geom,
+    pair_policy=pair_policy,
+    policy_state=...,
+    return_result=True,
+)
+```
+
+The policy receives generic pair geometry/state and returns:
+- `action`: one of accept-far / accept-near / refine
+- `tag`: integer metadata stored for accepted far pairs
+
+When `return_result=True`, raw far-pair tags are available on
+`result.interaction_tags`. This is intended for downstream solvers that need
+solver-side scheduling or adaptive-order bucketing without moving solver logic
+into `yggdrax`.
+
 See `examples/getting_started.ipynb` for a runnable walkthrough.
 
 ## KD-Tree MAC Note
