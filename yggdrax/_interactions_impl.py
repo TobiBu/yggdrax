@@ -2116,6 +2116,16 @@ def _run_dual_tree_walk(
         and max_pair_queue is None
         and traversal_config is None
     )
+    if use_count_pass:
+        # The count-pass auto-sizing path converts observed counts to Python
+        # ints for host-side buffer sizing. Under an outer jit those counts are
+        # traced, so fall back to the existing static candidate capacities
+        # instead of forcing concretization.
+        traced_count_pass = isinstance(tree.parent, jax_core.Tracer) or isinstance(
+            geometry.center, jax_core.Tracer
+        )
+        if traced_count_pass:
+            use_count_pass = False
 
     if use_count_pass:
         # Choose a process block for the count pass. Prefer an explicit

@@ -117,6 +117,40 @@ def test_pair_policy_returns_tagged_far_pairs():
     assert neighbors.neighbors.ndim == 1
 
 
+def test_pair_policy_supports_outer_jit_with_auto_capacities():
+    positions, masses = _sample_problem()
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        leaf_size=8,
+        return_reordered=True,
+    )
+    geometry = compute_tree_geometry(tree, pos_sorted)
+
+    @jax.jit
+    def run(tree_arg, geom_arg, far_sq, tag_sq):
+        _interactions, _neighbors, result = build_interactions_and_neighbors(
+            tree_arg,
+            geom_arg,
+            pair_policy=_distance_bucket_policy,
+            policy_state={
+                "far_sq": far_sq,
+                "tag_split_sq": tag_sq,
+            },
+            return_result=True,
+        )
+        return result.far_pair_count, jnp.sum(result.interaction_tags >= 0)
+
+    far_count, tagged_count = run(
+        tree,
+        geometry,
+        jnp.asarray(0.18, dtype=jnp.float32),
+        jnp.asarray(0.75, dtype=jnp.float32),
+    )
+    assert int(far_count) >= 0
+    assert int(tagged_count) == int(far_count)
+
+
 def test_pair_policy_supports_outer_jit():
     positions, masses = _sample_problem()
     tree, pos_sorted, _, _ = build_tree(
