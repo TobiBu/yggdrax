@@ -1392,39 +1392,37 @@ def _dual_tree_walk_impl(
             (process_block_int * _MAX_REFINEMENT_PAIRS,)
         )
 
-        def push_body(i, carry):
-            stk_t, stk_s, sz, of = carry
-            tgt = refine_targets[i]
-            src = refine_sources[i]
+        # Vectorised stack push: replace sequential fori_loop with a
+        # single prefix-sum + scatter pass over all refined pairs.
+        valid_push = (refine_targets >= 0) & (refine_sources >= 0)
+        push_count = jnp.sum(valid_push.astype(INDEX_DTYPE))
 
-            def do_push(_):
-                return _push_pair_sorted(
-                    stk_t,
-                    stk_s,
-                    sz,
-                    of,
-                    tgt,
-                    src,
-                    max_stack=stack_capacity,
-                )
+        # Exclusive prefix sum gives each valid pair a unique offset.
+        push_prefix = jnp.cumsum(valid_push.astype(INDEX_DTYPE)) - valid_push.astype(
+            INDEX_DTYPE
+        )
+        push_slot = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + push_prefix
 
-            return lax.cond(
-                (tgt >= 0) & (src >= 0),
-                do_push,
-                lambda _: (stk_t, stk_s, sz, of),
-                operand=None,
-            )
+        # Capacity check: entries that would exceed the stack are dropped.
+        push_ok = valid_push & (push_slot < as_index(stack_capacity))
+        stack_overflow = stack_overflow | jnp.any(
+            valid_push & (push_slot >= as_index(stack_capacity))
+        )
 
-        stack_target, stack_source, stack_sz, stack_overflow = lax.fori_loop(
-            0,
-            process_block_int * _MAX_REFINEMENT_PAIRS,
-            push_body,
-            (
-                stack_target,
-                stack_source,
-                jnp.asarray(stack_sz, dtype=INDEX_DTYPE),
-                stack_overflow,
-            ),
+        # Sorted push: lo = min(tgt, src), hi = max(tgt, src).
+        push_lo = jnp.minimum(refine_targets, refine_sources)
+        push_hi = jnp.maximum(refine_targets, refine_sources)
+
+        oob_stack = as_index(stack_capacity)
+        safe_push_slot = jnp.where(push_ok, push_slot, oob_stack)
+        stack_target = stack_target.at[safe_push_slot].set(
+            jnp.where(push_ok, push_lo, as_index(-1)), mode="drop"
+        )
+        stack_source = stack_source.at[safe_push_slot].set(
+            jnp.where(push_ok, push_hi, as_index(-1)), mode="drop"
+        )
+        stack_sz = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + jnp.sum(
+            push_ok.astype(INDEX_DTYPE)
         )
 
         return (
@@ -1872,41 +1870,27 @@ def _dual_tree_walk_count_impl(
             (process_block_int * _MAX_REFINEMENT_PAIRS,)
         )
 
-        def push_body(i, carry):
-            stk_t, stk_s, sz = carry
-            tgt = refine_targets[i]
-            src = refine_sources[i]
+        # Vectorised stack push (count-only walk variant).
+        valid_push = (refine_targets >= 0) & (refine_sources >= 0)
+        push_prefix = jnp.cumsum(valid_push.astype(INDEX_DTYPE)) - valid_push.astype(
+            INDEX_DTYPE
+        )
+        push_slot = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + push_prefix
 
-            def do_push(_):
-                return _push_pair_sorted(
-                    stk_t,
-                    stk_s,
-                    sz,
-                    jnp.bool_(False),
-                    tgt,
-                    src,
-                    max_stack=stack_capacity,
-                )
+        push_ok = valid_push & (push_slot < as_index(stack_capacity))
+        push_lo = jnp.minimum(refine_targets, refine_sources)
+        push_hi = jnp.maximum(refine_targets, refine_sources)
 
-            stk_t, stk_s, sz, _ = lax.cond(
-                (tgt >= 0) & (src >= 0),
-                do_push,
-                lambda _: (
-                    stk_t,
-                    stk_s,
-                    jnp.asarray(sz, dtype=INDEX_DTYPE),
-                    jnp.bool_(False),
-                ),
-                operand=None,
-            )
-
-            return stk_t, stk_s, sz
-
-        stack_target, stack_source, stack_sz = lax.fori_loop(
-            0,
-            process_block_int * _MAX_REFINEMENT_PAIRS,
-            push_body,
-            (stack_target, stack_source, jnp.asarray(stack_sz, dtype=INDEX_DTYPE)),
+        oob_stack = as_index(stack_capacity)
+        safe_push_slot = jnp.where(push_ok, push_slot, oob_stack)
+        stack_target = stack_target.at[safe_push_slot].set(
+            jnp.where(push_ok, push_lo, as_index(-1)), mode="drop"
+        )
+        stack_source = stack_source.at[safe_push_slot].set(
+            jnp.where(push_ok, push_hi, as_index(-1)), mode="drop"
+        )
+        stack_sz = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + jnp.sum(
+            push_ok.astype(INDEX_DTYPE)
         )
 
         max_stack = jnp.maximum(max_stack, stack_sz)
