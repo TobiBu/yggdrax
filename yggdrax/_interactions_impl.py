@@ -1521,64 +1521,56 @@ def _dual_tree_walk_impl(
     num_nodes_level = nodes_by_level.shape[0]
 
     if collect_far:
-        interaction_sources = jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
-        interaction_targets = jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
-        interaction_tags = jnp.full((max_total_far_pairs,), -1, dtype=INDEX_DTYPE)
+        # Vectorised compression: flatten the 2D far_buffer into sorted 1D
+        # arrays using the precomputed per-node counts and level ordering.
+        #
+        # 1. Compute per-node write offsets in level order.
+        level_counts = far_counts[nodes_by_level]
+        level_cumsum = jnp.cumsum(level_counts, dtype=INDEX_DTYPE)
+        level_offsets_write = jnp.concatenate(
+            [jnp.zeros((1,), dtype=INDEX_DTYPE), level_cumsum]
+        )
 
-        def compress_far(idx, carry):
-            sources_out, targets_out, tags_out, ptr = carry
-            node = lax.dynamic_index_in_dim(nodes_by_level, idx, axis=0, keepdims=False)
-            count = lax.dynamic_index_in_dim(far_counts, node, axis=0, keepdims=False)
-            row = lax.dynamic_index_in_dim(far_buffer, node, axis=0, keepdims=False)
-            row_tags = lax.dynamic_index_in_dim(
-                far_tag_buffer,
-                node,
-                axis=0,
-                keepdims=False,
-            )
+        # 2. Build flat (num_nodes_level * K) index arrays where K is
+        #    max_interactions_per_node.
+        K = max_interactions_per_node
+        node_rep = jnp.repeat(
+            jnp.arange(num_nodes_level, dtype=INDEX_DTYPE), K
+        )  # which level-order position
+        slot_rep = jnp.tile(
+            jnp.arange(K, dtype=INDEX_DTYPE), num_nodes_level
+        )  # which slot within that node
+        level_node_ids = nodes_by_level[node_rep]  # actual node id
+        per_node_count = far_counts[level_node_ids]
+        valid = slot_rep < per_node_count
 
-            def write_pairs(state):
-                def cond_fun(loop_state):
-                    j, _src_out, _tgt_out, _tag_out, _ptr_val = loop_state
-                    return j < count
+        # 3. Compute write position: level_offsets_write[node_rep] + slot_rep
+        write_pos = level_offsets_write[node_rep] + slot_rep
 
-                def body_fun(loop_state):
-                    j, s_out, t_out, tag_out, ptr_val = loop_state
-                    value = lax.dynamic_index_in_dim(row, j, axis=0, keepdims=False)
-                    tag = lax.dynamic_index_in_dim(
-                        row_tags,
-                        j,
-                        axis=0,
-                        keepdims=False,
-                    )
-                    s_out = s_out.at[ptr_val].set(value)
-                    t_out = t_out.at[ptr_val].set(node)
-                    tag_out = tag_out.at[ptr_val].set(tag)
-                    return (
-                        j + as_index(1),
-                        s_out,
-                        t_out,
-                        tag_out,
-                        ptr_val + as_index(1),
-                    )
+        # 4. Gather source values and tags from the 2D buffers.
+        src_vals = far_buffer[level_node_ids, slot_rep]
+        tag_vals = far_tag_buffer[level_node_ids, slot_rep]
 
-                _, new_sources, new_targets, new_tags, new_ptr = lax.while_loop(
-                    cond_fun,
-                    body_fun,
-                    (as_index(0), sources_out, targets_out, tags_out, ptr),
-                )
-                return new_sources, new_targets, new_tags, new_ptr
+        # 5. Scatter into flat output arrays.  Invalid entries get an
+        #    out-of-bounds write position that ``mode="drop"`` silently
+        #    discards, so they never clobber valid data.
+        oob = as_index(max_total_far_pairs)  # guaranteed out-of-bounds
+        safe_write = jnp.where(valid, write_pos, oob)
 
-            def skip_pairs(_):
-                return sources_out, targets_out, tags_out, ptr
-
-            return lax.cond(count > 0, write_pairs, skip_pairs, operand=None)
-
-        interaction_sources, interaction_targets, interaction_tags, _ = lax.fori_loop(
-            0,
-            num_nodes_level,
-            compress_far,
-            (interaction_sources, interaction_targets, interaction_tags, as_index(0)),
+        interaction_sources = (
+            jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
+            .at[safe_write]
+            .set(src_vals, mode="drop")
+        )
+        interaction_targets = (
+            jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
+            .at[safe_write]
+            .set(level_node_ids, mode="drop")
+        )
+        interaction_tags = (
+            jnp.full((max_total_far_pairs,), -1, dtype=INDEX_DTYPE)
+            .at[safe_write]
+            .set(tag_vals, mode="drop")
         )
     else:
         interaction_sources = jnp.zeros((0,), dtype=INDEX_DTYPE)
@@ -1586,36 +1578,28 @@ def _dual_tree_walk_impl(
         interaction_tags = jnp.zeros((0,), dtype=INDEX_DTYPE)
 
     if collect_near:
-        neighbor_indices = jnp.zeros((max_total_near_pairs,), dtype=INDEX_DTYPE)
+        # Vectorised compression for near-field buffer.
+        K_near = max_neighbors_per_leaf
+        near_node_rep = jnp.repeat(jnp.arange(num_leaves, dtype=INDEX_DTYPE), K_near)
+        near_slot_rep = jnp.tile(jnp.arange(K_near, dtype=INDEX_DTYPE), num_leaves)
+        near_per_leaf_count = near_counts[near_node_rep]
+        near_valid = near_slot_rep < near_per_leaf_count
 
-        def compress_near(idx, carry):
-            neighbors_out, ptr = carry
-            count = lax.dynamic_index_in_dim(near_counts, idx, axis=0, keepdims=False)
-            row = lax.dynamic_index_in_dim(neighbor_buffer, idx, axis=0, keepdims=False)
+        # Per-leaf write offsets (leaves are already in order 0..num_leaves-1).
+        near_cumsum = jnp.cumsum(near_counts, dtype=INDEX_DTYPE)
+        near_offsets_write = jnp.concatenate(
+            [jnp.zeros((1,), dtype=INDEX_DTYPE), near_cumsum]
+        )
+        near_write_pos = near_offsets_write[near_node_rep] + near_slot_rep
 
-            def write_pairs(state):
-                def cond_fun(loop_state):
-                    j, _arr_out, _ptr_val = loop_state
-                    return j < count
+        near_vals = neighbor_buffer[near_node_rep, near_slot_rep]
+        oob_near = as_index(max_total_near_pairs)
+        safe_near_write = jnp.where(near_valid, near_write_pos, oob_near)
 
-                def body_fun(loop_state):
-                    j, arr_out, ptr_val = loop_state
-                    value = lax.dynamic_index_in_dim(row, j, axis=0, keepdims=False)
-                    arr_out = arr_out.at[ptr_val].set(value)
-                    return j + as_index(1), arr_out, ptr_val + as_index(1)
-
-                _, new_neighbors, new_ptr = lax.while_loop(
-                    cond_fun, body_fun, (as_index(0), neighbors_out, ptr)
-                )
-                return new_neighbors, new_ptr
-
-            def skip_pairs(_):
-                return neighbors_out, ptr
-
-            return lax.cond(count > 0, write_pairs, skip_pairs, operand=None)
-
-        neighbor_indices, _ = lax.fori_loop(
-            0, num_leaves, compress_near, (neighbor_indices, as_index(0))
+        neighbor_indices = (
+            jnp.zeros((max_total_near_pairs,), dtype=INDEX_DTYPE)
+            .at[safe_near_write]
+            .set(near_vals, mode="drop")
         )
     else:
         neighbor_indices = jnp.zeros((0,), dtype=INDEX_DTYPE)
