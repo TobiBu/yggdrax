@@ -464,19 +464,20 @@ def _resolve_pair_actions(
     dist_sq: Array,
     extent_target: Array,
     extent_source: Array,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Resolve per-pair traversal actions and optional integer tags."""
 
     if pair_policy is None:
-        return _default_pair_actions(
+        actions, tags = _default_pair_actions(
             mac_ok=mac_ok,
             valid_pairs=valid_pairs,
             different_nodes=different_nodes,
             target_leaf=target_leaf,
             source_leaf=source_leaf,
         )
+        return actions, tags, tags
 
-    actions, tags = pair_policy(
+    forward_actions, forward_tags = pair_policy(
         policy_state,
         valid_pairs=valid_pairs,
         mac_ok=mac_ok,
@@ -492,11 +493,40 @@ def _resolve_pair_actions(
         extent_target=extent_target,
         extent_source=extent_source,
     )
-    actions = jnp.asarray(actions, dtype=INDEX_DTYPE)
-    tags = jnp.asarray(tags, dtype=INDEX_DTYPE)
-    actions = jnp.where(valid_pairs, actions, as_index(_ACTION_REFINE))
-    tags = jnp.where(valid_pairs, tags, as_index(-1))
-    return actions, tags
+    reverse_actions, reverse_tags = pair_policy(
+        policy_state,
+        valid_pairs=valid_pairs,
+        mac_ok=mac_ok,
+        different_nodes=different_nodes,
+        target_leaf=source_leaf,
+        source_leaf=target_leaf,
+        same_node=same_node,
+        target_nodes=source_nodes,
+        source_nodes=target_nodes,
+        center_target=center_source,
+        center_source=center_target,
+        dist_sq=dist_sq,
+        extent_target=extent_source,
+        extent_source=extent_target,
+    )
+    forward_actions = jnp.asarray(forward_actions, dtype=INDEX_DTYPE)
+    reverse_actions = jnp.asarray(reverse_actions, dtype=INDEX_DTYPE)
+    forward_tags = jnp.asarray(forward_tags, dtype=INDEX_DTYPE)
+    reverse_tags = jnp.asarray(reverse_tags, dtype=INDEX_DTYPE)
+    forward_actions = jnp.where(valid_pairs, forward_actions, as_index(_ACTION_REFINE))
+    reverse_actions = jnp.where(valid_pairs, reverse_actions, as_index(_ACTION_REFINE))
+    accept_both = (forward_actions == as_index(_ACTION_ACCEPT)) & (
+        reverse_actions == as_index(_ACTION_ACCEPT)
+    )
+    near_both = (forward_actions == as_index(_ACTION_NEAR)) & (
+        reverse_actions == as_index(_ACTION_NEAR)
+    )
+    actions = jnp.full(valid_pairs.shape, _ACTION_REFINE, dtype=INDEX_DTYPE)
+    actions = jnp.where(accept_both, as_index(_ACTION_ACCEPT), actions)
+    actions = jnp.where(near_both, as_index(_ACTION_NEAR), actions)
+    forward_tags = jnp.where(accept_both, forward_tags, as_index(-1))
+    reverse_tags = jnp.where(accept_both, reverse_tags, as_index(-1))
+    return actions, forward_tags, reverse_tags
 
 
 def _propagate_extents(parent: Array, extents: Array) -> Array:
@@ -1135,7 +1165,7 @@ def _dual_tree_walk_impl(
         target_leaf = valid_pairs_bool & (~target_internal)
         source_leaf = valid_pairs_bool & (~source_internal)
         same_node = valid_pairs_bool & (targets == sources)
-        pair_actions, pair_tags = _resolve_pair_actions(
+        pair_actions, pair_tags, pair_tags_rev = _resolve_pair_actions(
             pair_policy=pair_policy,
             policy_state=policy_state,
             valid_pairs=valid_pairs_bool,
@@ -1193,6 +1223,7 @@ def _dual_tree_walk_impl(
             accept_targets = targets[accept_perm]
             accept_sources = sources[accept_perm]
             accept_tags = pair_tags[accept_perm]
+            accept_tags_rev = pair_tags_rev[accept_perm]
             accept_count = jnp.sum(should_accept.astype(INDEX_DTYPE))
 
             def accept_cond(state):
@@ -1231,6 +1262,12 @@ def _dual_tree_walk_impl(
                     max_total_pairs=max_total_far_pairs,
                 )
                 tag_buf = tag_buf.at[tgt, current].set(tag)
+                tag_rev = lax.dynamic_index_in_dim(
+                    accept_tags_rev,
+                    idx,
+                    axis=0,
+                    keepdims=False,
+                )
                 current_rev = lax.dynamic_index_in_dim(
                     cnts,
                     src,
@@ -1247,7 +1284,7 @@ def _dual_tree_walk_impl(
                     max_interactions_per_node=max_interactions_per_node,
                     max_total_pairs=max_total_far_pairs,
                 )
-                tag_buf = tag_buf.at[src, current_rev].set(tag)
+                tag_buf = tag_buf.at[src, current_rev].set(tag_rev)
                 return (
                     idx + as_index(1),
                     buf,
@@ -1782,7 +1819,7 @@ def _dual_tree_walk_count_impl(
         target_leaf = valid_pairs_bool & (~target_internal)
         source_leaf = valid_pairs_bool & (~source_internal)
         same_node = valid_pairs_bool & (targets == sources)
-        pair_actions, _pair_tags = _resolve_pair_actions(
+        pair_actions, _pair_tags, _pair_tags_rev = _resolve_pair_actions(
             pair_policy=pair_policy,
             policy_state=policy_state,
             valid_pairs=valid_pairs_bool,

@@ -113,9 +113,10 @@ def build_interactions_and_neighbors(
     """Construct both far-field interactions and near-field neighbors.
 
     When ``pair_policy`` is provided, it overrides the built-in MAC decision
-    for each candidate pair and may attach an integer tag to accepted far
-    pairs. Those tags are exposed on ``DualTreeWalkResult.interaction_tags``
-    when ``return_result=True``.
+    for each candidate pair and may attach integer tags to accepted far
+    pairs. Policies are evaluated in both directions; a pair is accepted only
+    when both directed decisions accept, and the directed tags are exposed on
+    ``DualTreeWalkResult.interaction_tags`` when ``return_result=True``.
     """
 
     topology = resolve_tree_topology(tree)
