@@ -1214,190 +1214,162 @@ def _dual_tree_walk_impl(
         leaf_pos_target = leaf_position[safe_targets]
         leaf_pos_source = leaf_position[safe_sources]
 
+        # Helper: per-key exclusive prefix count for vectorised scatter.
+        def _per_key_prefix(keys, mask, num_segments):
+            """Exclusive prefix count per key among masked entries.
+
+            For each masked position *i*, count how many earlier masked
+            positions share the same key.  This gives an exclusive
+            offset within each key group, suitable for scatter writes.
+            """
+            idx = jnp.arange(keys.shape[0], dtype=INDEX_DTYPE)
+            same_key = (keys[:, None] == keys[None, :]) & mask[None, :]
+            earlier = idx[None, :] < idx[:, None]
+            prefix = jnp.sum((same_key & earlier).astype(INDEX_DTYPE), axis=1)
+            return jnp.where(mask, prefix, as_index(0))
+
         if collect_far:
-            score_scale = as_index(process_block_int + 1)
-            accept_scores = (
-                should_accept.astype(INDEX_DTYPE) * score_scale - batch_indices
+            # Vectorised accept recording.  For each accepted pair
+            # (tgt, src) we record src in far_buffer[tgt, ...] AND tgt in
+            # far_buffer[src, ...].  To avoid the sequential while_loop we
+            # compute a per-key exclusive prefix sum that assigns each
+            # entry its slot within the node's buffer row.
+            accept_mask = should_accept
+            accept_targets_a = jnp.where(accept_mask, targets, as_index(-1))
+            accept_sources_a = jnp.where(accept_mask, sources, as_index(-1))
+            accept_tags_fwd = jnp.where(accept_mask, pair_tags, as_index(-1))
+            accept_tags_bwd = jnp.where(accept_mask, pair_tags_rev, as_index(-1))
+
+            # --- forward direction: record src at far_buffer[tgt, ...] ---
+            fwd_prefix = _per_key_prefix(accept_targets_a, accept_mask, total_nodes)
+            fwd_slot = far_counts[safe_targets] + fwd_prefix
+
+            # Check capacity: any slot >= max_interactions_per_node → overflow
+            fwd_ok = accept_mask & (fwd_slot < as_index(max_interactions_per_node))
+            far_overflow = far_overflow | jnp.any(
+                accept_mask & (fwd_slot >= as_index(max_interactions_per_node))
             )
-            _, accept_perm = lax.top_k(accept_scores, process_block_int)
-            accept_targets = targets[accept_perm]
-            accept_sources = sources[accept_perm]
-            accept_tags = pair_tags[accept_perm]
-            accept_tags_rev = pair_tags_rev[accept_perm]
-            accept_count = jnp.sum(should_accept.astype(INDEX_DTYPE))
 
-            def accept_cond(state):
-                idx, _buf, _tag_buf, _cnts, _ptr, overflow = state
-                return (idx < accept_count) & (~overflow)
+            # Scatter into far_buffer and far_tag_buffer
+            oob_far = as_index(total_nodes)  # out-of-bounds node index
+            fwd_node = jnp.where(fwd_ok, safe_targets, oob_far)
+            fwd_col = jnp.where(
+                fwd_ok, fwd_slot, as_index(max_interactions_per_node - 1)
+            )
+            far_buffer = far_buffer.at[fwd_node, fwd_col].set(
+                jnp.where(fwd_ok, safe_sources, as_index(-1)), mode="drop"
+            )
+            far_tag_buffer = far_tag_buffer.at[fwd_node, fwd_col].set(
+                jnp.where(fwd_ok, accept_tags_fwd, as_index(-1)), mode="drop"
+            )
 
-            def accept_loop(state):
-                idx, buf, tag_buf, cnts, ptr, overflow = state
-                tgt = lax.dynamic_index_in_dim(
-                    accept_targets,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                src = lax.dynamic_index_in_dim(
-                    accept_sources,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                tag = lax.dynamic_index_in_dim(
-                    accept_tags,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                current = lax.dynamic_index_in_dim(cnts, tgt, axis=0, keepdims=False)
-                buf, cnts, ptr, overflow = _add_far_entry(
-                    buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                    tgt,
-                    src,
-                    max_interactions_per_node=max_interactions_per_node,
-                    max_total_pairs=max_total_far_pairs,
-                )
-                tag_buf = tag_buf.at[tgt, current].set(tag)
-                tag_rev = lax.dynamic_index_in_dim(
-                    accept_tags_rev,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                current_rev = lax.dynamic_index_in_dim(
-                    cnts,
-                    src,
-                    axis=0,
-                    keepdims=False,
-                )
-                buf, cnts, ptr, overflow = _add_far_entry(
-                    buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                    src,
-                    tgt,
-                    max_interactions_per_node=max_interactions_per_node,
-                    max_total_pairs=max_total_far_pairs,
-                )
-                tag_buf = tag_buf.at[src, current_rev].set(tag_rev)
-                return (
-                    idx + as_index(1),
-                    buf,
-                    tag_buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                )
+            # --- backward direction: record tgt at far_buffer[src, ...] ---
+            # The forward writes already updated far_counts conceptually;
+            # we need the updated counts for the backward pass.
+            fwd_incr = jax.ops.segment_sum(
+                fwd_ok.astype(INDEX_DTYPE), safe_targets, num_segments=total_nodes
+            )
+            far_counts_after_fwd = far_counts + fwd_incr
 
-            (
-                _,
-                far_buffer,
-                far_tag_buffer,
-                far_counts,
-                far_pair_total,
-                far_overflow,
-            ) = lax.while_loop(
-                accept_cond,
-                accept_loop,
-                (
-                    as_index(0),
-                    far_buffer,
-                    far_tag_buffer,
-                    far_counts,
-                    far_pair_total,
-                    far_overflow,
-                ),
+            bwd_prefix = _per_key_prefix(accept_sources_a, accept_mask, total_nodes)
+            bwd_slot = far_counts_after_fwd[safe_sources] + bwd_prefix
+            bwd_ok = accept_mask & (bwd_slot < as_index(max_interactions_per_node))
+            far_overflow = far_overflow | jnp.any(
+                accept_mask & (bwd_slot >= as_index(max_interactions_per_node))
+            )
+
+            bwd_node = jnp.where(bwd_ok, safe_sources, oob_far)
+            bwd_col = jnp.where(
+                bwd_ok, bwd_slot, as_index(max_interactions_per_node - 1)
+            )
+            far_buffer = far_buffer.at[bwd_node, bwd_col].set(
+                jnp.where(bwd_ok, safe_targets, as_index(-1)), mode="drop"
+            )
+            far_tag_buffer = far_tag_buffer.at[bwd_node, bwd_col].set(
+                jnp.where(bwd_ok, accept_tags_bwd, as_index(-1)), mode="drop"
+            )
+
+            bwd_incr = jax.ops.segment_sum(
+                bwd_ok.astype(INDEX_DTYPE),
+                safe_sources,
+                num_segments=total_nodes,
+            )
+            far_counts = far_counts_after_fwd + bwd_incr
+            far_pair_total = (
+                far_pair_total
+                + jnp.sum(fwd_ok.astype(INDEX_DTYPE))
+                + jnp.sum(bwd_ok.astype(INDEX_DTYPE))
             )
 
         if collect_near:
-            score_scale = as_index(process_block_int + 1)
-            near_scores = should_near.astype(INDEX_DTYPE) * score_scale - batch_indices
-            _, near_perm = lax.top_k(near_scores, process_block_int)
-            near_targets = targets[near_perm]
-            near_sources = sources[near_perm]
-            near_leaf_pos_t = leaf_pos_target[near_perm]
-            near_leaf_pos_s = leaf_pos_source[near_perm]
-            near_count = jnp.sum(should_near.astype(INDEX_DTYPE))
+            # Vectorised near recording.  For each near pair (tgt, src)
+            # both directions are recorded: src at neighbor_buffer[pos_t, ...]
+            # and tgt at neighbor_buffer[pos_s, ...].
+            near_mask = should_near
+            near_pos_t = jnp.where(near_mask, leaf_pos_target, as_index(-1))
+            near_pos_s = jnp.where(near_mask, leaf_pos_source, as_index(-1))
+            near_tgt_nodes = jnp.where(near_mask, targets, as_index(-1))
+            near_src_nodes = jnp.where(near_mask, sources, as_index(-1))
 
-            def near_cond(state):
-                idx, _buf, _cnts, _ptr, overflow = state
-                return (idx < near_count) & (~overflow)
+            # Forward: record src at neighbor_buffer[pos_t, ...]
+            safe_pos_t = jnp.where(near_mask, near_pos_t, as_index(0))
+            safe_pos_s = jnp.where(near_mask, near_pos_s, as_index(0))
 
-            def near_loop(state):
-                idx, buf, cnts, ptr, overflow = state
-                pos_t = lax.dynamic_index_in_dim(
-                    near_leaf_pos_t,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                pos_s = lax.dynamic_index_in_dim(
-                    near_leaf_pos_s,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                tgt = lax.dynamic_index_in_dim(
-                    near_targets,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                src = lax.dynamic_index_in_dim(
-                    near_sources,
-                    idx,
-                    axis=0,
-                    keepdims=False,
-                )
-                buf, cnts, ptr, overflow = _add_neighbor_entry(
-                    buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                    pos_t,
-                    src,
-                    max_neighbors_per_leaf=max_neighbors_per_leaf,
-                    max_total_pairs=max_total_near_pairs,
-                )
-                buf, cnts, ptr, overflow = _add_neighbor_entry(
-                    buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                    pos_s,
-                    tgt,
-                    max_neighbors_per_leaf=max_neighbors_per_leaf,
-                    max_total_pairs=max_total_near_pairs,
-                )
-                return (
-                    idx + as_index(1),
-                    buf,
-                    cnts,
-                    ptr,
-                    overflow,
-                )
+            fwd_near_prefix = _per_key_prefix(safe_pos_t, near_mask, num_leaves)
+            fwd_near_slot = near_counts[safe_pos_t] + fwd_near_prefix
+            fwd_near_ok = near_mask & (fwd_near_slot < as_index(max_neighbors_per_leaf))
+            near_overflow = near_overflow | jnp.any(
+                near_mask & (fwd_near_slot >= as_index(max_neighbors_per_leaf))
+            )
 
-            (
-                _,
-                neighbor_buffer,
-                near_counts,
-                near_pair_total,
-                near_overflow,
-            ) = lax.while_loop(
-                near_cond,
-                near_loop,
-                (
-                    as_index(0),
-                    neighbor_buffer,
-                    near_counts,
-                    near_pair_total,
-                    near_overflow,
-                ),
+            oob_leaf = as_index(num_leaves)
+            fwd_near_row = jnp.where(fwd_near_ok, safe_pos_t, oob_leaf)
+            fwd_near_col = jnp.where(
+                fwd_near_ok,
+                fwd_near_slot,
+                as_index(max_neighbors_per_leaf - 1),
+            )
+            neighbor_buffer = neighbor_buffer.at[fwd_near_row, fwd_near_col].set(
+                jnp.where(fwd_near_ok, near_src_nodes, as_index(-1)),
+                mode="drop",
+            )
+
+            fwd_near_incr = jax.ops.segment_sum(
+                fwd_near_ok.astype(INDEX_DTYPE),
+                safe_pos_t,
+                num_segments=num_leaves,
+            )
+            near_counts_after_fwd = near_counts + fwd_near_incr
+
+            # Backward: record tgt at neighbor_buffer[pos_s, ...]
+            bwd_near_prefix = _per_key_prefix(safe_pos_s, near_mask, num_leaves)
+            bwd_near_slot = near_counts_after_fwd[safe_pos_s] + bwd_near_prefix
+            bwd_near_ok = near_mask & (bwd_near_slot < as_index(max_neighbors_per_leaf))
+            near_overflow = near_overflow | jnp.any(
+                near_mask & (bwd_near_slot >= as_index(max_neighbors_per_leaf))
+            )
+
+            bwd_near_row = jnp.where(bwd_near_ok, safe_pos_s, oob_leaf)
+            bwd_near_col = jnp.where(
+                bwd_near_ok,
+                bwd_near_slot,
+                as_index(max_neighbors_per_leaf - 1),
+            )
+            neighbor_buffer = neighbor_buffer.at[bwd_near_row, bwd_near_col].set(
+                jnp.where(bwd_near_ok, near_tgt_nodes, as_index(-1)),
+                mode="drop",
+            )
+
+            bwd_near_incr = jax.ops.segment_sum(
+                bwd_near_ok.astype(INDEX_DTYPE),
+                safe_pos_s,
+                num_segments=num_leaves,
+            )
+            near_counts = near_counts_after_fwd + bwd_near_incr
+            near_pair_total = (
+                near_pair_total
+                + jnp.sum(fwd_near_ok.astype(INDEX_DTYPE))
+                + jnp.sum(bwd_near_ok.astype(INDEX_DTYPE))
             )
 
         refine_pairs = refine_vm(
