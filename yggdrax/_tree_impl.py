@@ -895,29 +895,32 @@ def _build_tree_from_leaf_partitions(
     )
     node_ranges = node_ranges.at[num_internal:].set(leaf_ranges)
 
-    node_level = jnp.full((total_nodes,), -1, dtype=INDEX_DTYPE)
-    node_level = node_level.at[0].set(as_index(0))
+    # Derive node depths from the parent array.  The root (parent == -1)
+    # gets depth 0; every other node gets depth = parent_depth + 1.
+    # We iterate until all depths converge, with the inner body fully
+    # vectorised over all nodes.
+    parent_safe = jnp.where(parent >= 0, parent, as_index(0))
+    node_level = jnp.where(parent < 0, as_index(0), as_index(-1))
 
-    def propagate_level(idx, level_arr):
-        current_level = level_arr[idx]
+    def _depth_cond(state):
+        _levels, changed = state
+        return changed
 
-        def assign_child(child_idx, arr):
-            def set_level(ci):
-                return arr.at[ci].set(current_level + as_index(1))
+    def _depth_body(state):
+        levels, _ = state
+        parent_depth = levels[parent_safe]
+        candidate = jnp.where(
+            (parent >= 0) & (parent_depth >= 0),
+            parent_depth + as_index(1),
+            levels,
+        )
+        new_levels = jnp.maximum(levels, candidate)
+        changed = jnp.any(new_levels != levels)
+        return new_levels, changed
 
-            return lax.cond(
-                child_idx >= 0,
-                set_level,
-                lambda _: arr,
-                child_idx,
-            )
-
-        arr = level_arr
-        arr = assign_child(left_child[idx], arr)
-        arr = assign_child(right_child[idx], arr)
-        return arr
-
-    node_level = lax.fori_loop(0, num_internal, propagate_level, node_level)
+    node_level, _ = lax.while_loop(
+        _depth_cond, _depth_body, (node_level, jnp.bool_(True))
+    )
 
     max_level = jnp.max(node_level)
     num_levels = max_level + as_index(1)
