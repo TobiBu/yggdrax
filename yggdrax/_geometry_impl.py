@@ -65,38 +65,39 @@ def _compute_leaf_bounds(
     leaf_starts: Array,
     leaf_counts: Array,
 ) -> tuple[Array, Array]:
-    index_dtype = leaf_starts.dtype
     dtype = positions_sorted.dtype
-    dim = positions_sorted.shape[1]
-    one = as_index(1)
-    zero = as_index(0)
-    inf_vec = jnp.full((dim,), jnp.inf, dtype=dtype)
-    neg_inf_vec = jnp.full((dim,), -jnp.inf, dtype=dtype)
+    num_leaves = leaf_starts.shape[0]
+    num_particles = positions_sorted.shape[0]
 
-    def single(start, count):
-        row_start = lax.convert_element_type(start, index_dtype)
-        row_count = lax.convert_element_type(count, index_dtype)
+    # Upper bound on particles per leaf.  Under JIT ``leaf_counts`` may
+    # contain traced values so we fall back to the particle count (a
+    # concrete int) which is always a safe upper bound.
+    if isinstance(leaf_counts, jax_core.Tracer):
+        max_count = num_particles
+    else:
+        max_count = int(jnp.max(leaf_counts)) if num_leaves > 0 else 0
 
-        def cond_fun(state):
-            i, _mn, _mx = state
-            return i < row_count
+    if max_count == 0:
+        # All leaves are empty – return neutral bounds.
+        inf_mins = jnp.full((num_leaves, 3), jnp.inf, dtype=dtype)
+        neg_inf_maxs = jnp.full((num_leaves, 3), -jnp.inf, dtype=dtype)
+        return inf_mins, neg_inf_maxs
 
-        def body_fun(state):
-            i, mn, mx = state
-            idx = row_start + i
-            point = lax.dynamic_index_in_dim(
-                positions_sorted, idx, axis=0, keepdims=False
-            )
-            return i + one, jnp.minimum(mn, point), jnp.maximum(mx, point)
+    # Build a (num_leaves, max_count) index array and a validity mask.
+    offsets = jnp.arange(max_count, dtype=INDEX_DTYPE)[None, :]  # (1, M)
+    indices = leaf_starts[:, None] + offsets  # (L, M)
+    valid = offsets < leaf_counts[:, None]  # (L, M)
 
-        _, mins, maxs = lax.while_loop(
-            cond_fun,
-            body_fun,
-            (zero, inf_vec, neg_inf_vec),
-        )
-        return mins, maxs
+    # Clamp out-of-range indices so the gather is safe.
+    safe_indices = jnp.where(valid, indices, as_index(0))
+    points = positions_sorted[safe_indices]  # (L, M, 3)
 
-    mins, maxs = jax.vmap(single)(leaf_starts, leaf_counts)
+    # Masked min / max reduction along axis=1.
+    big = jnp.finfo(dtype).max
+    mins = jnp.where(valid[:, :, None], points, big)
+    maxs = jnp.where(valid[:, :, None], points, -big)
+    mins = jnp.min(mins, axis=1)  # (L, 3)
+    maxs = jnp.max(maxs, axis=1)  # (L, 3)
     return mins, maxs
 
 
