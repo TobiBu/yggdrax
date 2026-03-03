@@ -530,70 +530,64 @@ def _resolve_pair_actions(
 
 
 def _propagate_extents(parent: Array, extents: Array) -> Array:
-    """Propagate zero extents up the tree to obtain conservative sizes."""
+    """Propagate zero extents up the tree to obtain conservative sizes.
 
-    indices = jnp.arange(extents.shape[0], dtype=INDEX_DTYPE)
+    Uses iterative pointer doubling: each node tracks a "cursor" that
+    walks up the parent chain.  On every round the cursor jumps to its
+    own parent, and if the node's extent is still zero the cursor's
+    extent is adopted.  After O(log depth) rounds every node has found
+    its nearest ancestor with a positive extent.
+    """
+    n = extents.shape[0]
+    cursor = jnp.arange(n, dtype=INDEX_DTYPE)
+    result = extents.copy()
 
-    def _extent_for(idx: int) -> Array:
-        def cond_fun(state):
-            node, value = state
-            parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
-            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
-            return (value <= 0.0) & (parent_idx >= 0)
+    def cond_fn(state):
+        _cursor, _result, changed = state
+        return changed
 
-        def body_fun(state):
-            node, _value = state
-            parent_idx = lax.dynamic_index_in_dim(parent, node, axis=0, keepdims=False)
-            parent_idx = lax.convert_element_type(parent_idx, node.dtype)
-            new_value = lax.dynamic_index_in_dim(
-                extents, parent_idx, axis=0, keepdims=False
-            )
-            return parent_idx, new_value
+    def body_fn(state):
+        cur, res, _changed = state
+        # Each cursor jumps to its parent (roots stay at themselves).
+        par = parent[cur]
+        new_cur = jnp.where(par >= 0, par, cur)
+        # Adopt the extent of the new cursor position when own is zero.
+        candidate = extents[new_cur]
+        new_res = jnp.where(res <= 0.0, candidate, res)
+        changed = jnp.any((new_res != res) | ((new_cur != cur) & (res <= 0.0)))
+        return new_cur, new_res, changed
 
-        init_val = lax.dynamic_index_in_dim(extents, idx, axis=0, keepdims=False)
-        _, value = lax.while_loop(cond_fun, body_fun, (idx, init_val))
-        return value
-
-    return jax.vmap(_extent_for)(indices)
+    _, result, _ = lax.while_loop(cond_fn, body_fn, (cursor, result, jnp.bool_(True)))
+    return result
 
 
 def _compute_node_depths(parent: Array) -> Array:
-    """Return the depth of every node (root depth = 0)."""
+    """Return the depth of every node (root depth = 0).
 
+    Uses a convergent while_loop that computes all depths in parallel:
+    each round sets ``depth[i] = depth[parent[i]] + 1`` for non-root
+    nodes.  Converges in O(tree_depth) rounds.
+    """
     total_nodes = parent.shape[0]
+    depth = jnp.where(parent < 0, as_index(0), as_index(-1))
 
-    def _body(i, depth_array):
-        parent_idx = lax.dynamic_index_in_dim(
-            parent,
-            i,
-            axis=0,
-            keepdims=False,
+    def cond_fn(state):
+        d, changed = state
+        return changed
+
+    def body_fn(state):
+        d, _changed = state
+        parent_depth = d[parent.clip(0)]
+        new_d = jnp.where(
+            parent >= 0,
+            jnp.where(parent_depth >= 0, parent_depth + as_index(1), d),
+            d,
         )
+        changed = jnp.any(new_d != d)
+        return new_d, changed
 
-        def depth_from_parent(idx):
-            parent_depth = lax.dynamic_index_in_dim(
-                depth_array,
-                idx,
-                axis=0,
-                keepdims=False,
-            )
-            return parent_depth + as_index(1)
-
-        depth_val = lax.cond(
-            parent_idx < 0,
-            lambda _idx: as_index(0),
-            depth_from_parent,
-            parent_idx,
-        )
-        depth_array = depth_array.at[i].set(depth_val)
-        return depth_array
-
-    return lax.fori_loop(
-        0,
-        total_nodes,
-        _body,
-        jnp.zeros((total_nodes,), dtype=INDEX_DTYPE),
-    )
+    depth, _ = lax.while_loop(cond_fn, body_fn, (depth, jnp.bool_(True)))
+    return depth
 
 
 def _compute_effective_extents(parent: Array, extents: Array) -> Array:
