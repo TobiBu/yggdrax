@@ -1665,7 +1665,7 @@ def _dual_tree_walk_count_impl(
 ) -> tuple[Array, Array, Array]:
     """Count-only dual-tree walk.
 
-    Returns (far_counts, near_counts, max_stack_usage).
+    Returns (far_counts, near_counts, max_wf_usage).
     This function performs the same traversal logic but only accumulates
     per-node/per-leaf counts and tracks the maximum stack size observed.
     It avoids building buffers so it cannot overflow; allocate safe
@@ -1712,24 +1712,34 @@ def _dual_tree_walk_count_impl(
     positions = jnp.arange(total_nodes, dtype=INDEX_DTYPE) - as_index(num_internal)
     leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
 
-    # safe stack capacity: total_nodes
-    stack_capacity = int(total_nodes)
-    process_block_int = int(max(1, min(process_block, stack_capacity)))
-    process_block_val = as_index(process_block_int)
-    batch_indices = jnp.arange(process_block_int, dtype=INDEX_DTYPE)
+    # Wavefront capacity for the count-only walk.  Each pair can produce
+    # up to _MAX_REFINEMENT_PAIRS refined pairs per round, and the peak
+    # wavefront can grow substantially before the accept/near paths start
+    # removing pairs.  Use a generous multiplier so we never silently
+    # drop pairs (which would undercount and lead to overflow on the
+    # sized fill pass).  For the full walk the caller controls the
+    # capacity via *max_pair_queue*; here we must be self-sufficient.
+    #
+    # Also ensure we use at least the same capacity the full walk would
+    # pick via _auto_pair_queue_candidates, so the two walks process the
+    # same pairs per round and produce identical counts.
+    auto_base = _auto_pair_queue_candidates(total_nodes, num_internal)[0]
+    stack_capacity = max(
+        int(total_nodes) * _MAX_REFINEMENT_PAIRS * _MAX_REFINEMENT_PAIRS,
+        int(auto_base),
+    )
+    wf_indices = jnp.arange(stack_capacity, dtype=INDEX_DTYPE)
 
-    # Use distinct local names for the counting-pass stacks to avoid
-    # accidental name-capture / UnboundLocalError from Python's scope
-    # analysis when nested closures are present.
-    count_stack_t = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
-    count_stack_s = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
-    count_stack_t = count_stack_t.at[0].set(root_idx)
-    count_stack_s = count_stack_s.at[0].set(root_idx)
-    count_stack_size = as_index(1)
+    # Use distinct local names for the counting-pass wavefront.
+    count_wf_t = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+    count_wf_s = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+    count_wf_t = count_wf_t.at[0].set(root_idx)
+    count_wf_s = count_wf_s.at[0].set(root_idx)
+    count_wf_size = as_index(1)
 
     far_counts = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
     near_counts = jnp.zeros((num_leaves,), dtype=INDEX_DTYPE)
-    max_stack = as_index(1)
+    max_wf = as_index(1)
 
     num_internal_val = as_index(num_internal)
     node_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
@@ -1759,31 +1769,23 @@ def _dual_tree_walk_count_impl(
     right_child_full = jnp.concatenate([right_child, leaf_fill], axis=0)
 
     def cond_fun(state):
-        _stk_t, _stk_s, current_size, _far_c, _near_c, _max_s = state
+        _wf_t, _wf_s, current_size, _far_c, _near_c, _max_wf = state
         return current_size > 0
 
     def body_fun(state):
         (
-            stack_target,
-            stack_source,
-            stack_sz,
+            wf_target,
+            wf_source,
+            wf_size,
             far_counts,
             near_counts,
-            max_stack,
+            max_wf,
         ) = state
 
-        block = jnp.minimum(process_block_val, stack_sz)
-        valid_mask = batch_indices < block
-
-        pop_indices = stack_sz - as_index(1) - batch_indices
-        pop_indices = jnp.where(valid_mask, pop_indices, as_index(0))
-        targets = stack_target[pop_indices]
-        sources = stack_source[pop_indices]
-        targets = jnp.where(valid_mask, targets, as_index(-1))
-        sources = jnp.where(valid_mask, sources, as_index(-1))
-
-        stack_sz = stack_sz - block
-        stack_sz = jnp.maximum(stack_sz, as_index(0))
+        # --- Read entire wavefront ---
+        valid_mask = wf_indices < wf_size
+        targets = jnp.where(valid_mask, wf_target, as_index(-1))
+        sources = jnp.where(valid_mask, wf_source, as_index(-1))
 
         valid_pairs = valid_mask & (targets >= 0) & (sources >= 0)
         valid_pairs_bool = valid_pairs.astype(jnp.bool_)
@@ -1906,67 +1908,68 @@ def _dual_tree_walk_count_impl(
         )
 
         refine_targets = refine_pairs[..., 0].reshape(
-            (process_block_int * _MAX_REFINEMENT_PAIRS,)
+            (stack_capacity * _MAX_REFINEMENT_PAIRS,)
         )
         refine_sources = refine_pairs[..., 1].reshape(
-            (process_block_int * _MAX_REFINEMENT_PAIRS,)
+            (stack_capacity * _MAX_REFINEMENT_PAIRS,)
         )
 
-        # Vectorised stack push (count-only walk variant).
+        # --- Build new wavefront from refined pairs ---
         valid_push = (refine_targets >= 0) & (refine_sources >= 0)
         push_prefix = jnp.cumsum(valid_push.astype(INDEX_DTYPE)) - valid_push.astype(
             INDEX_DTYPE
         )
-        push_slot = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + push_prefix
 
-        push_ok = valid_push & (push_slot < as_index(stack_capacity))
+        push_ok = valid_push & (push_prefix < as_index(stack_capacity))
         push_lo = jnp.minimum(refine_targets, refine_sources)
         push_hi = jnp.maximum(refine_targets, refine_sources)
 
-        oob_stack = as_index(stack_capacity)
-        safe_push_slot = jnp.where(push_ok, push_slot, oob_stack)
-        stack_target = stack_target.at[safe_push_slot].set(
-            jnp.where(push_ok, push_lo, as_index(-1)), mode="drop"
+        oob_wf = as_index(stack_capacity)
+        safe_slot = jnp.where(push_ok, push_prefix, oob_wf)
+        new_wf_target = (
+            jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_lo, as_index(-1)), mode="drop")
         )
-        stack_source = stack_source.at[safe_push_slot].set(
-            jnp.where(push_ok, push_hi, as_index(-1)), mode="drop"
+        new_wf_source = (
+            jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_hi, as_index(-1)), mode="drop")
         )
-        stack_sz = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + jnp.sum(
-            push_ok.astype(INDEX_DTYPE)
-        )
+        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE))
 
-        max_stack = jnp.maximum(max_stack, stack_sz)
+        max_wf = jnp.maximum(max_wf, new_wf_size)
 
         return (
-            stack_target,
-            stack_source,
-            stack_sz,
+            new_wf_target,
+            new_wf_source,
+            new_wf_size,
             far_counts,
             near_counts,
-            max_stack,
+            max_wf,
         )
 
     (
-        count_out_t,
-        count_out_s,
-        _stack_size,
+        _wf_out_t,
+        _wf_out_s,
+        _wf_size_out,
         far_counts,
         near_counts,
-        max_stack,
+        max_wf,
     ) = lax.while_loop(
         cond_fun,
         body_fun,
         (
-            count_stack_t,
-            count_stack_s,
-            jnp.asarray(count_stack_size, dtype=INDEX_DTYPE),
+            count_wf_t,
+            count_wf_s,
+            jnp.asarray(count_wf_size, dtype=INDEX_DTYPE),
             far_counts,
             near_counts,
-            jnp.asarray(max_stack, dtype=INDEX_DTYPE),
+            jnp.asarray(max_wf, dtype=INDEX_DTYPE),
         ),
     )
 
-    return far_counts, near_counts, max_stack
+    return far_counts, near_counts, max_wf
 
 
 def _result_to_interactions(
@@ -2157,7 +2160,7 @@ def _run_dual_tree_walk(
         else:
             count_process_block = int(resolved_block)
 
-        far_counts, near_counts, max_stack = _dual_tree_walk_count_impl(
+        far_counts, near_counts, max_wf = _dual_tree_walk_count_impl(
             tree,
             geometry,
             theta_val,
@@ -2187,7 +2190,7 @@ def _run_dual_tree_walk(
         # least as large as the default auto candidate. That avoids
         # process_block differences that can reorder accepted pairs.
         auto_base = _auto_pair_queue_candidates(total_nodes, num_internal)[0]
-        queue_suggest = max(4, int(max_stack) + 4, int(auto_base))
+        queue_suggest = max(4, int(max_wf) + 4, int(auto_base))
 
         # Replace candidate lists so the main loop performs a single
         # sized pass. Add a defensive guard to avoid producing host-side
