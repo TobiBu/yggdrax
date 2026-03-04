@@ -76,53 +76,42 @@ def _count_refine_pairs_single(
     src_left: Array,
     src_right: Array,
 ) -> Array:
-    """Module-level version of the refine-pair helper used by the count pass.
+    """Branchless refine-pair helper for the count pass.
 
-    Kept at module scope to be accessible during jitted tracing.
+    Computes all 5 possible outcomes and selects with ``jnp.where``
+    instead of nested ``lax.cond``, which under ``vmap`` evaluates
+    all branches anyway.
     """
+    # Case 1: split_both & same
+    p_bs_0 = _count_sorted_pair(tgt_left, tgt_left)
+    p_bs_1 = _count_sorted_pair(tgt_left, tgt_right)
+    p_bs_2 = _count_sorted_pair(tgt_right, tgt_right)
+    both_same = jnp.stack([p_bs_0, p_bs_1, p_bs_2, _FILLER_PAIR], axis=0)
 
-    def handle_split_both(_):
-        def same_branch(_):
-            pair0 = _count_sorted_pair(tgt_left, tgt_left)
-            pair1 = _count_sorted_pair(tgt_left, tgt_right)
-            pair2 = _count_sorted_pair(tgt_right, tgt_right)
-            return jnp.stack([pair0, pair1, pair2, _FILLER_PAIR], axis=0)
+    # Case 2: split_both & ~same
+    p_bc_0 = _count_sorted_pair(tgt_left, src_left)
+    p_bc_1 = _count_sorted_pair(tgt_left, src_right)
+    p_bc_2 = _count_sorted_pair(tgt_right, src_left)
+    p_bc_3 = _count_sorted_pair(tgt_right, src_right)
+    both_cross = jnp.stack([p_bc_0, p_bc_1, p_bc_2, p_bc_3], axis=0)
 
-        def cross_branch(_):
-            pair0 = _count_sorted_pair(tgt_left, src_left)
-            pair1 = _count_sorted_pair(tgt_left, src_right)
-            pair2 = _count_sorted_pair(tgt_right, src_left)
-            pair3 = _count_sorted_pair(tgt_right, src_right)
-            return jnp.stack([pair0, pair1, pair2, pair3], axis=0)
+    # Case 3: split_target only
+    p_st_0 = _count_sorted_pair(tgt_left, src)
+    p_st_1 = _count_sorted_pair(tgt_right, src)
+    split_tgt = jnp.stack([p_st_0, p_st_1, _FILLER_PAIR, _FILLER_PAIR], axis=0)
 
-        return lax.cond(same, same_branch, cross_branch, operand=None)
+    # Case 4: split_source only
+    p_ss_0 = _count_sorted_pair(tgt, src_left)
+    p_ss_1 = _count_sorted_pair(tgt, src_right)
+    split_src = jnp.stack([p_ss_0, p_ss_1, _FILLER_PAIR, _FILLER_PAIR], axis=0)
 
-    def handle_split_target(_):
-        pair0 = _count_sorted_pair(tgt_left, src)
-        pair1 = _count_sorted_pair(tgt_right, src)
-        return jnp.stack([pair0, pair1, _FILLER_PAIR, _FILLER_PAIR], axis=0)
-
-    def handle_split_source(_):
-        pair0 = _count_sorted_pair(tgt, src_left)
-        pair1 = _count_sorted_pair(tgt, src_right)
-        return jnp.stack([pair0, pair1, _FILLER_PAIR, _FILLER_PAIR], axis=0)
-
-    return lax.cond(
-        split_both_flag,
-        handle_split_both,
-        lambda _: lax.cond(
-            split_target_flag,
-            handle_split_target,
-            lambda _: lax.cond(
-                split_source_flag,
-                handle_split_source,
-                lambda __: _EMPTY_REFINEMENT_PAIRS,
-                operand=None,
-            ),
-            operand=None,
-        ),
-        operand=None,
-    )
+    # Select: priority order split_both > split_target > split_source > empty
+    result = _EMPTY_REFINEMENT_PAIRS
+    result = jnp.where(split_source_flag, split_src, result)
+    result = jnp.where(split_target_flag, split_tgt, result)
+    result = jnp.where(split_both_flag & ~same, both_cross, result)
+    result = jnp.where(split_both_flag & same, both_same, result)
+    return result
 
 
 def _next_power_of_two(value: int) -> int:
@@ -594,61 +583,67 @@ def _per_key_prefix(keys: Array, mask: Array, num_segments: int = 0) -> Array:
 def _propagate_extents(parent: Array, extents: Array) -> Array:
     """Propagate zero extents up the tree to obtain conservative sizes.
 
-    Uses iterative pointer doubling: each node tracks a "cursor" that
-    walks up the parent chain.  On every round the cursor jumps to its
-    own parent, and if the node's extent is still zero the cursor's
-    extent is adopted.  After O(log depth) rounds every node has found
-    its nearest ancestor with a positive extent.
+    Uses pointer doubling: each node maintains a "shortcut" pointer
+    that doubles its reach each round.  On round *k* the shortcut
+    jumps 2^k ancestors, so convergence takes O(log depth) rounds
+    instead of O(depth).
     """
     n = extents.shape[0]
-    cursor = jnp.arange(n, dtype=INDEX_DTYPE)
+    # shortcut[i] starts as parent[i] (or i for the root).
+    shortcut = jnp.where(parent >= 0, parent, jnp.arange(n, dtype=parent.dtype))
     result = extents.copy()
 
     def cond_fn(state):
-        _cursor, _result, changed = state
+        _shortcut, _result, changed = state
         return changed
 
     def body_fn(state):
-        cur, res, _changed = state
-        # Each cursor jumps to its parent (roots stay at themselves).
-        par = parent[cur]
-        new_cur = jnp.where(par >= 0, par, cur)
-        # Adopt the extent of the new cursor position when own is zero.
-        candidate = extents[new_cur]
+        sc, res, _changed = state
+        # Pointer doubling: jump through the shortcut itself.
+        new_sc = sc[sc]
+        # Adopt the extent of the shortcut target when own is zero.
+        candidate = extents[new_sc]
         new_res = jnp.where(res <= 0.0, candidate, res)
-        changed = jnp.any((new_res != res) | ((new_cur != cur) & (res <= 0.0)))
-        return new_cur, new_res, changed
+        changed = jnp.any(new_res != res) | jnp.any(new_sc != sc)
+        return new_sc, new_res, changed
 
-    _, result, _ = lax.while_loop(cond_fn, body_fn, (cursor, result, jnp.bool_(True)))
+    _, result, _ = lax.while_loop(cond_fn, body_fn, (shortcut, result, jnp.bool_(True)))
     return result
 
 
 def _compute_node_depths(parent: Array) -> Array:
     """Return the depth of every node (root depth = 0).
 
-    Uses a convergent while_loop that computes all depths in parallel:
-    each round sets ``depth[i] = depth[parent[i]] + 1`` for non-root
-    nodes.  Converges in O(tree_depth) rounds.
+    Uses pointer doubling for O(log depth) convergence.  Each node
+    keeps a *depth-to-root* counter and a shortcut pointer.  On each
+    round the shortcut doubles its reach and accumulated depth
+    contributions are propagated.
     """
     total_nodes = parent.shape[0]
-    depth = jnp.where(parent < 0, as_index(0), as_index(-1))
+    is_root = parent < 0
+    # dist[i] = accumulated distance along the shortcut chain.
+    # Initially 1 for non-root nodes (edge to parent), 0 for root.
+    dist = jnp.where(is_root, as_index(0), as_index(1))
+    # shortcut[i] = parent[i] for non-root, i for root.
+    shortcut = jnp.where(
+        is_root,
+        jnp.arange(total_nodes, dtype=parent.dtype),
+        parent,
+    )
 
     def cond_fn(state):
-        d, changed = state
+        _sc, _d, changed = state
         return changed
 
     def body_fn(state):
-        d, _changed = state
-        parent_depth = d[parent.clip(0)]
-        new_d = jnp.where(
-            parent >= 0,
-            jnp.where(parent_depth >= 0, parent_depth + as_index(1), d),
-            d,
-        )
-        changed = jnp.any(new_d != d)
-        return new_d, changed
+        sc, d, _changed = state
+        # Pointer doubling: add distance of shortcut target.
+        new_d = d + d[sc]
+        new_sc = sc[sc]
+        changed = jnp.any(new_sc != sc)
+        return new_sc, new_d, changed
 
-    depth, _ = lax.while_loop(cond_fn, body_fn, (depth, jnp.bool_(True)))
+    _, depth, _ = lax.while_loop(cond_fn, body_fn, (shortcut, dist, jnp.bool_(True)))
     return depth
 
 
@@ -878,7 +873,7 @@ def _dual_tree_walk_impl(
         hi = jnp.maximum(a, b)
         return jnp.stack([lo, hi], axis=0)
 
-    def _refine_pairs_single(
+    def _refine_pairs_branchless(
         tgt: Array,
         src: Array,
         same: Array,
@@ -890,60 +885,46 @@ def _dual_tree_walk_impl(
         src_left: Array,
         src_right: Array,
     ) -> Array:
-        def handle_split_both(_):
-            def same_branch(_):
-                pair0 = _sorted_pair(tgt_left, tgt_left)
-                pair1 = _sorted_pair(tgt_left, tgt_right)
-                pair2 = _sorted_pair(tgt_right, tgt_right)
-                return jnp.stack(
-                    [pair0, pair1, pair2, filler_pair],
-                    axis=0,
-                )
+        """Branchless refine-pair computation.
 
-            def cross_branch(_):
-                pair0 = _sorted_pair(tgt_left, src_left)
-                pair1 = _sorted_pair(tgt_left, src_right)
-                pair2 = _sorted_pair(tgt_right, src_left)
-                pair3 = _sorted_pair(tgt_right, src_right)
-                return jnp.stack([pair0, pair1, pair2, pair3], axis=0)
+        Computes all 5 possible outcomes using ``jnp.where`` and selects
+        the correct one.  Under ``vmap`` this avoids the overhead of
+        nested ``lax.cond`` which evaluates all branches anyway.
+        """
+        # Pre-compute all candidate pairs using _sorted_pair.
+        # Case 1: split_both & same → (tL,tL), (tL,tR), (tR,tR), filler
+        p_bs_0 = _sorted_pair(tgt_left, tgt_left)
+        p_bs_1 = _sorted_pair(tgt_left, tgt_right)
+        p_bs_2 = _sorted_pair(tgt_right, tgt_right)
+        both_same = jnp.stack([p_bs_0, p_bs_1, p_bs_2, filler_pair], axis=0)
 
-            return lax.cond(same, same_branch, cross_branch, operand=None)
+        # Case 2: split_both & ~same → (tL,sL), (tL,sR), (tR,sL), (tR,sR)
+        p_bc_0 = _sorted_pair(tgt_left, src_left)
+        p_bc_1 = _sorted_pair(tgt_left, src_right)
+        p_bc_2 = _sorted_pair(tgt_right, src_left)
+        p_bc_3 = _sorted_pair(tgt_right, src_right)
+        both_cross = jnp.stack([p_bc_0, p_bc_1, p_bc_2, p_bc_3], axis=0)
 
-        def handle_split_target(_):
-            pair0 = _sorted_pair(tgt_left, src)
-            pair1 = _sorted_pair(tgt_right, src)
-            return jnp.stack(
-                [pair0, pair1, filler_pair, filler_pair],
-                axis=0,
-            )
+        # Case 3: split_target only → (tL,src), (tR,src), filler, filler
+        p_st_0 = _sorted_pair(tgt_left, src)
+        p_st_1 = _sorted_pair(tgt_right, src)
+        split_tgt = jnp.stack([p_st_0, p_st_1, filler_pair, filler_pair], axis=0)
 
-        def handle_split_source(_):
-            pair0 = _sorted_pair(tgt, src_left)
-            pair1 = _sorted_pair(tgt, src_right)
-            return jnp.stack(
-                [pair0, pair1, filler_pair, filler_pair],
-                axis=0,
-            )
+        # Case 4: split_source only → (tgt,sL), (tgt,sR), filler, filler
+        p_ss_0 = _sorted_pair(tgt, src_left)
+        p_ss_1 = _sorted_pair(tgt, src_right)
+        split_src = jnp.stack([p_ss_0, p_ss_1, filler_pair, filler_pair], axis=0)
 
-        return lax.cond(
-            split_both_flag,
-            handle_split_both,
-            lambda _: lax.cond(
-                split_target_flag,
-                handle_split_target,
-                lambda _: lax.cond(
-                    split_source_flag,
-                    handle_split_source,
-                    lambda __: empty_pairs,
-                    operand=None,
-                ),
-                operand=None,
-            ),
-            operand=None,
-        )
+        # Select: priority order split_both > split_target > split_source > empty
+        result = empty_pairs
+        result = jnp.where(split_source_flag, split_src, result)
+        result = jnp.where(split_target_flag, split_tgt, result)
+        result = jnp.where(split_both_flag & ~same, both_cross, result)
+        result = jnp.where(split_both_flag & same, both_same, result)
+        return result
 
     refine_vm = jax.vmap(
-        _refine_pairs_single,
+        _refine_pairs_branchless,
         in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     )
 
