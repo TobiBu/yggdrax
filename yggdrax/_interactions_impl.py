@@ -529,6 +529,68 @@ def _resolve_pair_actions(
     return actions, forward_tags, reverse_tags
 
 
+def _per_key_prefix(keys: Array, mask: Array, num_segments: int = 0) -> Array:
+    """Exclusive prefix count per key among masked entries.
+
+    For each masked position *i*, count how many earlier masked positions
+    share the same key.  Uses ``argsort`` for *O(B log B)* complexity
+    instead of the *O(B²)* pairwise comparison matrix, enabling
+    efficient processing of large batches (wavefront traversal).
+
+    Parameters
+    ----------
+    keys : Array
+        Per-entry key values, shape ``(B,)``.
+    mask : Array
+        Boolean mask, shape ``(B,)``.  Only masked entries participate.
+    num_segments : int
+        Unused; kept for call-site compatibility.
+
+    Returns
+    -------
+    Array
+        Shape ``(B,)`` with exclusive prefix counts.  Unmasked entries
+        are zero.
+    """
+    sentinel_high = jnp.array(jnp.iinfo(INDEX_DTYPE).max, dtype=INDEX_DTYPE)
+    sentinel_low = jnp.array(jnp.iinfo(INDEX_DTYPE).min, dtype=INDEX_DTYPE)
+    effective_keys = jnp.where(mask, keys, sentinel_high)
+
+    # Stable sort groups same-key entries together while preserving
+    # their original relative order within each group.
+    order = jnp.argsort(effective_keys, stable=True)
+    sorted_keys = effective_keys[order]
+    sorted_mask = mask[order]
+
+    # Detect group boundaries (where the key changes).
+    prev_keys = jnp.concatenate(
+        [jnp.full((1,), sentinel_low, dtype=INDEX_DTYPE), sorted_keys[:-1]]
+    )
+    is_group_start = sorted_keys != prev_keys
+
+    # Inclusive cumulative count of masked entries.
+    cumsum = jnp.cumsum(sorted_mask.astype(INDEX_DTYPE))
+
+    # At each group boundary, record how many masked entries preceded
+    # this group.  Forward-fill via prefix-maximum (cumsum is monotone,
+    # so boundary values are non-decreasing).
+    group_base = jnp.where(
+        is_group_start,
+        cumsum - sorted_mask.astype(INDEX_DTYPE),
+        as_index(0),
+    )
+    group_base = lax.associative_scan(jnp.maximum, group_base)
+
+    # 0-based position within each key group.
+    prefix_sorted = cumsum - group_base - sorted_mask.astype(INDEX_DTYPE)
+
+    # Un-sort back to original positions.
+    result = jnp.zeros(keys.shape[0], dtype=INDEX_DTYPE)
+    result = result.at[order].set(prefix_sorted)
+
+    return jnp.where(mask, result, as_index(0))
+
+
 def _propagate_extents(parent: Array, extents: Array) -> Array:
     """Propagate zero extents up the tree to obtain conservative sizes.
 
@@ -1207,20 +1269,6 @@ def _dual_tree_walk_impl(
 
         leaf_pos_target = leaf_position[safe_targets]
         leaf_pos_source = leaf_position[safe_sources]
-
-        # Helper: per-key exclusive prefix count for vectorised scatter.
-        def _per_key_prefix(keys, mask, num_segments):
-            """Exclusive prefix count per key among masked entries.
-
-            For each masked position *i*, count how many earlier masked
-            positions share the same key.  This gives an exclusive
-            offset within each key group, suitable for scatter writes.
-            """
-            idx = jnp.arange(keys.shape[0], dtype=INDEX_DTYPE)
-            same_key = (keys[:, None] == keys[None, :]) & mask[None, :]
-            earlier = idx[None, :] < idx[:, None]
-            prefix = jnp.sum((same_key & earlier).astype(INDEX_DTYPE), axis=1)
-            return jnp.where(mask, prefix, as_index(0))
 
         if collect_far:
             # Vectorised accept recording.  For each accepted pair
