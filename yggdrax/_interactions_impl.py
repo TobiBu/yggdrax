@@ -984,9 +984,6 @@ def _dual_tree_walk_impl(
     leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
 
     stack_capacity = max(int(max_pair_queue), 4)
-    process_block_int = int(max(1, min(process_block, stack_capacity)))
-    process_block_val = as_index(process_block_int)
-    batch_indices = jnp.arange(process_block_int, dtype=INDEX_DTYPE)
 
     pair_stack_target = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
     pair_stack_source = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
@@ -1026,7 +1023,7 @@ def _dual_tree_walk_impl(
         neighbor_buffer = jnp.zeros((0, 0), dtype=INDEX_DTYPE)
     near_pair_total = as_index(0)
 
-    overflow_stack = jnp.bool_(False)
+    overflow_wf = jnp.bool_(False)
     far_overflow = jnp.bool_(False)
     near_overflow = jnp.bool_(False)
 
@@ -1137,10 +1134,21 @@ def _dual_tree_walk_impl(
         in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     )
 
+    # --- Wavefront-based traversal ---
+    # Instead of a LIFO stack that processes ``process_block`` pairs per
+    # iteration, use a wavefront buffer that holds ALL pairs for the
+    # current "generation".  Each round evaluates the full wavefront in
+    # parallel, records accept/near results, and collects refined child
+    # pairs into a *new* wavefront.  This reduces the number of
+    # while_loop rounds from O(total_pairs / process_block) to
+    # O(tree_depth) while maximising data-level parallelism per round.
+    wavefront_capacity = stack_capacity
+    wf_indices = jnp.arange(wavefront_capacity, dtype=INDEX_DTYPE)
+
     def cond_fun(state):
         (
-            _stack_target,
-            _stack_source,
+            _wf_target,
+            _wf_source,
             current_size,
             _far_buf,
             _far_tag_buf,
@@ -1149,20 +1157,20 @@ def _dual_tree_walk_impl(
             _nbr_buf,
             _nbr_cnts,
             _nbr_ptr,
-            stack_over,
+            wf_over,
             far_over,
             near_over,
             _accept_decisions,
             _near_decisions,
             _refine_decisions,
         ) = state
-        return (current_size > 0) & (~stack_over) & (~far_over) & (~near_over)
+        return (current_size > 0) & (~wf_over) & (~far_over) & (~near_over)
 
     def body_fun(state):
         (
-            stack_target,
-            stack_source,
-            stack_sz,
+            wf_target,
+            wf_source,
+            wf_size,
             far_buffer,
             far_tag_buffer,
             far_counts,
@@ -1170,7 +1178,7 @@ def _dual_tree_walk_impl(
             neighbor_buffer,
             near_counts,
             near_pair_total,
-            stack_overflow,
+            wf_overflow,
             far_overflow,
             near_overflow,
             accept_decisions,
@@ -1178,18 +1186,10 @@ def _dual_tree_walk_impl(
             refine_decisions,
         ) = state
 
-        block = jnp.minimum(process_block_val, stack_sz)
-        valid_mask = batch_indices < block
-
-        pop_indices = stack_sz - as_index(1) - batch_indices
-        pop_indices = jnp.where(valid_mask, pop_indices, as_index(0))
-        targets = stack_target[pop_indices]
-        sources = stack_source[pop_indices]
-        targets = jnp.where(valid_mask, targets, as_index(-1))
-        sources = jnp.where(valid_mask, sources, as_index(-1))
-
-        stack_sz = stack_sz - block
-        stack_sz = jnp.maximum(stack_sz, as_index(0))
+        # --- Read entire wavefront ---
+        valid_mask = wf_indices < wf_size
+        targets = jnp.where(valid_mask, wf_target, as_index(-1))
+        sources = jnp.where(valid_mask, wf_source, as_index(-1))
 
         valid_pairs = valid_mask & (targets >= 0) & (sources >= 0)
         valid_pairs_bool = valid_pairs.astype(jnp.bool_)
@@ -1427,50 +1427,50 @@ def _dual_tree_walk_impl(
             source_right,
         )
 
+        # --- Build new wavefront from refined pairs ---
         refine_targets = refine_pairs[..., 0].reshape(
-            (process_block_int * _MAX_REFINEMENT_PAIRS,)
+            (wavefront_capacity * _MAX_REFINEMENT_PAIRS,)
         )
         refine_sources = refine_pairs[..., 1].reshape(
-            (process_block_int * _MAX_REFINEMENT_PAIRS,)
+            (wavefront_capacity * _MAX_REFINEMENT_PAIRS,)
         )
 
-        # Vectorised stack push: replace sequential fori_loop with a
-        # single prefix-sum + scatter pass over all refined pairs.
         valid_push = (refine_targets >= 0) & (refine_sources >= 0)
-        push_count = jnp.sum(valid_push.astype(INDEX_DTYPE))
 
-        # Exclusive prefix sum gives each valid pair a unique offset.
+        # Exclusive prefix sum gives each valid pair a unique slot
+        # in the new wavefront.
         push_prefix = jnp.cumsum(valid_push.astype(INDEX_DTYPE)) - valid_push.astype(
             INDEX_DTYPE
         )
-        push_slot = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + push_prefix
 
-        # Capacity check: entries that would exceed the stack are dropped.
-        push_ok = valid_push & (push_slot < as_index(stack_capacity))
-        stack_overflow = stack_overflow | jnp.any(
-            valid_push & (push_slot >= as_index(stack_capacity))
+        # Capacity check.
+        push_ok = valid_push & (push_prefix < as_index(wavefront_capacity))
+        wf_overflow = wf_overflow | jnp.any(
+            valid_push & (push_prefix >= as_index(wavefront_capacity))
         )
 
         # Sorted push: lo = min(tgt, src), hi = max(tgt, src).
         push_lo = jnp.minimum(refine_targets, refine_sources)
         push_hi = jnp.maximum(refine_targets, refine_sources)
 
-        oob_stack = as_index(stack_capacity)
-        safe_push_slot = jnp.where(push_ok, push_slot, oob_stack)
-        stack_target = stack_target.at[safe_push_slot].set(
-            jnp.where(push_ok, push_lo, as_index(-1)), mode="drop"
+        oob_wf = as_index(wavefront_capacity)
+        safe_slot = jnp.where(push_ok, push_prefix, oob_wf)
+        new_wf_target = (
+            jnp.full((wavefront_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_lo, as_index(-1)), mode="drop")
         )
-        stack_source = stack_source.at[safe_push_slot].set(
-            jnp.where(push_ok, push_hi, as_index(-1)), mode="drop"
+        new_wf_source = (
+            jnp.full((wavefront_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_hi, as_index(-1)), mode="drop")
         )
-        stack_sz = jnp.asarray(stack_sz, dtype=INDEX_DTYPE) + jnp.sum(
-            push_ok.astype(INDEX_DTYPE)
-        )
+        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE))
 
         return (
-            stack_target,
-            stack_source,
-            stack_sz,
+            new_wf_target,
+            new_wf_source,
+            new_wf_size,
             far_buffer,
             far_tag_buffer,
             far_counts,
@@ -1478,7 +1478,7 @@ def _dual_tree_walk_impl(
             neighbor_buffer,
             near_counts,
             near_pair_total,
-            stack_overflow,
+            wf_overflow,
             far_overflow,
             near_overflow,
             accept_decisions + batch_accept,
@@ -1487,9 +1487,9 @@ def _dual_tree_walk_impl(
         )
 
     (
-        pair_stack_target,
-        pair_stack_source,
-        stack_size,
+        _wf_target_out,
+        _wf_source_out,
+        _wf_size_out,
         far_buffer,
         far_tag_buffer,
         far_counts,
@@ -1497,7 +1497,7 @@ def _dual_tree_walk_impl(
         neighbor_buffer,
         near_counts,
         near_pair_total,
-        overflow_stack,
+        overflow_wf,
         far_overflow,
         near_overflow,
         accept_decisions,
@@ -1517,7 +1517,7 @@ def _dual_tree_walk_impl(
             neighbor_buffer,
             near_counts,
             near_pair_total,
-            overflow_stack,
+            overflow_wf,
             far_overflow,
             near_overflow,
             as_index(0),
@@ -1631,7 +1631,7 @@ def _dual_tree_walk_impl(
         leaf_indices=leaf_indices,
         far_pair_count=far_pair_count,
         near_pair_count=near_pair_count,
-        queue_overflow=overflow_stack,
+        queue_overflow=overflow_wf,
         far_overflow=far_overflow,
         near_overflow=near_overflow,
         accept_decisions=accept_decisions,
