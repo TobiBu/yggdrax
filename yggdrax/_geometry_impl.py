@@ -224,32 +224,33 @@ def compute_tree_geometry(
         parent = jnp.asarray(tree.parent, dtype=INDEX_DTYPE)
         parent_safe = jnp.where(parent >= 0, parent, as_index(0))
 
-        # Iteratively compute depths: depth[root]=0,
-        # depth[i] = depth[parent[i]] + 1.  Because the parent pointer
-        # can reference any node, we iterate until convergence.  At most
-        # ``num_nodes`` rounds are needed but typical trees converge in
-        # O(depth) rounds, and the inner body is fully vectorised over
-        # all nodes.
-        init_depth = jnp.where(parent < 0, as_index(0), as_index(-1))
+        # Compute depths via pointer doubling: each node maintains a
+        # shortcut pointer and an accumulated distance. On each round
+        # the shortcut doubles its reach, converging in O(log depth)
+        # rounds instead of O(depth).
+        is_root = parent < 0
+        init_dist = jnp.where(is_root, as_index(0), as_index(1))
+        init_shortcut = jnp.where(
+            is_root,
+            jnp.arange(num_nodes, dtype=INDEX_DTYPE),
+            parent_safe,
+        )
 
         def _depth_cond(state):
-            depth, changed = state
+            _sc, _d, changed = state
             return changed
 
         def _depth_body(state):
-            depth, _ = state
-            parent_depth = depth[parent_safe]
-            candidate = jnp.where(
-                (parent >= 0) & (parent_depth >= 0),
-                parent_depth + as_index(1),
-                depth,
-            )
-            new_depth = jnp.maximum(depth, candidate)
-            changed = jnp.any(new_depth != depth)
-            return new_depth, changed
+            sc, d, _changed = state
+            new_d = d + d[sc]
+            new_sc = sc[sc]
+            changed = jnp.any(new_sc != sc)
+            return new_sc, new_d, changed
 
-        node_depth, _ = lax.while_loop(
-            _depth_cond, _depth_body, (init_depth, jnp.bool_(True))
+        _, node_depth, _ = lax.while_loop(
+            _depth_cond,
+            _depth_body,
+            (init_shortcut, init_dist, jnp.bool_(True)),
         )
 
         max_depth = jnp.max(node_depth)

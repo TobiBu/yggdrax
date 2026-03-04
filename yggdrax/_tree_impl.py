@@ -895,31 +895,31 @@ def _build_tree_from_leaf_partitions(
     )
     node_ranges = node_ranges.at[num_internal:].set(leaf_ranges)
 
-    # Derive node depths from the parent array.  The root (parent == -1)
-    # gets depth 0; every other node gets depth = parent_depth + 1.
-    # We iterate until all depths converge, with the inner body fully
-    # vectorised over all nodes.
+    # Derive node depths via pointer doubling.  Each node maintains a
+    # shortcut pointer and accumulated distance.  On each round the
+    # shortcut doubles its reach, converging in O(log depth) rounds.
     parent_safe = jnp.where(parent >= 0, parent, as_index(0))
-    node_level = jnp.where(parent < 0, as_index(0), as_index(-1))
+    is_root = parent < 0
+    init_dist = jnp.where(is_root, as_index(0), as_index(1))
+    init_shortcut = jnp.where(
+        is_root,
+        jnp.arange(total_nodes, dtype=INDEX_DTYPE),
+        parent_safe,
+    )
 
     def _depth_cond(state):
-        _levels, changed = state
+        _sc, _d, changed = state
         return changed
 
     def _depth_body(state):
-        levels, _ = state
-        parent_depth = levels[parent_safe]
-        candidate = jnp.where(
-            (parent >= 0) & (parent_depth >= 0),
-            parent_depth + as_index(1),
-            levels,
-        )
-        new_levels = jnp.maximum(levels, candidate)
-        changed = jnp.any(new_levels != levels)
-        return new_levels, changed
+        sc, d, _changed = state
+        new_d = d + d[sc]
+        new_sc = sc[sc]
+        changed = jnp.any(new_sc != sc)
+        return new_sc, new_d, changed
 
-    node_level, _ = lax.while_loop(
-        _depth_cond, _depth_body, (node_level, jnp.bool_(True))
+    _, node_level, _ = lax.while_loop(
+        _depth_cond, _depth_body, (init_shortcut, init_dist, jnp.bool_(True))
     )
 
     max_level = jnp.max(node_level)
