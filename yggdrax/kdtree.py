@@ -537,7 +537,20 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
             for i in range(n)
         ]
     )
-    is_leaf_host = _np.array([subtree_sizes_host[i] <= leaf_size_int for i in range(n)])
+    # Only mark *top-level* leaves: nodes whose subtree fits within
+    # leaf_size but whose parent's subtree does NOT.  Descendants inside
+    # a leaf's subtree are excluded so the compact tree has O(N/leaf_size)
+    # nodes rather than O(N), matching the radix tree.
+    is_leaf_host = _np.array(
+        [
+            subtree_sizes_host[i] <= leaf_size_int
+            and (
+                i == 0
+                or subtree_sizes_host[(i - 1) // 2] > leaf_size_int
+            )
+            for i in range(n)
+        ]
+    )
 
     internal_nodes_host = _np.where(is_internal_host)[0]
     leaf_nodes_host_arr = _np.where(is_leaf_host)[0]
