@@ -990,9 +990,12 @@ def _resolve_query_backend(
     platform = jax.devices()[0].platform
 
     if platform == "gpu":
-        if (work <= 8_000_000) and (k <= 16):
-            return "tiled"
-        return "tree"
+        # Dense matmul-like evaluation is fastest for small/medium work on GPU.
+        # For larger workloads, tiled exact search is more robust than the
+        # branch-heavy tree walk for kNN.
+        if (work <= 80_000_000) and (k <= 32):
+            return "dense"
+        return "tiled"
 
     # CPU: dense is excellent for small work; tiled is best medium; tree wins large.
     if (work <= 1_500_000) and (k <= 32):
@@ -1010,7 +1013,7 @@ def query_neighbors(
     k: int = 1,
     exclude_self: bool = False,
     backend: Literal["dense", "tiled", "tree", "auto"] = "tiled",
-    point_block_size: int = 2048,
+    point_block_size: int = 4096,
     return_squared: bool = False,
 ) -> tuple[Array, Array]:
     """Return nearest-neighbor indices and distances for each query point.
@@ -1024,7 +1027,7 @@ def query_neighbors(
         backend: Query backend. ``dense`` builds a full pairwise matrix;
             ``tiled`` computes exact neighbors blockwise with lower memory;
             ``tree`` uses KD leaf bounding boxes to prune exact search;
-            ``auto`` selects a backend by problem size.
+            ``auto`` selects a backend by problem size and device.
         point_block_size: Block size used by the tiled backend.
         return_squared: If ``True``, return squared Euclidean distances.
 

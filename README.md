@@ -97,6 +97,9 @@ solver-side scheduling or adaptive-order bucketing without moving solver logic
 into `yggdrax`.
 
 See `examples/getting_started.ipynb` for a runnable walkthrough.
+For the locked high-performance GPU benchmark configuration, see
+`docs/gpu_benchmark_recommended_setup.md` and
+`examples/tree_gpu_performance_scaling.ipynb`.
 
 ## KD-Tree MAC Note
 
