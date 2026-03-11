@@ -14,6 +14,7 @@ from .geometry import (
     geometry_to_level_major,
 )
 from .interactions import (
+    CompactTaggedFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
@@ -93,6 +94,7 @@ __all__ = [
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
+    "CompactTaggedFarPairs",
     "FixedDepthTreeBuildConfig",
     "INDEX_DTYPE",
     "LevelMajorTreeGeometry",

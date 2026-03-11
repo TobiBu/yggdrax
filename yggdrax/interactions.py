@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from . import _interactions_impl
 from ._interactions_impl import (
+    CompactTaggedFarPairs,
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
@@ -108,6 +109,7 @@ def build_interactions_and_neighbors(
     policy_state: object = None,
     *,
     return_result: bool = False,
+    return_compact_far_pairs: bool = False,
     return_grouped: bool = False,
 ):
     """Construct both far-field interactions and near-field neighbors.
@@ -135,6 +137,7 @@ def build_interactions_and_neighbors(
         pair_policy=pair_policy,
         policy_state=policy_state,
         return_result=return_result,
+        return_compact_far_pairs=return_compact_far_pairs,
         return_grouped=return_grouped,
     )
 
@@ -188,6 +191,7 @@ __all__ = [
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
+    "CompactTaggedFarPairs",
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",

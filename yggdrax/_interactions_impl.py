@@ -441,6 +441,14 @@ class DualTreeWalkResult(NamedTuple):
     refine_decisions: Array
 
 
+class CompactTaggedFarPairs(NamedTuple):
+    """Exact-length far-pair payload for downstream adaptive-order consumers."""
+
+    sources: Array
+    targets: Array
+    tags: Array
+
+
 class _DualTreeWalkRawOutputs(NamedTuple):
     """Raw dual-tree walk payload before caller-specific compaction."""
 
@@ -2411,6 +2419,24 @@ def _raw_to_result(raw: _DualTreeWalkRawOutputs) -> DualTreeWalkResult:
     )
 
 
+def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarPairs:
+    """Return exact-length far-pair arrays without retaining traversal buffers."""
+    far_pair_count = jnp.asarray(raw.far_pair_count, dtype=INDEX_DTYPE)
+    if isinstance(raw.far_pair_count, jax_core.Tracer):
+        return CompactTaggedFarPairs(
+            sources=jnp.asarray(raw.interaction_sources, dtype=INDEX_DTYPE),
+            targets=jnp.asarray(raw.interaction_targets, dtype=INDEX_DTYPE),
+            tags=jnp.asarray(raw.interaction_tags, dtype=INDEX_DTYPE),
+        )
+
+    far_total = int(far_pair_count)
+    return CompactTaggedFarPairs(
+        sources=jax.device_put(raw.interaction_sources[:far_total]),
+        targets=jax.device_put(raw.interaction_targets[:far_total]),
+        tags=jax.device_put(raw.interaction_tags[:far_total]),
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def build_well_separated_interactions(
     tree: object,
@@ -2511,15 +2537,36 @@ def build_interactions_and_neighbors(
     policy_state: object = None,
     *,
     return_result: bool = False,
+    return_compact_far_pairs: bool = False,
     return_grouped: bool = False,
 ) -> Union[
     tuple[NodeInteractionList, NodeNeighborList],
     tuple[NodeInteractionList, NodeNeighborList, DualTreeWalkResult],
+    tuple[NodeInteractionList, NodeNeighborList, CompactTaggedFarPairs],
     tuple[NodeInteractionList, NodeNeighborList, GroupedInteractionBuffers],
     tuple[
         NodeInteractionList,
         NodeNeighborList,
         DualTreeWalkResult,
+        GroupedInteractionBuffers,
+    ],
+    tuple[
+        NodeInteractionList,
+        NodeNeighborList,
+        DualTreeWalkResult,
+        CompactTaggedFarPairs,
+    ],
+    tuple[
+        NodeInteractionList,
+        NodeNeighborList,
+        CompactTaggedFarPairs,
+        GroupedInteractionBuffers,
+    ],
+    tuple[
+        NodeInteractionList,
+        NodeNeighborList,
+        DualTreeWalkResult,
+        CompactTaggedFarPairs,
         GroupedInteractionBuffers,
     ],
 ]:
@@ -2564,10 +2611,21 @@ def build_interactions_and_neighbors(
         )
 
     result = _raw_to_result(raw) if return_result else None
+    compact_far_pairs = (
+        _raw_to_compact_far_pairs(raw) if return_compact_far_pairs else None
+    )
+    if return_result and return_compact_far_pairs and return_grouped:
+        return interactions, neighbors, result, compact_far_pairs, grouped
+    if return_result and return_compact_far_pairs:
+        return interactions, neighbors, result, compact_far_pairs
     if return_result and return_grouped:
         return interactions, neighbors, result, grouped
     if return_result:
         return interactions, neighbors, result
+    if return_compact_far_pairs and return_grouped:
+        return interactions, neighbors, compact_far_pairs, grouped
+    if return_compact_far_pairs:
+        return interactions, neighbors, compact_far_pairs
     if return_grouped:
         return interactions, neighbors, grouped
     return interactions, neighbors
@@ -2696,6 +2754,7 @@ __all__ = [
     "NodeInteractionList",
     "NodeNeighborList",
     "DualTreeWalkResult",
+    "CompactTaggedFarPairs",
     "build_well_separated_interactions",
     "build_leaf_neighbor_lists",
     "build_interactions_and_neighbors",
