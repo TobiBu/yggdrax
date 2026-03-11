@@ -11,6 +11,7 @@ from ._interactions_impl import (
     MACType,
     NodeInteractionList,
     NodeNeighborList,
+    PairPolicy,
     _compute_effective_extents,
     _compute_leaf_effective_extents,
     _interaction_capacity_candidates,
@@ -28,6 +29,8 @@ def build_well_separated_interactions(
     max_interactions_per_node: int | None = None,
     mac_type: MACType = "bh",
     *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
@@ -43,6 +46,8 @@ def build_well_separated_interactions(
         theta=theta,
         max_interactions_per_node=max_interactions_per_node,
         mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         max_pair_queue=max_pair_queue,
         process_block=process_block,
         traversal_config=traversal_config,
@@ -59,6 +64,8 @@ def build_leaf_neighbor_lists(
     max_interactions_per_node: int | None = None,
     mac_type: MACType = "bh",
     *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
@@ -75,6 +82,8 @@ def build_leaf_neighbor_lists(
         max_neighbors_per_leaf=max_neighbors_per_leaf,
         max_interactions_per_node=max_interactions_per_node,
         mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         max_pair_queue=max_pair_queue,
         process_block=process_block,
         traversal_config=traversal_config,
@@ -95,11 +104,20 @@ def build_interactions_and_neighbors(
     retry_logger=None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
     *,
     return_result: bool = False,
     return_grouped: bool = False,
 ):
-    """Construct both far-field interactions and near-field neighbors."""
+    """Construct both far-field interactions and near-field neighbors.
+
+    When ``pair_policy`` is provided, it overrides the built-in MAC decision
+    for each candidate pair and may attach integer tags to accepted far
+    pairs. Policies are evaluated in both directions; a pair is accepted only
+    when both directed decisions accept, and the directed tags are exposed on
+    ``DualTreeWalkResult.interaction_tags`` when ``return_result=True``.
+    """
 
     topology = resolve_tree_topology(tree)
     return _interactions_impl.build_interactions_and_neighbors(
@@ -114,6 +132,8 @@ def build_interactions_and_neighbors(
         retry_logger=retry_logger,
         mac_type=mac_type,
         dehnen_radius_scale=dehnen_radius_scale,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
         return_result=return_result,
         return_grouped=return_grouped,
     )
@@ -164,6 +184,7 @@ def diagnose_leaf_neighbor_growth(
 __all__ = [
     "DEFAULT_PAIR_QUEUE_MULTIPLIER",
     "MACType",
+    "PairPolicy",
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",

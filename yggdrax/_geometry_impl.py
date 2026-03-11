@@ -65,38 +65,39 @@ def _compute_leaf_bounds(
     leaf_starts: Array,
     leaf_counts: Array,
 ) -> tuple[Array, Array]:
-    index_dtype = leaf_starts.dtype
     dtype = positions_sorted.dtype
-    dim = positions_sorted.shape[1]
-    one = as_index(1)
-    zero = as_index(0)
-    inf_vec = jnp.full((dim,), jnp.inf, dtype=dtype)
-    neg_inf_vec = jnp.full((dim,), -jnp.inf, dtype=dtype)
+    num_leaves = leaf_starts.shape[0]
+    num_particles = positions_sorted.shape[0]
 
-    def single(start, count):
-        row_start = lax.convert_element_type(start, index_dtype)
-        row_count = lax.convert_element_type(count, index_dtype)
+    # Upper bound on particles per leaf.  Under JIT ``leaf_counts`` may
+    # contain traced values so we fall back to the particle count (a
+    # concrete int) which is always a safe upper bound.
+    if isinstance(leaf_counts, jax_core.Tracer):
+        max_count = num_particles
+    else:
+        max_count = int(jnp.max(leaf_counts)) if num_leaves > 0 else 0
 
-        def cond_fun(state):
-            i, _mn, _mx = state
-            return i < row_count
+    if max_count == 0:
+        # All leaves are empty – return neutral bounds.
+        inf_mins = jnp.full((num_leaves, 3), jnp.inf, dtype=dtype)
+        neg_inf_maxs = jnp.full((num_leaves, 3), -jnp.inf, dtype=dtype)
+        return inf_mins, neg_inf_maxs
 
-        def body_fun(state):
-            i, mn, mx = state
-            idx = row_start + i
-            point = lax.dynamic_index_in_dim(
-                positions_sorted, idx, axis=0, keepdims=False
-            )
-            return i + one, jnp.minimum(mn, point), jnp.maximum(mx, point)
+    # Build a (num_leaves, max_count) index array and a validity mask.
+    offsets = jnp.arange(max_count, dtype=INDEX_DTYPE)[None, :]  # (1, M)
+    indices = leaf_starts[:, None] + offsets  # (L, M)
+    valid = offsets < leaf_counts[:, None]  # (L, M)
 
-        _, mins, maxs = lax.while_loop(
-            cond_fun,
-            body_fun,
-            (zero, inf_vec, neg_inf_vec),
-        )
-        return mins, maxs
+    # Clamp out-of-range indices so the gather is safe.
+    safe_indices = jnp.where(valid, indices, as_index(0))
+    points = positions_sorted[safe_indices]  # (L, M, 3)
 
-    mins, maxs = jax.vmap(single)(leaf_starts, leaf_counts)
+    # Masked min / max reduction along axis=1.
+    big = jnp.finfo(dtype).max
+    mins = jnp.where(valid[:, :, None], points, big)
+    maxs = jnp.where(valid[:, :, None], points, -big)
+    mins = jnp.min(mins, axis=1)  # (L, 3)
+    maxs = jnp.max(maxs, axis=1)  # (L, 3)
     return mins, maxs
 
 
@@ -210,47 +211,76 @@ def compute_tree_geometry(
     left_child = jnp.asarray(tree.left_child, dtype=INDEX_DTYPE)
     right_child = jnp.asarray(tree.right_child, dtype=INDEX_DTYPE)
 
-    indices_full = jnp.arange(num_nodes, dtype=INDEX_DTYPE)
-    processed = indices_full >= as_index(num_internal)
-
-    def cond_fun(state):
-        _mins_state, _maxs_state, processed_state = state
-        return jnp.any(~processed_state[:num_internal])
-
-    def body_fun(state):
-        mins_state, maxs_state, processed_state = state
-        child_min = jnp.minimum(
-            mins_state[left_child],
-            mins_state[right_child],
-        )
-        child_max = jnp.maximum(
-            maxs_state[left_child],
-            maxs_state[right_child],
-        )
-        ready = processed_state[left_child] & processed_state[right_child]
-        update_mask = (~processed_state[:num_internal]) & ready
-        mins_internal = jnp.where(
-            update_mask[:, None],
-            child_min,
-            mins_state[:num_internal],
-        )
-        maxs_internal = jnp.where(
-            update_mask[:, None],
-            child_max,
-            maxs_state[:num_internal],
-        )
-        mins_state = mins_state.at[:num_internal].set(mins_internal)
-        maxs_state = maxs_state.at[:num_internal].set(maxs_internal)
-        processed_internal = processed_state[:num_internal] | update_mask
-        processed_state = processed_state.at[:num_internal].set(processed_internal)
-        return mins_state, maxs_state, processed_state
-
     if num_internal > 0:
-        mins, maxs, _ = lax.while_loop(
-            cond_fun,
-            body_fun,
-            (mins, maxs, processed),
+        # Level-parallel upward pass: process one tree level at a time from
+        # the deepest internal level up to the root.  All internal nodes at
+        # the same level are independent, so the merge within each level is
+        # fully vectorised.
+        #
+        # We derive correct node depths from the parent array instead of
+        # relying on tree.node_level (which may contain stale values when
+        # the tree build propagated levels in index order rather than BFS
+        # order).
+        parent = jnp.asarray(tree.parent, dtype=INDEX_DTYPE)
+        parent_safe = jnp.where(parent >= 0, parent, as_index(0))
+
+        # Compute depths via pointer doubling: each node maintains a
+        # shortcut pointer and an accumulated distance. On each round
+        # the shortcut doubles its reach, converging in O(log depth)
+        # rounds instead of O(depth).
+        is_root = parent < 0
+        init_dist = jnp.where(is_root, as_index(0), as_index(1))
+        init_shortcut = jnp.where(
+            is_root,
+            jnp.arange(num_nodes, dtype=INDEX_DTYPE),
+            parent_safe,
         )
+
+        def _depth_cond(state):
+            _sc, _d, changed = state
+            return changed
+
+        def _depth_body(state):
+            sc, d, _changed = state
+            new_d = d + d[sc]
+            new_sc = sc[sc]
+            changed = jnp.any(new_sc != sc)
+            return new_sc, new_d, changed
+
+        _, node_depth, _ = lax.while_loop(
+            _depth_cond,
+            _depth_body,
+            (init_shortcut, init_dist, jnp.bool_(True)),
+        )
+
+        max_depth = jnp.max(node_depth)
+        internal_depth = node_depth[:num_internal]
+
+        def _upward_body(rev_idx, state):
+            mins_s, maxs_s = state
+            # rev_idx 0 -> deepest internal level, …
+            level = max_depth - as_index(1) - as_index(rev_idx)
+
+            # Mask: which internal nodes sit at this level?
+            at_level = internal_depth == level
+
+            # Merge children bounds (computed for ALL internal nodes but
+            # only applied where at_level is True).
+            child_min = jnp.minimum(mins_s[left_child], mins_s[right_child])
+            child_max = jnp.maximum(maxs_s[left_child], maxs_s[right_child])
+
+            mins_s = mins_s.at[:num_internal].set(
+                jnp.where(at_level[:, None], child_min, mins_s[:num_internal])
+            )
+            maxs_s = maxs_s.at[:num_internal].set(
+                jnp.where(at_level[:, None], child_max, maxs_s[:num_internal])
+            )
+            return mins_s, maxs_s
+
+        # fori_loop accepts traced bounds; extra iterations where no node
+        # matches a negative level are harmless no-ops.
+        num_internal_levels = jnp.maximum(max_depth, as_index(0))
+        mins, maxs = lax.fori_loop(0, num_internal_levels, _upward_body, (mins, maxs))
 
     centers = 0.5 * (mins + maxs)
     half_extents = 0.5 * (maxs - mins)

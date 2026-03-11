@@ -503,20 +503,6 @@ def build_fixed_depth_tree(
     leaf_codes = jnp.asarray(refined_codes_np, dtype=jnp.uint64)
     leaf_depths = jnp.asarray(refined_depths_np, dtype=INDEX_DTYPE)
 
-    # Enforce fixed-depth leaf occupancy contract whenever host values are
-    # available (non-traced path).
-    try:
-        max_leaf_particles = int(jnp.max(leaf_ends - leaf_starts).item())
-        if max_leaf_particles > int(target_leaf_particles):
-            raise ValueError(
-                "fixed-depth tree exceeded target_leaf_particles: "
-                f"max_leaf_particles={max_leaf_particles} > "
-                f"target_leaf_particles={int(target_leaf_particles)}"
-            )
-    except TypeError:
-        # Under tracing/JIT we may not be able to materialize host scalars.
-        pass
-
     return _build_tree_from_leaf_partitions(
         positions,
         masses,
@@ -909,29 +895,32 @@ def _build_tree_from_leaf_partitions(
     )
     node_ranges = node_ranges.at[num_internal:].set(leaf_ranges)
 
-    node_level = jnp.full((total_nodes,), -1, dtype=INDEX_DTYPE)
-    node_level = node_level.at[0].set(as_index(0))
+    # Derive node depths via pointer doubling.  Each node maintains a
+    # shortcut pointer and accumulated distance.  On each round the
+    # shortcut doubles its reach, converging in O(log depth) rounds.
+    parent_safe = jnp.where(parent >= 0, parent, as_index(0))
+    is_root = parent < 0
+    init_dist = jnp.where(is_root, as_index(0), as_index(1))
+    init_shortcut = jnp.where(
+        is_root,
+        jnp.arange(total_nodes, dtype=INDEX_DTYPE),
+        parent_safe,
+    )
 
-    def propagate_level(idx, level_arr):
-        current_level = level_arr[idx]
+    def _depth_cond(state):
+        _sc, _d, changed = state
+        return changed
 
-        def assign_child(child_idx, arr):
-            def set_level(ci):
-                return arr.at[ci].set(current_level + as_index(1))
+    def _depth_body(state):
+        sc, d, _changed = state
+        new_d = d + d[sc]
+        new_sc = sc[sc]
+        changed = jnp.any(new_sc != sc)
+        return new_sc, new_d, changed
 
-            return lax.cond(
-                child_idx >= 0,
-                set_level,
-                lambda _: arr,
-                child_idx,
-            )
-
-        arr = level_arr
-        arr = assign_child(left_child[idx], arr)
-        arr = assign_child(right_child[idx], arr)
-        return arr
-
-    node_level = lax.fori_loop(0, num_internal, propagate_level, node_level)
+    _, node_level, _ = lax.while_loop(
+        _depth_cond, _depth_body, (init_shortcut, init_dist, jnp.bool_(True))
+    )
 
     max_level = jnp.max(node_level)
     num_levels = max_level + as_index(1)

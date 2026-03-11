@@ -19,6 +19,7 @@ class TraversalResult:
     interaction_offsets: Array
     interaction_sources: Array
     interaction_targets: Array
+    interaction_tags: Array
     interaction_counts: Array
     neighbor_offsets: Array
     neighbor_indices: Array
@@ -41,6 +42,7 @@ def traversal_result_from_expanse(result: DualTreeWalkResult) -> TraversalResult
         interaction_offsets=result.interaction_offsets,
         interaction_sources=result.interaction_sources,
         interaction_targets=result.interaction_targets,
+        interaction_tags=result.interaction_tags,
         interaction_counts=result.interaction_counts,
         neighbor_offsets=result.neighbor_offsets,
         neighbor_indices=result.neighbor_indices,
