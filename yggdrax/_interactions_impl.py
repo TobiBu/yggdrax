@@ -1254,7 +1254,9 @@ def _dual_tree_walk_impl(
                     fwd_near_slot,
                     as_index(max_neighbors_per_leaf - 1),
                 )
-                neighbor_buffer_c = neighbor_buffer_c.at[fwd_near_row, fwd_near_col].set(
+                neighbor_buffer_c = neighbor_buffer_c.at[
+                    fwd_near_row, fwd_near_col
+                ].set(
                     jnp.where(fwd_near_ok, near_src_nodes, as_index(-1)),
                     mode="drop",
                 )
@@ -1281,7 +1283,9 @@ def _dual_tree_walk_impl(
                     bwd_near_slot,
                     as_index(max_neighbors_per_leaf - 1),
                 )
-                neighbor_buffer_c = neighbor_buffer_c.at[bwd_near_row, bwd_near_col].set(
+                neighbor_buffer_c = neighbor_buffer_c.at[
+                    bwd_near_row, bwd_near_col
+                ].set(
                     jnp.where(bwd_near_ok, near_tgt_nodes, as_index(-1)),
                     mode="drop",
                 )
