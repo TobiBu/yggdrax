@@ -128,6 +128,22 @@ topology contracts:
 Contract details and required/optional fields are documented in
 `docs/backend_contract.md`.
 
+## Build And Traversal Configs
+
+Public config dataclasses provide a stable way to reuse tuned settings across
+repeated builds and traversals:
+
+- `TreeBuildConfig`: adaptive radix-tree settings (`leaf_size`,
+  `return_reordered`, reusable workspace handling)
+- `FixedDepthTreeBuildConfig`: fixed-depth tree settings, including local
+  Morton refinement controls
+- `DualTreeTraversalConfig`: traversal queue, block size, interaction capacity,
+  and neighbor capacity
+
+When a `config=...` object is passed to `build_tree(...)` or
+`build_fixed_depth_tree(...)`, it takes precedence over the equivalent
+individual keyword arguments.
+
 Conformance tests:
 
 ```bash

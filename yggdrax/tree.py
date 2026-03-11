@@ -24,7 +24,14 @@ reorder_particles_by_indices = _tree_impl.reorder_particles_by_indices
 
 @dataclass(frozen=True)
 class TreeBuildConfig:
-    """Resolved options for standard LBVH tree construction."""
+    """Resolved options for standard LBVH tree construction.
+
+    Attributes:
+        leaf_size: Maximum particles per Morton leaf.
+        return_reordered: Whether to return Morton-sorted particle arrays.
+        workspace: Optional reusable radix workspace.
+        return_workspace: Whether to return the workspace alongside the tree.
+    """
 
     leaf_size: int = 8
     return_reordered: bool = False
@@ -34,7 +41,19 @@ class TreeBuildConfig:
 
 @dataclass(frozen=True)
 class FixedDepthTreeBuildConfig:
-    """Resolved options for fixed-depth tree construction."""
+    """Resolved options for fixed-depth tree construction.
+
+    Attributes:
+        target_leaf_particles: Target occupancy used to resolve Morton depth.
+        return_reordered: Whether to return Morton-sorted particle arrays.
+        workspace: Optional reusable radix workspace.
+        return_workspace: Whether to return the workspace alongside the tree.
+        max_depth: Optional upper bound on Morton depth.
+        refine_local: Whether to locally refine elongated Morton buckets.
+        max_refine_levels: Maximum extra local refinement depth.
+        aspect_threshold: Axis-aligned aspect ratio threshold for refinement.
+        min_refined_leaf_particles: Smallest locally refined leaf occupancy.
+    """
 
     target_leaf_particles: int = 32
     return_reordered: bool = False
@@ -53,7 +72,11 @@ TreeBuildMode = Literal["adaptive", "fixed_depth"]
 
 @dataclass(frozen=True)
 class TreeBuildRequest:
-    """Common request object passed to registered tree builders."""
+    """Common request object passed to registered tree builders.
+
+    Registered builders receive a fully normalized request so wrapper code can
+    share one dispatch path across radix and backend-provided tree families.
+    """
 
     positions: Array
     masses: Array
@@ -204,6 +227,37 @@ class Tree:
 
 
 @dataclass(frozen=True)
+class _ResolvedTreeBuildOptions:
+    """Internal normalized options shared by public tree wrappers."""
+
+    return_reordered: bool
+    return_workspace: bool
+    workspace: Optional[RadixTreeWorkspace]
+
+
+def _resolve_tree_build_options(
+    *,
+    config: Optional[TreeBuildConfig | FixedDepthTreeBuildConfig],
+    return_reordered: bool,
+    workspace: Optional[RadixTreeWorkspace],
+    return_workspace: bool,
+) -> _ResolvedTreeBuildOptions:
+    """Resolve wrapper flags while preserving explicit config precedence."""
+
+    if config is None:
+        return _ResolvedTreeBuildOptions(
+            return_reordered=return_reordered,
+            return_workspace=return_workspace,
+            workspace=workspace,
+        )
+    return _ResolvedTreeBuildOptions(
+        return_reordered=config.return_reordered,
+        return_workspace=config.return_workspace,
+        workspace=config.workspace,
+    )
+
+
+@dataclass(frozen=True)
 class RadixTree(Tree):
     """Concrete radix-tree container implementing the generic Tree contract."""
 
@@ -332,6 +386,8 @@ class KDParticleTree(Tree):
 
     @property
     def tree_type(self) -> TreeType:
+        """Tree-family identifier for this concrete tree."""
+
         return "kdtree"
 
     @classmethod
@@ -732,24 +788,33 @@ def build_tree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an LBVH tree, inferring bounds when not provided."""
+    """Build an LBVH tree, inferring bounds when not provided.
 
-    cfg = config or TreeBuildConfig()
+    Passing ``config`` overrides the individual keyword flags so callers can
+    reuse one validated options object across repeated builds.
+    """
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
     result = _tree_impl.build_tree(
         positions,
         masses,
         bounds_resolved,
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        leaf_size=cfg.leaf_size if config else leaf_size,
-        workspace=cfg.workspace if config else workspace,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        leaf_size=config.leaf_size if config is not None else leaf_size,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
     )
     return _wrap_radix_public_result(
         result=result,
         build_mode="adaptive",
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
     )
 
 
@@ -767,22 +832,27 @@ def build_tree_jit(
 ):
     """JIT build for an LBVH tree, inferring bounds when not provided."""
 
-    cfg = config or TreeBuildConfig()
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
     result = _tree_impl.build_tree_jit(
         positions,
         masses,
         bounds_resolved,
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        leaf_size=cfg.leaf_size if config else leaf_size,
-        workspace=cfg.workspace if config else workspace,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        leaf_size=config.leaf_size if config is not None else leaf_size,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
     )
     return _wrap_radix_public_result(
         result=result,
         build_mode="adaptive",
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
     )
 
 
@@ -803,33 +873,50 @@ def build_fixed_depth_tree(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """Build a fixed-depth tree, inferring bounds when not provided."""
+    """Build a fixed-depth tree, inferring bounds when not provided.
 
-    cfg = config or FixedDepthTreeBuildConfig()
+    Passing ``config`` overrides the individual keyword flags so callers can
+    package build settings once and reuse them consistently.
+    """
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
     result = _tree_impl.build_fixed_depth_tree(
         positions,
         masses,
         bounds_resolved,
         target_leaf_particles=(
-            cfg.target_leaf_particles if config else target_leaf_particles
+            config.target_leaf_particles
+            if config is not None
+            else target_leaf_particles
         ),
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        workspace=cfg.workspace if config else workspace,
-        return_workspace=cfg.return_workspace if config else return_workspace,
-        max_depth=cfg.max_depth if config else max_depth,
-        refine_local=cfg.refine_local if config else refine_local,
-        max_refine_levels=cfg.max_refine_levels if config else max_refine_levels,
-        aspect_threshold=cfg.aspect_threshold if config else aspect_threshold,
+        return_reordered=resolved.return_reordered,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+        max_depth=config.max_depth if config is not None else max_depth,
+        refine_local=config.refine_local if config is not None else refine_local,
+        max_refine_levels=(
+            config.max_refine_levels if config is not None else max_refine_levels
+        ),
+        aspect_threshold=(
+            config.aspect_threshold if config is not None else aspect_threshold
+        ),
         min_refined_leaf_particles=(
-            cfg.min_refined_leaf_particles if config else min_refined_leaf_particles
+            config.min_refined_leaf_particles
+            if config is not None
+            else min_refined_leaf_particles
         ),
     )
     return _wrap_radix_public_result(
         result=result,
         build_mode="fixed_depth",
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
     )
 
 
@@ -852,31 +939,44 @@ def build_fixed_depth_tree_jit(
 ):
     """JIT build for a fixed-depth tree, inferring bounds when not provided."""
 
-    cfg = config or FixedDepthTreeBuildConfig()
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
     result = _tree_impl.build_fixed_depth_tree_jit(
         positions,
         masses,
         bounds_resolved,
         target_leaf_particles=(
-            cfg.target_leaf_particles if config else target_leaf_particles
+            config.target_leaf_particles
+            if config is not None
+            else target_leaf_particles
         ),
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        workspace=cfg.workspace if config else workspace,
-        return_workspace=cfg.return_workspace if config else return_workspace,
-        max_depth=cfg.max_depth if config else max_depth,
-        refine_local=cfg.refine_local if config else refine_local,
-        max_refine_levels=cfg.max_refine_levels if config else max_refine_levels,
-        aspect_threshold=cfg.aspect_threshold if config else aspect_threshold,
+        return_reordered=resolved.return_reordered,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+        max_depth=config.max_depth if config is not None else max_depth,
+        refine_local=config.refine_local if config is not None else refine_local,
+        max_refine_levels=(
+            config.max_refine_levels if config is not None else max_refine_levels
+        ),
+        aspect_threshold=(
+            config.aspect_threshold if config is not None else aspect_threshold
+        ),
         min_refined_leaf_particles=(
-            cfg.min_refined_leaf_particles if config else min_refined_leaf_particles
+            config.min_refined_leaf_particles
+            if config is not None
+            else min_refined_leaf_particles
         ),
     )
     return _wrap_radix_public_result(
         result=result,
         build_mode="fixed_depth",
-        return_reordered=cfg.return_reordered if config else return_reordered,
-        return_workspace=cfg.return_workspace if config else return_workspace,
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
     )
 
 

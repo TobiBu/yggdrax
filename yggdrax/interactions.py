@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from . import _interactions_impl
 from ._interactions_impl import (
-    CompactTaggedFarPairs,
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
+    CompactTaggedFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
@@ -21,6 +21,12 @@ from ._interactions_impl import (
 )
 from .geometry import TreeGeometry
 from .tree import resolve_tree_topology
+
+
+def _call_with_topology(func, tree: object, /, *args, **kwargs):
+    """Resolve tree containers to topology payloads before dispatch."""
+
+    return func(resolve_tree_topology(tree), *args, **kwargs)
 
 
 def build_well_separated_interactions(
@@ -40,9 +46,9 @@ def build_well_separated_interactions(
 ) -> NodeInteractionList:
     """Construct far-field interaction lists from a dual-tree walk."""
 
-    topology = resolve_tree_topology(tree)
-    return _interactions_impl.build_well_separated_interactions(
-        topology,
+    return _call_with_topology(
+        _interactions_impl.build_well_separated_interactions,
+        tree,
         geometry,
         theta=theta,
         max_interactions_per_node=max_interactions_per_node,
@@ -75,9 +81,9 @@ def build_leaf_neighbor_lists(
 ) -> NodeNeighborList:
     """Construct near-field neighbor lists from a dual-tree walk."""
 
-    topology = resolve_tree_topology(tree)
-    return _interactions_impl.build_leaf_neighbor_lists(
-        topology,
+    return _call_with_topology(
+        _interactions_impl.build_leaf_neighbor_lists,
+        tree,
         geometry,
         theta=theta,
         max_neighbors_per_leaf=max_neighbors_per_leaf,
@@ -121,9 +127,9 @@ def build_interactions_and_neighbors(
     ``DualTreeWalkResult.interaction_tags`` when ``return_result=True``.
     """
 
-    topology = resolve_tree_topology(tree)
-    return _interactions_impl.build_interactions_and_neighbors(
-        topology,
+    return _call_with_topology(
+        _interactions_impl.build_interactions_and_neighbors,
+        tree,
         geometry,
         theta=theta,
         max_interactions_per_node=max_interactions_per_node,
@@ -152,9 +158,9 @@ def build_grouped_interactions_from_pairs(
 ):
     """Group interaction pairs by tree level for level-major processing."""
 
-    topology = resolve_tree_topology(tree)
-    return _interactions_impl.build_grouped_interactions_from_pairs(
-        topology,
+    return _call_with_topology(
+        _interactions_impl.build_grouped_interactions_from_pairs,
+        tree,
         geometry,
         interaction_sources,
         interaction_targets,
@@ -173,9 +179,9 @@ def diagnose_leaf_neighbor_growth(
 ) -> dict:
     """Return a compact report of highest per-leaf neighbor counts."""
 
-    topology = resolve_tree_topology(tree)
-    return _interactions_impl.diagnose_leaf_neighbor_growth(
-        topology,
+    return _call_with_topology(
+        _interactions_impl.diagnose_leaf_neighbor_growth,
+        tree,
         geometry,
         theta=theta,
         max_neighbors_per_leaf=max_neighbors_per_leaf,

@@ -90,6 +90,183 @@ _MAX_MORTON_LEVEL = 21  # 21 * 3 = 63 bits of Morton depth
 # ---------------------------------------------
 
 
+def _refine_leaf_partitions_by_aspect(
+    pos_sorted_np: np.ndarray,
+    sorted_codes_np: np.ndarray,
+    leaf_starts_np: np.ndarray,
+    leaf_ends_np: np.ndarray,
+    leaf_codes_np: np.ndarray,
+    leaf_depths_np: np.ndarray,
+    current_depth: int,
+    max_refine_levels: int = 2,
+    aspect_threshold: float = 8.0,
+    min_leaf_particles: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Refine Morton leaf partitions locally where aspect ratio is high."""
+
+    new_starts: list[int] = []
+    new_ends: list[int] = []
+    new_codes: list[np.uint64] = []
+    new_depths: list[int] = []
+
+    queue = deque[tuple[int, int, np.uint64, int]]()
+    for i in range(leaf_starts_np.shape[0]):
+        queue.append(
+            (
+                int(leaf_starts_np[i]),
+                int(leaf_ends_np[i]),
+                np.uint64(leaf_codes_np[i]),
+                int(leaf_depths_np[i]),
+            )
+        )
+
+    eps = 1e-12
+    while queue:
+        s, e, base_code, depth_level = queue.popleft()
+        if e <= s:
+            # Preserve empty leaves so Morton layout remains stable.
+            new_starts.append(s)
+            new_ends.append(e)
+            new_codes.append(base_code)
+            new_depths.append(depth_level)
+            continue
+
+        pts = pos_sorted_np[s:e]
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        extents = maxs - mins
+        min_axis = float(max(extents.min(), eps))
+        max_axis = float(extents.max())
+        aspect = max_axis / min_axis if min_axis > 0 else float("inf")
+
+        exceeded_levels = (depth_level - current_depth) >= max_refine_levels
+        if aspect <= aspect_threshold or exceeded_levels:
+            new_starts.append(s)
+            new_ends.append(e)
+            new_codes.append(base_code)
+            new_depths.append(depth_level)
+            continue
+
+        entry_shift = max(0, 64 - depth_level * 3)
+        child_depth = depth_level + 1
+        child_shift = entry_shift - 3
+        if child_shift < 0:
+            new_starts.append(s)
+            new_ends.append(e)
+            new_codes.append(base_code)
+            new_depths.append(depth_level)
+            continue
+
+        sub_ids = (
+            (sorted_codes_np[s:e] >> np.uint64(child_shift)) & np.uint64(0x7)
+        ).astype(np.int64)
+        counts = np.bincount(sub_ids, minlength=8)
+        if int(np.count_nonzero(counts)) <= 1:
+            new_starts.append(s)
+            new_ends.append(e)
+            new_codes.append(base_code)
+            new_depths.append(depth_level)
+            continue
+
+        offset = s
+        for sub in range(8):
+            cnt = int(counts[sub])
+            if cnt == 0:
+                continue
+            child_s = offset
+            child_e = offset + cnt
+            child_code = np.uint64(
+                base_code | (np.uint64(sub) << np.uint64(child_shift))
+            )
+            if cnt <= min_leaf_particles:
+                new_starts.append(child_s)
+                new_ends.append(child_e)
+                new_codes.append(child_code)
+                new_depths.append(child_depth)
+            else:
+                queue.append((child_s, child_e, child_code, child_depth))
+            offset = child_e
+
+    if len(new_starts) == 0:
+        return leaf_starts_np, leaf_ends_np, leaf_codes_np, leaf_depths_np
+
+    starts_arr = np.asarray(new_starts, dtype=np.int64)
+    order = np.argsort(starts_arr)
+    return (
+        starts_arr[order],
+        np.asarray(new_ends, dtype=np.int64)[order],
+        np.asarray(new_codes, dtype=np.uint64)[order],
+        np.asarray(new_depths, dtype=np.int64)[order],
+    )
+
+
+def _maybe_refine_fixed_depth_leaf_partitions(
+    *,
+    positions: Array,
+    sorted_indices: Array,
+    sorted_codes: Array,
+    leaf_starts: Array,
+    leaf_ends: Array,
+    leaf_codes: Array,
+    leaf_depths: Array,
+    resolved_depth: int,
+    refine_local: bool,
+    max_refine_levels: int,
+    aspect_threshold: float,
+    min_refined_leaf_particles: int,
+) -> tuple[Array, Array, Array, Array]:
+    """Run host-side local refinement only when eager execution allows it.
+
+    The eager path fetches all required arrays with a single ``device_get`` so
+    the refinement helper does not trigger multiple host/device synchronizations.
+    Traced/JIT execution returns the original JAX partitions unchanged.
+    """
+
+    if not refine_local or isinstance(positions, jax.core.Tracer):
+        return leaf_starts, leaf_ends, leaf_codes, leaf_depths
+
+    try:
+        (
+            pos_sorted_np,
+            sorted_codes_np,
+            leaf_starts_np,
+            leaf_ends_np,
+            leaf_codes_np,
+            (leaf_depths_np),
+        ) = jax.device_get(
+            (
+                positions[sorted_indices],
+                sorted_codes,
+                leaf_starts,
+                leaf_ends,
+                leaf_codes,
+                leaf_depths,
+            )
+        )
+        refined = _refine_leaf_partitions_by_aspect(
+            pos_sorted_np,
+            np.asarray(sorted_codes_np, dtype=np.uint64),
+            np.asarray(leaf_starts_np, dtype=np.int64),
+            np.asarray(leaf_ends_np, dtype=np.int64),
+            np.asarray(leaf_codes_np, dtype=np.uint64),
+            np.asarray(leaf_depths_np, dtype=np.int64),
+            resolved_depth,
+            max_refine_levels=max_refine_levels,
+            aspect_threshold=aspect_threshold,
+            min_leaf_particles=min_refined_leaf_particles,
+        )
+    except (TypeError, ValueError):
+        return leaf_starts, leaf_ends, leaf_codes, leaf_depths
+
+    refined_starts_np, refined_ends_np, refined_codes_np, refined_depths_np = refined
+    return (
+        jnp.asarray(refined_starts_np, dtype=INDEX_DTYPE),
+        jnp.asarray(refined_ends_np, dtype=INDEX_DTYPE),
+        jnp.asarray(refined_codes_np, dtype=jnp.uint64),
+        jnp.asarray(refined_depths_np, dtype=INDEX_DTYPE),
+    )
+
+
 def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     """
     Count leading zeros for uint64 values (returns int32).
@@ -273,235 +450,24 @@ def build_fixed_depth_tree(
 
     # Post-process leaf partitions to avoid pathological aspect ratios by
     # locally refining Morton buckets where leaves are highly elongated.
-    # This preserves Morton contiguity and keeps downstream LBVH logic intact.
-    # Prepare JAX-side reordered slices; convert to host NumPy only when
-    # running the host-based refinement helper (and when not tracing).
-    pos_sorted_jax = positions[sorted_indices]
-    sorted_codes_jax = sorted_codes
-    leaf_starts_jax = leaf_starts
-    leaf_ends_jax = leaf_ends
-    leaf_codes_jax = leaf_codes
-    leaf_depths_jax = leaf_depths
-
-    def _refine_leaf_partitions_by_aspect(
-        pos_sorted_np: np.ndarray,
-        sorted_codes_np: np.ndarray,
-        leaf_starts_np: np.ndarray,
-        leaf_ends_np: np.ndarray,
-        leaf_codes_np: np.ndarray,
-        leaf_depths_np: np.ndarray,
-        current_depth: int,
-        max_refine_levels: int = 2,
-        aspect_threshold: float = 8.0,
-        min_leaf_particles: int = 2,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Refine Morton leaf partitions locally where aspect ratio is high.
-
-        Parameters are NumPy arrays on host. Returns refined (starts, ends,
-        codes, depths) arrays also as NumPy arrays.
-        """
-
-        codes_all = sorted_codes_np
-
-        new_starts: list[int] = []
-        new_ends: list[int] = []
-        new_codes: list[np.uint64] = []
-        new_depths: list[int] = []
-
-        # Queue items are tuples (s, e, base_code, depth)
-        queue = deque[tuple[int, int, np.uint64, int]]()
-        for i in range(leaf_starts_np.shape[0]):
-            s = int(leaf_starts_np[i])
-            e = int(leaf_ends_np[i])
-            base_code = np.uint64(leaf_codes_np[i])
-            depth_val = (
-                int(leaf_depths_np[i])
-                if leaf_depths_np is not None
-                else int(current_depth)
-            )
-            queue.append((s, e, base_code, depth_val))
-
-        eps = 1e-12
-        while queue:
-            s, e, base_code, depth_level = queue.popleft()
-            if e <= s:
-                # Keep zero-particle leaves so downstream consumers retain
-                # the original Morton layout and near-field neighbour lists
-                # continue to include placeholder entries for empty cells.
-                new_starts.append(s)
-                new_ends.append(e)
-                new_codes.append(base_code)
-                new_depths.append(depth_level)
-                continue
-            pts = pos_sorted_np[s:e]
-            mins = pts.min(axis=0)
-            maxs = pts.max(axis=0)
-            extents = maxs - mins
-            min_axis = float(max(extents.min(), eps))
-            max_axis = float(extents.max())
-            aspect = max_axis / min_axis if min_axis > 0 else float("inf")
-
-            # If aspect is acceptable or we've exhausted refinement levels,
-            # keep this partition.
-            exceeded_levels = (depth_level - current_depth) >= max_refine_levels
-            if aspect <= aspect_threshold or exceeded_levels:
-                new_starts.append(s)
-                new_ends.append(e)
-                new_codes.append(base_code)
-                new_depths.append(depth_level)
-                continue
-
-            # Attempt one level of Morton subdivision for this leaf.
-            entry_shift = max(0, 64 - depth_level * 3)
-            child_depth = depth_level + 1
-            child_shift = entry_shift - 3
-            if child_shift < 0:
-                # can't subdivide further in Morton bits; keep as-is
-                new_starts.append(s)
-                new_ends.append(e)
-                new_codes.append(base_code)
-                new_depths.append(depth_level)
-                continue
-
-            # compute 3-bit sub-id for each particle within this leaf
-            sub_ids = (
-                (codes_all[s:e] >> np.uint64(child_shift)) & np.uint64(0x7)
-            ).astype(np.int64)
-            # bincount (length 8) gives counts for child subcells
-            # in Morton order
-            counts = np.bincount(sub_ids, minlength=8)
-            # If subdivision fails to distribute particles across multiple
-            # child buckets, keep the original partition to avoid inventing
-            # deeper Morton depths that do not correspond to actual tree
-            # nodes. This prevents downstream geometry from assigning
-            # overly tight bounds and retains consistency with the radix
-            # tree structure.
-            if int(np.count_nonzero(counts)) <= 1:
-                new_starts.append(s)
-                new_ends.append(e)
-                new_codes.append(base_code)
-                new_depths.append(depth_level)
-                continue
-            # Build child ranges for non-empty bins
-            offset = s
-            for sub in range(8):
-                cnt = int(counts[sub])
-                if cnt == 0:
-                    continue
-                child_s = offset
-                child_e = offset + cnt
-                child_code = np.uint64(
-                    base_code | (np.uint64(sub) << np.uint64(child_shift))
-                )
-                if cnt <= min_leaf_particles:
-                    new_starts.append(child_s)
-                    new_ends.append(child_e)
-                    new_codes.append(child_code)
-                    new_depths.append(child_depth)
-                    offset = child_e
-                    continue
-                # push child back into queue for further refinement if needed
-                queue.append((child_s, child_e, child_code, child_depth))
-                offset = child_e
-
-        if len(new_starts) == 0:
-            # fallback to original partitions
-            return leaf_starts_np, leaf_ends_np, leaf_codes_np, leaf_depths_np
-
-        starts_arr = np.asarray(new_starts, dtype=np.int64)
-        ends_arr = np.asarray(new_ends, dtype=np.int64)
-        codes_arr = np.asarray(new_codes, dtype=np.uint64)
-        depths_arr = np.asarray(new_depths, dtype=np.int64)
-        order = np.argsort(starts_arr)
-
-        return (
-            starts_arr[order],
-            ends_arr[order],
-            codes_arr[order],
-            depths_arr[order],
+    # Host/device conversion is only attempted in eager mode, and eager
+    # refinement pulls all required arrays back in a single device_get call.
+    leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
+        _maybe_refine_fixed_depth_leaf_partitions(
+            positions=positions,
+            sorted_indices=sorted_indices,
+            sorted_codes=sorted_codes,
+            leaf_starts=leaf_starts,
+            leaf_ends=leaf_ends,
+            leaf_codes=leaf_codes,
+            leaf_depths=leaf_depths,
+            resolved_depth=resolved_depth,
+            refine_local=refine_local,
+            max_refine_levels=max_refine_levels,
+            aspect_threshold=aspect_threshold,
+            min_refined_leaf_particles=min_refined_leaf_particles,
         )
-
-    # Run the local refinement pass. The refinement helper uses NumPy and
-    # performs host-side array manipulation, so avoid invoking it when this
-    # function is being traced by JAX (e.g., when JIT-compiling). In traced
-    # contexts we simply skip refinement to keep the function JAX-traceable.
-    if refine_local:
-        # Detect whether `positions` is a JAX Tracer; if so, skip host
-        # NumPy conversion and refinement.
-        _is_tracing = isinstance(positions, jax.core.Tracer)
-
-        if _is_tracing:
-            # Under tracing/JIT we cannot call np.asarray on traced arrays.
-            # Skip the local refinement and use the original JAX partitions.
-            refined_starts_np, refined_ends_np, refined_codes_np = (
-                leaf_starts_jax,
-                leaf_ends_jax,
-                leaf_codes_jax,
-            )
-            refined_depths_np = leaf_depths_jax
-        else:
-            (
-                refined_starts_np,
-                refined_ends_np,
-                refined_codes_np,
-                refined_depths_np,
-            ) = (
-                leaf_starts_jax,
-                leaf_ends_jax,
-                leaf_codes_jax,
-                leaf_depths_jax,
-            )
-            try:
-                # Convert required arrays to host NumPy and run the refinement
-                pos_sorted = np.asarray(pos_sorted_jax)
-                sorted_codes_np = np.asarray(sorted_codes_jax, dtype=np.uint64)
-                leaf_starts_np = np.asarray(leaf_starts_jax, dtype=np.int64)
-                leaf_ends_np = np.asarray(leaf_ends_jax, dtype=np.int64)
-                leaf_codes_np = np.asarray(leaf_codes_jax, dtype=np.uint64)
-                leaf_depths_np = np.asarray(leaf_depths_jax, dtype=np.int64)
-
-                (
-                    refined_starts_np,
-                    refined_ends_np,
-                    refined_codes_np,
-                    refined_depths_np,
-                ) = _refine_leaf_partitions_by_aspect(
-                    pos_sorted,
-                    sorted_codes_np,
-                    leaf_starts_np,
-                    leaf_ends_np,
-                    leaf_codes_np,
-                    leaf_depths_np,
-                    resolved_depth,
-                    max_refine_levels=max_refine_levels,
-                    aspect_threshold=aspect_threshold,
-                    min_leaf_particles=min_refined_leaf_particles,
-                )
-            except (TypeError, ValueError):
-                # If any unexpected failure occurs, fall back to original
-                # partitions
-                pass
-    else:
-        # No refinement requested; use the original JAX-side partitions so
-        # later conversions to JAX arrays work consistently whether we ran
-        # the host-based refinement or not.
-        (
-            refined_starts_np,
-            refined_ends_np,
-            refined_codes_np,
-            refined_depths_np,
-        ) = (
-            leaf_starts_jax,
-            leaf_ends_jax,
-            leaf_codes_jax,
-            leaf_depths_jax,
-        )
-
-    # Convert back to jnp arrays for downstream processing
-    leaf_starts = jnp.asarray(refined_starts_np, dtype=INDEX_DTYPE)
-    leaf_ends = jnp.asarray(refined_ends_np, dtype=INDEX_DTYPE)
-    leaf_codes = jnp.asarray(refined_codes_np, dtype=jnp.uint64)
-    leaf_depths = jnp.asarray(refined_depths_np, dtype=INDEX_DTYPE)
+    )
 
     return _build_tree_from_leaf_partitions(
         positions,

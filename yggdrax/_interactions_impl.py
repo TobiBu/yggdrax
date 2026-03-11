@@ -11,6 +11,7 @@ in the number of tree nodes.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from typing import List, Literal, NamedTuple, Optional, Union
@@ -114,6 +115,12 @@ def _count_refine_pairs_single(
     return result
 
 
+_COUNT_REFINE_VM = jax.vmap(
+    _count_refine_pairs_single,
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+)
+
+
 def _next_power_of_two(value: int) -> int:
     value = max(1, int(value))
     return 1 << (value - 1).bit_length()
@@ -130,7 +137,8 @@ class DualTreeTraversalConfig:
 
 
 _GLOBAL_DUAL_TREE_CONFIG: Optional[DualTreeTraversalConfig] = None
-_DUAL_TREE_QUEUE_CACHE: dict[tuple, int] = {}
+_MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES = 128
+_DUAL_TREE_QUEUE_CACHE: "OrderedDict[tuple, int]" = OrderedDict()
 
 
 def set_default_dual_tree_config(
@@ -158,6 +166,25 @@ def _resolve_dual_tree_config(
     if config is not None:
         return config
     return _GLOBAL_DUAL_TREE_CONFIG
+
+
+def _get_cached_queue_capacity(cache_key: tuple) -> Optional[int]:
+    """Return a cached queue capacity and refresh its recency ordering."""
+
+    cached = _DUAL_TREE_QUEUE_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    _DUAL_TREE_QUEUE_CACHE.move_to_end(cache_key)
+    return int(cached)
+
+
+def _store_cached_queue_capacity(cache_key: tuple, queue_capacity: int) -> None:
+    """Store a queue capacity while bounding cache growth."""
+
+    _DUAL_TREE_QUEUE_CACHE[cache_key] = int(queue_capacity)
+    _DUAL_TREE_QUEUE_CACHE.move_to_end(cache_key)
+    while len(_DUAL_TREE_QUEUE_CACHE) > _MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES:
+        _DUAL_TREE_QUEUE_CACHE.popitem(last=False)
 
 
 def _queue_candidates_bounded(
@@ -779,7 +806,6 @@ def _raise_if_true(flag, message: str) -> None:
         "pair_policy",
         "collect_far",
         "collect_near",
-        "process_block",
     ),
 )
 def _dual_tree_walk_impl(
@@ -1586,7 +1612,6 @@ def _dual_tree_walk_impl(
         "pair_policy",
         "collect_far",
         "collect_near",
-        "process_block",
     ),
 )
 def _dual_tree_walk_count_impl(
@@ -1857,13 +1882,8 @@ def _dual_tree_walk_count_impl(
                 near_counts,
             )
 
-        # refine: push refined pairs onto stack
-        refine_vm = jax.vmap(
-            _count_refine_pairs_single,
-            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        )
-
-        refine_pairs = refine_vm(
+        # refine: push refined pairs onto the next wavefront
+        refine_pairs = _COUNT_REFINE_VM(
             targets,
             sources,
             same_node,
@@ -2011,7 +2031,7 @@ def _result_to_interactions(
 
 
 def _result_to_neighbors(
-    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs]
+    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
 ) -> NodeNeighborList:
     traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
@@ -2090,7 +2110,7 @@ def _run_dual_tree_walk_raw(
             bool(collect_near),
             str(mac_type),
         )
-        cached_q = _DUAL_TREE_QUEUE_CACHE.get(queue_cache_key)
+        cached_q = _get_cached_queue_capacity(queue_cache_key)
         if cached_q is not None:
             queue_candidates = [int(cached_q)]
         else:
@@ -2353,7 +2373,7 @@ def _run_dual_tree_walk_raw(
 
         if success:
             if queue_cache_key is not None:
-                _DUAL_TREE_QUEUE_CACHE[queue_cache_key] = int(queue_capacity)
+                _store_cached_queue_capacity(queue_cache_key, queue_capacity)
             break
     else:
         assert result is not None
