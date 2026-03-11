@@ -441,6 +441,28 @@ class DualTreeWalkResult(NamedTuple):
     refine_decisions: Array
 
 
+class _DualTreeWalkRawOutputs(NamedTuple):
+    """Raw dual-tree walk payload before caller-specific compaction."""
+
+    interaction_offsets: Array
+    interaction_sources: Array
+    interaction_targets: Array
+    interaction_tags: Array
+    interaction_counts: Array
+    neighbor_offsets: Array
+    neighbor_indices: Array
+    neighbor_counts: Array
+    leaf_indices: Array
+    far_pair_count: Array
+    near_pair_count: Array
+    queue_overflow: Array
+    far_overflow: Array
+    near_overflow: Array
+    accept_decisions: Array
+    near_decisions: Array
+    refine_decisions: Array
+
+
 def _default_pair_actions(
     *,
     mac_ok: Array,
@@ -1912,7 +1934,7 @@ def _dual_tree_walk_count_impl(
 
 
 def _result_to_interactions(
-    result: DualTreeWalkResult,
+    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
     tree: object,
 ) -> NodeInteractionList:
     total_nodes = int(tree.parent.shape[0])
@@ -1980,7 +2002,9 @@ def _result_to_interactions(
     )
 
 
-def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
+def _result_to_neighbors(
+    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs]
+) -> NodeNeighborList:
     traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
     neighbor_counts = jnp.asarray(result.neighbor_counts)
@@ -1997,7 +2021,7 @@ def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
     )
 
 
-def _run_dual_tree_walk(
+def _run_dual_tree_walk_raw(
     tree: object,
     geometry: TreeGeometry,
     theta: float,
@@ -2014,7 +2038,7 @@ def _run_dual_tree_walk(
     dehnen_radius_scale: float = 1.0,
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
-) -> DualTreeWalkResult:
+) -> _DualTreeWalkRawOutputs:
     # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
     tree = tree.topology if hasattr(tree, "topology") else tree
@@ -2197,7 +2221,7 @@ def _run_dual_tree_walk(
         allow_auto_interactions = False
         user_supplied_queue = True
 
-    result: Optional[DualTreeWalkResult] = None
+    result: Optional[_DualTreeWalkRawOutputs] = None
     attempt_counter = 0
 
     queue_error_msg = (
@@ -2363,6 +2387,30 @@ def _run_dual_tree_walk(
     return result
 
 
+def _raw_to_result(raw: _DualTreeWalkRawOutputs) -> DualTreeWalkResult:
+    """Wrap raw traversal payload in the public result container."""
+
+    return DualTreeWalkResult(
+        interaction_offsets=raw.interaction_offsets,
+        interaction_sources=raw.interaction_sources,
+        interaction_targets=raw.interaction_targets,
+        interaction_tags=raw.interaction_tags,
+        interaction_counts=raw.interaction_counts,
+        neighbor_offsets=raw.neighbor_offsets,
+        neighbor_indices=raw.neighbor_indices,
+        neighbor_counts=raw.neighbor_counts,
+        leaf_indices=raw.leaf_indices,
+        far_pair_count=raw.far_pair_count,
+        near_pair_count=raw.near_pair_count,
+        queue_overflow=raw.queue_overflow,
+        far_overflow=raw.far_overflow,
+        near_overflow=raw.near_overflow,
+        accept_decisions=raw.accept_decisions,
+        near_decisions=raw.near_decisions,
+        refine_decisions=raw.refine_decisions,
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def build_well_separated_interactions(
     tree: object,
@@ -2387,7 +2435,7 @@ def build_well_separated_interactions(
     sacrificing correctness for adversarial inputs.
     """
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2404,7 +2452,7 @@ def build_well_separated_interactions(
         process_block=process_block,
         retry_logger=retry_logger,
     )
-    return _result_to_interactions(result, tree)
+    return _result_to_interactions(raw, tree)
 
 
 @jaxtyped(typechecker=beartype)
@@ -2426,7 +2474,7 @@ def build_leaf_neighbor_lists(
 ) -> NodeNeighborList:
     """Construct near-field adjacency for leaf nodes via a MAC walk."""
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2443,7 +2491,7 @@ def build_leaf_neighbor_lists(
         process_block=process_block,
         retry_logger=retry_logger,
     )
-    return _result_to_neighbors(result)
+    return _result_to_neighbors(raw)
 
 
 @jaxtyped(typechecker=beartype)
@@ -2484,7 +2532,7 @@ def build_interactions_and_neighbors(
     and defaults to ``DEFAULT_PAIR_QUEUE_MULTIPLIER * num_nodes``.
     """
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2502,19 +2550,20 @@ def build_interactions_and_neighbors(
         retry_logger=retry_logger,
     )
 
-    interactions = _result_to_interactions(result, tree)
-    neighbors = _result_to_neighbors(result)
+    interactions = _result_to_interactions(raw, tree)
+    neighbors = _result_to_neighbors(raw)
     grouped = None
     if return_grouped:
-        far_total = int(result.far_pair_count)
+        far_total = int(raw.far_pair_count)
         grouped = build_grouped_interactions_from_pairs(
             tree,
             geometry,
-            result.interaction_sources[:far_total],
-            result.interaction_targets[:far_total],
+            raw.interaction_sources[:far_total],
+            raw.interaction_targets[:far_total],
             level_offsets=interactions.level_offsets,
         )
 
+    result = _raw_to_result(raw) if return_result else None
     if return_result and return_grouped:
         return interactions, neighbors, result, grouped
     if return_result:
