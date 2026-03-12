@@ -544,10 +544,7 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
     is_leaf_host = _np.array(
         [
             subtree_sizes_host[i] <= leaf_size_int
-            and (
-                i == 0
-                or subtree_sizes_host[(i - 1) // 2] > leaf_size_int
-            )
+            and (i == 0 or subtree_sizes_host[(i - 1) // 2] > leaf_size_int)
             for i in range(n)
         ]
     )
