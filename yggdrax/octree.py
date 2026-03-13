@@ -197,7 +197,14 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
         ],
         axis=0,
     )
-    oct_nodes_by_level = jnp.arange(num_nodes, dtype=INDEX_DTYPE)
+    sort_depths = jnp.where(
+        oct_valid_mask,
+        oct_node_depths,
+        jnp.asarray(_MAX_MORTON_LEVEL + 1, dtype=oct_node_depths.dtype),
+    )
+    oct_nodes_by_level = jnp.argsort(sort_depths, kind="stable").astype(
+        INDEX_DTYPE
+    )
 
     parent_depths = oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE)
     parent_codes = _prefix_code(oct_node_codes, parent_depths)
