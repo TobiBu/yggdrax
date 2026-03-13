@@ -72,6 +72,27 @@ class OctreeTopology(NamedTuple):
     radix_leaf_to_oct: jnp.ndarray
 
 
+def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
+    """Unique sortable uint64 key for (depth, code) pairs.
+
+    Maps each (depth, code) pair to a uint64 value that preserves
+    lexicographic ordering on (depth, code).  Specifically::
+
+        address = (8**depth - 1) // 7 + (code >> (63 - 3 * depth))
+
+    The first term counts all nodes in a full octree above depth ``depth``,
+    ensuring keys at different depths never overlap.  This is used to
+    enable O(n log n) parent lookup via :func:`jnp.searchsorted`.
+    """
+    depths_u64 = jnp.asarray(jnp.maximum(0, depths), dtype=jnp.uint64)  # clamp negative sentinel values (e.g. -1 padding) before uint64 cast
+    codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
+    bit_shift = jnp.uint64(_MORTON_BITS) - jnp.uint64(3) * depths_u64
+    level_prefix = jnp.right_shift(codes_u64, bit_shift)
+    pow8d = jnp.left_shift(jnp.uint64(1), jnp.uint64(3) * depths_u64)
+    level_offset = (pow8d - jnp.uint64(1)) // jnp.uint64(7)
+    return level_offset + level_prefix
+
+
 def _prefix_code(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     depths_i32 = jnp.asarray(depths, dtype=INDEX_DTYPE)
@@ -105,8 +126,9 @@ def _common_depth_from_codes(
 
 
 def _resolved_leaf_cells(topology: object) -> tuple[jnp.ndarray, jnp.ndarray]:
-    num_internal = int(getattr(topology, "num_internal_nodes"))
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
+    # Derive num_internal from the static shape (total_nodes = 2*num_leaves - 1).
+    num_internal = (node_ranges.shape[0] - 1) // 2
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
     leaf_codes_raw = jnp.asarray(getattr(topology, "leaf_codes"), dtype=jnp.uint64)
     leaf_depths_raw = jnp.asarray(getattr(topology, "leaf_depths"), dtype=INDEX_DTYPE)
@@ -130,7 +152,8 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
     num_nodes = node_ranges.shape[0]
-    num_internal = int(getattr(topology, "num_internal_nodes"))
+    # Derive num_internal from the static shape (total_nodes = 2*num_leaves - 1).
+    num_internal = (num_nodes - 1) // 2
 
     leaf_codes, leaf_depths = _resolved_leaf_cells(topology)
     node_first = morton_codes[node_ranges[:, 0]]
@@ -204,33 +227,46 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
     )
     oct_nodes_by_level = jnp.argsort(sort_depths, kind="stable").astype(INDEX_DTYPE)
 
+    # O(n log n) parent lookup: assign each valid oct node a sortable uint64
+    # address that encodes (depth, code) in a globally ordered key space, then
+    # use jnp.searchsorted to locate each node's parent in O(log n) per node.
+    # Invalid (padded) positions receive UINT64_MAX so they sort last and never
+    # match a genuine parent query.
+    _uint64_max = jnp.array(jnp.iinfo(jnp.uint64).max, dtype=jnp.uint64)
+    oct_addresses = jnp.where(
+        oct_valid_mask,
+        _oct_address(oct_node_codes, oct_node_depths),
+        _uint64_max,
+    )
     parent_depths = oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE)
     parent_codes = _prefix_code(oct_node_codes, parent_depths)
-    valid = oct_valid_mask
-    matches = (
-        valid[:, None]
-        & valid[None, :]
-        & (oct_node_depths[None, :] == parent_depths[:, None])
-        & (oct_node_codes[None, :] == parent_codes[:, None])
+    parent_addresses = _oct_address(parent_codes, parent_depths)
+    parent_pos = jnp.searchsorted(oct_addresses, parent_addresses, side="left").astype(
+        INDEX_DTYPE
     )
-    has_parent = jnp.any(matches, axis=1)
+    parent_pos_safe = jnp.minimum(
+        parent_pos, jnp.asarray(num_nodes - 1, dtype=INDEX_DTYPE)
+    )
+    address_match = oct_addresses[parent_pos_safe] == parent_addresses
     oct_parent = jnp.where(
-        valid & has_parent,
-        jnp.argmax(matches, axis=1).astype(INDEX_DTYPE),
+        oct_valid_mask
+        & (oct_node_depths > jnp.asarray(0, dtype=INDEX_DTYPE))
+        & address_match,
+        parent_pos,
         jnp.asarray(-1, dtype=INDEX_DTYPE),
     )
 
     octants = _octant_at_depth(oct_node_codes, oct_node_depths).astype(INDEX_DTYPE)
-    valid_child = valid & (oct_parent >= 0)
+    valid_child = oct_valid_mask & (oct_parent >= 0)
     child_rows = jnp.where(valid_child, oct_parent, 0)
     child_cols = jnp.where(valid_child, octants, 0)
     child_vals = jnp.where(valid_child, jnp.arange(num_nodes, dtype=INDEX_DTYPE) + 1, 0)
     children_plus = jnp.zeros((num_nodes, 8), dtype=INDEX_DTYPE)
     children_plus = children_plus.at[child_rows, child_cols].max(child_vals)
     oct_children = children_plus - jnp.asarray(1, dtype=INDEX_DTYPE)
-    oct_child_mask = valid[:, None] & (oct_children >= 0)
+    oct_child_mask = oct_valid_mask[:, None] & (oct_children >= 0)
     oct_child_counts = jnp.sum(oct_child_mask.astype(INDEX_DTYPE), axis=1)
-    oct_leaf_mask = valid & (oct_child_counts == 0)
+    oct_leaf_mask = oct_valid_mask & (oct_child_counts == 0)
     oct_leaf_nodes = jnp.nonzero(
         oct_leaf_mask,
         size=num_nodes,
