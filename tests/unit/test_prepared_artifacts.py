@@ -27,7 +27,7 @@ def _sample_problem(n: int = 64):
     return positions, masses
 
 
-@pytest.mark.parametrize("tree_type", ["radix", "kdtree"])
+@pytest.mark.parametrize("tree_type", ["radix", "octree", "kdtree"])
 def test_prepared_tree_artifacts_smoke(tree_type: str):
     positions, masses = _sample_problem(n=48)
     bounds = (

@@ -43,6 +43,31 @@ these from `parent`:
 - `level_offsets`
 - `num_levels`
 
+### Explicit octree metadata (optional, octree-oriented consumers)
+
+Backends that want to support level-wise FMM kernels or octant-major scheduling
+may additionally expose:
+
+- `oct_parent`
+- `oct_children`
+- `oct_child_counts`
+- `oct_child_mask`
+- `oct_valid_mask`
+- `oct_node_codes`
+- `oct_node_depths`
+- `oct_node_ranges`
+- `oct_nodes_by_level`
+- `oct_level_offsets`
+- `oct_num_levels`
+- `oct_leaf_mask`
+- `oct_leaf_nodes`
+- `radix_node_to_oct`
+- `radix_leaf_to_oct`
+
+These fields are not required by current yggdrax geometry/traversal APIs, but
+they are useful for downstream FMM implementations that prefer explicit octree
+cells over the binary radix traversal structure.
+
 ## Topology Containers
 
 Public wrappers accept either:
@@ -63,6 +88,10 @@ When level metadata is not precomputed, use:
 - `get_num_internal_nodes(tree)`
 
 Precomputing and storing these fields is still recommended for performance.
+
+For octree-aware consumers, precomputing `oct_children` and the octree
+level-index buffers is likewise recommended when repeated FMM passes will reuse
+the same tree.
 
 ## Minimum Practical Backend
 

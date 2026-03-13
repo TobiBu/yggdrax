@@ -15,6 +15,7 @@ from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
 from .kdtree import KDTree as KDTreeTopology
 from .kdtree import build_kdtree
+from .octree import OctreeTopology, augment_radix_topology_with_octree
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -66,7 +67,7 @@ class FixedDepthTreeBuildConfig:
     min_refined_leaf_particles: int = 2
 
 
-TreeType = Literal["radix", "kdtree"]
+TreeType = Literal["radix", "octree", "kdtree"]
 TreeBuildMode = Literal["adaptive", "fixed_depth"]
 
 
@@ -374,6 +375,75 @@ class RadixTree(Tree):
 
 
 @dataclass(frozen=True)
+class OctreeTree(RadixTree):
+    """Oct-tree container backed by Morton/radix topology buffers.
+
+    This exposes a distinct public tree family for downstream FMM consumers
+    while intentionally reusing the existing Morton/radix builder and geometry
+    contracts. That keeps construction JAX-friendly and lets us iterate on
+    octree-specific metadata without destabilizing the traversal core.
+    """
+
+    @property
+    def tree_type(self) -> TreeType:
+        """Tree-family identifier for this concrete tree."""
+
+        return "octree"
+
+    @property
+    def oct_num_nodes(self) -> int:
+        """Return the number of explicit octree cells carried by the topology."""
+
+        return int(jnp.sum(self.topology.oct_valid_mask))
+
+    @property
+    def oct_num_leaf_nodes(self) -> int:
+        """Return the number of valid explicit octree leaves."""
+
+        return int(jnp.sum(self.topology.oct_leaf_mask))
+
+    @classmethod
+    def _from_build_result(
+        cls,
+        *,
+        result,
+        build_mode: str,
+        return_reordered: bool,
+        return_workspace: bool,
+    ) -> "OctreeTree":
+        if return_reordered and return_workspace:
+            topology, pos_sorted, mass_sorted, inv, workspace = result
+            return cls(
+                topology=augment_radix_topology_with_octree(topology),
+                build_mode=build_mode,  # type: ignore[arg-type]
+                positions_sorted=pos_sorted,
+                masses_sorted=mass_sorted,
+                inverse_permutation=inv,
+                workspace=workspace,
+            )
+        if return_reordered:
+            topology, pos_sorted, mass_sorted, inv = result
+            return cls(
+                topology=augment_radix_topology_with_octree(topology),
+                build_mode=build_mode,  # type: ignore[arg-type]
+                positions_sorted=pos_sorted,
+                masses_sorted=mass_sorted,
+                inverse_permutation=inv,
+            )
+        if return_workspace:
+            topology, workspace = result
+            return cls(
+                topology=augment_radix_topology_with_octree(topology),
+                build_mode=build_mode,  # type: ignore[arg-type]
+                workspace=workspace,
+            )
+        return cls(
+            topology=augment_radix_topology_with_octree(result),
+            build_mode=build_mode,  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
 class KDParticleTree(Tree):
     """Concrete KD-tree container implementing the generic Tree contract."""
 
@@ -443,8 +513,8 @@ class KDParticleTree(Tree):
         return cls(topology=topology)
 
 
-def _register_radix_tree_pytree() -> None:
-    if getattr(RadixTree, "_yggdrax_pytree_registered", False):
+def _register_binary_morton_tree_pytree(tree_cls: type[RadixTree]) -> None:
+    if tree_cls.__dict__.get("_yggdrax_pytree_registered", False):
         return
 
     def flatten(tree: RadixTree):
@@ -464,7 +534,7 @@ def _register_radix_tree_pytree() -> None:
         topology_values = children[:n_topo]
         positions_sorted, masses_sorted, inverse_permutation = children[n_topo:]
         topology = topology_type(*topology_values)
-        return RadixTree(
+        return tree_cls(
             topology=topology,
             build_mode=build_mode,
             positions_sorted=positions_sorted,
@@ -473,11 +543,12 @@ def _register_radix_tree_pytree() -> None:
             workspace=None,
         )
 
-    jax.tree_util.register_pytree_node(RadixTree, flatten, unflatten)
-    setattr(RadixTree, "_yggdrax_pytree_registered", True)
+    jax.tree_util.register_pytree_node(tree_cls, flatten, unflatten)
+    setattr(tree_cls, "_yggdrax_pytree_registered", True)
 
 
-_register_radix_tree_pytree()
+_register_binary_morton_tree_pytree(RadixTree)
+_register_binary_morton_tree_pytree(OctreeTree)
 
 
 def _register_kdtree_tree_pytree() -> None:
@@ -532,6 +603,25 @@ def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
     )
 
 
+def _build_octree_from_request(request: TreeBuildRequest) -> Tree:
+    return OctreeTree.from_particles(
+        request.positions,
+        request.masses,
+        build_mode=request.build_mode,
+        bounds=request.bounds,
+        return_reordered=request.return_reordered,
+        workspace=request.workspace,
+        return_workspace=request.return_workspace,
+        leaf_size=request.leaf_size,
+        target_leaf_particles=request.target_leaf_particles,
+        max_depth=request.max_depth,
+        refine_local=request.refine_local,
+        max_refine_levels=request.max_refine_levels,
+        aspect_threshold=request.aspect_threshold,
+        min_refined_leaf_particles=request.min_refined_leaf_particles,
+    )
+
+
 def _build_kdtree_from_request(request: TreeBuildRequest) -> Tree:
     return KDParticleTree.from_particles(
         request.positions,
@@ -544,6 +634,7 @@ def _build_kdtree_from_request(request: TreeBuildRequest) -> Tree:
 
 _TREE_BUILDERS: dict[str, TreeBuilder] = {
     "radix": _build_radix_tree_from_request,
+    "octree": _build_octree_from_request,
     "kdtree": _build_kdtree_from_request,
 }
 
@@ -776,6 +867,50 @@ def _wrap_radix_public_result(
     )
 
 
+def _wrap_octree_public_result(
+    *,
+    result,
+    build_mode: str,
+    return_reordered: bool,
+    return_workspace: bool,
+):
+    """Wrap radix builder outputs in an octree-augmented public container."""
+
+    if return_reordered and return_workspace:
+        topology, pos_sorted, mass_sorted, inv, workspace = result
+        tree = OctreeTree(
+            topology=augment_radix_topology_with_octree(topology),
+            build_mode=build_mode,  # type: ignore[arg-type]
+            positions_sorted=pos_sorted,
+            masses_sorted=mass_sorted,
+            inverse_permutation=inv,
+            workspace=workspace,
+        )
+        return tree, pos_sorted, mass_sorted, inv, workspace
+    if return_reordered:
+        topology, pos_sorted, mass_sorted, inv = result
+        tree = OctreeTree(
+            topology=augment_radix_topology_with_octree(topology),
+            build_mode=build_mode,  # type: ignore[arg-type]
+            positions_sorted=pos_sorted,
+            masses_sorted=mass_sorted,
+            inverse_permutation=inv,
+        )
+        return tree, pos_sorted, mass_sorted, inv
+    if return_workspace:
+        topology, workspace = result
+        tree = OctreeTree(
+            topology=augment_radix_topology_with_octree(topology),
+            build_mode=build_mode,  # type: ignore[arg-type]
+            workspace=workspace,
+        )
+        return tree, workspace
+    return OctreeTree(
+        topology=augment_radix_topology_with_octree(result),
+        build_mode=build_mode,  # type: ignore[arg-type]
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def build_tree(
     positions: Array,
@@ -819,6 +954,44 @@ def build_tree(
 
 
 @jaxtyped(typechecker=beartype)
+def build_octree(
+    positions: Array,
+    masses: Array,
+    bounds: Optional[tuple[Array, Array]] = None,
+    *,
+    return_reordered: bool = False,
+    leaf_size: int = 8,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    config: Optional[TreeBuildConfig] = None,
+):
+    """Build an octree-compatible topology from Morton/radix construction."""
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    result = _tree_impl.build_tree(
+        positions,
+        masses,
+        bounds_resolved,
+        return_reordered=resolved.return_reordered,
+        leaf_size=config.leaf_size if config is not None else leaf_size,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+    )
+    return _wrap_octree_public_result(
+        result=result,
+        build_mode="adaptive",
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def build_tree_jit(
     positions: Array,
     masses: Array,
@@ -849,6 +1022,44 @@ def build_tree_jit(
         return_workspace=resolved.return_workspace,
     )
     return _wrap_radix_public_result(
+        result=result,
+        build_mode="adaptive",
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def build_octree_jit(
+    positions: Array,
+    masses: Array,
+    bounds: Optional[tuple[Array, Array]] = None,
+    *,
+    return_reordered: bool = False,
+    leaf_size: int = 8,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    config: Optional[TreeBuildConfig] = None,
+):
+    """JIT build for an octree-compatible topology."""
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    result = _tree_impl.build_tree_jit(
+        positions,
+        masses,
+        bounds_resolved,
+        return_reordered=resolved.return_reordered,
+        leaf_size=config.leaf_size if config is not None else leaf_size,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+    )
+    return _wrap_octree_public_result(
         result=result,
         build_mode="adaptive",
         return_reordered=resolved.return_reordered,
@@ -921,6 +1132,66 @@ def build_fixed_depth_tree(
 
 
 @jaxtyped(typechecker=beartype)
+def build_fixed_depth_octree(
+    positions: Array,
+    masses: Array,
+    bounds: Optional[tuple[Array, Array]] = None,
+    *,
+    target_leaf_particles: int = 32,
+    return_reordered: bool = False,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    max_depth: Optional[int] = None,
+    refine_local: bool = True,
+    max_refine_levels: int = 2,
+    aspect_threshold: float = 8.0,
+    min_refined_leaf_particles: int = 2,
+    config: Optional[FixedDepthTreeBuildConfig] = None,
+):
+    """Build a fixed-depth octree-compatible topology."""
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    result = _tree_impl.build_fixed_depth_tree(
+        positions,
+        masses,
+        bounds_resolved,
+        target_leaf_particles=(
+            config.target_leaf_particles
+            if config is not None
+            else target_leaf_particles
+        ),
+        return_reordered=resolved.return_reordered,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+        max_depth=config.max_depth if config is not None else max_depth,
+        refine_local=config.refine_local if config is not None else refine_local,
+        max_refine_levels=(
+            config.max_refine_levels if config is not None else max_refine_levels
+        ),
+        aspect_threshold=(
+            config.aspect_threshold if config is not None else aspect_threshold
+        ),
+        min_refined_leaf_particles=(
+            config.min_refined_leaf_particles
+            if config is not None
+            else min_refined_leaf_particles
+        ),
+    )
+    return _wrap_octree_public_result(
+        result=result,
+        build_mode="fixed_depth",
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def build_fixed_depth_tree_jit(
     positions: Array,
     masses: Array,
@@ -980,6 +1251,66 @@ def build_fixed_depth_tree_jit(
     )
 
 
+@jaxtyped(typechecker=beartype)
+def build_fixed_depth_octree_jit(
+    positions: Array,
+    masses: Array,
+    bounds: Optional[tuple[Array, Array]] = None,
+    *,
+    target_leaf_particles: int = 32,
+    return_reordered: bool = False,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    max_depth: Optional[int] = None,
+    refine_local: bool = True,
+    max_refine_levels: int = 2,
+    aspect_threshold: float = 8.0,
+    min_refined_leaf_particles: int = 2,
+    config: Optional[FixedDepthTreeBuildConfig] = None,
+):
+    """JIT build for a fixed-depth octree-compatible topology."""
+
+    resolved = _resolve_tree_build_options(
+        config=config,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    result = _tree_impl.build_fixed_depth_tree_jit(
+        positions,
+        masses,
+        bounds_resolved,
+        target_leaf_particles=(
+            config.target_leaf_particles
+            if config is not None
+            else target_leaf_particles
+        ),
+        return_reordered=resolved.return_reordered,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+        max_depth=config.max_depth if config is not None else max_depth,
+        refine_local=config.refine_local if config is not None else refine_local,
+        max_refine_levels=(
+            config.max_refine_levels if config is not None else max_refine_levels
+        ),
+        aspect_threshold=(
+            config.aspect_threshold if config is not None else aspect_threshold
+        ),
+        min_refined_leaf_particles=(
+            config.min_refined_leaf_particles
+            if config is not None
+            else min_refined_leaf_particles
+        ),
+    )
+    return _wrap_octree_public_result(
+        result=result,
+        build_mode="fixed_depth",
+        return_reordered=resolved.return_reordered,
+        return_workspace=resolved.return_workspace,
+    )
+
+
 __all__ = [
     "MAX_TREE_LEVELS",
     "FMM_CORE_REQUIRED_FIELDS",
@@ -991,12 +1322,18 @@ __all__ = [
     "TreeType",
     "TreeBuildMode",
     "RadixTree",
+    "OctreeTree",
+    "OctreeTopology",
     "KDParticleTree",
     "RadixTreeWorkspace",
     "TreeBuildConfig",
     "FixedDepthTreeBuildConfig",
     "build_fixed_depth_tree",
+    "build_fixed_depth_octree",
     "build_fixed_depth_tree_jit",
+    "build_fixed_depth_octree_jit",
+    "build_octree",
+    "build_octree_jit",
     "build_tree",
     "build_tree_jit",
     "available_tree_types",
