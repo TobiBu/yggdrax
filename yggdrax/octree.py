@@ -84,7 +84,7 @@ def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
     ensuring keys at different depths never overlap.  This is used to
     enable O(n log n) parent lookup via :func:`jnp.searchsorted`.
     """
-    depths_u64 = jnp.asarray(jnp.maximum(0, depths), dtype=jnp.uint64)
+    depths_u64 = jnp.asarray(jnp.maximum(0, depths), dtype=jnp.uint64)  # clamp negative sentinel values (e.g. -1 padding) before uint64 cast
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     bit_shift = jnp.uint64(_MORTON_BITS) - jnp.uint64(3) * depths_u64
     level_prefix = jnp.right_shift(codes_u64, bit_shift)
@@ -233,10 +233,7 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
         _oct_address(oct_node_codes, oct_node_depths),
         _uint64_max,
     )
-    parent_depths = jnp.maximum(
-        jnp.asarray(0, dtype=INDEX_DTYPE),
-        oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE),
-    )
+    parent_depths = oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE)
     parent_codes = _prefix_code(oct_node_codes, parent_depths)
     parent_addresses = _oct_address(parent_codes, parent_depths)
     parent_pos = jnp.searchsorted(oct_addresses, parent_addresses, side="left").astype(
