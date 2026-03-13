@@ -59,7 +59,7 @@ def test_build_octree_accepts_config_object():
     assert int(tree.num_particles) == 64
     assert tree.tree_type == "octree"
     assert tree.oct_num_nodes >= 1
-    assert tree.oct_leaf_nodes.shape[0] >= 1
+    assert tree.oct_num_leaf_nodes >= 1
     assert tree.radix_leaf_to_oct.shape == (tree.num_leaves,)
     assert pos_sorted.shape == positions.shape
     assert mass_sorted.shape == masses.shape
@@ -91,7 +91,7 @@ def test_build_fixed_depth_octree_accepts_config_and_infers_bounds():
     assert int(tree.num_particles) == 64
     assert tree.tree_type == "octree"
     assert tree.oct_num_nodes >= 1
-    assert tree.oct_leaf_nodes.shape[0] >= 1
+    assert tree.oct_num_leaf_nodes >= 1
     assert tree.radix_leaf_to_oct.shape == (tree.num_leaves,)
     assert pos_sorted.shape == positions.shape
     assert mass_sorted.shape == masses.shape

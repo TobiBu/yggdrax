@@ -1,5 +1,6 @@
 """Tests for explicit octree metadata on top of radix-compatible trees."""
 
+import jax
 import jax.numpy as jnp
 
 from yggdrax import (
@@ -45,7 +46,10 @@ def test_fixed_depth_octree_populates_eight_root_children():
     assert int(tree.oct_child_counts[0]) == 8
     assert jnp.all(tree.oct_children[0] >= 0)
     assert jnp.all(tree.oct_node_depths[tree.oct_children[0]] == 1)
-    assert jnp.array_equal(tree.oct_leaf_nodes, tree.oct_children[0])
+    assert jnp.array_equal(
+        tree.oct_leaf_nodes[: tree.oct_num_leaf_nodes],
+        tree.oct_children[0],
+    )
 
 
 def test_octree_radix_node_mapping_covers_all_nodes():
@@ -138,3 +142,31 @@ def test_octree_matches_radix_interaction_counts():
     assert jnp.array_equal(radix.masses_sorted, octree.masses_sorted)
     assert jnp.array_equal(radix_interactions.counts, oct_interactions.counts)
     assert jnp.array_equal(radix_neighbors.counts, oct_neighbors.counts)
+
+
+def test_octree_tree_is_jittable_pytree():
+    positions = jnp.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.15, 0.12, 0.14],
+            [0.20, 0.24, 0.28],
+            [0.35, 0.32, 0.30],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((4,), dtype=jnp.float32)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=2,
+    )
+
+    jitted = jax.jit(
+        lambda t: t.positions_sorted.shape[0]
+        + jnp.sum(t.oct_valid_mask.astype(jnp.int32))
+    )
+    result = jitted(tree)
+
+    assert int(result) >= 4

@@ -394,7 +394,13 @@ class OctreeTree(RadixTree):
     def oct_num_nodes(self) -> int:
         """Return the number of explicit octree cells carried by the topology."""
 
-        return int(self.topology.oct_parent.shape[0])
+        return int(jnp.sum(self.topology.oct_valid_mask))
+
+    @property
+    def oct_num_leaf_nodes(self) -> int:
+        """Return the number of valid explicit octree leaves."""
+
+        return int(jnp.sum(self.topology.oct_leaf_mask))
 
     @classmethod
     def _from_build_result(
@@ -508,7 +514,7 @@ class KDParticleTree(Tree):
 
 
 def _register_binary_morton_tree_pytree(tree_cls: type[RadixTree]) -> None:
-    if getattr(tree_cls, "_yggdrax_pytree_registered", False):
+    if tree_cls.__dict__.get("_yggdrax_pytree_registered", False):
         return
 
     def flatten(tree: RadixTree):
