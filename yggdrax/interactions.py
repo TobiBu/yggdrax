@@ -116,6 +116,7 @@ def build_interactions_and_neighbors(
     *,
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
+    return_interactions: bool = True,
     return_grouped: bool = False,
 ):
     """Construct both far-field interactions and near-field neighbors.
@@ -144,6 +145,7 @@ def build_interactions_and_neighbors(
         policy_state=policy_state,
         return_result=return_result,
         return_compact_far_pairs=return_compact_far_pairs,
+        return_interactions=return_interactions,
         return_grouped=return_grouped,
     )
 

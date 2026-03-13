@@ -17,11 +17,23 @@ _MAX_MORTON_LEVEL = _geometry_impl._MAX_MORTON_LEVEL
 def compute_tree_geometry(
     tree: object,
     positions_sorted: Array,
+    *,
+    max_leaf_size: int | None = None,
 ) -> TreeGeometry:
-    """Compute per-node geometric bounds and helper radii."""
+    """Compute per-node geometric bounds and helper radii.
+
+    ``max_leaf_size`` is optional for correctness, but passing it is important
+    for large JIT-compiled radix trees. It bounds the temporary leaf gather
+    shape used during geometry construction and avoids falling back to a
+    ``num_particles``-sized staging buffer under tracing.
+    """
 
     topology = resolve_tree_topology(tree)
-    return _geometry_impl.compute_tree_geometry(topology, positions_sorted)
+    return _geometry_impl.compute_tree_geometry(
+        topology,
+        positions_sorted,
+        max_leaf_size=max_leaf_size,
+    )
 
 
 @jaxtyped(typechecker=beartype)

@@ -140,6 +140,21 @@ def test_compute_tree_geometry_supports_outer_jit_wrapper():
     assert geometry.center.shape == (total_nodes, 3)
 
 
+def test_compute_tree_geometry_supports_explicit_leaf_cap_under_outer_jit():
+    positions, masses = _sample_problem(n=64)
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        leaf_size=16,
+        return_reordered=True,
+    )
+    jitted = jax.jit(
+        lambda t, ps: compute_tree_geometry(t, ps, max_leaf_size=16).max_extent.sum()
+    )
+    value = jitted(tree, pos_sorted)
+    assert jnp.isfinite(value)
+
+
 def test_geometry_level_views_can_derive_missing_level_fields():
     positions, masses = _sample_problem(n=64)
     tree, pos_sorted, _, _ = build_tree(
