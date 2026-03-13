@@ -170,3 +170,42 @@ def test_octree_tree_is_jittable_pytree():
     result = jitted(tree)
 
     assert int(result) >= 4
+
+
+def test_build_explicit_octree_metadata_is_jit_compatible():
+    """``build_explicit_octree_metadata`` must execute inside ``jax.jit``."""
+    from yggdrax.octree import build_explicit_octree_metadata
+
+    positions = jnp.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.15, 0.12, 0.14],
+            [0.20, 0.24, 0.28],
+            [0.35, 0.32, 0.30],
+            [0.55, 0.58, 0.53],
+            [0.70, 0.72, 0.74],
+            [0.82, 0.84, 0.78],
+            [0.95, 0.94, 0.96],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((8,), dtype=jnp.float32)
+    radix_tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="radix",
+        return_reordered=True,
+        leaf_size=2,
+    )
+    topology = radix_tree.topology
+
+    # Eager reference run.
+    eager = build_explicit_octree_metadata(topology)
+
+    # JIT run: must not raise ConcretizationTypeError or any trace-time error.
+    jitted = jax.jit(build_explicit_octree_metadata)
+    jit_result = jitted(topology)
+
+    assert jnp.array_equal(jit_result.oct_valid_mask, eager.oct_valid_mask)
+    assert jnp.array_equal(jit_result.oct_node_depths, eager.oct_node_depths)
+    assert jnp.array_equal(jit_result.oct_parent, eager.oct_parent)
