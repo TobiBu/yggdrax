@@ -227,7 +227,7 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
         oct_node_depths,
         jnp.asarray(_MAX_MORTON_LEVEL + 1, dtype=oct_node_depths.dtype),
     )
-    oct_nodes_by_level = jnp.argsort(sort_depths, kind="stable").astype(INDEX_DTYPE)
+    oct_nodes_by_level = jnp.argsort(sort_depths, stable=True).astype(INDEX_DTYPE)
 
     # O(n log n) parent lookup: assign each valid oct node a sortable uint64
     # address that encodes (depth, code) in a globally ordered key space, then
