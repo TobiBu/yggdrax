@@ -7,7 +7,9 @@ from yggdrax import (
     FixedDepthTreeBuildConfig,
     RadixTreeWorkspace,
     TreeBuildConfig,
+    build_fixed_depth_octree,
     build_fixed_depth_tree,
+    build_octree,
     build_tree,
 )
 
@@ -50,6 +52,20 @@ def test_build_tree_accepts_config_object():
     assert inv.shape == (64,)
 
 
+def test_build_octree_accepts_config_object():
+    positions, masses = _sample_problem(n=64)
+    cfg = TreeBuildConfig(leaf_size=8, return_reordered=True)
+    tree, pos_sorted, mass_sorted, inv = build_octree(positions, masses, config=cfg)
+    assert int(tree.num_particles) == 64
+    assert tree.tree_type == "octree"
+    assert tree.oct_num_nodes >= 1
+    assert tree.oct_leaf_nodes.shape[0] >= 1
+    assert tree.radix_leaf_to_oct.shape == (tree.num_leaves,)
+    assert pos_sorted.shape == positions.shape
+    assert mass_sorted.shape == masses.shape
+    assert inv.shape == (64,)
+
+
 def test_build_fixed_depth_tree_accepts_config_and_infers_bounds():
     positions, masses = _sample_problem(n=64)
     cfg = FixedDepthTreeBuildConfig(target_leaf_particles=16, return_reordered=True)
@@ -59,6 +75,24 @@ def test_build_fixed_depth_tree_accepts_config_and_infers_bounds():
         config=cfg,
     )
     assert int(tree.num_particles) == 64
+    assert pos_sorted.shape == positions.shape
+    assert mass_sorted.shape == masses.shape
+    assert inv.shape == (64,)
+
+
+def test_build_fixed_depth_octree_accepts_config_and_infers_bounds():
+    positions, masses = _sample_problem(n=64)
+    cfg = FixedDepthTreeBuildConfig(target_leaf_particles=16, return_reordered=True)
+    tree, pos_sorted, mass_sorted, inv = build_fixed_depth_octree(
+        positions,
+        masses,
+        config=cfg,
+    )
+    assert int(tree.num_particles) == 64
+    assert tree.tree_type == "octree"
+    assert tree.oct_num_nodes >= 1
+    assert tree.oct_leaf_nodes.shape[0] >= 1
+    assert tree.radix_leaf_to_oct.shape == (tree.num_leaves,)
     assert pos_sorted.shape == positions.shape
     assert mass_sorted.shape == masses.shape
     assert inv.shape == (64,)

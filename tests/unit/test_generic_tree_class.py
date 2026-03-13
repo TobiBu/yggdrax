@@ -78,10 +78,30 @@ def test_tree_from_particles_builds_fixed_depth_tree():
     assert tree.inverse_permutation is not None
 
 
+def test_tree_from_particles_builds_octree():
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+
+    assert tree.tree_type == "octree"
+    assert tree.build_mode == "adaptive"
+    assert tree.num_particles == 64
+    assert tree.num_nodes > 0
+    assert tree.positions_sorted is not None
+    assert tree.masses_sorted is not None
+    assert tree.inverse_permutation is not None
+
+
 def test_tree_from_particles_rejects_unknown_tree_type():
     positions, masses = _sample_problem(n=16)
     with pytest.raises(ValueError, match="Unsupported tree_type"):
-        Tree.from_particles(positions, masses, tree_type="octree")
+        Tree.from_particles(positions, masses, tree_type="banana_tree")
 
 
 def test_tree_from_particles_rejects_unknown_build_mode():
@@ -172,6 +192,7 @@ def test_tree_from_particles_kdtree_rejects_fixed_depth():
 
 def test_available_tree_types_includes_radix():
     assert "radix" in tree_api.available_tree_types()
+    assert "octree" in tree_api.available_tree_types()
     assert "kdtree" in tree_api.available_tree_types()
 
 
