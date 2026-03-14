@@ -12,6 +12,7 @@ from yggdrax import (
     NodeNeighborList,
     Tree,
     _interactions_impl,
+    build_leaf_neighbor_lists,
     build_interactions_and_neighbors,
     build_tree,
     compute_tree_geometry,
@@ -248,3 +249,50 @@ def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
         assert isinstance(interactions, NodeInteractionList)
         assert isinstance(neighbors, NodeNeighborList)
         assert dispatch_calls == expected_calls
+
+
+def test_octree_leaf_neighbor_lists_use_native_dispatch(monkeypatch):
+    positions, masses = _sample_problem(n=64)
+    dispatch_calls: list[str] = []
+    original_octree = _interactions_impl._run_octree_walk_raw
+    original_legacy = _interactions_impl._run_legacy_dual_tree_walk_raw
+
+    def _record_octree(*args, **kwargs):
+        dispatch_calls.append("octree")
+        return original_octree(*args, **kwargs)
+
+    def _record_legacy(*args, **kwargs):
+        dispatch_calls.append("legacy")
+        return original_legacy(*args, **kwargs)
+
+    monkeypatch.setattr(_interactions_impl, "_run_octree_walk_raw", _record_octree)
+    monkeypatch.setattr(
+        _interactions_impl,
+        "_run_legacy_dual_tree_walk_raw",
+        _record_legacy,
+    )
+
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        bounds=infer_bounds(positions),
+        leaf_size=16,
+        return_reordered=True,
+        tree_type="octree",
+    )
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+    neighbors = build_leaf_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=DualTreeTraversalConfig(
+            max_pair_queue=8192,
+            process_block=256,
+            max_interactions_per_node=2048,
+            max_neighbors_per_leaf=2048,
+        ),
+    )
+
+    assert isinstance(neighbors, NodeNeighborList)
+    assert dispatch_calls == ["octree"]
