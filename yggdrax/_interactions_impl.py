@@ -2802,6 +2802,7 @@ def _run_dual_tree_walk_raw(
     dehnen_radius_scale: float = 1.0,
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
+    _dispatch_mode: str = "auto",
 ) -> _DualTreeWalkRawOutputs:
     # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
@@ -2809,6 +2810,7 @@ def _run_dual_tree_walk_raw(
 
     theta_val = float(theta)
     dehnen_scale_val = float(dehnen_radius_scale)
+    is_octree_topology = hasattr(tree, "oct_children") and hasattr(tree, "oct_parent")
     is_kdtree_topology = (
         hasattr(tree, "split_dim")
         and hasattr(tree, "points")
@@ -2827,6 +2829,32 @@ def _run_dual_tree_walk_raw(
     nodes_by_level = get_nodes_by_level(tree)
 
     config = _resolve_dual_tree_config(traversal_config)
+
+    # Route all public entry calls through explicit dispatch helpers. Octree
+    # gets its own seam now; radix and kd continue through the legacy binary
+    # walk via a dedicated helper so the shared entry point stays thin.
+    if _dispatch_mode not in ("auto", "legacy"):
+        raise ValueError(f"Unknown dual-tree dispatch mode: {_dispatch_mode}")
+
+    if _dispatch_mode == "auto":
+        helper = _run_octree_walk_raw if is_octree_topology else _run_legacy_dual_tree_walk_raw
+        return helper(
+            tree,
+            geometry,
+            theta_val,
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            max_interactions_per_node=max_interactions_per_node,
+            max_neighbors_per_leaf=max_neighbors_per_leaf,
+            max_pair_queue=max_pair_queue,
+            traversal_config=config,
+            collect_far=collect_far,
+            collect_near=collect_near,
+            dehnen_radius_scale=dehnen_scale_val,
+            process_block=process_block,
+            retry_logger=retry_logger,
+        )
 
     if config is not None:
         queue_max = max(4, int(config.max_pair_queue))
@@ -3310,6 +3338,93 @@ def _run_dual_tree_walk_raw(
         )
 
     return result
+
+
+def _run_octree_walk_raw(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float,
+    *,
+    mac_type: MACType,
+    pair_policy: Optional[PairPolicy],
+    policy_state: object,
+    max_interactions_per_node: Optional[int],
+    max_neighbors_per_leaf: int,
+    max_pair_queue: Optional[int],
+    traversal_config: Optional[DualTreeTraversalConfig],
+    collect_far: bool,
+    collect_near: bool,
+    dehnen_radius_scale: float,
+    process_block: Optional[int],
+    retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
+) -> _DualTreeWalkRawOutputs:
+    """Octree-specific traversal entry point.
+
+    The current implementation still delegates to the legacy binary walk.
+    Keeping this seam separate lets octree evolve toward a true native walk
+    without perturbing radix or kd dispatch.
+    """
+
+    # Re-enter the legacy implementation through a small helper so octree can
+    # diverge here later without threading more conditionals through the shared
+    # binary path.
+    return _run_legacy_dual_tree_walk_raw(
+        tree,
+        geometry,
+        theta,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_interactions_per_node=max_interactions_per_node,
+        max_neighbors_per_leaf=max_neighbors_per_leaf,
+        max_pair_queue=max_pair_queue,
+        traversal_config=traversal_config,
+        collect_far=collect_far,
+        collect_near=collect_near,
+        dehnen_radius_scale=dehnen_radius_scale,
+        process_block=process_block,
+        retry_logger=retry_logger,
+    )
+
+
+def _run_legacy_dual_tree_walk_raw(
+    tree: object,
+    geometry: TreeGeometry,
+    theta_val: float,
+    *,
+    mac_type: MACType,
+    pair_policy: Optional[PairPolicy],
+    policy_state: object,
+    max_interactions_per_node: Optional[int],
+    max_neighbors_per_leaf: int,
+    max_pair_queue: Optional[int],
+    traversal_config: Optional[DualTreeTraversalConfig],
+    collect_far: bool,
+    collect_near: bool,
+    dehnen_radius_scale: float,
+    process_block: Optional[int],
+    retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
+) -> _DualTreeWalkRawOutputs:
+    """Legacy binary dual-tree walk shared by radix and kd and currently octree."""
+
+    return _run_dual_tree_walk_raw(
+        tree,
+        geometry,
+        theta_val,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_interactions_per_node=max_interactions_per_node,
+        max_neighbors_per_leaf=max_neighbors_per_leaf,
+        max_pair_queue=max_pair_queue,
+        traversal_config=traversal_config,
+        collect_far=collect_far,
+        collect_near=collect_near,
+        dehnen_radius_scale=dehnen_radius_scale,
+        process_block=process_block,
+        retry_logger=retry_logger,
+        _dispatch_mode="legacy",
+    )
 
 
 def _raw_to_result(raw: _DualTreeWalkRawOutputs) -> DualTreeWalkResult:

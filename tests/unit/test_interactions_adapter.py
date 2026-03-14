@@ -10,6 +10,7 @@ from yggdrax import (
     DualTreeTraversalConfig,
     NodeInteractionList,
     NodeNeighborList,
+    Tree,
     _interactions_impl,
     build_interactions_and_neighbors,
     build_tree,
@@ -192,3 +193,58 @@ def test_dual_tree_queue_cache_is_bounded():
         )
         == _interactions_impl._MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES + 5
     )
+
+
+def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
+    positions, masses = _sample_problem(n=64)
+
+    dispatch_calls: list[str] = []
+    original_octree = _interactions_impl._run_octree_walk_raw
+    original_legacy = _interactions_impl._run_legacy_dual_tree_walk_raw
+
+    def _record_octree(*args, **kwargs):
+        dispatch_calls.append("octree")
+        return original_octree(*args, **kwargs)
+
+    def _record_legacy(*args, **kwargs):
+        dispatch_calls.append("legacy")
+        return original_legacy(*args, **kwargs)
+
+    monkeypatch.setattr(_interactions_impl, "_run_octree_walk_raw", _record_octree)
+    monkeypatch.setattr(
+        _interactions_impl,
+        "_run_legacy_dual_tree_walk_raw",
+        _record_legacy,
+    )
+
+    for tree_type, expected_calls in (
+        ("radix", ["legacy"]),
+        ("octree", ["octree", "legacy"]),
+        ("kdtree", ["legacy"]),
+    ):
+        dispatch_calls.clear()
+        tree = Tree.from_particles(
+            positions,
+            masses,
+            bounds=infer_bounds(positions),
+            leaf_size=16,
+            return_reordered=True,
+            tree_type=tree_type,
+        )
+        geometry = compute_tree_geometry(tree, tree.positions_sorted)
+        interactions, neighbors = build_interactions_and_neighbors(
+            tree,
+            geometry,
+            theta=0.6,
+            mac_type="dehnen",
+            traversal_config=DualTreeTraversalConfig(
+                max_pair_queue=8192,
+                process_block=256,
+                max_interactions_per_node=2048,
+                max_neighbors_per_leaf=2048,
+            ),
+        )
+
+        assert isinstance(interactions, NodeInteractionList)
+        assert isinstance(neighbors, NodeNeighborList)
+        assert dispatch_calls == expected_calls
