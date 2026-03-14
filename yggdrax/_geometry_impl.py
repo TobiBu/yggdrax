@@ -64,15 +64,24 @@ def _compute_leaf_bounds(
     positions_sorted: Array,
     leaf_starts: Array,
     leaf_counts: Array,
+    *,
+    max_leaf_size: int | None = None,
 ) -> tuple[Array, Array]:
     dtype = positions_sorted.dtype
     num_leaves = leaf_starts.shape[0]
     num_particles = positions_sorted.shape[0]
 
-    # Upper bound on particles per leaf.  Under JIT ``leaf_counts`` may
-    # contain traced values so we fall back to the particle count (a
-    # concrete int) which is always a safe upper bound.
-    if isinstance(leaf_counts, jax_core.Tracer):
+    # Upper bound on particles per leaf.
+    #
+    # This bound drives the temporary gather shape ``(num_leaves, max_count, 3)``.
+    # Falling back to ``num_particles`` is functionally safe but disastrous for
+    # large JIT-compiled trees because it inflates geometry staging buffers from
+    # "leaf-sized" to "whole-problem-sized". Callers that already know the tree's
+    # leaf cap should pass it explicitly to keep geometry memory proportional to
+    # leaf occupancy rather than total particle count.
+    if max_leaf_size is not None:
+        max_count = int(max_leaf_size)
+    elif isinstance(leaf_counts, jax_core.Tracer):
         max_count = num_particles
     else:
         max_count = int(jnp.max(leaf_counts)) if num_leaves > 0 else 0
@@ -150,6 +159,8 @@ def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
 def compute_tree_geometry(
     tree: object,
     positions_sorted: Array,
+    *,
+    max_leaf_size: int | None = None,
 ) -> TreeGeometry:
     """Compute per-node bounding boxes and helper radii.
 
@@ -160,6 +171,10 @@ def compute_tree_geometry(
     positions_sorted : Array
         Particle positions reordered into Morton order. This should be the
         ``positions`` output from ``build_tree(..., return_reordered=True)``.
+    max_leaf_size : int | None, optional
+        Optional explicit upper bound for particles per leaf. Passing the known
+        tree leaf cap keeps JIT-staged leaf gathers bounded by leaf occupancy
+        instead of the full particle count.
 
     Returns
     -------
@@ -191,6 +206,7 @@ def compute_tree_geometry(
             positions_sorted,
             leaf_starts,
             leaf_counts,
+            max_leaf_size=max_leaf_size,
         )
 
     if has_morton_fields:

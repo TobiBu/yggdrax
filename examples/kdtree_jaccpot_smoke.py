@@ -1,7 +1,7 @@
-"""Smoke test for KD-tree vs Radix-tree compatibility with jaccpot call paths.
+"""Smoke test for KD-tree, radix-tree, and octree compatibility with jaccpot.
 
-Run in the `expanse` conda environment:
-    python examples/kdtree_jaccpot_smoke.py
+Run in the `odisseo` micromamba environment:
+    CUDA_VISIBLE_DEVICES=3 micromamba run -n odisseo python examples/kdtree_jaccpot_smoke.py
 """
 
 from __future__ import annotations
@@ -59,6 +59,9 @@ def _run_tree_pipeline(tree: Tree, label: str) -> dict[str, int]:
         "num_interaction_edges": int(interactions.sources.shape[0]),
         "num_neighbor_edges": int(neighbors.neighbors.shape[0]),
     }
+    if hasattr(tree, "oct_num_nodes"):
+        stats["oct_num_nodes"] = int(tree.oct_num_nodes)
+        stats["oct_leaf_nodes"] = int(tree.oct_num_leaf_nodes)
     print(f"[{label}] stats:", stats)
     return stats
 
@@ -131,6 +134,13 @@ def main() -> None:
         return_reordered=True,
         leaf_size=args.leaf_size,
     )
+    octree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=args.leaf_size,
+    )
     kd = Tree.from_particles(
         positions,
         masses,
@@ -139,7 +149,7 @@ def main() -> None:
         leaf_size=args.leaf_size,
     )
 
-    for label, tree in (("radix", radix), ("kdtree", kd)):
+    for label, tree in (("radix", radix), ("octree", octree), ("kdtree", kd)):
         missing = missing_fmm_core_topology_fields(tree)
         print(
             f"[{label}] fmm-core:",
@@ -176,10 +186,13 @@ def main() -> None:
             return None
 
     radix_neighbors = _jit_dual_tree_run(radix, "radix")
+    octree_neighbors = _jit_dual_tree_run(octree, "octree")
     kd_neighbors = _jit_dual_tree_run(kd, "kdtree")
 
     if radix_neighbors is not None:
         _run_jaccpot_nearfield_probe(radix, radix_neighbors)
+    if octree_neighbors is not None:
+        _run_jaccpot_nearfield_probe(octree, octree_neighbors)
     if kd_neighbors is not None:
         _run_jaccpot_nearfield_probe(kd, kd_neighbors)
 

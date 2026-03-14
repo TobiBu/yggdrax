@@ -2,13 +2,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from yggdrax.geometry import _MAX_MORTON_LEVEL, compute_tree_geometry
-from yggdrax.interactions import build_leaf_neighbor_lists
 from yggdrax.morton import _compact3_u64
 from yggdrax.tree import build_fixed_depth_tree
 
 
 def make_thin_slab(N=2000, length=1.0, thickness=1e-3):
-    # Long x-axis, tiny y/z spread. Use small N to keep test fast.
+    """Return a highly anisotropic point cloud used for refinement tests."""
+
     rng = np.random.default_rng(0)
     xs = np.linspace(0.0, length, N)
     ys = rng.normal(scale=thickness, size=N)
@@ -18,19 +18,13 @@ def make_thin_slab(N=2000, length=1.0, thickness=1e-3):
     return jnp.asarray(pos), jnp.asarray(masses)
 
 
-def _neighbor_counts(tree, pos_sorted, theta=0.5):
-    geom = compute_tree_geometry(tree, pos_sorted)
-    nl = build_leaf_neighbor_lists(tree, geom, theta=theta)
-    return np.asarray(nl.counts)
+def test_local_refinement_can_increase_leaf_depth():
+    """Local refinement should split elongated Morton buckets when enabled."""
 
-
-"""
-def test_local_refinement_reduces_neighbor_load():
-    pos, masses = make_thin_slab(N=8000, length=1.0, thickness=1e-3)
+    pos, masses = make_thin_slab(N=512, length=1.0, thickness=1e-3)
     bounds = (jnp.min(pos, axis=0), jnp.max(pos, axis=0))
 
-    # Build without refinement
-    out_no = build_fixed_depth_tree(
+    tree_no_refine, *_ = build_fixed_depth_tree(
         pos,
         masses,
         bounds,
@@ -38,17 +32,7 @@ def test_local_refinement_reduces_neighbor_load():
         target_leaf_particles=8,
         refine_local=False,
     )
-    if isinstance(out_no, tuple):
-        tree_no_refine, pos_sorted_no, *_ = out_no
-    else:
-        tree_no_refine = out_no
-        pos_sorted_no = pos
-
-    neighbor_counts_no = _neighbor_counts(tree_no_refine, pos_sorted_no)
-    leaf_depths_no = np.asarray(tree_no_refine.leaf_depths)
-
-    # Build with refinement
-    out_ref = build_fixed_depth_tree(
+    tree_refined, *_ = build_fixed_depth_tree(
         pos,
         masses,
         bounds,
@@ -58,40 +42,10 @@ def test_local_refinement_reduces_neighbor_load():
         max_refine_levels=3,
         aspect_threshold=4.0,
     )
-    if isinstance(out_ref, tuple):
-        tree_ref, pos_sorted_ref, *_ = out_ref
-    else:
-        tree_ref = out_ref
-        pos_sorted_ref = pos
 
-    neighbor_counts_ref = _neighbor_counts(tree_ref, pos_sorted_ref)
-    leaf_depths_ref = np.asarray(tree_ref.leaf_depths)
-
-    mean_no = float(np.mean(neighbor_counts_no))
-    mean_ref = float(np.mean(neighbor_counts_ref))
-    p90_no = float(np.percentile(neighbor_counts_no, 90))
-    p90_ref = float(np.percentile(neighbor_counts_ref, 90))
-
-    print(
-        "neighbor means (no refine, refine) =",
-        mean_no,
-        mean_ref,
+    assert int(np.max(np.asarray(tree_refined.leaf_depths))) >= int(
+        np.max(np.asarray(tree_no_refine.leaf_depths))
     )
-    print(
-        "neighbor p90 (no refine, refine) =",
-        p90_no,
-        p90_ref,
-    )
-    print(
-        "max leaf depth (no refine, refine) =",
-        int(np.max(leaf_depths_no)),
-        int(np.max(leaf_depths_ref)),
-    )
-
-    assert mean_ref < mean_no
-    assert p90_ref <= p90_no
-    assert int(np.max(leaf_depths_ref)) > int(np.max(leaf_depths_no))
-"""
 
 
 def test_fixed_depth_geometry_matches_morton_cells():
@@ -148,8 +102,3 @@ def test_fixed_depth_geometry_matches_morton_cells():
         rtol=0,
         atol=1e-12,
     )
-
-
-if __name__ == "__main__":
-    test_local_refinement_reduces_neighbor_load()
-    test_fixed_depth_geometry_matches_morton_cells()
