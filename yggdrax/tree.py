@@ -526,7 +526,9 @@ def _register_binary_morton_tree_pytree(tree_cls: type[RadixTree]) -> None:
             topology_field_names = tuple(
                 name for name in topology_field_names if name != "leaf_size"
             )
-        topology_fields = tuple(getattr(topology, name) for name in topology_field_names)
+        topology_fields = tuple(
+            getattr(topology, name) for name in topology_field_names
+        )
         children = topology_fields + (
             tree.positions_sorted,
             tree.masses_sorted,
@@ -552,7 +554,9 @@ def _register_binary_morton_tree_pytree(tree_cls: type[RadixTree]) -> None:
         n_topo = len(dynamic_topology_fields)
         topology_values = children[:n_topo]
         positions_sorted, masses_sorted, inverse_permutation = children[n_topo:]
-        dynamic_values = dict(zip(dynamic_topology_fields, topology_values, strict=True))
+        dynamic_values = dict(
+            zip(dynamic_topology_fields, topology_values, strict=True)
+        )
         if "leaf_size" in topology_fields:
             dynamic_values["leaf_size"] = static_leaf_size
         topology = topology_type(*(dynamic_values[name] for name in topology_fields))
