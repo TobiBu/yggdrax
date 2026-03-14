@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from beartype import beartype
+from jax import core as jax_core
 from jaxtyping import Array, jaxtyped
 
 from . import _geometry_impl
@@ -29,10 +30,19 @@ def compute_tree_geometry(
     """
 
     topology = resolve_tree_topology(tree)
+    resolved_leaf_cap = max_leaf_size
+    if (
+        resolved_leaf_cap is None
+        and hasattr(topology, "leaf_size")
+        and topology.leaf_size is not None
+        and not isinstance(topology.leaf_size, jax_core.Tracer)
+    ):
+        resolved_leaf_cap = int(topology.leaf_size)
+
     return _geometry_impl.compute_tree_geometry(
         topology,
         positions_sorted,
-        max_leaf_size=max_leaf_size,
+        max_leaf_size=resolved_leaf_cap,
     )
 
 

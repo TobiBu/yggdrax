@@ -39,12 +39,13 @@ class RadixTree(NamedTuple):
         level_offsets: Prefix offsets into ``nodes_by_level`` for each level
         nodes_by_level: Node indices arranged contiguously by level depth
         num_levels: Total populated levels (scalar ``int32`` array)
-    bounds_min: Minimum domain corner used during Morton encoding
-    bounds_max: Maximum domain corner used during Morton encoding
-    leaf_codes: Morton codes representing each leaf's spatial cell
-    leaf_depths: Morton depth for each leaf (``-1`` when unspecified)
+        bounds_min: Minimum domain corner used during Morton encoding
+        bounds_max: Maximum domain corner used during Morton encoding
+        leaf_codes: Morton codes representing each leaf's spatial cell
+        leaf_depths: Morton depth for each leaf (``-1`` when unspecified)
         use_morton_geometry: Flag indicating whether Morton-derived geometry
             should be used when computing node extents
+        leaf_size: Safe upper bound for particles per leaf when known
     """
 
     parent: jnp.ndarray
@@ -66,6 +67,7 @@ class RadixTree(NamedTuple):
     leaf_codes: jnp.ndarray
     leaf_depths: jnp.ndarray
     use_morton_geometry: jnp.ndarray
+    leaf_size: int | None
 
 
 class RadixTreeWorkspace(NamedTuple):
@@ -383,6 +385,7 @@ def build_tree(
         leaf_starts,
         leaf_ends,
         bounds,
+        leaf_size=leaf_size,
         return_reordered=return_reordered,
         workspace=workspace,
         return_workspace=return_workspace,
@@ -477,6 +480,7 @@ def build_fixed_depth_tree(
         leaf_starts,
         leaf_ends,
         bounds,
+        leaf_size=None,
         use_morton_geometry=True,
         return_reordered=return_reordered,
         workspace=workspace,
@@ -609,6 +613,7 @@ def _build_tree_from_leaf_partitions(
     leaf_ends_exclusive: Array,
     bounds: Bounds,
     *,
+    leaf_size: int | None = None,
     use_morton_geometry: bool = False,
     return_reordered: bool,
     workspace: Optional[RadixTreeWorkspace],
@@ -689,6 +694,7 @@ def _build_tree_from_leaf_partitions(
             leaf_codes=leaf_codes,
             leaf_depths=leaf_depths,
             use_morton_geometry=morton_geometry_flag,
+            leaf_size=None if leaf_size is None else int(leaf_size),
         )
         updated_workspace = RadixTreeWorkspace(
             parent=parent,
@@ -925,6 +931,7 @@ def _build_tree_from_leaf_partitions(
         leaf_codes=leaf_codes,
         leaf_depths=leaf_depths,
         use_morton_geometry=morton_geometry_flag,
+        leaf_size=None if leaf_size is None else int(leaf_size),
     )
 
     updated_workspace = RadixTreeWorkspace(

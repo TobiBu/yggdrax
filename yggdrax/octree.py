@@ -55,6 +55,7 @@ class OctreeTopology(NamedTuple):
     leaf_codes: jnp.ndarray
     leaf_depths: jnp.ndarray
     use_morton_geometry: jnp.ndarray
+    leaf_size: int | None
     oct_parent: jnp.ndarray
     oct_children: jnp.ndarray
     oct_child_counts: jnp.ndarray

@@ -519,21 +519,43 @@ def _register_binary_morton_tree_pytree(tree_cls: type[RadixTree]) -> None:
 
     def flatten(tree: RadixTree):
         topology = tree.topology
-        topology_fields = tuple(getattr(topology, name) for name in topology._fields)
+        topology_field_names = tuple(topology._fields)
+        static_leaf_size = None
+        if "leaf_size" in topology_field_names:
+            static_leaf_size = topology.leaf_size
+            topology_field_names = tuple(
+                name for name in topology_field_names if name != "leaf_size"
+            )
+        topology_fields = tuple(getattr(topology, name) for name in topology_field_names)
         children = topology_fields + (
             tree.positions_sorted,
             tree.masses_sorted,
             tree.inverse_permutation,
         )
-        aux = (type(topology), topology._fields, tree.build_mode)
+        aux = (
+            type(topology),
+            topology._fields,
+            topology_field_names,
+            static_leaf_size,
+            tree.build_mode,
+        )
         return children, aux
 
     def unflatten(aux, children):
-        topology_type, topology_fields, build_mode = aux
-        n_topo = len(topology_fields)
+        (
+            topology_type,
+            topology_fields,
+            dynamic_topology_fields,
+            static_leaf_size,
+            build_mode,
+        ) = aux
+        n_topo = len(dynamic_topology_fields)
         topology_values = children[:n_topo]
         positions_sorted, masses_sorted, inverse_permutation = children[n_topo:]
-        topology = topology_type(*topology_values)
+        dynamic_values = dict(zip(dynamic_topology_fields, topology_values, strict=True))
+        if "leaf_size" in topology_fields:
+            dynamic_values["leaf_size"] = static_leaf_size
+        topology = topology_type(*(dynamic_values[name] for name in topology_fields))
         return tree_cls(
             topology=topology,
             build_mode=build_mode,
