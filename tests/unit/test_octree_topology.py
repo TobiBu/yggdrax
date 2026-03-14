@@ -262,3 +262,40 @@ def test_build_explicit_octree_metadata_from_leaf_partitions_is_jit_compatible()
     assert jnp.array_equal(jit_result.oct_valid_mask, eager.oct_valid_mask)
     assert jnp.array_equal(jit_result.oct_node_depths, eager.oct_node_depths)
     assert jnp.array_equal(jit_result.oct_leaf_mask, eager.oct_leaf_mask)
+
+
+def test_build_explicit_octree_traversal_view_exposes_native_geometry_and_mappings():
+    from yggdrax.octree import build_explicit_octree_traversal_view
+
+    positions = jnp.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.15, 0.12, 0.14],
+            [0.20, 0.24, 0.28],
+            [0.35, 0.32, 0.30],
+            [0.55, 0.58, 0.53],
+            [0.70, 0.72, 0.74],
+            [0.82, 0.84, 0.78],
+            [0.95, 0.94, 0.96],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((8,), dtype=jnp.float32)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=2,
+    )
+
+    view = build_explicit_octree_traversal_view(tree.topology)
+
+    assert view.valid_mask.shape == view.parent.shape
+    assert view.children.shape[1] == 8
+    assert view.box_centers.shape == (view.valid_mask.shape[0], 3)
+    assert view.box_half_extents.shape == (view.valid_mask.shape[0], 3)
+    assert view.box_radii.shape == view.valid_mask.shape
+    assert view.box_max_extents.shape == view.valid_mask.shape
+    assert view.radix_node_to_oct.shape[0] == tree.num_nodes
+    assert view.radix_leaf_to_oct.shape[0] == tree.num_leaves
