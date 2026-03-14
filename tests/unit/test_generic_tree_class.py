@@ -9,12 +9,16 @@ from yggdrax import (
     Tree,
     has_fmm_core_topology,
     has_fmm_topology,
+    has_leaf_topology,
     has_morton_topology,
+    get_leaf_nodes,
     missing_fmm_core_topology_fields,
     missing_fmm_topology_fields,
+    missing_leaf_topology_fields,
     missing_morton_topology_fields,
     require_fmm_core_topology,
     require_fmm_topology,
+    require_leaf_topology,
     require_morton_topology,
 )
 
@@ -194,6 +198,28 @@ def test_available_tree_types_includes_radix():
     assert "radix" in tree_api.available_tree_types()
     assert "octree" in tree_api.available_tree_types()
     assert "kdtree" in tree_api.available_tree_types()
+
+
+@pytest.mark.parametrize("tree_type", ["radix", "octree", "kdtree"])
+def test_tree_leaf_contract_is_shared_across_topologies(tree_type: str):
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type=tree_type,
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+
+    leaf_nodes = get_leaf_nodes(tree)
+    assert has_leaf_topology(tree)
+    assert missing_leaf_topology_fields(tree) == ()
+    require_leaf_topology(tree)
+    assert leaf_nodes.ndim == 1
+    assert leaf_nodes.shape[0] == tree.num_leaves
+    assert int(jnp.min(leaf_nodes)) >= 0
+    assert int(jnp.max(leaf_nodes)) < tree.num_nodes
 
 
 def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):

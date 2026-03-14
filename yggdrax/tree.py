@@ -106,6 +106,8 @@ FMM_CORE_REQUIRED_FIELDS: tuple[str, ...] = (
     "use_morton_geometry",
 )
 
+LEAF_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = ("node_ranges",)
+
 MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
     "bounds_min",
     "bounds_max",
@@ -702,6 +704,22 @@ def has_morton_topology(tree_or_topology: object) -> bool:
     return len(missing_morton_topology_fields(tree_or_topology)) == 0
 
 
+def missing_leaf_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return fields needed to derive or expose leaf-node indices."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name for name in LEAF_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
+    )
+
+
+def has_leaf_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when leaf-node metadata can be resolved."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return hasattr(topology, "leaf_nodes") or len(missing_leaf_topology_fields(topology)) == 0
+
+
 def require_fmm_core_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when FMM-core topology fields are missing."""
 
@@ -730,6 +748,23 @@ def require_morton_topology(tree_or_topology: object) -> None:
     )
 
 
+def require_leaf_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when leaf-node metadata cannot be resolved."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    if hasattr(topology, "leaf_nodes"):
+        return
+    missing = missing_leaf_topology_fields(topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(
+        f"{prefix}topology is missing leaf-required fields: {missing_txt}"
+    )
+
+
 # Backward-compatible aliases
 def missing_fmm_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Alias of ``missing_fmm_core_topology_fields`` for compatibility."""
@@ -752,9 +787,33 @@ def require_fmm_topology(tree_or_topology: object) -> None:
 def get_num_internal_nodes(tree: object) -> int:
     """Return number of internal nodes, deriving it from child buffers when needed."""
 
+    if hasattr(tree, "left_child"):
+        return int(jnp.asarray(tree.left_child).shape[0])
     if hasattr(tree, "num_internal_nodes"):
-        return int(getattr(tree, "num_internal_nodes"))
-    return int(jnp.asarray(tree.left_child).shape[0])
+        num_internal = getattr(tree, "num_internal_nodes")
+        if isinstance(num_internal, jax.core.Tracer):
+            raise ValueError(
+                "tree.num_internal_nodes is traced; expose left_child or another "
+                "statically shaped child buffer to derive internal-node count."
+            )
+        return int(num_internal)
+    raise AttributeError(
+        "topology does not expose left_child or num_internal_nodes"
+    )
+
+
+def get_leaf_nodes(tree: object) -> Array:
+    """Return leaf-node indices, deriving a stable default when needed."""
+
+    topology = resolve_tree_topology(tree)
+    if hasattr(topology, "leaf_nodes"):
+        return jnp.asarray(getattr(topology, "leaf_nodes"), dtype=INDEX_DTYPE)
+
+    require_leaf_topology(topology)
+    node_ranges = jnp.asarray(topology.node_ranges, dtype=INDEX_DTYPE)
+    total_nodes = int(node_ranges.shape[0])
+    num_internal = get_num_internal_nodes(topology)
+    return jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
 
 
 def get_node_levels(tree: object) -> Array:
@@ -1364,19 +1423,23 @@ __all__ = [
     "build_tree_jit",
     "available_tree_types",
     "get_level_offsets",
+    "get_leaf_nodes",
     "get_node_levels",
     "get_nodes_by_level",
     "get_num_internal_nodes",
     "get_num_levels",
     "has_fmm_core_topology",
     "has_fmm_topology",
+    "has_leaf_topology",
     "has_morton_topology",
     "missing_fmm_core_topology_fields",
     "missing_fmm_topology_fields",
+    "missing_leaf_topology_fields",
     "missing_morton_topology_fields",
     "resolve_tree_topology",
     "require_fmm_core_topology",
     "require_fmm_topology",
+    "require_leaf_topology",
     "require_morton_topology",
     "register_tree_builder",
     "reorder_particles_by_indices",

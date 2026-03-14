@@ -32,6 +32,7 @@ from .grouped_interactions import (
     build_grouped_interactions_from_pairs,
 )
 from .tree import (
+    get_leaf_nodes,
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
@@ -461,6 +462,8 @@ class NodeNeighborList(NamedTuple):
     neighbors: Array
     leaf_indices: Array
     counts: Array
+    particle_order_leaf_indices: Array
+    particle_order_to_native_leaf: Array
 
 
 class DualTreeWalkResult(NamedTuple):
@@ -801,6 +804,41 @@ def _exclusive_cumsum(values: Array, *, dtype=None) -> Array:
     return jnp.concatenate([zeros, cumsum])
 
 
+def _resolve_leaf_ordering(
+    tree: object,
+    *,
+    total_nodes: int,
+    num_internal: int,
+) -> tuple[Array, Array, Array, Array]:
+    """Resolve leaf ordering and lookup maps for radix and octree trees."""
+
+    particle_order_leaf_indices = get_leaf_nodes(tree).astype(INDEX_DTYPE)
+    num_leaves = particle_order_leaf_indices.shape[0]
+    native_order = jnp.arange(num_leaves, dtype=INDEX_DTYPE)
+    if hasattr(tree, "radix_leaf_to_oct"):
+        native_order = jnp.argsort(
+            jnp.asarray(getattr(tree, "radix_leaf_to_oct"), dtype=INDEX_DTYPE),
+            stable=True,
+        ).astype(INDEX_DTYPE)
+
+    leaf_indices = particle_order_leaf_indices[native_order]
+    particle_order_to_native_leaf = jnp.zeros((num_leaves,), dtype=INDEX_DTYPE)
+    particle_order_to_native_leaf = particle_order_to_native_leaf.at[native_order].set(
+        jnp.arange(num_leaves, dtype=INDEX_DTYPE)
+    )
+
+    leaf_position = jnp.full((total_nodes,), -1, dtype=INDEX_DTYPE)
+    leaf_position = leaf_position.at[leaf_indices].set(
+        jnp.arange(num_leaves, dtype=INDEX_DTYPE)
+    )
+    return (
+        leaf_indices,
+        leaf_position,
+        particle_order_leaf_indices,
+        particle_order_to_native_leaf,
+    )
+
+
 def _raise_if_true(flag, message: str) -> None:
     if isinstance(flag, jax.core.Tracer):
 
@@ -848,9 +886,18 @@ def _dual_tree_walk_impl(
     right_child = tree.right_child
     total_nodes = parent.shape[0]
     num_internal = left_child.shape[0]
+    (
+        leaf_indices,
+        leaf_position,
+        _particle_order_leaf_indices,
+        _particle_order_to_native_leaf,
+    ) = _resolve_leaf_ordering(
+        tree,
+        total_nodes=total_nodes,
+        num_internal=num_internal,
+    )
 
     if num_internal == 0:
-        leaf_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
         leaf_count = leaf_indices.shape[0]
         zero_nodes = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
         zero_leaves = jnp.zeros((leaf_count,), dtype=INDEX_DTYPE)
@@ -899,14 +946,7 @@ def _dual_tree_walk_impl(
     # Root is the unique node whose parent is -1.
     root_idx = as_index(jnp.argmin(parent))
 
-    # Leaves are the nodes with indices >= num_internal. Construct the
-    # leaf index array without calling jnp.nonzero/jnp.where to remain
-    # JIT-traceable (same approach as the count-only pass).
-    leaf_indices = jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
     num_leaves = total_nodes - num_internal
-    # Map node index -> leaf ordinal (0..num_leaves-1) or -1 for non-leaves
-    positions = jnp.arange(total_nodes, dtype=INDEX_DTYPE) - as_index(num_internal)
-    leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
 
     stack_capacity = max(int(max_pair_queue), 4)
 
@@ -1659,6 +1699,16 @@ def _dual_tree_walk_count_impl(
     right_child = tree.right_child
     total_nodes = parent.shape[0]
     num_internal = left_child.shape[0]
+    (
+        _leaf_indices,
+        leaf_position,
+        _particle_order_leaf_indices,
+        _particle_order_to_native_leaf,
+    ) = _resolve_leaf_ordering(
+        tree,
+        total_nodes=total_nodes,
+        num_internal=num_internal,
+    )
 
     if num_internal == 0:
         leaf_count = total_nodes
@@ -1686,14 +1736,7 @@ def _dual_tree_walk_count_impl(
     )
 
     root_idx = as_index(jnp.argmax(parent < 0))
-
-    # Leaves are the nodes with indices >= num_internal. Use a static
-    # computation that avoids jnp.nonzero/nonzero (which requires a
-    # statically-known size) so this function remains JIT-traceable.
     num_leaves = total_nodes - num_internal
-    # Map node index -> leaf ordinal (0..num_leaves-1) or -1 for non-leaves
-    positions = jnp.arange(total_nodes, dtype=INDEX_DTYPE) - as_index(num_internal)
-    leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
 
     # Wavefront capacity for the count-only walk.  Each pair can produce
     # up to _MAX_REFINEMENT_PAIRS refined pairs per round, and the peak
@@ -2021,9 +2064,18 @@ def _dual_tree_walk_compact_fill_impl(
     right_child = tree.right_child
     total_nodes = parent.shape[0]
     num_internal = left_child.shape[0]
+    (
+        leaf_indices,
+        leaf_position,
+        _particle_order_leaf_indices,
+        _particle_order_to_native_leaf,
+    ) = _resolve_leaf_ordering(
+        tree,
+        total_nodes=total_nodes,
+        num_internal=num_internal,
+    )
 
     if num_internal == 0:
-        leaf_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
         leaf_count = leaf_indices.shape[0]
         zero_nodes = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
         zero_leaves = jnp.zeros((leaf_count,), dtype=INDEX_DTYPE)
@@ -2066,9 +2118,6 @@ def _dual_tree_walk_compact_fill_impl(
 
     root_idx = as_index(jnp.argmin(parent))
     num_leaves = total_nodes - num_internal
-    leaf_indices = jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
-    positions = jnp.arange(total_nodes, dtype=INDEX_DTYPE) - as_index(num_internal)
-    leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
 
     stack_capacity = max(int(max_pair_queue), 4)
     wf_indices = jnp.arange(stack_capacity, dtype=INDEX_DTYPE)
@@ -2699,6 +2748,7 @@ def _result_to_interactions(
 
 def _result_to_neighbors(
     result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
+    tree: object | None = None,
 ) -> NodeNeighborList:
     traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
@@ -2708,11 +2758,30 @@ def _result_to_neighbors(
     else:
         near_total = int(result.near_pair_count)
         neighbor_indices = jax.device_put(result.neighbor_indices[:near_total])
+    leaf_indices = jnp.asarray(result.leaf_indices)
+    particle_order_leaf_indices = leaf_indices
+    particle_order_to_native_leaf = jnp.arange(leaf_indices.shape[0], dtype=INDEX_DTYPE)
+    if tree is not None:
+        total_nodes = int(tree.parent.shape[0])
+        num_internal = int(tree.left_child.shape[0])
+        (
+            _native_leaf_indices,
+            _leaf_position,
+            particle_order_leaf_indices,
+            particle_order_to_native_leaf,
+        ) = _resolve_leaf_ordering(
+            tree,
+            total_nodes=total_nodes,
+            num_internal=num_internal,
+        )
+
     return NodeNeighborList(
         offsets=neighbor_offsets,
         neighbors=neighbor_indices,
-        leaf_indices=jnp.asarray(result.leaf_indices),
+        leaf_indices=leaf_indices,
         counts=neighbor_counts,
+        particle_order_leaf_indices=particle_order_leaf_indices,
+        particle_order_to_native_leaf=particle_order_to_native_leaf,
     )
 
 
@@ -3365,7 +3434,7 @@ def build_leaf_neighbor_lists(
         process_block=process_block,
         retry_logger=retry_logger,
     )
-    return _result_to_neighbors(raw)
+    return _result_to_neighbors(raw, tree)
 
 
 @jaxtyped(typechecker=beartype)
@@ -3449,7 +3518,7 @@ def build_interactions_and_neighbors(
     if return_grouped and not return_interactions:
         raise ValueError("grouped interaction return requires return_interactions=True")
     interactions = _result_to_interactions(raw, tree) if return_interactions else None
-    neighbors = _result_to_neighbors(raw)
+    neighbors = _result_to_neighbors(raw, tree)
     grouped = None
     if return_grouped:
         far_total = int(raw.far_pair_count)
@@ -3499,8 +3568,9 @@ def neighbors_for_leaf(data: NodeNeighborList, leaf_node: int) -> Array:
     """Return neighbouring leaf nodes interacting with ``leaf_node``."""
 
     leaf_indices = jnp.asarray(data.leaf_indices)
-    pos = int(jnp.searchsorted(leaf_indices, leaf_node, side="left"))
-    if pos >= leaf_indices.shape[0] or int(leaf_indices[pos]) != leaf_node:
+    matches = jnp.nonzero(leaf_indices == as_index(leaf_node), size=1, fill_value=-1)[0]
+    pos = int(matches[0])
+    if pos < 0:
         raise ValueError("leaf_node not present in neighbor list")
 
     start = int(data.offsets[pos])
