@@ -209,3 +209,56 @@ def test_build_explicit_octree_metadata_is_jit_compatible():
     assert jnp.array_equal(jit_result.oct_valid_mask, eager.oct_valid_mask)
     assert jnp.array_equal(jit_result.oct_node_depths, eager.oct_node_depths)
     assert jnp.array_equal(jit_result.oct_parent, eager.oct_parent)
+
+
+def test_build_explicit_octree_metadata_from_leaf_partitions_is_jit_compatible():
+    from yggdrax.octree import (
+        _resolved_leaf_partitions,
+        build_explicit_octree_metadata_from_leaf_partitions,
+    )
+
+    positions = jnp.array(
+        [
+            [0.10, 0.10, 0.10],
+            [0.15, 0.12, 0.14],
+            [0.20, 0.24, 0.28],
+            [0.35, 0.32, 0.30],
+            [0.55, 0.58, 0.53],
+            [0.70, 0.72, 0.74],
+            [0.82, 0.84, 0.78],
+            [0.95, 0.94, 0.96],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((8,), dtype=jnp.float32)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=2,
+    )
+    topology = tree.topology
+    leaf_starts, leaf_ends_exclusive, leaf_codes, leaf_depths = _resolved_leaf_partitions(
+        topology
+    )
+
+    eager = build_explicit_octree_metadata_from_leaf_partitions(
+        num_particles=int(topology.num_particles),
+        leaf_starts=leaf_starts,
+        leaf_ends_exclusive=leaf_ends_exclusive,
+        leaf_codes=leaf_codes,
+        leaf_depths=leaf_depths,
+    )
+    jitted = jax.jit(build_explicit_octree_metadata_from_leaf_partitions, static_argnames=("num_particles",))
+    jit_result = jitted(
+        num_particles=int(topology.num_particles),
+        leaf_starts=leaf_starts,
+        leaf_ends_exclusive=leaf_ends_exclusive,
+        leaf_codes=leaf_codes,
+        leaf_depths=leaf_depths,
+    )
+
+    assert jnp.array_equal(jit_result.oct_valid_mask, eager.oct_valid_mask)
+    assert jnp.array_equal(jit_result.oct_node_depths, eager.oct_node_depths)
+    assert jnp.array_equal(jit_result.oct_leaf_mask, eager.oct_leaf_mask)
