@@ -254,6 +254,31 @@ def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):
     assert tree.positions_sorted is not None
 
 
+def test_octree_build_path_does_not_delegate_to_radix_wrapper(monkeypatch):
+    positions, masses = _sample_problem(n=32)
+
+    def _forbidden_radix_builder(*args, **kwargs):
+        raise AssertionError("octree build should not call RadixTree.from_particles")
+
+    monkeypatch.setattr(
+        tree_api.RadixTree,
+        "from_particles",
+        classmethod(_forbidden_radix_builder),
+    )
+
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+
+    assert tree.tree_type == "octree"
+    assert tree.positions_sorted is not None
+
+
 def test_register_tree_builder_rejects_duplicate_without_overwrite(monkeypatch):
     original_builders = dict(tree_api._TREE_BUILDERS)
     monkeypatch.setattr(tree_api, "_TREE_BUILDERS", dict(original_builders))
