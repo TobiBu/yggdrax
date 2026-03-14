@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from beartype import beartype
+from jax import core as jax_core
 from jaxtyping import Array, jaxtyped
 
 from . import _geometry_impl
@@ -17,11 +18,32 @@ _MAX_MORTON_LEVEL = _geometry_impl._MAX_MORTON_LEVEL
 def compute_tree_geometry(
     tree: object,
     positions_sorted: Array,
+    *,
+    max_leaf_size: int | None = None,
 ) -> TreeGeometry:
-    """Compute per-node geometric bounds and helper radii."""
+    """Compute per-node geometric bounds and helper radii.
+
+    ``max_leaf_size`` is optional for correctness, but passing it is important
+    for large JIT-compiled radix trees. It bounds the temporary leaf gather
+    shape used during geometry construction and avoids falling back to a
+    ``num_particles``-sized staging buffer under tracing.
+    """
 
     topology = resolve_tree_topology(tree)
-    return _geometry_impl.compute_tree_geometry(topology, positions_sorted)
+    resolved_leaf_cap = max_leaf_size
+    if (
+        resolved_leaf_cap is None
+        and hasattr(topology, "leaf_size")
+        and topology.leaf_size is not None
+        and not isinstance(topology.leaf_size, jax_core.Tracer)
+    ):
+        resolved_leaf_cap = int(topology.leaf_size)
+
+    return _geometry_impl.compute_tree_geometry(
+        topology,
+        positions_sorted,
+        max_leaf_size=resolved_leaf_cap,
+    )
 
 
 @jaxtyped(typechecker=beartype)

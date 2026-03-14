@@ -10,6 +10,7 @@ from yggdrax import (
     DualTreeTraversalConfig,
     NodeInteractionList,
     NodeNeighborList,
+    _interactions_impl,
     build_interactions_and_neighbors,
     build_tree,
     compute_tree_geometry,
@@ -173,3 +174,21 @@ def test_interactions_can_derive_missing_level_fields():
     )
     assert isinstance(interactions, NodeInteractionList)
     assert isinstance(neighbors, NodeNeighborList)
+
+
+def test_dual_tree_queue_cache_is_bounded():
+    _interactions_impl._DUAL_TREE_QUEUE_CACHE.clear()
+    for idx in range(_interactions_impl._MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES + 5):
+        _interactions_impl._store_cached_queue_capacity((idx,), idx + 1)
+
+    assert (
+        len(_interactions_impl._DUAL_TREE_QUEUE_CACHE)
+        == _interactions_impl._MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES
+    )
+    assert (0,) not in _interactions_impl._DUAL_TREE_QUEUE_CACHE
+    assert (
+        _interactions_impl._get_cached_queue_capacity(
+            (_interactions_impl._MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES + 4,)
+        )
+        == _interactions_impl._MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES + 5
+    )

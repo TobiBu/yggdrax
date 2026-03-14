@@ -11,6 +11,8 @@ in the number of tree nodes.
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from typing import List, Literal, NamedTuple, Optional, Union
@@ -47,8 +49,9 @@ _MAX_REFINEMENT_PAIRS = 4
 _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE = 1.2
 
 _AUTO_INTERACTION_MIN = 2048
-_AUTO_INTERACTION_MAX = 65536
+_AUTO_INTERACTION_MAX = 16384
 _AUTO_INTERACTION_SCALE = 4
+_COUNT_PASS_FILL_INTERACTION_CAP = 4096
 
 
 # Module-level helper constants and functions used by the traversal refiners.
@@ -114,6 +117,12 @@ def _count_refine_pairs_single(
     return result
 
 
+_COUNT_REFINE_VM = jax.vmap(
+    _count_refine_pairs_single,
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+)
+
+
 def _next_power_of_two(value: int) -> int:
     value = max(1, int(value))
     return 1 << (value - 1).bit_length()
@@ -130,7 +139,8 @@ class DualTreeTraversalConfig:
 
 
 _GLOBAL_DUAL_TREE_CONFIG: Optional[DualTreeTraversalConfig] = None
-_DUAL_TREE_QUEUE_CACHE: dict[tuple, int] = {}
+_MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES = 128
+_DUAL_TREE_QUEUE_CACHE: "OrderedDict[tuple, int]" = OrderedDict()
 
 
 def set_default_dual_tree_config(
@@ -158,6 +168,25 @@ def _resolve_dual_tree_config(
     if config is not None:
         return config
     return _GLOBAL_DUAL_TREE_CONFIG
+
+
+def _get_cached_queue_capacity(cache_key: tuple) -> Optional[int]:
+    """Return a cached queue capacity and refresh its recency ordering."""
+
+    cached = _DUAL_TREE_QUEUE_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    _DUAL_TREE_QUEUE_CACHE.move_to_end(cache_key)
+    return int(cached)
+
+
+def _store_cached_queue_capacity(cache_key: tuple, queue_capacity: int) -> None:
+    """Store a queue capacity while bounding cache growth."""
+
+    _DUAL_TREE_QUEUE_CACHE[cache_key] = int(queue_capacity)
+    _DUAL_TREE_QUEUE_CACHE.move_to_end(cache_key)
+    while len(_DUAL_TREE_QUEUE_CACHE) > _MAX_DUAL_TREE_QUEUE_CACHE_ENTRIES:
+        _DUAL_TREE_QUEUE_CACHE.popitem(last=False)
 
 
 def _queue_candidates_bounded(
@@ -263,6 +292,21 @@ def _compute_mac_ok(
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+_TRAVERSAL_DIAGNOSTICS = _env_flag("YGGDRAX_TRAVERSAL_DIAGNOSTICS", False)
+
+
+def _traversal_diag(message: str) -> None:
+    if _TRAVERSAL_DIAGNOSTICS:
+        print(f"[yggdrax.traversal] {message}", flush=True)
 
 
 class DualTreeRetryEvent(NamedTuple):
@@ -421,6 +465,36 @@ class NodeNeighborList(NamedTuple):
 
 class DualTreeWalkResult(NamedTuple):
     """Container for far-field and near-field results from a dual walk."""
+
+    interaction_offsets: Array
+    interaction_sources: Array
+    interaction_targets: Array
+    interaction_tags: Array
+    interaction_counts: Array
+    neighbor_offsets: Array
+    neighbor_indices: Array
+    neighbor_counts: Array
+    leaf_indices: Array
+    far_pair_count: Array
+    near_pair_count: Array
+    queue_overflow: Array
+    far_overflow: Array
+    near_overflow: Array
+    accept_decisions: Array
+    near_decisions: Array
+    refine_decisions: Array
+
+
+class CompactTaggedFarPairs(NamedTuple):
+    """Exact-length far-pair payload for downstream adaptive-order consumers."""
+
+    sources: Array
+    targets: Array
+    tags: Array
+
+
+class _DualTreeWalkRawOutputs(NamedTuple):
+    """Raw dual-tree walk payload before caller-specific compaction."""
 
     interaction_offsets: Array
     interaction_sources: Array
@@ -720,9 +794,10 @@ def _compute_leaf_effective_extents(
     )
 
 
-def _exclusive_cumsum(values: Array) -> Array:
-    zeros = jnp.zeros((1,), dtype=values.dtype)
-    cumsum = jnp.cumsum(values, axis=0, dtype=values.dtype)
+def _exclusive_cumsum(values: Array, *, dtype=None) -> Array:
+    resolved_dtype = values.dtype if dtype is None else dtype
+    zeros = jnp.zeros((1,), dtype=resolved_dtype)
+    cumsum = jnp.cumsum(values, axis=0, dtype=resolved_dtype)
     return jnp.concatenate([zeros, cumsum])
 
 
@@ -749,7 +824,6 @@ def _raise_if_true(flag, message: str) -> None:
         "pair_policy",
         "collect_far",
         "collect_near",
-        "process_block",
     ),
 )
 def _dual_tree_walk_impl(
@@ -1096,9 +1170,9 @@ def _dual_tree_walk_impl(
         should_near = valid_pairs_bool & (pair_actions == as_index(_ACTION_NEAR))
         do_refine = valid_pairs_bool & (pair_actions == as_index(_ACTION_REFINE))
 
-        batch_accept = jnp.sum(should_accept.astype(INDEX_DTYPE))
-        batch_near = jnp.sum(should_near.astype(INDEX_DTYPE))
-        batch_refine = jnp.sum(do_refine.astype(INDEX_DTYPE))
+        batch_accept = jnp.sum(should_accept.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        batch_near = jnp.sum(should_near.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        batch_refine = jnp.sum(do_refine.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
 
         extent_target = mac_extents[safe_targets]
         extent_source = mac_extents[safe_sources]
@@ -1194,8 +1268,8 @@ def _dual_tree_walk_impl(
                 far_counts_c = far_counts_after_fwd + bwd_incr
                 far_pair_total_c = (
                     far_pair_total_c
-                    + jnp.sum(fwd_ok.astype(INDEX_DTYPE))
-                    + jnp.sum(bwd_ok.astype(INDEX_DTYPE))
+                    + jnp.sum(fwd_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+                    + jnp.sum(bwd_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
                 )
                 return (
                     far_buffer_c,
@@ -1298,8 +1372,8 @@ def _dual_tree_walk_impl(
                 near_counts_c = near_counts_after_fwd + bwd_near_incr
                 near_pair_total_c = (
                     near_pair_total_c
-                    + jnp.sum(fwd_near_ok.astype(INDEX_DTYPE))
-                    + jnp.sum(bwd_near_ok.astype(INDEX_DTYPE))
+                    + jnp.sum(fwd_near_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+                    + jnp.sum(bwd_near_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
                 )
                 return (
                     neighbor_buffer_c,
@@ -1345,9 +1419,10 @@ def _dual_tree_walk_impl(
 
         # Exclusive prefix sum gives each valid pair a unique slot
         # in the new wavefront.
-        push_prefix = jnp.cumsum(valid_push.astype(INDEX_DTYPE)) - valid_push.astype(
-            INDEX_DTYPE
-        )
+        push_prefix = jnp.cumsum(
+            valid_push.astype(INDEX_DTYPE),
+            dtype=INDEX_DTYPE,
+        ) - valid_push.astype(INDEX_DTYPE)
 
         # Capacity check.
         push_ok = valid_push & (push_prefix < as_index(wavefront_capacity))
@@ -1371,7 +1446,7 @@ def _dual_tree_walk_impl(
             .at[safe_slot]
             .set(jnp.where(push_ok, push_hi, as_index(-1)), mode="drop")
         )
-        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE))
+        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
 
         return (
             new_wf_target,
@@ -1556,7 +1631,6 @@ def _dual_tree_walk_impl(
         "pair_policy",
         "collect_far",
         "collect_near",
-        "process_block",
     ),
 )
 def _dual_tree_walk_count_impl(
@@ -1827,13 +1901,8 @@ def _dual_tree_walk_count_impl(
                 near_counts,
             )
 
-        # refine: push refined pairs onto stack
-        refine_vm = jax.vmap(
-            _count_refine_pairs_single,
-            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        )
-
-        refine_pairs = refine_vm(
+        # refine: push refined pairs onto the next wavefront
+        refine_pairs = _COUNT_REFINE_VM(
             targets,
             sources,
             same_node,
@@ -1875,9 +1944,12 @@ def _dual_tree_walk_count_impl(
             .at[safe_slot]
             .set(jnp.where(push_ok, push_hi, as_index(-1)), mode="drop")
         )
-        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE))
+        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
 
-        max_wf = jnp.maximum(max_wf, new_wf_size)
+        max_wf = jnp.maximum(
+            jnp.asarray(max_wf, dtype=INDEX_DTYPE),
+            jnp.asarray(new_wf_size, dtype=INDEX_DTYPE),
+        )
 
         return (
             new_wf_target,
@@ -1911,8 +1983,653 @@ def _dual_tree_walk_count_impl(
     return far_counts, near_counts, max_wf
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "mac_type",
+        "pair_policy",
+        "collect_far",
+        "collect_near",
+        "max_pair_queue",
+        "total_far_pairs",
+        "total_near_pairs",
+    ),
+)
+def _dual_tree_walk_compact_fill_impl(
+    tree: object,
+    geometry: TreeGeometry,
+    far_offsets: Array,
+    far_counts_expected: Array,
+    near_offsets: Array,
+    near_counts_expected: Array,
+    theta: float,
+    *,
+    mac_type: MACType = "bh",
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
+    dehnen_radius_scale: float = 1.0,
+    max_pair_queue: int,
+    total_far_pairs: int,
+    total_near_pairs: int,
+    collect_far: bool = True,
+    collect_near: bool = True,
+) -> DualTreeWalkResult:
+    """Fill exact-length far/near arrays from pre-counted traversal totals."""
+
+    parent = tree.parent
+    left_child = tree.left_child
+    right_child = tree.right_child
+    total_nodes = parent.shape[0]
+    num_internal = left_child.shape[0]
+
+    if num_internal == 0:
+        leaf_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
+        leaf_count = leaf_indices.shape[0]
+        zero_nodes = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+        zero_leaves = jnp.zeros((leaf_count,), dtype=INDEX_DTYPE)
+        return DualTreeWalkResult(
+            interaction_offsets=jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE),
+            interaction_sources=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            interaction_targets=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            interaction_tags=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            interaction_counts=zero_nodes,
+            neighbor_offsets=jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
+            neighbor_indices=jnp.zeros((0,), dtype=INDEX_DTYPE),
+            neighbor_counts=zero_leaves,
+            leaf_indices=leaf_indices,
+            far_pair_count=as_index(0),
+            near_pair_count=as_index(0),
+            queue_overflow=jnp.bool_(False),
+            far_overflow=jnp.bool_(False),
+            near_overflow=jnp.bool_(False),
+            accept_decisions=as_index(0),
+            near_decisions=as_index(0),
+            refine_decisions=as_index(0),
+        )
+
+    centers = jnp.asarray(geometry.center)
+    extents_box = jnp.asarray(geometry.max_extent)
+    extents_sphere = jnp.asarray(geometry.radius)
+    theta_sq = (jnp.asarray(theta, dtype=centers.dtype)) ** 2
+    effective_extents_box_far = _compute_effective_extents(parent, extents_box)
+    effective_extents_box_leaf = _compute_leaf_effective_extents(
+        parent,
+        extents_box,
+        num_internal,
+    )
+    effective_extents_sphere_far = _compute_effective_extents(parent, extents_sphere)
+    effective_extents_sphere_leaf = _compute_leaf_effective_extents(
+        parent,
+        extents_sphere,
+        num_internal,
+    )
+
+    root_idx = as_index(jnp.argmin(parent))
+    num_leaves = total_nodes - num_internal
+    leaf_indices = jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
+    positions = jnp.arange(total_nodes, dtype=INDEX_DTYPE) - as_index(num_internal)
+    leaf_position = jnp.where(positions >= as_index(0), positions, as_index(-1))
+
+    stack_capacity = max(int(max_pair_queue), 4)
+    wf_indices = jnp.arange(stack_capacity, dtype=INDEX_DTYPE)
+    pair_stack_target = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+    pair_stack_source = jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+    pair_stack_target = pair_stack_target.at[0].set(root_idx)
+    pair_stack_source = pair_stack_source.at[0].set(root_idx)
+    stack_size = as_index(1)
+
+    num_internal_val = as_index(num_internal)
+    node_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
+    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
+    extents_far = jnp.where(
+        use_sphere,
+        effective_extents_sphere_far,
+        effective_extents_box_far,
+    )
+    extents_leaf = jnp.where(
+        use_sphere,
+        effective_extents_sphere_leaf,
+        effective_extents_box_leaf,
+    )
+    dehnen_scale = jnp.asarray(dehnen_radius_scale, dtype=centers.dtype)
+    is_dehnen = jnp.asarray(mac_type == "dehnen")
+    extents_far = jnp.where(is_dehnen, dehnen_scale * extents_far, extents_far)
+    extents_leaf = jnp.where(is_dehnen, dehnen_scale * extents_leaf, extents_leaf)
+    mac_extents = jnp.where(
+        node_indices >= num_internal_val,
+        extents_leaf,
+        extents_far,
+    )
+
+    leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
+    left_child_full = jnp.concatenate([left_child, leaf_fill], axis=0)
+    right_child_full = jnp.concatenate([right_child, leaf_fill], axis=0)
+
+    filler_pair = jnp.asarray([-1, -1], dtype=INDEX_DTYPE)
+    empty_pairs = jnp.tile(filler_pair[None, :], (_MAX_REFINEMENT_PAIRS, 1))
+
+    def _sorted_pair(a: Array, b: Array) -> Array:
+        lo = jnp.minimum(a, b)
+        hi = jnp.maximum(a, b)
+        return jnp.stack([lo, hi], axis=0)
+
+    def _refine_pairs_branchless(
+        tgt: Array,
+        src: Array,
+        same: Array,
+        split_both_flag: Array,
+        split_target_flag: Array,
+        split_source_flag: Array,
+        tgt_left: Array,
+        tgt_right: Array,
+        src_left: Array,
+        src_right: Array,
+    ) -> Array:
+        p_bs_0 = _sorted_pair(tgt_left, tgt_left)
+        p_bs_1 = _sorted_pair(tgt_left, tgt_right)
+        p_bs_2 = _sorted_pair(tgt_right, tgt_right)
+        both_same = jnp.stack([p_bs_0, p_bs_1, p_bs_2, filler_pair], axis=0)
+
+        p_bc_0 = _sorted_pair(tgt_left, src_left)
+        p_bc_1 = _sorted_pair(tgt_left, src_right)
+        p_bc_2 = _sorted_pair(tgt_right, src_left)
+        p_bc_3 = _sorted_pair(tgt_right, src_right)
+        both_cross = jnp.stack([p_bc_0, p_bc_1, p_bc_2, p_bc_3], axis=0)
+
+        p_st_0 = _sorted_pair(tgt_left, src)
+        p_st_1 = _sorted_pair(tgt_right, src)
+        split_tgt = jnp.stack([p_st_0, p_st_1, filler_pair, filler_pair], axis=0)
+
+        p_ss_0 = _sorted_pair(tgt, src_left)
+        p_ss_1 = _sorted_pair(tgt, src_right)
+        split_src = jnp.stack([p_ss_0, p_ss_1, filler_pair, filler_pair], axis=0)
+
+        result = empty_pairs
+        result = jnp.where(split_source_flag, split_src, result)
+        result = jnp.where(split_target_flag, split_tgt, result)
+        result = jnp.where(split_both_flag & ~same, both_cross, result)
+        result = jnp.where(split_both_flag & same, both_same, result)
+        return result
+
+    refine_vm = jax.vmap(
+        _refine_pairs_branchless,
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )
+
+    far_sources = (
+        jnp.zeros((total_far_pairs,), dtype=INDEX_DTYPE)
+        if collect_far
+        else jnp.zeros((0,), dtype=INDEX_DTYPE)
+    )
+    far_targets = (
+        jnp.zeros((total_far_pairs,), dtype=INDEX_DTYPE)
+        if collect_far
+        else jnp.zeros((0,), dtype=INDEX_DTYPE)
+    )
+    far_tags = (
+        jnp.full((total_far_pairs,), -1, dtype=INDEX_DTYPE)
+        if collect_far
+        else jnp.zeros((0,), dtype=INDEX_DTYPE)
+    )
+    far_written = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+
+    neighbor_indices = (
+        jnp.zeros((total_near_pairs,), dtype=INDEX_DTYPE)
+        if collect_near
+        else jnp.zeros((0,), dtype=INDEX_DTYPE)
+    )
+    near_written = jnp.zeros((num_leaves,), dtype=INDEX_DTYPE)
+
+    overflow_wf = jnp.bool_(False)
+    far_overflow = jnp.bool_(False)
+    near_overflow = jnp.bool_(False)
+
+    def cond_fun(state):
+        (
+            _wf_target,
+            _wf_source,
+            current_size,
+            _far_sources,
+            _far_targets,
+            _far_tags,
+            _far_written,
+            _neighbor_indices,
+            _near_written,
+            wf_over,
+            far_over,
+            near_over,
+            _accept_decisions,
+            _near_decisions,
+            _refine_decisions,
+        ) = state
+        return (current_size > 0) & (~wf_over) & (~far_over) & (~near_over)
+
+    def body_fun(state):
+        (
+            wf_target,
+            wf_source,
+            wf_size,
+            far_sources_out,
+            far_targets_out,
+            far_tags_out,
+            far_written_out,
+            neighbor_indices_out,
+            near_written_out,
+            wf_overflow,
+            far_overflow,
+            near_overflow,
+            accept_decisions,
+            near_decisions,
+            refine_decisions,
+        ) = state
+
+        valid_mask = wf_indices < wf_size
+        targets = jnp.where(valid_mask, wf_target, as_index(-1))
+        sources = jnp.where(valid_mask, wf_source, as_index(-1))
+
+        valid_pairs = valid_mask & (targets >= 0) & (sources >= 0)
+        valid_pairs_bool = valid_pairs.astype(jnp.bool_)
+        safe_targets = jnp.where(valid_pairs, targets, as_index(0))
+        safe_sources = jnp.where(valid_pairs, sources, as_index(0))
+
+        center_target = centers[safe_targets]
+        center_source = centers[safe_sources]
+        delta = center_target - center_source
+        valid_scale = valid_pairs[:, None].astype(delta.dtype)
+        delta = delta * valid_scale
+        dist_sq = jnp.sum(delta * delta, axis=1)
+
+        different_nodes = targets != sources
+        extent_mac_target = mac_extents[safe_targets]
+        extent_mac_source = mac_extents[safe_sources]
+        mac_ok = _compute_mac_ok(
+            mac_type=mac_type,
+            theta_sq=theta_sq,
+            dist_sq=dist_sq,
+            extent_target=extent_mac_target,
+            extent_source=extent_mac_source,
+            valid_pairs=valid_pairs_bool,
+            different_nodes=different_nodes,
+        )
+
+        target_internal = valid_pairs_bool & (targets < num_internal_val)
+        source_internal = valid_pairs_bool & (sources < num_internal_val)
+        target_leaf = valid_pairs_bool & (~target_internal)
+        source_leaf = valid_pairs_bool & (~source_internal)
+        same_node = valid_pairs_bool & (targets == sources)
+        if pair_policy is None:
+            pair_actions = _default_pair_actions_only(
+                mac_ok=mac_ok,
+                valid_pairs=valid_pairs_bool,
+                different_nodes=different_nodes,
+                target_leaf=target_leaf,
+                source_leaf=source_leaf,
+            )
+            pair_tags = jnp.zeros((0,), dtype=INDEX_DTYPE)
+            pair_tags_rev = jnp.zeros((0,), dtype=INDEX_DTYPE)
+        else:
+            pair_actions, pair_tags, pair_tags_rev = _resolve_pair_actions(
+                pair_policy=pair_policy,
+                policy_state=policy_state,
+                valid_pairs=valid_pairs_bool,
+                mac_ok=mac_ok,
+                different_nodes=different_nodes,
+                target_leaf=target_leaf,
+                source_leaf=source_leaf,
+                same_node=same_node,
+                target_nodes=targets,
+                source_nodes=sources,
+                center_target=center_target,
+                center_source=center_source,
+                dist_sq=dist_sq,
+                extent_target=extent_mac_target,
+                extent_source=extent_mac_source,
+            )
+
+        should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
+        should_near = valid_pairs_bool & (pair_actions == as_index(_ACTION_NEAR))
+        do_refine = valid_pairs_bool & (pair_actions == as_index(_ACTION_REFINE))
+
+        batch_accept = jnp.sum(should_accept.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        batch_near = jnp.sum(should_near.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        batch_refine = jnp.sum(do_refine.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+
+        extent_target = mac_extents[safe_targets]
+        extent_source = mac_extents[safe_sources]
+
+        split_target = (
+            do_refine
+            & target_internal
+            & (same_node | (~source_internal) | (extent_target >= extent_source))
+        )
+        split_source = (
+            do_refine
+            & source_internal
+            & (same_node | (~target_internal) | (extent_source > extent_target))
+        )
+        split_both = split_target & split_source
+
+        target_left = left_child_full[safe_targets]
+        target_right = right_child_full[safe_targets]
+        source_left = left_child_full[safe_sources]
+        source_right = right_child_full[safe_sources]
+
+        leaf_pos_target = leaf_position[safe_targets]
+        leaf_pos_source = leaf_position[safe_sources]
+
+        if collect_far:
+            accept_mask = should_accept
+
+            def _far_update(carry):
+                (
+                    far_sources_c,
+                    far_targets_c,
+                    far_tags_c,
+                    far_written_c,
+                    far_overflow_c,
+                ) = carry
+                accept_targets_a = jnp.where(accept_mask, targets, as_index(-1))
+                accept_sources_a = jnp.where(accept_mask, sources, as_index(-1))
+
+                fwd_prefix = _per_key_prefix(accept_targets_a, accept_mask, total_nodes)
+                fwd_slot = far_written_c[safe_targets] + fwd_prefix
+                fwd_cap = far_counts_expected[safe_targets]
+                fwd_ok = accept_mask & (fwd_slot < fwd_cap)
+                far_overflow_c = far_overflow_c | jnp.any(accept_mask & (~fwd_ok))
+
+                oob_far = as_index(total_far_pairs)
+                fwd_pos = jnp.where(
+                    fwd_ok,
+                    far_offsets[safe_targets] + fwd_slot,
+                    oob_far,
+                )
+                far_sources_c = far_sources_c.at[fwd_pos].set(
+                    jnp.where(fwd_ok, safe_sources, as_index(-1)),
+                    mode="drop",
+                )
+                far_targets_c = far_targets_c.at[fwd_pos].set(
+                    jnp.where(fwd_ok, safe_targets, as_index(-1)),
+                    mode="drop",
+                )
+                if pair_policy is not None:
+                    far_tags_c = far_tags_c.at[fwd_pos].set(
+                        jnp.where(fwd_ok, pair_tags, as_index(-1)),
+                        mode="drop",
+                    )
+
+                fwd_incr = jax.ops.segment_sum(
+                    fwd_ok.astype(INDEX_DTYPE), safe_targets, num_segments=total_nodes
+                )
+                far_written_after_fwd = far_written_c + fwd_incr
+
+                bwd_prefix = _per_key_prefix(accept_sources_a, accept_mask, total_nodes)
+                bwd_slot = far_written_after_fwd[safe_sources] + bwd_prefix
+                bwd_cap = far_counts_expected[safe_sources]
+                bwd_ok = accept_mask & (bwd_slot < bwd_cap)
+                far_overflow_c = far_overflow_c | jnp.any(accept_mask & (~bwd_ok))
+
+                bwd_pos = jnp.where(
+                    bwd_ok,
+                    far_offsets[safe_sources] + bwd_slot,
+                    oob_far,
+                )
+                far_sources_c = far_sources_c.at[bwd_pos].set(
+                    jnp.where(bwd_ok, safe_targets, as_index(-1)),
+                    mode="drop",
+                )
+                far_targets_c = far_targets_c.at[bwd_pos].set(
+                    jnp.where(bwd_ok, safe_sources, as_index(-1)),
+                    mode="drop",
+                )
+                if pair_policy is not None:
+                    far_tags_c = far_tags_c.at[bwd_pos].set(
+                        jnp.where(bwd_ok, pair_tags_rev, as_index(-1)),
+                        mode="drop",
+                    )
+
+                bwd_incr = jax.ops.segment_sum(
+                    bwd_ok.astype(INDEX_DTYPE),
+                    safe_sources,
+                    num_segments=total_nodes,
+                )
+                far_written_c = far_written_after_fwd + bwd_incr
+                return (
+                    far_sources_c,
+                    far_targets_c,
+                    far_tags_c,
+                    far_written_c,
+                    far_overflow_c,
+                )
+
+            (
+                far_sources_out,
+                far_targets_out,
+                far_tags_out,
+                far_written_out,
+                far_overflow,
+            ) = lax.cond(
+                jnp.any(accept_mask),
+                _far_update,
+                lambda c: c,
+                (
+                    far_sources_out,
+                    far_targets_out,
+                    far_tags_out,
+                    far_written_out,
+                    far_overflow,
+                ),
+            )
+
+        if collect_near:
+            near_mask = should_near
+
+            def _near_update(carry):
+                (
+                    neighbor_indices_c,
+                    near_written_c,
+                    near_overflow_c,
+                ) = carry
+                near_pos_t = jnp.where(near_mask, leaf_pos_target, as_index(-1))
+                near_pos_s = jnp.where(near_mask, leaf_pos_source, as_index(-1))
+                near_tgt_nodes = jnp.where(near_mask, targets, as_index(-1))
+                near_src_nodes = jnp.where(near_mask, sources, as_index(-1))
+
+                safe_pos_t = jnp.where(near_mask, near_pos_t, as_index(0))
+                safe_pos_s = jnp.where(near_mask, near_pos_s, as_index(0))
+
+                fwd_prefix = _per_key_prefix(safe_pos_t, near_mask, num_leaves)
+                fwd_slot = near_written_c[safe_pos_t] + fwd_prefix
+                fwd_cap = near_counts_expected[safe_pos_t]
+                fwd_ok = near_mask & (fwd_slot < fwd_cap)
+                near_overflow_c = near_overflow_c | jnp.any(near_mask & (~fwd_ok))
+
+                oob_near = as_index(total_near_pairs)
+                fwd_pos = jnp.where(
+                    fwd_ok,
+                    near_offsets[safe_pos_t] + fwd_slot,
+                    oob_near,
+                )
+                neighbor_indices_c = neighbor_indices_c.at[fwd_pos].set(
+                    jnp.where(fwd_ok, near_src_nodes, as_index(-1)),
+                    mode="drop",
+                )
+
+                fwd_incr = jax.ops.segment_sum(
+                    fwd_ok.astype(INDEX_DTYPE),
+                    safe_pos_t,
+                    num_segments=num_leaves,
+                )
+                near_written_after_fwd = near_written_c + fwd_incr
+
+                bwd_prefix = _per_key_prefix(safe_pos_s, near_mask, num_leaves)
+                bwd_slot = near_written_after_fwd[safe_pos_s] + bwd_prefix
+                bwd_cap = near_counts_expected[safe_pos_s]
+                bwd_ok = near_mask & (bwd_slot < bwd_cap)
+                near_overflow_c = near_overflow_c | jnp.any(near_mask & (~bwd_ok))
+
+                bwd_pos = jnp.where(
+                    bwd_ok,
+                    near_offsets[safe_pos_s] + bwd_slot,
+                    oob_near,
+                )
+                neighbor_indices_c = neighbor_indices_c.at[bwd_pos].set(
+                    jnp.where(bwd_ok, near_tgt_nodes, as_index(-1)),
+                    mode="drop",
+                )
+
+                bwd_incr = jax.ops.segment_sum(
+                    bwd_ok.astype(INDEX_DTYPE),
+                    safe_pos_s,
+                    num_segments=num_leaves,
+                )
+                near_written_c = near_written_after_fwd + bwd_incr
+                return (
+                    neighbor_indices_c,
+                    near_written_c,
+                    near_overflow_c,
+                )
+
+            (
+                neighbor_indices_out,
+                near_written_out,
+                near_overflow,
+            ) = lax.cond(
+                jnp.any(near_mask),
+                _near_update,
+                lambda c: c,
+                (
+                    neighbor_indices_out,
+                    near_written_out,
+                    near_overflow,
+                ),
+            )
+
+        refine_pairs = refine_vm(
+            targets,
+            sources,
+            same_node,
+            split_both.astype(jnp.bool_),
+            split_target.astype(jnp.bool_),
+            split_source.astype(jnp.bool_),
+            target_left,
+            target_right,
+            source_left,
+            source_right,
+        )
+
+        refine_targets = refine_pairs[..., 0].reshape(
+            (stack_capacity * _MAX_REFINEMENT_PAIRS,)
+        )
+        refine_sources = refine_pairs[..., 1].reshape(
+            (stack_capacity * _MAX_REFINEMENT_PAIRS,)
+        )
+
+        valid_push = (refine_targets >= 0) & (refine_sources >= 0)
+        push_prefix = jnp.cumsum(
+            valid_push.astype(INDEX_DTYPE),
+            dtype=INDEX_DTYPE,
+        ) - valid_push.astype(INDEX_DTYPE)
+        push_ok = valid_push & (push_prefix < as_index(stack_capacity))
+        wf_overflow = wf_overflow | jnp.any(
+            valid_push & (push_prefix >= as_index(stack_capacity))
+        )
+
+        push_lo = jnp.minimum(refine_targets, refine_sources)
+        push_hi = jnp.maximum(refine_targets, refine_sources)
+
+        oob_wf = as_index(stack_capacity)
+        safe_slot = jnp.where(push_ok, push_prefix, oob_wf)
+        new_wf_target = (
+            jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_lo, as_index(-1)), mode="drop")
+        )
+        new_wf_source = (
+            jnp.full((stack_capacity,), -1, dtype=INDEX_DTYPE)
+            .at[safe_slot]
+            .set(jnp.where(push_ok, push_hi, as_index(-1)), mode="drop")
+        )
+        new_wf_size = jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+
+        return (
+            new_wf_target,
+            new_wf_source,
+            new_wf_size,
+            far_sources_out,
+            far_targets_out,
+            far_tags_out,
+            far_written_out,
+            neighbor_indices_out,
+            near_written_out,
+            wf_overflow,
+            far_overflow,
+            near_overflow,
+            accept_decisions + batch_accept,
+            near_decisions + batch_near,
+            refine_decisions + batch_refine,
+        )
+
+    (
+        _wf_target_out,
+        _wf_source_out,
+        _wf_size_out,
+        far_sources,
+        far_targets,
+        far_tags,
+        _far_written,
+        neighbor_indices,
+        _near_written,
+        overflow_wf,
+        far_overflow,
+        near_overflow,
+        accept_decisions,
+        near_decisions,
+        refine_decisions,
+    ) = lax.while_loop(
+        cond_fun,
+        body_fun,
+        (
+            pair_stack_target,
+            pair_stack_source,
+            stack_size,
+            far_sources,
+            far_targets,
+            far_tags,
+            far_written,
+            neighbor_indices,
+            near_written,
+            overflow_wf,
+            far_overflow,
+            near_overflow,
+            as_index(0),
+            as_index(0),
+            as_index(0),
+        ),
+    )
+
+    return DualTreeWalkResult(
+        interaction_offsets=jnp.asarray(far_offsets, dtype=INDEX_DTYPE),
+        interaction_sources=far_sources,
+        interaction_targets=far_targets,
+        interaction_tags=far_tags,
+        interaction_counts=jnp.asarray(far_counts_expected, dtype=INDEX_DTYPE),
+        neighbor_offsets=jnp.asarray(near_offsets, dtype=INDEX_DTYPE),
+        neighbor_indices=neighbor_indices,
+        neighbor_counts=jnp.asarray(near_counts_expected, dtype=INDEX_DTYPE),
+        leaf_indices=leaf_indices,
+        far_pair_count=as_index(total_far_pairs),
+        near_pair_count=as_index(total_near_pairs),
+        queue_overflow=overflow_wf,
+        far_overflow=far_overflow,
+        near_overflow=near_overflow,
+        accept_decisions=accept_decisions,
+        near_decisions=near_decisions,
+        refine_decisions=refine_decisions,
+    )
+
+
 def _result_to_interactions(
-    result: DualTreeWalkResult,
+    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
     tree: object,
 ) -> NodeInteractionList:
     total_nodes = int(tree.parent.shape[0])
@@ -1980,7 +2697,9 @@ def _result_to_interactions(
     )
 
 
-def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
+def _result_to_neighbors(
+    result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
+) -> NodeNeighborList:
     traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
     neighbor_counts = jnp.asarray(result.neighbor_counts)
@@ -1997,7 +2716,7 @@ def _result_to_neighbors(result: DualTreeWalkResult) -> NodeNeighborList:
     )
 
 
-def _run_dual_tree_walk(
+def _run_dual_tree_walk_raw(
     tree: object,
     geometry: TreeGeometry,
     theta: float,
@@ -2014,7 +2733,7 @@ def _run_dual_tree_walk(
     dehnen_radius_scale: float = 1.0,
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
-) -> DualTreeWalkResult:
+) -> _DualTreeWalkRawOutputs:
     # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
     tree = tree.topology if hasattr(tree, "topology") else tree
@@ -2043,7 +2762,7 @@ def _run_dual_tree_walk(
     if config is not None:
         queue_max = max(4, int(config.max_pair_queue))
         interaction_candidates = [int(config.max_interactions_per_node)]
-        allow_auto_interactions = False
+        allow_auto_interactions = len(interaction_candidates) > 1
         neighbors_limit = int(config.max_neighbors_per_leaf)
         process_override = int(config.process_block)
         user_supplied_queue = True
@@ -2058,7 +2777,7 @@ def _run_dual_tree_walk(
             bool(collect_near),
             str(mac_type),
         )
-        cached_q = _DUAL_TREE_QUEUE_CACHE.get(queue_cache_key)
+        cached_q = _get_cached_queue_capacity(queue_cache_key)
         if cached_q is not None:
             queue_candidates = [int(cached_q)]
         else:
@@ -2108,6 +2827,32 @@ def _run_dual_tree_walk(
         if traced_count_pass:
             use_count_pass = False
 
+    _traversal_diag(
+        "walk start "
+        f"total_nodes={total_nodes} num_internal={num_internal} "
+        f"use_count_pass={bool(use_count_pass)} "
+        f"max_interactions_per_node={max_interactions_per_node} "
+        f"max_neighbors_per_leaf={int(max_neighbors_per_leaf)} "
+        f"max_pair_queue={max_pair_queue} traversal_config={traversal_config} "
+        f"process_block={process_block} mac_type={mac_type}"
+    )
+
+    queue_error_msg = (
+        "Pair queue capacity exceeded; increase max_pair_queue and rebuild."
+        if user_supplied_queue
+        else (
+            "Pair queue capacity exceeded; pass a larger max_pair_queue "
+            "value to override auto-scaling."
+        )
+    )
+
+    far_error_msg = (
+        "Interaction list capacity exceeded; increase "
+        "max_interactions_per_node and rebuild."
+    )
+
+    attempt_counter = 0
+
     if use_count_pass:
         # Choose a process block for the count pass. Prefer an explicit
         # override, else use the provided block size or the default.
@@ -2130,6 +2875,19 @@ def _run_dual_tree_walk(
             collect_far=collect_far,
             collect_near=collect_near,
             process_block=count_process_block,
+        )
+
+        far_total_diag = int(jnp.sum(far_counts, dtype=jnp.int64)) if collect_far else 0
+        near_total_diag = (
+            int(jnp.sum(near_counts, dtype=jnp.int64)) if collect_near else 0
+        )
+        _traversal_diag(
+            "count pass "
+            f"process_block={count_process_block} "
+            f"max_far_per_node={int(jnp.max(far_counts)) if collect_far else 0} "
+            f"max_near_per_leaf={int(jnp.max(near_counts)) if collect_near else 0} "
+            f"far_total={far_total_diag} near_total={near_total_diag} "
+            f"max_wf={int(max_wf)}"
         )
 
         # Compute suggested capacities from observed counts.
@@ -2163,13 +2921,35 @@ def _run_dual_tree_walk(
             observed_wf + observed_wf // 2,  # 1.5× observed peak
         )
 
-        # Replace candidate lists so the main loop performs a single
-        # sized pass. Add a defensive guard to avoid producing host-side
-        # allocation sizes that overflow 32-bit integers or are otherwise
-        # unrealistic (this previously caused an OverflowError when the
-        # derived total pairs exceeded int32 limits).
+        # Replace candidate lists so the main loop performs a tightly-bounded
+        # fill pass. Do not feed the raw observed maximum directly into one
+        # giant allocation: large irregular trees can momentarily report a
+        # pathological per-node count which would materialize far_buffer and
+        # flattened interaction arrays at impractical sizes. Start from a
+        # practical cap and let the existing retry loop grow only if the fill
+        # pass actually overflows.
         queue_candidates = [queue_suggest]
-        interaction_candidates = [max(1, max_interactions_suggest)]
+        suggested_interactions = max(1, int(max_interactions_suggest))
+        if suggested_interactions <= _COUNT_PASS_FILL_INTERACTION_CAP:
+            interaction_candidates = [suggested_interactions]
+        else:
+            interaction_candidates = []
+            cap = int(_COUNT_PASS_FILL_INTERACTION_CAP)
+            while cap < suggested_interactions:
+                interaction_candidates.append(int(cap))
+                if cap >= _AUTO_INTERACTION_MAX:
+                    break
+                cap = min(int(_AUTO_INTERACTION_MAX), int(cap) * 2)
+            interaction_candidates.append(
+                int(min(suggested_interactions, _AUTO_INTERACTION_MAX))
+            )
+            # Remove duplicates while preserving ascending order.
+            seen_caps = set()
+            interaction_candidates = [
+                cap_i
+                for cap_i in interaction_candidates
+                if not (cap_i in seen_caps or seen_caps.add(cap_i))
+            ]
 
         # Clamp per-leaf neighbor suggestion so the estimated total
         # neighbour pair count (num_leaves * per_leaf) fits in signed
@@ -2197,22 +2977,122 @@ def _run_dual_tree_walk(
         allow_auto_interactions = False
         user_supplied_queue = True
 
-    result: Optional[DualTreeWalkResult] = None
-    attempt_counter = 0
+        auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
+        queue_candidates = [
+            int(cap) for cap in auto_queue_candidates if cap >= queue_suggest
+        ]
+        if len(queue_candidates) == 0:
+            queue_candidates = [int(queue_suggest)]
+        elif queue_candidates[0] != int(queue_suggest):
+            queue_candidates = [int(queue_suggest), *queue_candidates]
+        seen_queue_caps = set()
+        queue_candidates = [
+            int(cap_i)
+            for cap_i in queue_candidates
+            if not (int(cap_i) in seen_queue_caps or seen_queue_caps.add(int(cap_i)))
+        ]
 
-    queue_error_msg = (
-        "Pair queue capacity exceeded; increase max_pair_queue and rebuild."
-        if user_supplied_queue
-        else (
-            "Pair queue capacity exceeded; pass a larger max_pair_queue "
-            "value to override auto-scaling."
+        far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
+        near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
+        total_far_pairs = int(far_offsets64[-1]) if collect_far else 0
+        total_near_pairs = int(near_offsets64[-1]) if collect_near else 0
+        int32_max = (1 << 31) - 1
+        if total_far_pairs < 0 or total_near_pairs < 0:
+            raise RuntimeError(
+                "Dual-tree traversal produced a negative pair total; "
+                "this indicates count overflow in the compact-fill sizing path."
+            )
+        if total_far_pairs > int32_max or total_near_pairs > int32_max:
+            raise RuntimeError(
+                "Dual-tree traversal pair totals exceed signed int32 capacity; "
+                "refine the tree or use a lower-memory traversal strategy."
+            )
+        far_offsets = jnp.asarray(far_offsets64, dtype=INDEX_DTYPE)
+        near_offsets = jnp.asarray(near_offsets64, dtype=INDEX_DTYPE)
+        _traversal_diag(
+            "compact fill sizing "
+            f"queue_candidates={queue_candidates} "
+            f"suggested_interactions={suggested_interactions} "
+            f"neighbors_limit={neighbors_limit} "
+            f"total_far_pairs={total_far_pairs} total_near_pairs={total_near_pairs}"
         )
-    )
 
-    far_error_msg = (
-        "Interaction list capacity exceeded; increase "
-        "max_interactions_per_node and rebuild."
-    )
+        result = None
+        success = False
+        for queue_capacity in queue_candidates:
+            attempt_counter += 1
+            attempt_idx = attempt_counter
+            result = _dual_tree_walk_compact_fill_impl(
+                tree,
+                geometry,
+                far_offsets,
+                far_counts,
+                near_offsets,
+                near_counts,
+                theta_val,
+                mac_type=mac_type,
+                pair_policy=pair_policy,
+                policy_state=policy_state,
+                dehnen_radius_scale=dehnen_scale_val,
+                max_pair_queue=int(queue_capacity),
+                total_far_pairs=int(total_far_pairs),
+                total_near_pairs=int(total_near_pairs),
+                collect_far=collect_far,
+                collect_near=collect_near,
+            )
+
+            overflow_queue = result.queue_overflow
+            if isinstance(overflow_queue, jax_core.Tracer):
+                success = True
+                break
+            if bool(overflow_queue):
+                _emit_retry_event(
+                    "queue_overflow",
+                    attempt=attempt_idx,
+                    queue_capacity=int(queue_capacity),
+                    interaction_capacity=max(1, int(max_interactions_suggest)),
+                    walk_result=result,
+                )
+                continue
+
+            success = True
+            if attempt_idx > 1:
+                _emit_retry_event(
+                    "success",
+                    attempt=attempt_idx,
+                    queue_capacity=int(queue_capacity),
+                    interaction_capacity=max(1, int(max_interactions_suggest)),
+                    walk_result=result,
+                )
+            break
+
+        if result is None:
+            raise RuntimeError(
+                "count-pass compact fill failed without producing output"
+            )
+
+        if not success:
+            _raise_if_true(result.queue_overflow, queue_error_msg)
+
+        traced_overflow = isinstance(
+            result.far_overflow, jax_core.Tracer
+        ) or isinstance(result.near_overflow, jax_core.Tracer)
+        if traced_overflow:
+            return result
+
+        if collect_far:
+            _raise_if_true(result.far_overflow, far_error_msg)
+        if collect_near:
+            _raise_if_true(
+                result.near_overflow,
+                (
+                    "Neighbor list capacity exceeded; increase "
+                    "max_neighbors_per_leaf and rebuild."
+                ),
+            )
+        return result
+
+    result: Optional[_DualTreeWalkRawOutputs] = None
 
     success = False
 
@@ -2321,7 +3201,7 @@ def _run_dual_tree_walk(
 
         if success:
             if queue_cache_key is not None:
-                _DUAL_TREE_QUEUE_CACHE[queue_cache_key] = int(queue_capacity)
+                _store_cached_queue_capacity(queue_cache_key, queue_capacity)
             break
     else:
         assert result is not None
@@ -2363,6 +3243,48 @@ def _run_dual_tree_walk(
     return result
 
 
+def _raw_to_result(raw: _DualTreeWalkRawOutputs) -> DualTreeWalkResult:
+    """Wrap raw traversal payload in the public result container."""
+
+    return DualTreeWalkResult(
+        interaction_offsets=raw.interaction_offsets,
+        interaction_sources=raw.interaction_sources,
+        interaction_targets=raw.interaction_targets,
+        interaction_tags=raw.interaction_tags,
+        interaction_counts=raw.interaction_counts,
+        neighbor_offsets=raw.neighbor_offsets,
+        neighbor_indices=raw.neighbor_indices,
+        neighbor_counts=raw.neighbor_counts,
+        leaf_indices=raw.leaf_indices,
+        far_pair_count=raw.far_pair_count,
+        near_pair_count=raw.near_pair_count,
+        queue_overflow=raw.queue_overflow,
+        far_overflow=raw.far_overflow,
+        near_overflow=raw.near_overflow,
+        accept_decisions=raw.accept_decisions,
+        near_decisions=raw.near_decisions,
+        refine_decisions=raw.refine_decisions,
+    )
+
+
+def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarPairs:
+    """Return exact-length far-pair arrays without retaining traversal buffers."""
+    far_pair_count = jnp.asarray(raw.far_pair_count, dtype=INDEX_DTYPE)
+    if isinstance(raw.far_pair_count, jax_core.Tracer):
+        return CompactTaggedFarPairs(
+            sources=jnp.asarray(raw.interaction_sources, dtype=INDEX_DTYPE),
+            targets=jnp.asarray(raw.interaction_targets, dtype=INDEX_DTYPE),
+            tags=jnp.asarray(raw.interaction_tags, dtype=INDEX_DTYPE),
+        )
+
+    far_total = int(far_pair_count)
+    return CompactTaggedFarPairs(
+        sources=jax.device_put(raw.interaction_sources[:far_total]),
+        targets=jax.device_put(raw.interaction_targets[:far_total]),
+        tags=jax.device_put(raw.interaction_tags[:far_total]),
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def build_well_separated_interactions(
     tree: object,
@@ -2387,7 +3309,7 @@ def build_well_separated_interactions(
     sacrificing correctness for adversarial inputs.
     """
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2404,7 +3326,7 @@ def build_well_separated_interactions(
         process_block=process_block,
         retry_logger=retry_logger,
     )
-    return _result_to_interactions(result, tree)
+    return _result_to_interactions(raw, tree)
 
 
 @jaxtyped(typechecker=beartype)
@@ -2426,7 +3348,7 @@ def build_leaf_neighbor_lists(
 ) -> NodeNeighborList:
     """Construct near-field adjacency for leaf nodes via a MAC walk."""
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2443,7 +3365,7 @@ def build_leaf_neighbor_lists(
         process_block=process_block,
         retry_logger=retry_logger,
     )
-    return _result_to_neighbors(result)
+    return _result_to_neighbors(raw)
 
 
 @jaxtyped(typechecker=beartype)
@@ -2463,15 +3385,37 @@ def build_interactions_and_neighbors(
     policy_state: object = None,
     *,
     return_result: bool = False,
+    return_compact_far_pairs: bool = False,
+    return_interactions: bool = True,
     return_grouped: bool = False,
 ) -> Union[
-    tuple[NodeInteractionList, NodeNeighborList],
-    tuple[NodeInteractionList, NodeNeighborList, DualTreeWalkResult],
-    tuple[NodeInteractionList, NodeNeighborList, GroupedInteractionBuffers],
+    tuple[Optional[NodeInteractionList], NodeNeighborList],
+    tuple[Optional[NodeInteractionList], NodeNeighborList, DualTreeWalkResult],
+    tuple[Optional[NodeInteractionList], NodeNeighborList, CompactTaggedFarPairs],
+    tuple[Optional[NodeInteractionList], NodeNeighborList, GroupedInteractionBuffers],
     tuple[
-        NodeInteractionList,
+        Optional[NodeInteractionList],
         NodeNeighborList,
         DualTreeWalkResult,
+        GroupedInteractionBuffers,
+    ],
+    tuple[
+        Optional[NodeInteractionList],
+        NodeNeighborList,
+        DualTreeWalkResult,
+        CompactTaggedFarPairs,
+    ],
+    tuple[
+        Optional[NodeInteractionList],
+        NodeNeighborList,
+        CompactTaggedFarPairs,
+        GroupedInteractionBuffers,
+    ],
+    tuple[
+        Optional[NodeInteractionList],
+        NodeNeighborList,
+        DualTreeWalkResult,
+        CompactTaggedFarPairs,
         GroupedInteractionBuffers,
     ],
 ]:
@@ -2484,7 +3428,7 @@ def build_interactions_and_neighbors(
     and defaults to ``DEFAULT_PAIR_QUEUE_MULTIPLIER * num_nodes``.
     """
 
-    result = _run_dual_tree_walk(
+    raw = _run_dual_tree_walk_raw(
         tree,
         geometry,
         theta,
@@ -2502,23 +3446,39 @@ def build_interactions_and_neighbors(
         retry_logger=retry_logger,
     )
 
-    interactions = _result_to_interactions(result, tree)
-    neighbors = _result_to_neighbors(result)
+    if return_grouped and not return_interactions:
+        raise ValueError("grouped interaction return requires return_interactions=True")
+    interactions = _result_to_interactions(raw, tree) if return_interactions else None
+    neighbors = _result_to_neighbors(raw)
     grouped = None
     if return_grouped:
-        far_total = int(result.far_pair_count)
+        far_total = int(raw.far_pair_count)
         grouped = build_grouped_interactions_from_pairs(
             tree,
             geometry,
-            result.interaction_sources[:far_total],
-            result.interaction_targets[:far_total],
-            level_offsets=interactions.level_offsets,
+            raw.interaction_sources[:far_total],
+            raw.interaction_targets[:far_total],
+            level_offsets=(
+                interactions.level_offsets if interactions is not None else None
+            ),
         )
 
+    result = _raw_to_result(raw) if return_result else None
+    compact_far_pairs = (
+        _raw_to_compact_far_pairs(raw) if return_compact_far_pairs else None
+    )
+    if return_result and return_compact_far_pairs and return_grouped:
+        return interactions, neighbors, result, compact_far_pairs, grouped
+    if return_result and return_compact_far_pairs:
+        return interactions, neighbors, result, compact_far_pairs
     if return_result and return_grouped:
         return interactions, neighbors, result, grouped
     if return_result:
         return interactions, neighbors, result
+    if return_compact_far_pairs and return_grouped:
+        return interactions, neighbors, compact_far_pairs, grouped
+    if return_compact_far_pairs:
+        return interactions, neighbors, compact_far_pairs
     if return_grouped:
         return interactions, neighbors, grouped
     return interactions, neighbors
@@ -2647,6 +3607,7 @@ __all__ = [
     "NodeInteractionList",
     "NodeNeighborList",
     "DualTreeWalkResult",
+    "CompactTaggedFarPairs",
     "build_well_separated_interactions",
     "build_leaf_neighbor_lists",
     "build_interactions_and_neighbors",
