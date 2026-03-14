@@ -47,6 +47,7 @@ _DEFAULT_MAX_NEIGHBORS = 2048
 DEFAULT_PAIR_QUEUE_MULTIPLIER = 128
 _DEFAULT_PAIR_BATCH = 32
 _MAX_REFINEMENT_PAIRS = 4
+_MAX_OCTREE_REFINEMENT_PAIRS = 36
 _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE = 1.2
 
 _AUTO_INTERACTION_MIN = 2048
@@ -60,12 +61,109 @@ _COUNT_PASS_FILL_INTERACTION_CAP = 4096
 # tracer during jitting of nested traversal functions.
 _FILLER_PAIR = jnp.asarray([-1, -1], dtype=INDEX_DTYPE)
 _EMPTY_REFINEMENT_PAIRS = jnp.tile(_FILLER_PAIR[None, :], (_MAX_REFINEMENT_PAIRS, 1))
+_EMPTY_OCTREE_REFINEMENT_PAIRS = jnp.tile(
+    _FILLER_PAIR[None, :],
+    (_MAX_OCTREE_REFINEMENT_PAIRS, 1),
+)
 
 
 def _count_sorted_pair(a: Array, b: Array) -> Array:
     lo = jnp.minimum(a, b)
     hi = jnp.maximum(a, b)
     return jnp.stack([lo, hi], axis=0)
+
+
+def _sorted_pair_rows(a: Array, b: Array) -> Array:
+    lo = jnp.minimum(a, b)
+    hi = jnp.maximum(a, b)
+    return jnp.stack([lo, hi], axis=1)
+
+
+def _compact_pair_rows(
+    pairs: Array,
+    valid_mask: Array,
+    *,
+    max_pairs: int,
+) -> Array:
+    """Pack valid pair rows into a fixed-size buffer."""
+
+    pair_count = pairs.shape[0]
+    prefix = jnp.cumsum(valid_mask.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    prefix = prefix - valid_mask.astype(INDEX_DTYPE)
+    in_bounds = valid_mask & (prefix < as_index(max_pairs))
+    safe_slot = jnp.where(in_bounds, prefix, as_index(max_pairs))
+    return jnp.full((max_pairs, 2), -1, dtype=INDEX_DTYPE).at[safe_slot].set(
+        jnp.where(valid_mask[:, None], pairs, _FILLER_PAIR),
+        mode="drop",
+    )
+
+
+def _octree_refine_pairs_single(
+    tgt: Array,
+    src: Array,
+    same: Array,
+    split_both_flag: Array,
+    split_target_flag: Array,
+    split_source_flag: Array,
+    tgt_children: Array,
+    tgt_child_count: Array,
+    src_children: Array,
+    src_child_count: Array,
+) -> Array:
+    """Expand a refinement step in native octree child space."""
+
+    child_slots = jnp.arange(tgt_children.shape[0], dtype=INDEX_DTYPE)
+    tgt_valid = child_slots < tgt_child_count
+    src_valid = child_slots < src_child_count
+
+    tgt_only_pairs = _sorted_pair_rows(tgt_children, jnp.full_like(tgt_children, src))
+    tgt_only = _compact_pair_rows(
+        tgt_only_pairs,
+        tgt_valid,
+        max_pairs=_MAX_OCTREE_REFINEMENT_PAIRS,
+    )
+
+    src_only_pairs = _sorted_pair_rows(
+        jnp.full_like(src_children, tgt),
+        src_children,
+    )
+    src_only = _compact_pair_rows(
+        src_only_pairs,
+        src_valid,
+        max_pairs=_MAX_OCTREE_REFINEMENT_PAIRS,
+    )
+
+    pair_i = jnp.repeat(child_slots, tgt_children.shape[0])
+    pair_j = jnp.tile(child_slots, tgt_children.shape[0])
+
+    same_pairs = _sorted_pair_rows(tgt_children[pair_i], tgt_children[pair_j])
+    same_valid = tgt_valid[pair_i] & tgt_valid[pair_j] & (pair_i <= pair_j)
+    both_same = _compact_pair_rows(
+        same_pairs,
+        same_valid,
+        max_pairs=_MAX_OCTREE_REFINEMENT_PAIRS,
+    )
+
+    cross_pairs = _sorted_pair_rows(tgt_children[pair_i], src_children[pair_j])
+    cross_valid = tgt_valid[pair_i] & src_valid[pair_j]
+    both_cross = _compact_pair_rows(
+        cross_pairs,
+        cross_valid,
+        max_pairs=_MAX_OCTREE_REFINEMENT_PAIRS,
+    )
+
+    result = _EMPTY_OCTREE_REFINEMENT_PAIRS
+    result = jnp.where(split_source_flag, src_only, result)
+    result = jnp.where(split_target_flag, tgt_only, result)
+    result = jnp.where(split_both_flag & ~same, both_cross, result)
+    result = jnp.where(split_both_flag & same, both_same, result)
+    return result
+
+
+_OCTREE_REFINE_VM = jax.vmap(
+    _octree_refine_pairs_single,
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+)
 
 
 def _count_refine_pairs_single(

@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 
+from yggdrax import _interactions_impl
 from yggdrax import (
     DualTreeTraversalConfig,
     Tree,
@@ -299,3 +300,88 @@ def test_build_explicit_octree_traversal_view_exposes_native_geometry_and_mappin
     assert view.box_max_extents.shape == view.valid_mask.shape
     assert view.radix_node_to_oct.shape[0] == tree.num_nodes
     assert view.radix_leaf_to_oct.shape[0] == tree.num_leaves
+
+
+def test_octree_refine_pairs_expand_same_node_children():
+    pairs = _interactions_impl._octree_refine_pairs_single(
+        jnp.asarray(9, dtype=jnp.int32),
+        jnp.asarray(9, dtype=jnp.int32),
+        jnp.bool_(True),
+        jnp.bool_(True),
+        jnp.bool_(False),
+        jnp.bool_(False),
+        jnp.asarray([11, 13, 17, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(3, dtype=jnp.int32),
+        jnp.asarray([11, 13, 17, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(3, dtype=jnp.int32),
+    )
+
+    valid = pairs[pairs[:, 0] >= 0]
+    expected = jnp.asarray(
+        [
+            [11, 11],
+            [11, 13],
+            [11, 17],
+            [13, 13],
+            [13, 17],
+            [17, 17],
+        ],
+        dtype=jnp.int32,
+    )
+    assert jnp.array_equal(valid, expected)
+
+
+def test_octree_refine_pairs_expand_cross_children():
+    pairs = _interactions_impl._octree_refine_pairs_single(
+        jnp.asarray(20, dtype=jnp.int32),
+        jnp.asarray(30, dtype=jnp.int32),
+        jnp.bool_(False),
+        jnp.bool_(True),
+        jnp.bool_(False),
+        jnp.bool_(False),
+        jnp.asarray([22, 24, -1, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.asarray([31, 33, 35, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(3, dtype=jnp.int32),
+    )
+
+    valid = pairs[pairs[:, 0] >= 0]
+    expected = jnp.asarray(
+        [
+            [22, 31],
+            [22, 33],
+            [22, 35],
+            [24, 31],
+            [24, 33],
+            [24, 35],
+        ],
+        dtype=jnp.int32,
+    )
+    assert jnp.array_equal(valid, expected)
+
+
+def test_octree_refine_pairs_support_jit_for_one_sided_split():
+    jitted = jax.jit(_interactions_impl._octree_refine_pairs_single)
+    pairs = jitted(
+        jnp.asarray(40, dtype=jnp.int32),
+        jnp.asarray(55, dtype=jnp.int32),
+        jnp.bool_(False),
+        jnp.bool_(False),
+        jnp.bool_(True),
+        jnp.bool_(False),
+        jnp.asarray([41, 42, 43, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(3, dtype=jnp.int32),
+        jnp.asarray([56, 57, -1, -1, -1, -1, -1, -1], dtype=jnp.int32),
+        jnp.asarray(2, dtype=jnp.int32),
+    )
+
+    valid = pairs[pairs[:, 0] >= 0]
+    expected = jnp.asarray(
+        [
+            [41, 55],
+            [42, 55],
+            [43, 55],
+        ],
+        dtype=jnp.int32,
+    )
+    assert jnp.array_equal(valid, expected)
