@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from .dtypes import INDEX_DTYPE
+from .morton import _compact3_u64
 
 _MORTON_BITS = 63
 _MAX_MORTON_LEVEL = 21
@@ -31,6 +32,15 @@ class ExplicitOctreeMetadata(NamedTuple):
     oct_leaf_nodes: jnp.ndarray
     radix_node_to_oct: jnp.ndarray
     radix_leaf_to_oct: jnp.ndarray
+
+
+class ExplicitOctreeBoxGeometry(NamedTuple):
+    """Axis-aligned box geometry for explicit octree cells."""
+
+    centers: jnp.ndarray
+    half_extents: jnp.ndarray
+    radii: jnp.ndarray
+    max_extents: jnp.ndarray
 
 
 class OctreeTopology(NamedTuple):
@@ -330,6 +340,63 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     )
 
 
+def compute_explicit_octree_box_geometry(
+    *,
+    valid_mask: jnp.ndarray,
+    node_codes: jnp.ndarray,
+    node_depths: jnp.ndarray,
+    bounds_min: jnp.ndarray,
+    bounds_max: jnp.ndarray,
+) -> ExplicitOctreeBoxGeometry:
+    """Compute explicit octree box geometry directly from code/depth pairs."""
+
+    bounds_min = jnp.asarray(bounds_min)
+    bounds_max = jnp.asarray(bounds_max)
+    domain = bounds_max - bounds_min
+    depth_clamped = jnp.clip(
+        jnp.asarray(node_depths, dtype=INDEX_DTYPE),
+        jnp.asarray(0, dtype=INDEX_DTYPE),
+        jnp.asarray(_MAX_MORTON_LEVEL, dtype=INDEX_DTYPE),
+    )
+    shift = jnp.asarray(_MAX_MORTON_LEVEL, dtype=jnp.uint64) - depth_clamped.astype(
+        jnp.uint64
+    )
+    node_codes = jnp.asarray(node_codes, dtype=jnp.uint64)
+    x_coords = _compact3_u64(node_codes)
+    y_coords = _compact3_u64(node_codes >> jnp.uint64(1))
+    z_coords = _compact3_u64(node_codes >> jnp.uint64(2))
+
+    x_idx = x_coords >> shift
+    y_idx = y_coords >> shift
+    z_idx = z_coords >> shift
+    indices = jnp.stack([x_idx, y_idx, z_idx], axis=1).astype(bounds_min.dtype)
+
+    counts = jnp.left_shift(
+        jnp.ones_like(depth_clamped, dtype=jnp.uint64),
+        depth_clamped.astype(jnp.uint64),
+    )
+    counts = jnp.maximum(counts, jnp.uint64(1)).astype(bounds_min.dtype)
+    cell_sizes = domain[None, :] / counts[:, None]
+    mins = bounds_min[None, :] + cell_sizes * indices
+    maxs = mins + cell_sizes
+    centers = 0.5 * (mins + maxs)
+    half_extents = 0.5 * (maxs - mins)
+    radii = jnp.linalg.norm(half_extents, axis=1)
+    max_extents = jnp.max(half_extents, axis=1)
+
+    valid_mask = jnp.asarray(valid_mask, dtype=jnp.bool_)
+    centers = jnp.where(valid_mask[:, None], centers, 0.0)
+    half_extents = jnp.where(valid_mask[:, None], half_extents, 0.0)
+    radii = jnp.where(valid_mask, radii, 0.0)
+    max_extents = jnp.where(valid_mask, max_extents, 0.0)
+    return ExplicitOctreeBoxGeometry(
+        centers=centers,
+        half_extents=half_extents,
+        radii=radii,
+        max_extents=max_extents,
+    )
+
+
 def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
     """Derive explicit octree cells from octree leaves and map compat nodes onto them."""
 
@@ -397,8 +464,10 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
 
 
 __all__ = [
+    "ExplicitOctreeBoxGeometry",
     "ExplicitOctreeMetadata",
     "OctreeTopology",
     "augment_radix_topology_with_octree",
+    "compute_explicit_octree_box_geometry",
     "build_explicit_octree_metadata",
 ]
