@@ -13,6 +13,7 @@ from ._interactions_impl import (
     MACType,
     NodeInteractionList,
     NodeNeighborList,
+    OctreeNativeNeighborList,
     PairPolicy,
     _compute_effective_extents,
     _compute_leaf_effective_extents,
@@ -185,6 +186,42 @@ def build_octree_native_far_pairs(
     )
 
 
+def build_octree_native_neighbor_lists(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_neighbors_per_leaf: int = _interactions_impl._DEFAULT_MAX_NEIGHBORS,
+    max_interactions_per_node: int | None = None,
+    mac_type: MACType = "bh",
+    *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
+    max_pair_queue: int | None = None,
+    process_block: int | None = None,
+    traversal_config: DualTreeTraversalConfig | None = None,
+    retry_logger=None,
+    dehnen_radius_scale: float = 1.0,
+) -> OctreeNativeNeighborList:
+    """Construct exact-length near neighbors in explicit octree leaf space."""
+
+    return _call_with_topology(
+        _interactions_impl.build_octree_native_neighbor_lists,
+        tree,
+        geometry,
+        theta=theta,
+        max_neighbors_per_leaf=max_neighbors_per_leaf,
+        max_interactions_per_node=max_interactions_per_node,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_pair_queue=max_pair_queue,
+        process_block=process_block,
+        traversal_config=traversal_config,
+        retry_logger=retry_logger,
+        dehnen_radius_scale=dehnen_radius_scale,
+    )
+
+
 def build_grouped_interactions_from_pairs(
     tree: object,
     geometry: TreeGeometry,
@@ -236,10 +273,12 @@ __all__ = [
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
     "CompactTaggedOctreeFarPairs",
+    "OctreeNativeNeighborList",
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",
     "build_octree_native_far_pairs",
+    "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_grouped_interactions_from_pairs",
     "build_well_separated_interactions",

@@ -9,6 +9,7 @@ from yggdrax import (
     Tree,
     build_interactions_and_neighbors,
     build_octree_native_far_pairs,
+    build_octree_native_neighbor_lists,
     compute_tree_geometry,
 )
 
@@ -188,6 +189,59 @@ def test_octree_native_far_pairs_stay_in_octree_node_space():
         assert int(jnp.min(far_pairs.targets)) >= 0
         assert int(jnp.max(far_pairs.sources)) < int(tree.oct_num_nodes)
         assert int(jnp.max(far_pairs.targets)) < int(tree.oct_num_nodes)
+
+
+def test_octree_native_neighbor_lists_stay_in_octree_leaf_space():
+    key = jax.random.PRNGKey(11)
+    positions = jax.random.uniform(
+        key,
+        (64, 3),
+        minval=-1.0,
+        maxval=1.0,
+        dtype=jnp.float32,
+    )
+    masses = jnp.linspace(1.0, 2.0, positions.shape[0], dtype=jnp.float32)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=8,
+    )
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+    cfg = DualTreeTraversalConfig(
+        max_pair_queue=8192,
+        process_block=128,
+        max_interactions_per_node=1024,
+        max_neighbors_per_leaf=1024,
+    )
+
+    native_neighbors = build_octree_native_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=cfg,
+    )
+
+    leaf_indices = native_neighbors.leaf_indices
+    assert leaf_indices.ndim == 1
+    assert native_neighbors.counts.shape == leaf_indices.shape
+    assert native_neighbors.offsets.shape == (leaf_indices.shape[0] + 1,)
+    assert jnp.array_equal(native_neighbors.offsets[1:], jnp.cumsum(native_neighbors.counts))
+    if leaf_indices.shape[0] > 0:
+        assert int(jnp.min(leaf_indices)) >= 0
+        assert int(jnp.max(leaf_indices)) < int(tree.oct_num_nodes)
+        carrier_nodes = jnp.unique(tree.radix_leaf_to_oct)
+        assert jnp.array_equal(jnp.sort(leaf_indices), jnp.sort(carrier_nodes))
+    if native_neighbors.neighbors.shape[0] > 0:
+        assert int(jnp.min(native_neighbors.neighbors)) >= 0
+        assert int(jnp.max(native_neighbors.neighbors)) < int(tree.oct_num_nodes)
+        carrier_nodes = jnp.unique(tree.radix_leaf_to_oct)
+        assert jnp.all(jnp.isin(native_neighbors.neighbors, carrier_nodes))
+    native_map = native_neighbors.particle_order_to_native_leaf
+    assert native_map.shape == leaf_indices.shape
+    assert jnp.array_equal(jnp.sort(native_map), jnp.arange(leaf_indices.shape[0]))
 
 
 def test_octree_tree_is_jittable_pytree():

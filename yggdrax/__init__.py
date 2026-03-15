@@ -22,9 +22,11 @@ from .interactions import (
     MACType,
     NodeInteractionList,
     NodeNeighborList,
+    OctreeNativeNeighborList,
     PairPolicy,
     build_interactions_and_neighbors,
     build_octree_native_far_pairs,
+    build_octree_native_neighbor_lists,
     build_leaf_neighbor_lists,
 )
 from .kdtree import (
@@ -112,6 +114,7 @@ __all__ = [
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
     "CompactTaggedOctreeFarPairs",
+    "OctreeNativeNeighborList",
     "FixedDepthTreeBuildConfig",
     "INDEX_DTYPE",
     "LevelMajorTreeGeometry",
@@ -148,6 +151,7 @@ __all__ = [
     "available_tree_types",
     "build_interactions_and_neighbors",
     "build_octree_native_far_pairs",
+    "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_prepared_tree_artifacts",
     "build_tree",
