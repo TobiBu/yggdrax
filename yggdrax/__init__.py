@@ -15,6 +15,7 @@ from .geometry import (
 )
 from .interactions import (
     CompactTaggedFarPairs,
+    CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
@@ -23,6 +24,7 @@ from .interactions import (
     NodeNeighborList,
     PairPolicy,
     build_interactions_and_neighbors,
+    build_octree_native_far_pairs,
     build_leaf_neighbor_lists,
 )
 from .kdtree import (
@@ -109,6 +111,7 @@ __all__ = [
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
+    "CompactTaggedOctreeFarPairs",
     "FixedDepthTreeBuildConfig",
     "INDEX_DTYPE",
     "LevelMajorTreeGeometry",
@@ -144,6 +147,7 @@ __all__ = [
     "build_fixed_depth_tree_jit",
     "available_tree_types",
     "build_interactions_and_neighbors",
+    "build_octree_native_far_pairs",
     "build_leaf_neighbor_lists",
     "build_prepared_tree_artifacts",
     "build_tree",

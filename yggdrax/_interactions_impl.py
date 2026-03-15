@@ -595,6 +595,14 @@ class CompactTaggedFarPairs(NamedTuple):
     tags: Array
 
 
+class CompactTaggedOctreeFarPairs(NamedTuple):
+    """Exact-length far-pair payload stored in explicit octree node space."""
+
+    sources: Array
+    targets: Array
+    tags: Array
+
+
 class _DualTreeWalkRawOutputs(NamedTuple):
     """Raw dual-tree walk payload before caller-specific compaction."""
 
@@ -1793,6 +1801,7 @@ def _dual_tree_walk_impl(
         "pair_policy",
         "collect_far",
         "collect_near",
+        "far_node_space",
     ),
 )
 def _dual_tree_walk_octree_impl(
@@ -1811,6 +1820,7 @@ def _dual_tree_walk_octree_impl(
     collect_far: bool = True,
     collect_near: bool = True,
     process_block: int = _DEFAULT_PAIR_BATCH,
+    far_node_space: str = "compat",
 ) -> DualTreeWalkResult:
     del process_block
 
@@ -1831,6 +1841,7 @@ def _dual_tree_walk_octree_impl(
     oct_parent = octree.parent
     oct_leaf_mask = jnp.asarray(octree.leaf_mask, dtype=jnp.bool_)
     oct_total_nodes = oct_parent.shape[0]
+    far_total_nodes = oct_total_nodes if far_node_space == "octree" else total_nodes
 
     if num_internal == 0:
         leaf_count = leaf_indices.shape[0]
@@ -1884,18 +1895,18 @@ def _dual_tree_walk_octree_impl(
     pair_stack_source = pair_stack_source.at[0].set(root_idx)
     stack_size = as_index(1)
 
-    far_counts = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+    far_counts = jnp.zeros((far_total_nodes,), dtype=INDEX_DTYPE)
     store_far_tags = pair_policy is not None
     if collect_far:
-        max_total_far_pairs = max(total_nodes * max_interactions_per_node, 1)
+        max_total_far_pairs = max(far_total_nodes * max_interactions_per_node, 1)
         far_buffer = jnp.full(
-            (total_nodes, max_interactions_per_node),
+            (far_total_nodes, max_interactions_per_node),
             -1,
             dtype=INDEX_DTYPE,
         )
         if store_far_tags:
             far_tag_buffer = jnp.full(
-                (total_nodes, max_interactions_per_node),
+                (far_total_nodes, max_interactions_per_node),
                 -1,
                 dtype=INDEX_DTYPE,
             )
@@ -2089,36 +2100,46 @@ def _dual_tree_walk_octree_impl(
         leaf_pos_source = leaf_position[safe_source_radix_leaves]
 
         if collect_far:
+            safe_target_far_nodes = (
+                safe_targets if far_node_space == "octree" else safe_target_radix_nodes
+            )
+            safe_source_far_nodes = (
+                safe_sources if far_node_space == "octree" else safe_source_radix_nodes
+            )
             accept_targets_a = jnp.where(
                 should_accept,
-                safe_target_radix_nodes,
+                safe_target_far_nodes,
                 as_index(-1),
             )
             accept_sources_a = jnp.where(
                 should_accept,
-                safe_source_radix_nodes,
+                safe_source_far_nodes,
                 as_index(-1),
             )
             if store_far_tags:
                 accept_tags_fwd = jnp.where(should_accept, pair_tags, as_index(-1))
                 accept_tags_bwd = jnp.where(should_accept, pair_tags_rev, as_index(-1))
 
-            fwd_prefix = _per_key_prefix(accept_targets_a, should_accept, total_nodes)
-            fwd_slot = far_counts[safe_target_radix_nodes] + fwd_prefix
+            fwd_prefix = _per_key_prefix(
+                accept_targets_a,
+                should_accept,
+                far_total_nodes,
+            )
+            fwd_slot = far_counts[safe_target_far_nodes] + fwd_prefix
             fwd_ok = should_accept & (fwd_slot < as_index(max_interactions_per_node))
             far_overflow = far_overflow | jnp.any(
                 should_accept & (fwd_slot >= as_index(max_interactions_per_node))
             )
 
-            oob_far = as_index(total_nodes)
-            fwd_node = jnp.where(fwd_ok, safe_target_radix_nodes, oob_far)
+            oob_far = as_index(far_total_nodes)
+            fwd_node = jnp.where(fwd_ok, safe_target_far_nodes, oob_far)
             fwd_col = jnp.where(
                 fwd_ok,
                 fwd_slot,
                 as_index(max_interactions_per_node - 1),
             )
             far_buffer = far_buffer.at[fwd_node, fwd_col].set(
-                jnp.where(fwd_ok, safe_source_radix_nodes, as_index(-1)),
+                jnp.where(fwd_ok, safe_source_far_nodes, as_index(-1)),
                 mode="drop",
             )
             if store_far_tags:
@@ -2129,24 +2150,28 @@ def _dual_tree_walk_octree_impl(
 
             far_counts_after_fwd = far_counts + jax.ops.segment_sum(
                 fwd_ok.astype(INDEX_DTYPE),
-                safe_target_radix_nodes,
-                num_segments=total_nodes,
+                safe_target_far_nodes,
+                num_segments=far_total_nodes,
             )
 
-            bwd_prefix = _per_key_prefix(accept_sources_a, should_accept, total_nodes)
-            bwd_slot = far_counts_after_fwd[safe_source_radix_nodes] + bwd_prefix
+            bwd_prefix = _per_key_prefix(
+                accept_sources_a,
+                should_accept,
+                far_total_nodes,
+            )
+            bwd_slot = far_counts_after_fwd[safe_source_far_nodes] + bwd_prefix
             bwd_ok = should_accept & (bwd_slot < as_index(max_interactions_per_node))
             far_overflow = far_overflow | jnp.any(
                 should_accept & (bwd_slot >= as_index(max_interactions_per_node))
             )
-            bwd_node = jnp.where(bwd_ok, safe_source_radix_nodes, oob_far)
+            bwd_node = jnp.where(bwd_ok, safe_source_far_nodes, oob_far)
             bwd_col = jnp.where(
                 bwd_ok,
                 bwd_slot,
                 as_index(max_interactions_per_node - 1),
             )
             far_buffer = far_buffer.at[bwd_node, bwd_col].set(
-                jnp.where(bwd_ok, safe_target_radix_nodes, as_index(-1)),
+                jnp.where(bwd_ok, safe_target_far_nodes, as_index(-1)),
                 mode="drop",
             )
             if store_far_tags:
@@ -2157,8 +2182,8 @@ def _dual_tree_walk_octree_impl(
 
             far_counts = far_counts_after_fwd + jax.ops.segment_sum(
                 bwd_ok.astype(INDEX_DTYPE),
-                safe_source_radix_nodes,
-                num_segments=total_nodes,
+                safe_source_far_nodes,
+                num_segments=far_total_nodes,
             )
 
         if collect_near:
@@ -4273,6 +4298,105 @@ def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarP
     )
 
 
+def _raw_to_octree_compact_far_pairs(
+    raw: _DualTreeWalkRawOutputs,
+) -> CompactTaggedOctreeFarPairs:
+    """Return exact-length far-pair arrays in explicit octree node space."""
+    far_pair_count = jnp.asarray(raw.far_pair_count, dtype=INDEX_DTYPE)
+    if isinstance(raw.far_pair_count, jax_core.Tracer):
+        return CompactTaggedOctreeFarPairs(
+            sources=jnp.asarray(raw.interaction_sources, dtype=INDEX_DTYPE),
+            targets=jnp.asarray(raw.interaction_targets, dtype=INDEX_DTYPE),
+            tags=jnp.asarray(raw.interaction_tags, dtype=INDEX_DTYPE),
+        )
+
+    far_total = int(far_pair_count)
+    return CompactTaggedOctreeFarPairs(
+        sources=jax.device_put(raw.interaction_sources[:far_total]),
+        targets=jax.device_put(raw.interaction_targets[:far_total]),
+        tags=jax.device_put(raw.interaction_tags[:far_total]),
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def build_octree_native_far_pairs(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_interactions_per_node: Optional[int] = None,
+    mac_type: MACType = "bh",
+    *,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
+    max_pair_queue: Optional[int] = None,
+    process_block: Optional[int] = None,
+    traversal_config: Optional[DualTreeTraversalConfig] = None,
+    retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
+    dehnen_radius_scale: float = 1.0,
+) -> CompactTaggedOctreeFarPairs:
+    """Construct exact-length far pairs directly in explicit octree node space."""
+    del geometry, retry_logger
+
+    tree = tree.topology if hasattr(tree, "topology") else tree
+    if not (hasattr(tree, "oct_children") and hasattr(tree, "oct_parent")):
+        raise ValueError("build_octree_native_far_pairs requires an octree topology")
+
+    resolved_cfg = _resolve_dual_tree_config(traversal_config)
+    if resolved_cfg is None:
+        queue_capacity = max(
+            4,
+            int(max_pair_queue)
+            if max_pair_queue is not None
+            else int(tree.parent.shape[0]) * DEFAULT_PAIR_QUEUE_MULTIPLIER,
+        )
+        interaction_capacity = int(
+            max_interactions_per_node
+            if max_interactions_per_node is not None
+            else _DEFAULT_MAX_INTERACTIONS
+        )
+        resolved_cfg = DualTreeTraversalConfig(
+            max_pair_queue=queue_capacity,
+            process_block=_resolve_process_block(queue_capacity, process_block),
+            max_interactions_per_node=interaction_capacity,
+            max_neighbors_per_leaf=_DEFAULT_MAX_NEIGHBORS,
+        )
+
+    octree = build_explicit_octree_traversal_view(tree)
+    raw = _dual_tree_walk_octree_impl(
+        tree,
+        octree,
+        octree.nodes_by_level,
+        float(theta),
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        dehnen_radius_scale=float(dehnen_radius_scale),
+        max_interactions_per_node=int(resolved_cfg.max_interactions_per_node),
+        max_neighbors_per_leaf=int(resolved_cfg.max_neighbors_per_leaf),
+        max_pair_queue=max(4, int(resolved_cfg.max_pair_queue)),
+        collect_far=True,
+        collect_near=False,
+        process_block=int(resolved_cfg.process_block),
+        far_node_space="octree",
+    )
+
+    traced_overflow = isinstance(raw.far_overflow, jax_core.Tracer) or isinstance(
+        raw.queue_overflow, jax_core.Tracer
+    )
+    if traced_overflow:
+        return _raw_to_octree_compact_far_pairs(raw)
+
+    _raise_if_true(
+        raw.far_overflow,
+        "Native octree interaction list capacity exceeded; increase max_interactions_per_node and rebuild.",
+    )
+    _raise_if_true(
+        raw.queue_overflow,
+        "Native octree pair queue capacity exceeded; increase max_pair_queue and rebuild.",
+    )
+    return _raw_to_octree_compact_far_pairs(raw)
+
+
 @jaxtyped(typechecker=beartype)
 def build_well_separated_interactions(
     tree: object,
@@ -4597,7 +4721,9 @@ __all__ = [
     "NodeNeighborList",
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
+    "CompactTaggedOctreeFarPairs",
     "build_well_separated_interactions",
+    "build_octree_native_far_pairs",
     "build_leaf_neighbor_lists",
     "build_interactions_and_neighbors",
     "interactions_for_node",

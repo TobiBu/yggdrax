@@ -6,6 +6,7 @@ from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
     CompactTaggedFarPairs,
+    CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
@@ -150,6 +151,40 @@ def build_interactions_and_neighbors(
     )
 
 
+def build_octree_native_far_pairs(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_interactions_per_node: int | None = None,
+    mac_type: MACType = "bh",
+    *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
+    max_pair_queue: int | None = None,
+    process_block: int | None = None,
+    traversal_config: DualTreeTraversalConfig | None = None,
+    retry_logger=None,
+    dehnen_radius_scale: float = 1.0,
+) -> CompactTaggedOctreeFarPairs:
+    """Construct exact-length far-field pairs in explicit octree node space."""
+
+    return _call_with_topology(
+        _interactions_impl.build_octree_native_far_pairs,
+        tree,
+        geometry,
+        theta=theta,
+        max_interactions_per_node=max_interactions_per_node,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_pair_queue=max_pair_queue,
+        process_block=process_block,
+        traversal_config=traversal_config,
+        retry_logger=retry_logger,
+        dehnen_radius_scale=dehnen_radius_scale,
+    )
+
+
 def build_grouped_interactions_from_pairs(
     tree: object,
     geometry: TreeGeometry,
@@ -200,9 +235,11 @@ __all__ = [
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
+    "CompactTaggedOctreeFarPairs",
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",
+    "build_octree_native_far_pairs",
     "build_leaf_neighbor_lists",
     "build_grouped_interactions_from_pairs",
     "build_well_separated_interactions",

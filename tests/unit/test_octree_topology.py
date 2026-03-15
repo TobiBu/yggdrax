@@ -8,6 +8,7 @@ from yggdrax import (
     DualTreeTraversalConfig,
     Tree,
     build_interactions_and_neighbors,
+    build_octree_native_far_pairs,
     compute_tree_geometry,
 )
 
@@ -143,6 +144,50 @@ def test_octree_matches_radix_interaction_counts():
     assert jnp.array_equal(radix.masses_sorted, octree.masses_sorted)
     assert jnp.array_equal(radix_interactions.counts, oct_interactions.counts)
     assert jnp.array_equal(radix_neighbors.counts, oct_neighbors.counts)
+
+
+def test_octree_native_far_pairs_stay_in_octree_node_space():
+    key = jax.random.PRNGKey(7)
+    positions = jax.random.uniform(
+        key,
+        (64, 3),
+        minval=-1.0,
+        maxval=1.0,
+        dtype=jnp.float32,
+    )
+    masses = jnp.linspace(1.0, 2.0, positions.shape[0], dtype=jnp.float32)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        return_reordered=True,
+        leaf_size=8,
+    )
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+    cfg = DualTreeTraversalConfig(
+        max_pair_queue=8192,
+        process_block=128,
+        max_interactions_per_node=1024,
+        max_neighbors_per_leaf=1024,
+    )
+
+    far_pairs = build_octree_native_far_pairs(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=cfg,
+    )
+
+    assert far_pairs.sources.ndim == 1
+    assert far_pairs.targets.ndim == 1
+    assert far_pairs.tags.ndim == 1
+    assert far_pairs.sources.shape == far_pairs.targets.shape == far_pairs.tags.shape
+    if far_pairs.sources.shape[0] > 0:
+        assert int(jnp.min(far_pairs.sources)) >= 0
+        assert int(jnp.min(far_pairs.targets)) >= 0
+        assert int(jnp.max(far_pairs.sources)) < int(tree.oct_num_nodes)
+        assert int(jnp.max(far_pairs.targets)) < int(tree.oct_num_nodes)
 
 
 def test_octree_tree_is_jittable_pytree():
