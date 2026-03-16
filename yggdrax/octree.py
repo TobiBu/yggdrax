@@ -209,7 +209,19 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     leaf_codes: jnp.ndarray,
     leaf_depths: jnp.ndarray,
 ) -> ExplicitOctreeMetadata:
-    """Build explicit octree cells directly from Morton leaf-cell partitions."""
+    """Build explicit octree cells directly from Morton leaf-cell partitions.
+
+    Uses at most ``2 * num_leaves - 1`` node slots (one per node in a
+    compressed Morton octree) instead of the ``num_leaves * levels``
+    upper bound, avoiding materialising the full ``(num_leaves, levels)``
+    broadcast grid.
+
+    The 2N-1 bound follows from the observation that, for N Morton-sorted
+    leaves, every internal octree node is the lowest-common-ancestor (LCA)
+    of some consecutive leaf pair.  The N leaves together with the N-1
+    pairwise LCAs cover all distinct nodes; deduplication then yields at
+    most 2N-1 unique entries.
+    """
 
     leaf_starts = jnp.asarray(leaf_starts, dtype=INDEX_DTYPE)
     leaf_ends_exclusive = jnp.asarray(leaf_ends_exclusive, dtype=INDEX_DTYPE)
@@ -221,72 +233,79 @@ def build_explicit_octree_metadata_from_leaf_partitions(
             "build_explicit_octree_metadata_from_leaf_partitions requires at least "
             "one leaf; got 0 (empty leaf_starts)."
         )
-    candidate_depths = jnp.arange(_MAX_MORTON_LEVEL + 1, dtype=INDEX_DTYPE)
-    max_candidates = max(1, num_leaves * (_MAX_MORTON_LEVEL + 1))
 
-    depth_grid = jnp.broadcast_to(
-        candidate_depths[None, :], (num_leaves, _MAX_MORTON_LEVEL + 1)
-    )
-    code_grid = jnp.broadcast_to(
-        leaf_codes[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
-    )
-    valid_grid = depth_grid <= leaf_depths[:, None]
-    prefix_grid = _prefix_code(code_grid, depth_grid)
-    address_grid = _oct_address(prefix_grid, depth_grid)
+    # Tighter static upper bound: at most 2*N-1 unique nodes for N sorted leaves.
+    max_nodes = max(1, 2 * num_leaves - 1)
     uint64_max = jnp.asarray(jnp.iinfo(jnp.uint64).max, dtype=jnp.uint64)
-    address_grid = jnp.where(valid_grid, address_grid, uint64_max)
 
-    starts_grid = jnp.broadcast_to(
-        leaf_starts[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
-    )
-    ends_grid = jnp.broadcast_to(
-        (leaf_ends_exclusive - 1)[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
-    )
+    # === Phase 1: enumerate candidates without materialising the N×L grid ===
+    # For N sorted Morton leaves the complete set of octree nodes is:
+    #   • the N leaf nodes themselves, and
+    #   • the N-1 LCA nodes of each consecutive leaf pair.
+    # After deduplication this yields at most 2*N-1 unique entries.
+    if num_leaves > 1:
+        lca_depths_arr = _common_depth_from_codes(leaf_codes[:-1], leaf_codes[1:])
+        lca_codes_arr = _prefix_code(leaf_codes[:-1], lca_depths_arr)
+    else:
+        lca_depths_arr = jnp.zeros(0, dtype=INDEX_DTYPE)
+        lca_codes_arr = jnp.zeros(0, dtype=jnp.uint64)
 
-    flat_addresses = address_grid.reshape((max_candidates,))
-    flat_codes = prefix_grid.reshape((max_candidates,))
-    flat_depths = depth_grid.reshape((max_candidates,))
-    flat_starts = starts_grid.reshape((max_candidates,))
-    flat_ends = ends_grid.reshape((max_candidates,))
-    flat_valid = valid_grid.reshape((max_candidates,))
+    # Concatenate leaves then LCA nodes: total length = 2*N-1.
+    all_codes = jnp.concatenate([leaf_codes, lca_codes_arr])
+    all_depths = jnp.concatenate([leaf_depths, lca_depths_arr])
 
-    order = jnp.argsort(flat_addresses, stable=True)
-    addresses_sorted = flat_addresses[order]
-    codes_sorted = flat_codes[order]
-    depths_sorted = flat_depths[order]
-    starts_sorted = flat_starts[order]
-    ends_sorted = flat_ends[order]
-    valid_sorted = flat_valid[order] & (addresses_sorted != uint64_max)
+    # === Phase 2: sort by oct-address and deduplicate ===
+    all_addresses = _oct_address(all_codes, all_depths)
+    order = jnp.argsort(all_addresses, stable=True)
+    all_addresses_sorted = all_addresses[order]
+    all_codes_sorted = all_codes[order]
+    all_depths_sorted = all_depths[order]
 
-    is_new = valid_sorted
-    is_new = is_new.at[1:].set(
-        valid_sorted[1:]
-        & ((addresses_sorted[1:] != addresses_sorted[:-1]) | (~valid_sorted[:-1]))
+    # Mark the first occurrence of each unique address.
+    is_new = jnp.concatenate(
+        [
+            jnp.ones(1, dtype=jnp.bool_),
+            all_addresses_sorted[1:] != all_addresses_sorted[:-1],
+        ]
     )
     unique_index = jnp.cumsum(is_new.astype(INDEX_DTYPE)) - jnp.asarray(
         1, dtype=INDEX_DTYPE
     )
     num_unique = jnp.sum(is_new.astype(INDEX_DTYPE))
-    oct_valid_mask = jnp.arange(max_candidates, dtype=INDEX_DTYPE) < num_unique
+    # Positions 0..num_unique-1 are filled in ascending address order (scatter
+    # preserves the sorted ordering established above).
+    oct_valid_mask = jnp.arange(max_nodes, dtype=INDEX_DTYPE) < num_unique
 
-    oct_node_depths = jnp.full((max_candidates,), -1, dtype=INDEX_DTYPE)
-    oct_node_depths = oct_node_depths.at[unique_index].max(
-        jnp.where(valid_sorted, depths_sorted, jnp.asarray(-1, dtype=INDEX_DTYPE))
-    )
-    oct_node_codes = jnp.zeros((max_candidates,), dtype=jnp.uint64)
-    oct_node_codes = oct_node_codes.at[unique_index].max(
-        jnp.where(valid_sorted, codes_sorted, jnp.asarray(0, dtype=jnp.uint64))
-    )
+    oct_node_codes = jnp.zeros(max_nodes, dtype=jnp.uint64)
+    oct_node_codes = oct_node_codes.at[unique_index].max(all_codes_sorted)
+    oct_node_depths = jnp.full(max_nodes, -1, dtype=INDEX_DTYPE)
+    oct_node_depths = oct_node_depths.at[unique_index].max(all_depths_sorted)
 
-    max_index = jnp.asarray(max(num_particles, 1), dtype=INDEX_DTYPE)
-    oct_starts = jnp.full((max_candidates,), max_index, dtype=INDEX_DTYPE)
-    oct_starts = oct_starts.at[unique_index].min(
-        jnp.where(valid_sorted, starts_sorted, max_index)
+    # === Phase 3: node ranges via searchsorted on sorted leaf_codes ===
+    # For a node (code C, depth d) the subtree covers leaf codes in
+    # [C, C | mask_d] where mask_d = (1 << (MORTON_BITS - 3*d)) - 1.
+    # Searching the sorted leaf_codes array costs O(log N) per node with
+    # O(N) total intermediate storage — no (N × L) grid needed.
+    depths_u64 = jnp.maximum(oct_node_depths, 0).astype(jnp.uint64)
+    bit_shifts = jnp.uint64(_MORTON_BITS) - jnp.uint64(3) * depths_u64
+    # Clamp shift to 63 for invalid/padding slots to avoid undefined UB.
+    bit_shifts_safe = jnp.minimum(bit_shifts, jnp.uint64(_MORTON_BITS - 1))
+    subtree_mask = jnp.left_shift(jnp.uint64(1), bit_shifts_safe) - jnp.uint64(1)
+    end_codes = jnp.where(oct_valid_mask, oct_node_codes | subtree_mask, jnp.uint64(0))
+
+    first_leaf_idx = jnp.searchsorted(
+        leaf_codes, oct_node_codes, side="left"
+    ).astype(INDEX_DTYPE)
+    last_leaf_idx = (
+        jnp.searchsorted(leaf_codes, end_codes, side="right").astype(INDEX_DTYPE)
+        - jnp.asarray(1, dtype=INDEX_DTYPE)
     )
-    oct_ends = jnp.full((max_candidates,), -1, dtype=INDEX_DTYPE)
-    oct_ends = oct_ends.at[unique_index].max(
-        jnp.where(valid_sorted, ends_sorted, jnp.asarray(-1, dtype=INDEX_DTYPE))
-    )
+    leaf_bound = jnp.asarray(max(num_leaves - 1, 0), dtype=INDEX_DTYPE)
+    first_leaf_safe = jnp.clip(first_leaf_idx, 0, leaf_bound)
+    last_leaf_safe = jnp.clip(last_leaf_idx, 0, leaf_bound)
+
+    oct_starts = leaf_starts[first_leaf_safe]
+    oct_ends = leaf_ends_exclusive[last_leaf_safe] - jnp.asarray(1, dtype=INDEX_DTYPE)
     oct_node_ranges = jnp.stack([oct_starts, oct_ends], axis=1)
     oct_node_ranges = jnp.where(
         oct_valid_mask[:, None],
@@ -294,6 +313,7 @@ def build_explicit_octree_metadata_from_leaf_partitions(
         jnp.asarray([0, -1], dtype=INDEX_DTYPE),
     )
 
+    # === Phase 4: level-structure metadata ===
     oct_num_levels = jnp.asarray(
         jnp.max(jnp.where(oct_valid_mask, oct_node_depths, 0)) + 1,
         dtype=INDEX_DTYPE,
@@ -317,37 +337,51 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     )
     oct_nodes_by_level = jnp.argsort(sort_depths, stable=True).astype(INDEX_DTYPE)
 
+    # === Phase 5: parent lookup ===
+    # Because the compressed octree may skip depth levels (a leaf at depth D
+    # may have its direct parent at depth D-k for k > 1), we cannot rely on
+    # searching only at depth d-1.  Instead we iterate over decreasing step
+    # sizes 1..MAX_MORTON_LEVEL, assigning the parent at the first (deepest)
+    # step where an ancestor address exists in the sorted node array.
+    # Each iteration operates on an O(N) array, so peak memory stays O(N).
     oct_addresses = jnp.where(
         oct_valid_mask,
         _oct_address(oct_node_codes, oct_node_depths),
         uint64_max,
     )
-    parent_depths = oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE)
-    parent_codes = _prefix_code(oct_node_codes, parent_depths)
-    parent_addresses = _oct_address(parent_codes, parent_depths)
-    parent_pos = jnp.searchsorted(oct_addresses, parent_addresses, side="left").astype(
-        INDEX_DTYPE
-    )
-    parent_pos_safe = jnp.minimum(
-        parent_pos, jnp.asarray(max_candidates - 1, dtype=INDEX_DTYPE)
-    )
-    address_match = oct_addresses[parent_pos_safe] == parent_addresses
-    oct_parent = jnp.where(
-        oct_valid_mask
-        & (oct_node_depths > jnp.asarray(0, dtype=INDEX_DTYPE))
-        & address_match,
-        parent_pos,
-        jnp.asarray(-1, dtype=INDEX_DTYPE),
-    )
+    oct_parent = jnp.full(max_nodes, -1, dtype=INDEX_DTYPE)
+    for d_step in range(1, _MAX_MORTON_LEVEL + 1):
+        needs_parent = (
+            oct_valid_mask
+            & (oct_parent < jnp.asarray(0, dtype=INDEX_DTYPE))
+            & (oct_node_depths >= jnp.asarray(d_step, dtype=INDEX_DTYPE))
+        )
+        parent_depths_try = oct_node_depths - jnp.asarray(d_step, dtype=INDEX_DTYPE)
+        valid_depth = parent_depths_try >= jnp.asarray(0, dtype=INDEX_DTYPE)
+        parent_codes_try = _prefix_code(oct_node_codes, parent_depths_try)
+        parent_addrs_try = jnp.where(
+            valid_depth,
+            _oct_address(parent_codes_try, parent_depths_try),
+            uint64_max,
+        )
+        parent_pos_try = jnp.searchsorted(
+            oct_addresses, parent_addrs_try, side="left"
+        ).astype(INDEX_DTYPE)
+        parent_pos_safe = jnp.minimum(
+            parent_pos_try, jnp.asarray(max_nodes - 1, dtype=INDEX_DTYPE)
+        )
+        addr_match = oct_addresses[parent_pos_safe] == parent_addrs_try
+        oct_parent = jnp.where(needs_parent & addr_match, parent_pos_try, oct_parent)
 
+    # === Phase 6: children ===
     octants = _octant_at_depth(oct_node_codes, oct_node_depths).astype(INDEX_DTYPE)
     valid_child = oct_valid_mask & (oct_parent >= 0)
     child_rows = jnp.where(valid_child, oct_parent, 0)
     child_cols = jnp.where(valid_child, octants, 0)
     child_vals = jnp.where(
-        valid_child, jnp.arange(max_candidates, dtype=INDEX_DTYPE) + 1, 0
+        valid_child, jnp.arange(max_nodes, dtype=INDEX_DTYPE) + 1, 0
     )
-    children_plus = jnp.zeros((max_candidates, 8), dtype=INDEX_DTYPE)
+    children_plus = jnp.zeros((max_nodes, 8), dtype=INDEX_DTYPE)
     children_plus = children_plus.at[child_rows, child_cols].max(child_vals)
     oct_children = children_plus - jnp.asarray(1, dtype=INDEX_DTYPE)
     oct_child_mask = oct_valid_mask[:, None] & (oct_children >= 0)
@@ -355,10 +389,11 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     oct_leaf_mask = oct_valid_mask & (oct_child_counts == 0)
     oct_leaf_nodes = jnp.nonzero(
         oct_leaf_mask,
-        size=max_candidates,
+        size=max_nodes,
         fill_value=jnp.asarray(-1, dtype=INDEX_DTYPE),
     )[0].astype(INDEX_DTYPE)
 
+    # === Phase 7: radix-to-oct mappings ===
     leaf_addresses = _oct_address(leaf_codes, leaf_depths)
     radix_leaf_to_oct = jnp.searchsorted(
         oct_addresses, leaf_addresses, side="left"
