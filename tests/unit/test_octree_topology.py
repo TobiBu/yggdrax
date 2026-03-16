@@ -13,6 +13,13 @@ from yggdrax import (
     compute_tree_geometry,
 )
 
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
 
 def test_fixed_depth_octree_populates_eight_root_children():
     positions = jnp.array(
@@ -118,12 +125,6 @@ def test_octree_matches_radix_interaction_counts():
         leaf_size=2,
     )
 
-    cfg = DualTreeTraversalConfig(
-        max_pair_queue=1024,
-        process_block=64,
-        max_interactions_per_node=256,
-        max_neighbors_per_leaf=256,
-    )
     radix_geom = compute_tree_geometry(radix, radix.positions_sorted)
     oct_geom = compute_tree_geometry(octree, octree.positions_sorted)
     radix_interactions, radix_neighbors = build_interactions_and_neighbors(
@@ -131,14 +132,14 @@ def test_octree_matches_radix_interaction_counts():
         radix_geom,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     oct_interactions, oct_neighbors = build_interactions_and_neighbors(
         octree,
         oct_geom,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert jnp.array_equal(radix.positions_sorted, octree.positions_sorted)
@@ -165,19 +166,12 @@ def test_octree_native_far_pairs_stay_in_octree_node_space():
         leaf_size=8,
     )
     geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=128,
-        max_interactions_per_node=1024,
-        max_neighbors_per_leaf=1024,
-    )
-
     far_pairs = build_octree_native_far_pairs(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert far_pairs.sources.ndim == 1
@@ -209,19 +203,12 @@ def test_octree_native_neighbor_lists_stay_in_octree_leaf_space():
         leaf_size=8,
     )
     geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=128,
-        max_interactions_per_node=1024,
-        max_neighbors_per_leaf=1024,
-    )
-
     native_neighbors = build_octree_native_neighbor_lists(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     leaf_indices = native_neighbors.leaf_indices

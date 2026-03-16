@@ -3540,6 +3540,19 @@ def _result_to_interactions(
         num_levels = int(level_offsets_all.shape[0] - 1)
     level_indices = jnp.asarray(level_offsets_all[: num_levels + 1])
 
+    nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels_all)
+    counts_by_level = counts[nodes_by_level]
+    cumulative_counts = jnp.cumsum(counts_by_level, dtype=INDEX_DTYPE)
+    offsets_by_level = jnp.concatenate(
+        [jnp.zeros((1,), dtype=INDEX_DTYPE), cumulative_counts]
+    )
+
+    node_offsets = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+    node_offsets = node_offsets.at[nodes_by_level].set(offsets_by_level[:-1])
+    node_offsets = jnp.concatenate([node_offsets, far_pair_count[None]])
+
+    level_offsets = offsets_by_level[level_indices]
+
     if traced_total:
         sources_sorted = jnp.asarray(result.interaction_sources)
         targets_sorted = jnp.asarray(result.interaction_targets)
@@ -3556,22 +3569,19 @@ def _result_to_interactions(
                 level_offsets=zero_levels,
                 target_levels=jnp.zeros((0,), dtype=INDEX_DTYPE),
             )
-        sources_sorted = jax.device_put(result.interaction_sources[:far_total])
-        targets_sorted = jax.device_put(result.interaction_targets[:far_total])
+
+        sources_raw = jax.device_put(result.interaction_sources[:far_total])
+        targets_raw = jax.device_put(result.interaction_targets[:far_total])
+
+        node_rank = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+        node_rank = node_rank.at[nodes_by_level].set(
+            jnp.arange(total_nodes, dtype=INDEX_DTYPE)
+        )
+        pair_order = jnp.argsort(node_rank[targets_raw], stable=True)
+        sources_sorted = sources_raw[pair_order]
+        targets_sorted = targets_raw[pair_order]
+
     levels_sorted = node_levels_all[targets_sorted]
-
-    nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels_all)
-    counts_by_level = counts[nodes_by_level]
-    cumulative_counts = jnp.cumsum(counts_by_level, dtype=INDEX_DTYPE)
-    offsets_by_level = jnp.concatenate(
-        [jnp.zeros((1,), dtype=INDEX_DTYPE), cumulative_counts]
-    )
-
-    node_offsets = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
-    node_offsets = node_offsets.at[nodes_by_level].set(offsets_by_level[:-1])
-    node_offsets = jnp.concatenate([node_offsets, far_pair_count[None]])
-
-    level_offsets = offsets_by_level[level_indices]
 
     return NodeInteractionList(
         offsets=node_offsets,

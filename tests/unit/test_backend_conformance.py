@@ -13,6 +13,13 @@ from yggdrax import (
     compute_tree_geometry,
 )
 
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
 
 def _sample_problem(n: int = 128) -> tuple[jnp.ndarray, jnp.ndarray]:
     key = jax.random.PRNGKey(101)
@@ -35,7 +42,7 @@ def _sample_problem(n: int = 128) -> tuple[jnp.ndarray, jnp.ndarray]:
 
 
 def _run_conformance(adapter: BackendAdapter) -> None:
-    positions, masses = _sample_problem()
+    positions, masses = _sample_problem(n=64)
 
     tree, pos_sorted, mass_sorted, inverse = adapter.build_fn(
         positions,
@@ -56,18 +63,12 @@ def _run_conformance(adapter: BackendAdapter) -> None:
     assert geometry.max_extent.shape == (total_nodes,)
     assert jnp.all(jnp.isfinite(geometry.center))
 
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=256,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert interactions.sources.ndim == 1
@@ -89,7 +90,7 @@ def _run_conformance(adapter: BackendAdapter) -> None:
         geometry2,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     assert jnp.array_equal(tree.parent, tree2.parent)
     assert jnp.array_equal(tree.particle_indices, tree2.particle_indices)

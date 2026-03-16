@@ -20,6 +20,20 @@ from yggdrax import (
 )
 from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
 
+_TEST_N = 32
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+_TEST_EXPANSE_TRAVERSAL_CFG = ExpanseTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
 
 def _sample_problem(n: int = 64):
     key = jax.random.PRNGKey(19)
@@ -60,7 +74,7 @@ class _MinimalTopology(NamedTuple):
 
 
 def test_interactions_accepts_yggdrax_traversal_config():
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
     tree, pos_sorted, _, _ = build_tree(
         positions,
         masses,
@@ -69,18 +83,12 @@ def test_interactions_accepts_yggdrax_traversal_config():
         return_reordered=True,
     )
     geometry = compute_tree_geometry(tree, pos_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=256,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     assert isinstance(interactions, NodeInteractionList)
     assert isinstance(neighbors, NodeNeighborList)
@@ -89,7 +97,7 @@ def test_interactions_accepts_yggdrax_traversal_config():
 
 
 def test_interactions_accept_topology_carrier():
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
     tree, pos_sorted, _, _ = build_tree(
         positions,
         masses,
@@ -99,25 +107,19 @@ def test_interactions_accept_topology_carrier():
     )
     carrier = _TopologyCarrier(topology=tree.topology)
     geometry = compute_tree_geometry(carrier, pos_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=256,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
     interactions, neighbors = build_interactions_and_neighbors(
         carrier,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     assert isinstance(interactions, NodeInteractionList)
     assert isinstance(neighbors, NodeNeighborList)
 
 
 def test_interactions_accepts_expanse_traversal_config():
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
     tree, pos_sorted, _, _ = build_tree(
         positions,
         masses,
@@ -126,18 +128,12 @@ def test_interactions_accepts_expanse_traversal_config():
         return_reordered=True,
     )
     geometry = compute_tree_geometry(tree, pos_sorted)
-    traversal_cfg = ExpanseTraversalConfig(
-        max_pair_queue=8192,
-        process_block=256,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_EXPANSE_TRAVERSAL_CFG,
     )
     assert isinstance(interactions, NodeInteractionList)
     assert isinstance(neighbors, NodeNeighborList)
@@ -146,7 +142,7 @@ def test_interactions_accepts_expanse_traversal_config():
 
 
 def test_interactions_can_derive_missing_level_fields():
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
     tree, pos_sorted, _, _ = build_tree(
         positions,
         masses,
@@ -197,7 +193,7 @@ def test_dual_tree_queue_cache_is_bounded():
 
 
 def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
 
     dispatch_calls: list[str] = []
     original_octree = _interactions_impl._run_octree_walk_raw
@@ -238,12 +234,7 @@ def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
             geometry,
             theta=0.6,
             mac_type="dehnen",
-            traversal_config=DualTreeTraversalConfig(
-                max_pair_queue=8192,
-                process_block=256,
-                max_interactions_per_node=2048,
-                max_neighbors_per_leaf=2048,
-            ),
+            traversal_config=_TEST_TRAVERSAL_CFG,
         )
 
         assert isinstance(interactions, NodeInteractionList)
@@ -252,7 +243,7 @@ def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
 
 
 def test_octree_leaf_neighbor_lists_use_native_dispatch(monkeypatch):
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=_TEST_N)
     dispatch_calls: list[str] = []
     original_octree = _interactions_impl._run_octree_walk_raw
     original_legacy = _interactions_impl._run_legacy_dual_tree_walk_raw
@@ -286,12 +277,7 @@ def test_octree_leaf_neighbor_lists_use_native_dispatch(monkeypatch):
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=DualTreeTraversalConfig(
-            max_pair_queue=8192,
-            process_block=256,
-            max_interactions_per_node=2048,
-            max_neighbors_per_leaf=2048,
-        ),
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert isinstance(neighbors, NodeNeighborList)

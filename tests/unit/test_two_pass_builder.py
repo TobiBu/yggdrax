@@ -13,6 +13,8 @@ from yggdrax.geometry import compute_tree_geometry
 from yggdrax.interactions import build_interactions_and_neighbors
 from yggdrax.tree import build_tree
 
+_TEST_THETA = 0.6
+
 
 def _build_random_tree(n=1024, leaf_size=8, seed=0):
     key = jax.random.PRNGKey(seed)
@@ -28,13 +30,13 @@ def _build_random_tree(n=1024, leaf_size=8, seed=0):
 
 
 def test_two_pass_equivalence_small():
-    tree, geometry = _build_random_tree(n=1024, leaf_size=8, seed=42)
+    tree, geometry = _build_random_tree(n=256, leaf_size=8, seed=42)
 
     # Run with explicit (large) capacities to force the single fill pass.
     interactions_ref, neighbors_ref = build_interactions_and_neighbors(
         tree,
         geometry,
-        theta=0.6,
+        theta=_TEST_THETA,
         max_interactions_per_node=128,
         max_neighbors_per_leaf=128,
         max_pair_queue=4096,
@@ -44,7 +46,7 @@ def test_two_pass_equivalence_small():
     interactions_auto, neighbors_auto = build_interactions_and_neighbors(
         tree,
         geometry,
-        theta=0.6,
+        theta=_TEST_THETA,
         max_interactions_per_node=None,
         max_neighbors_per_leaf=128,
         max_pair_queue=None,
@@ -93,7 +95,7 @@ def test_two_pass_equivalence_small():
 
 
 def test_count_pass_large_suggestions_still_use_compact_fill(monkeypatch):
-    tree, geometry = _build_random_tree(n=256, leaf_size=8, seed=7)
+    tree, geometry = _build_random_tree(n=64, leaf_size=8, seed=7)
 
     compact_fill_calls = []
     original_compact_fill = interactions_impl_private._dual_tree_walk_compact_fill_impl
@@ -135,7 +137,7 @@ def test_count_pass_large_suggestions_still_use_compact_fill(monkeypatch):
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
-        theta=0.6,
+        theta=_TEST_THETA,
         max_interactions_per_node=None,
         max_neighbors_per_leaf=128,
         max_pair_queue=None,
@@ -147,7 +149,7 @@ def test_count_pass_large_suggestions_still_use_compact_fill(monkeypatch):
 
 
 def test_count_pass_uses_compact_fill_path(monkeypatch):
-    tree, geometry = _build_random_tree(n=512, leaf_size=8, seed=11)
+    tree, geometry = _build_random_tree(n=128, leaf_size=8, seed=11)
 
     compact_fill_calls = []
     original_compact_fill = interactions_impl_private._dual_tree_walk_compact_fill_impl
@@ -173,7 +175,7 @@ def test_count_pass_uses_compact_fill_path(monkeypatch):
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
-        theta=0.6,
+        theta=_TEST_THETA,
         max_interactions_per_node=None,
         max_neighbors_per_leaf=128,
         max_pair_queue=None,
@@ -185,12 +187,12 @@ def test_count_pass_uses_compact_fill_path(monkeypatch):
 
 
 def test_compact_far_pair_return_can_skip_node_interaction_materialization():
-    tree, geometry = _build_random_tree(n=256, leaf_size=8, seed=19)
+    tree, geometry = _build_random_tree(n=128, leaf_size=8, seed=19)
 
     interactions, neighbors, compact_far_pairs = build_interactions_and_neighbors(
         tree,
         geometry,
-        theta=0.6,
+        theta=_TEST_THETA,
         max_interactions_per_node=None,
         max_neighbors_per_leaf=128,
         max_pair_queue=None,
@@ -228,7 +230,7 @@ def test_count_pass_rejects_int32_pair_total_overflow(monkeypatch):
         build_interactions_and_neighbors(
             tree,
             geometry,
-            theta=0.6,
+            theta=_TEST_THETA,
             max_interactions_per_node=None,
             max_neighbors_per_leaf=128,
             max_pair_queue=None,

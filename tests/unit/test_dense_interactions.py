@@ -11,6 +11,13 @@ from yggdrax.interactions import (
 )
 from yggdrax.tree import Tree, build_fixed_depth_tree
 
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
 
 def _build_fixed_depth_state(theta: float = 0.6):
     positions = jnp.array(
@@ -143,24 +150,18 @@ def test_dense_interactions_accept_tree_wrappers(tree_type: str):
         leaf_size=2,
     )
     geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=4096,
-        process_block=64,
-        max_interactions_per_node=512,
-        max_neighbors_per_leaf=512,
-    )
     interactions, _ = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     dense = densify_interactions(tree, geometry, interactions)
     dense_built = build_dense_interactions(
         tree,
         geometry,
         theta=0.6,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert dense.m2l_sources.ndim == 3
