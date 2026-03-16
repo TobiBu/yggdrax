@@ -866,7 +866,10 @@ def has_leaf_topology(tree_or_topology: object) -> bool:
     """Return ``True`` when leaf-node metadata can be resolved."""
 
     topology = resolve_tree_topology(tree_or_topology)
-    return hasattr(topology, "leaf_nodes") or len(missing_leaf_topology_fields(topology)) == 0
+    return (
+        hasattr(topology, "leaf_nodes")
+        or len(missing_leaf_topology_fields(topology)) == 0
+    )
 
 
 def require_fmm_core_topology(tree_or_topology: object) -> None:
@@ -909,9 +912,7 @@ def require_leaf_topology(tree_or_topology: object) -> None:
     tree_type = getattr(tree_or_topology, "tree_type", None)
     prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
     missing_txt = ", ".join(missing)
-    raise ValueError(
-        f"{prefix}topology is missing leaf-required fields: {missing_txt}"
-    )
+    raise ValueError(f"{prefix}topology is missing leaf-required fields: {missing_txt}")
 
 
 # Backward-compatible aliases
@@ -946,9 +947,7 @@ def get_num_internal_nodes(tree: object) -> int:
                 "statically shaped child buffer to derive internal-node count."
             )
         return int(num_internal)
-    raise AttributeError(
-        "topology does not expose left_child or num_internal_nodes"
-    )
+    raise AttributeError("topology does not expose left_child or num_internal_nodes")
 
 
 def get_leaf_nodes(tree: object) -> Array:

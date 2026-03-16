@@ -3,10 +3,10 @@
 import jax
 import jax.numpy as jnp
 
-from yggdrax import _interactions_impl
 from yggdrax import (
     DualTreeTraversalConfig,
     Tree,
+    _interactions_impl,
     build_interactions_and_neighbors,
     build_octree_native_far_pairs,
     build_octree_native_neighbor_lists,
@@ -228,7 +228,9 @@ def test_octree_native_neighbor_lists_stay_in_octree_leaf_space():
     assert leaf_indices.ndim == 1
     assert native_neighbors.counts.shape == leaf_indices.shape
     assert native_neighbors.offsets.shape == (leaf_indices.shape[0] + 1,)
-    assert jnp.array_equal(native_neighbors.offsets[1:], jnp.cumsum(native_neighbors.counts))
+    assert jnp.array_equal(
+        native_neighbors.offsets[1:], jnp.cumsum(native_neighbors.counts)
+    )
     if leaf_indices.shape[0] > 0:
         assert int(jnp.min(leaf_indices)) >= 0
         assert int(jnp.max(leaf_indices)) < int(tree.oct_num_nodes)
@@ -339,8 +341,8 @@ def test_build_explicit_octree_metadata_from_leaf_partitions_is_jit_compatible()
         leaf_size=2,
     )
     topology = tree.topology
-    leaf_starts, leaf_ends_exclusive, leaf_codes, leaf_depths = _resolved_leaf_partitions(
-        topology
+    leaf_starts, leaf_ends_exclusive, leaf_codes, leaf_depths = (
+        _resolved_leaf_partitions(topology)
     )
 
     eager = build_explicit_octree_metadata_from_leaf_partitions(
@@ -350,7 +352,10 @@ def test_build_explicit_octree_metadata_from_leaf_partitions_is_jit_compatible()
         leaf_codes=leaf_codes,
         leaf_depths=leaf_depths,
     )
-    jitted = jax.jit(build_explicit_octree_metadata_from_leaf_partitions, static_argnames=("num_particles",))
+    jitted = jax.jit(
+        build_explicit_octree_metadata_from_leaf_partitions,
+        static_argnames=("num_particles",),
+    )
     jit_result = jitted(
         num_particles=int(topology.num_particles),
         leaf_starts=leaf_starts,

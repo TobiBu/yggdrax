@@ -25,9 +25,9 @@ from .interactions import (
     OctreeNativeNeighborList,
     PairPolicy,
     build_interactions_and_neighbors,
+    build_leaf_neighbor_lists,
     build_octree_native_far_pairs,
     build_octree_native_neighbor_lists,
-    build_leaf_neighbor_lists,
 )
 from .kdtree import (
     KDTree,

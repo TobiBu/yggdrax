@@ -93,9 +93,13 @@ def _compact_pair_rows(
     prefix = prefix - valid_mask.astype(INDEX_DTYPE)
     in_bounds = valid_mask & (prefix < as_index(max_pairs))
     safe_slot = jnp.where(in_bounds, prefix, as_index(max_pairs))
-    return jnp.full((max_pairs, 2), -1, dtype=INDEX_DTYPE).at[safe_slot].set(
-        jnp.where(valid_mask[:, None], pairs, _FILLER_PAIR),
-        mode="drop",
+    return (
+        jnp.full((max_pairs, 2), -1, dtype=INDEX_DTYPE)
+        .at[safe_slot]
+        .set(
+            jnp.where(valid_mask[:, None], pairs, _FILLER_PAIR),
+            mode="drop",
+        )
     )
 
 
@@ -1869,9 +1873,13 @@ def _dual_tree_walk_octree_impl(
         num_leaves = leaf_indices.shape[0]
         valid_leaf_rows = leaf_indices >= 0
         leaf_position = jnp.full((oct_total_nodes + 1,), -1, dtype=INDEX_DTYPE)
-        safe_leaf_indices = jnp.where(valid_leaf_rows, leaf_indices, as_index(oct_total_nodes))
+        safe_leaf_indices = jnp.where(
+            valid_leaf_rows, leaf_indices, as_index(oct_total_nodes)
+        )
         leaf_position = leaf_position.at[safe_leaf_indices].set(
-            jnp.where(valid_leaf_rows, jnp.arange(num_leaves, dtype=INDEX_DTYPE), as_index(-1)),
+            jnp.where(
+                valid_leaf_rows, jnp.arange(num_leaves, dtype=INDEX_DTYPE), as_index(-1)
+            ),
             mode="drop",
         )[:oct_total_nodes]
     else:
@@ -1913,7 +1921,9 @@ def _dual_tree_walk_octree_impl(
         extents_box,
         oct_leaf_mask,
     )
-    effective_extents_sphere_far = _compute_effective_extents(oct_parent, extents_sphere)
+    effective_extents_sphere_far = _compute_effective_extents(
+        oct_parent, extents_sphere
+    )
     effective_extents_sphere_leaf = _compute_leaf_effective_extents_from_mask(
         oct_parent,
         extents_sphere,
@@ -2048,7 +2058,9 @@ def _dual_tree_walk_octree_impl(
 
         center_target = centers[safe_targets]
         center_source = centers[safe_sources]
-        delta = (center_target - center_source) * valid_pairs[:, None].astype(centers.dtype)
+        delta = (center_target - center_source) * valid_pairs[:, None].astype(
+            centers.dtype
+        )
         dist_sq = jnp.sum(delta * delta, axis=1)
 
         different_nodes = targets != sources
@@ -2137,8 +2149,12 @@ def _dual_tree_walk_octree_impl(
         if near_node_space == "octree":
             near_target_nodes = jnp.where(should_near, safe_targets, as_index(-1))
             near_source_nodes = jnp.where(should_near, safe_sources, as_index(-1))
-            safe_pos_t = jnp.where(should_near, leaf_position[safe_targets], as_index(0))
-            safe_pos_s = jnp.where(should_near, leaf_position[safe_sources], as_index(0))
+            safe_pos_t = jnp.where(
+                should_near, leaf_position[safe_targets], as_index(0)
+            )
+            safe_pos_s = jnp.where(
+                should_near, leaf_position[safe_sources], as_index(0)
+            )
         else:
             safe_target_radix_leaves = jnp.where(
                 should_near,
@@ -3656,7 +3672,11 @@ def _run_dual_tree_walk_raw(
         raise ValueError(f"Unknown dual-tree dispatch mode: {_dispatch_mode}")
 
     if _dispatch_mode == "auto":
-        helper = _run_octree_walk_raw if is_octree_topology else _run_legacy_dual_tree_walk_raw
+        helper = (
+            _run_octree_walk_raw
+            if is_octree_topology
+            else _run_legacy_dual_tree_walk_raw
+        )
         return helper(
             tree,
             geometry,
@@ -4461,9 +4481,11 @@ def build_octree_native_far_pairs(
     if resolved_cfg is None:
         queue_capacity = max(
             4,
-            int(max_pair_queue)
-            if max_pair_queue is not None
-            else int(tree.parent.shape[0]) * DEFAULT_PAIR_QUEUE_MULTIPLIER,
+            (
+                int(max_pair_queue)
+                if max_pair_queue is not None
+                else int(tree.parent.shape[0]) * DEFAULT_PAIR_QUEUE_MULTIPLIER
+            ),
         )
         interaction_capacity = int(
             max_interactions_per_node
@@ -4543,9 +4565,11 @@ def build_octree_native_neighbor_lists(
     if resolved_cfg is None:
         queue_capacity = max(
             4,
-            int(max_pair_queue)
-            if max_pair_queue is not None
-            else int(tree.parent.shape[0]) * DEFAULT_PAIR_QUEUE_MULTIPLIER,
+            (
+                int(max_pair_queue)
+                if max_pair_queue is not None
+                else int(tree.parent.shape[0]) * DEFAULT_PAIR_QUEUE_MULTIPLIER
+            ),
         )
         interaction_capacity = int(
             max_interactions_per_node

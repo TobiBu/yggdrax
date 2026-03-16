@@ -219,16 +219,24 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     candidate_depths = jnp.arange(_MAX_MORTON_LEVEL + 1, dtype=INDEX_DTYPE)
     max_candidates = max(1, num_leaves * (_MAX_MORTON_LEVEL + 1))
 
-    depth_grid = jnp.broadcast_to(candidate_depths[None, :], (num_leaves, _MAX_MORTON_LEVEL + 1))
-    code_grid = jnp.broadcast_to(leaf_codes[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1))
+    depth_grid = jnp.broadcast_to(
+        candidate_depths[None, :], (num_leaves, _MAX_MORTON_LEVEL + 1)
+    )
+    code_grid = jnp.broadcast_to(
+        leaf_codes[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
+    )
     valid_grid = depth_grid <= leaf_depths[:, None]
     prefix_grid = _prefix_code(code_grid, depth_grid)
     address_grid = _oct_address(prefix_grid, depth_grid)
     uint64_max = jnp.asarray(jnp.iinfo(jnp.uint64).max, dtype=jnp.uint64)
     address_grid = jnp.where(valid_grid, address_grid, uint64_max)
 
-    starts_grid = jnp.broadcast_to(leaf_starts[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1))
-    ends_grid = jnp.broadcast_to((leaf_ends_exclusive - 1)[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1))
+    starts_grid = jnp.broadcast_to(
+        leaf_starts[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
+    )
+    ends_grid = jnp.broadcast_to(
+        (leaf_ends_exclusive - 1)[:, None], (num_leaves, _MAX_MORTON_LEVEL + 1)
+    )
 
     flat_addresses = address_grid.reshape((max_candidates,))
     flat_codes = prefix_grid.reshape((max_candidates,))
@@ -248,12 +256,11 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     is_new = valid_sorted
     is_new = is_new.at[1:].set(
         valid_sorted[1:]
-        & (
-            (addresses_sorted[1:] != addresses_sorted[:-1])
-            | (~valid_sorted[:-1])
-        )
+        & ((addresses_sorted[1:] != addresses_sorted[:-1]) | (~valid_sorted[:-1]))
     )
-    unique_index = jnp.cumsum(is_new.astype(INDEX_DTYPE)) - jnp.asarray(1, dtype=INDEX_DTYPE)
+    unique_index = jnp.cumsum(is_new.astype(INDEX_DTYPE)) - jnp.asarray(
+        1, dtype=INDEX_DTYPE
+    )
     num_unique = jnp.sum(is_new.astype(INDEX_DTYPE))
     oct_valid_mask = jnp.arange(max_candidates, dtype=INDEX_DTYPE) < num_unique
 
@@ -313,8 +320,12 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     parent_depths = oct_node_depths - jnp.asarray(1, dtype=INDEX_DTYPE)
     parent_codes = _prefix_code(oct_node_codes, parent_depths)
     parent_addresses = _oct_address(parent_codes, parent_depths)
-    parent_pos = jnp.searchsorted(oct_addresses, parent_addresses, side="left").astype(INDEX_DTYPE)
-    parent_pos_safe = jnp.minimum(parent_pos, jnp.asarray(max_candidates - 1, dtype=INDEX_DTYPE))
+    parent_pos = jnp.searchsorted(oct_addresses, parent_addresses, side="left").astype(
+        INDEX_DTYPE
+    )
+    parent_pos_safe = jnp.minimum(
+        parent_pos, jnp.asarray(max_candidates - 1, dtype=INDEX_DTYPE)
+    )
     address_match = oct_addresses[parent_pos_safe] == parent_addresses
     oct_parent = jnp.where(
         oct_valid_mask
@@ -328,7 +339,9 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     valid_child = oct_valid_mask & (oct_parent >= 0)
     child_rows = jnp.where(valid_child, oct_parent, 0)
     child_cols = jnp.where(valid_child, octants, 0)
-    child_vals = jnp.where(valid_child, jnp.arange(max_candidates, dtype=INDEX_DTYPE) + 1, 0)
+    child_vals = jnp.where(
+        valid_child, jnp.arange(max_candidates, dtype=INDEX_DTYPE) + 1, 0
+    )
     children_plus = jnp.zeros((max_candidates, 8), dtype=INDEX_DTYPE)
     children_plus = children_plus.at[child_rows, child_cols].max(child_vals)
     oct_children = children_plus - jnp.asarray(1, dtype=INDEX_DTYPE)
@@ -342,7 +355,9 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     )[0].astype(INDEX_DTYPE)
 
     leaf_addresses = _oct_address(leaf_codes, leaf_depths)
-    radix_leaf_to_oct = jnp.searchsorted(oct_addresses, leaf_addresses, side="left").astype(INDEX_DTYPE)
+    radix_leaf_to_oct = jnp.searchsorted(
+        oct_addresses, leaf_addresses, side="left"
+    ).astype(INDEX_DTYPE)
     radix_node_to_oct = jnp.full((max(2 * num_leaves - 1, 1),), -1, dtype=INDEX_DTYPE)
     if num_leaves > 0:
         num_internal = max(num_leaves - 1, 0)
@@ -431,8 +446,8 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
     num_nodes = int(node_ranges.shape[0])
     num_internal = (num_nodes - 1) // 2
-    leaf_starts, leaf_ends_exclusive, leaf_codes, leaf_depths = _resolved_leaf_partitions(
-        topology
+    leaf_starts, leaf_ends_exclusive, leaf_codes, leaf_depths = (
+        _resolved_leaf_partitions(topology)
     )
     metadata = build_explicit_octree_metadata_from_leaf_partitions(
         num_particles=int(morton_codes.shape[0]),

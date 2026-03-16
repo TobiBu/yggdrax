@@ -7,11 +7,11 @@ import pytest
 import yggdrax.tree as tree_api
 from yggdrax import (
     Tree,
+    get_leaf_nodes,
     has_fmm_core_topology,
     has_fmm_topology,
     has_leaf_topology,
     has_morton_topology,
-    get_leaf_nodes,
     missing_fmm_core_topology_fields,
     missing_fmm_topology_fields,
     missing_leaf_topology_fields,
