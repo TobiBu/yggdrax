@@ -513,11 +513,7 @@ def test_octree_refine_pairs_expand_full_8x8_cross_children():
     assert valid.shape[0] == 64, f"expected 64 pairs, got {valid.shape[0]}"
 
     expected = jnp.asarray(
-        [
-            [t, s]
-            for t in range(10, 18)
-            for s in range(20, 28)
-        ],
+        [[t, s] for t in range(10, 18) for s in range(20, 28)],
         dtype=jnp.int32,
     )
     assert jnp.array_equal(jnp.sort(valid, axis=0), jnp.sort(expected, axis=0))
