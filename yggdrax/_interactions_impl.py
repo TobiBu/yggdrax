@@ -1732,12 +1732,12 @@ def _dual_tree_walk_impl(
         safe_write = jnp.where(valid, write_pos, oob)
 
         interaction_sources = (
-            jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
+            jnp.full((max_total_far_pairs,), -1, dtype=INDEX_DTYPE)
             .at[safe_write]
             .set(src_vals, mode="drop")
         )
         interaction_targets = (
-            jnp.zeros((max_total_far_pairs,), dtype=INDEX_DTYPE)
+            jnp.full((max_total_far_pairs,), -1, dtype=INDEX_DTYPE)
             .at[safe_write]
             .set(level_node_ids, mode="drop")
         )
