@@ -180,6 +180,7 @@ def test_pair_policy_keeps_directional_tags_aligned(traversal_state):
 
 def test_pair_policy_supports_outer_jit_with_auto_capacities(traversal_state):
     tree, geometry = traversal_state
+
     @jax.jit
     def run(tree_arg, geom_arg, far_sq, tag_sq):
         _interactions, _neighbors, result = build_interactions_and_neighbors(
@@ -206,6 +207,7 @@ def test_pair_policy_supports_outer_jit_with_auto_capacities(traversal_state):
 
 def test_pair_policy_supports_outer_jit(traversal_state):
     tree, geometry = traversal_state
+
     @jax.jit
     def run(tree_arg, geom_arg, far_sq, tag_sq):
         _interactions, _neighbors, result = build_interactions_and_neighbors(
