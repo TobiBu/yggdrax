@@ -489,3 +489,35 @@ def test_octree_refine_pairs_support_jit_for_one_sided_split():
         dtype=jnp.int32,
     )
     assert jnp.array_equal(valid, expected)
+
+
+def test_octree_refine_pairs_expand_full_8x8_cross_children():
+    """8x8 cross-child split must not drop any of the 64 child pairs."""
+    tgt_children = jnp.arange(10, 18, dtype=jnp.int32)
+    src_children = jnp.arange(20, 28, dtype=jnp.int32)
+
+    pairs = _interactions_impl._octree_refine_pairs_single(
+        jnp.asarray(5, dtype=jnp.int32),
+        jnp.asarray(6, dtype=jnp.int32),
+        jnp.bool_(False),
+        jnp.bool_(True),
+        jnp.bool_(False),
+        jnp.bool_(False),
+        tgt_children,
+        jnp.asarray(8, dtype=jnp.int32),
+        src_children,
+        jnp.asarray(8, dtype=jnp.int32),
+    )
+
+    valid = pairs[pairs[:, 0] >= 0]
+    assert valid.shape[0] == 64, f"expected 64 pairs, got {valid.shape[0]}"
+
+    expected = jnp.asarray(
+        [
+            [t, s]
+            for t in range(10, 18)
+            for s in range(20, 28)
+        ],
+        dtype=jnp.int32,
+    )
+    assert jnp.array_equal(jnp.sort(valid, axis=0), jnp.sort(expected, axis=0))
