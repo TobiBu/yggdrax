@@ -957,7 +957,7 @@ def get_leaf_nodes(tree: object) -> Array:
     if hasattr(topology, "leaf_nodes"):
         return jnp.asarray(getattr(topology, "leaf_nodes"), dtype=INDEX_DTYPE)
 
-    require_leaf_topology(topology)
+    require_leaf_topology(tree)
     node_ranges = jnp.asarray(topology.node_ranges, dtype=INDEX_DTYPE)
     total_nodes = int(node_ranges.shape[0])
     num_internal = get_num_internal_nodes(topology)
