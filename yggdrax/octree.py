@@ -216,6 +216,11 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     leaf_codes = jnp.asarray(leaf_codes, dtype=jnp.uint64)
     leaf_depths = jnp.asarray(leaf_depths, dtype=INDEX_DTYPE)
     num_leaves = int(leaf_starts.shape[0])
+    if num_leaves == 0:
+        raise ValueError(
+            "build_explicit_octree_metadata_from_leaf_partitions requires at least "
+            "one leaf; got 0 (empty leaf_starts)."
+        )
     candidate_depths = jnp.arange(_MAX_MORTON_LEVEL + 1, dtype=INDEX_DTYPE)
     max_candidates = max(1, num_leaves * (_MAX_MORTON_LEVEL + 1))
 
