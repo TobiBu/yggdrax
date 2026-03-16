@@ -1775,12 +1775,16 @@ def _dual_tree_walk_impl(
         safe_near_write = jnp.where(near_valid, near_write_pos, oob_near)
 
         neighbor_indices = (
-            jnp.zeros((max_total_near_pairs,), dtype=INDEX_DTYPE)
+            jnp.full(
+                (max_total_near_pairs,),
+                fill_value=as_index(-1),
+                dtype=INDEX_DTYPE,
+            )
             .at[safe_near_write]
             .set(near_vals, mode="drop")
         )
     else:
-        neighbor_indices = jnp.zeros((0,), dtype=INDEX_DTYPE)
+        neighbor_indices = jnp.full((0,), fill_value=as_index(-1), dtype=INDEX_DTYPE)
 
     far_pair_count = jnp.sum(far_counts, dtype=INDEX_DTYPE)
     near_pair_count = jnp.sum(near_counts, dtype=INDEX_DTYPE)
