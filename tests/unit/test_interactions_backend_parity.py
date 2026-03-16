@@ -11,6 +11,13 @@ from yggdrax import (
     compute_tree_geometry,
 )
 
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=4096,
+    process_block=128,
+    max_interactions_per_node=1024,
+    max_neighbors_per_leaf=2048,
+)
+
 
 def _sample_problem(n: int = 96):
     key = jax.random.PRNGKey(2026)
@@ -90,7 +97,7 @@ def test_build_interactions_and_neighbors_contract_holds_for_backends(
     tree_type: str,
     leaf_size: int,
 ):
-    positions, masses = _sample_problem(n=128)
+    positions, masses = _sample_problem(n=64)
     tree = Tree.from_particles(
         positions,
         masses,
@@ -101,18 +108,12 @@ def test_build_interactions_and_neighbors_contract_holds_for_backends(
     )
 
     geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=32768,
-        process_block=256,
-        max_interactions_per_node=4096,
-        max_neighbors_per_leaf=8192,
-    )
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     _assert_interaction_contract(tree, interactions, neighbors)

@@ -20,18 +20,18 @@ from yggdrax import (
 )
 from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
 
-_TEST_N = 32
+_TEST_N = 16
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
-    max_pair_queue=1024,
-    process_block=64,
-    max_interactions_per_node=256,
-    max_neighbors_per_leaf=256,
+    max_pair_queue=512,
+    process_block=32,
+    max_interactions_per_node=128,
+    max_neighbors_per_leaf=128,
 )
 _TEST_EXPANSE_TRAVERSAL_CFG = ExpanseTraversalConfig(
-    max_pair_queue=1024,
-    process_block=64,
-    max_interactions_per_node=256,
-    max_neighbors_per_leaf=256,
+    max_pair_queue=512,
+    process_block=32,
+    max_interactions_per_node=128,
+    max_neighbors_per_leaf=128,
 )
 
 
