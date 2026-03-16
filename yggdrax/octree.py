@@ -293,13 +293,12 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     subtree_mask = jnp.left_shift(jnp.uint64(1), bit_shifts_safe) - jnp.uint64(1)
     end_codes = jnp.where(oct_valid_mask, oct_node_codes | subtree_mask, jnp.uint64(0))
 
-    first_leaf_idx = jnp.searchsorted(
-        leaf_codes, oct_node_codes, side="left"
-    ).astype(INDEX_DTYPE)
-    last_leaf_idx = (
-        jnp.searchsorted(leaf_codes, end_codes, side="right").astype(INDEX_DTYPE)
-        - jnp.asarray(1, dtype=INDEX_DTYPE)
+    first_leaf_idx = jnp.searchsorted(leaf_codes, oct_node_codes, side="left").astype(
+        INDEX_DTYPE
     )
+    last_leaf_idx = jnp.searchsorted(leaf_codes, end_codes, side="right").astype(
+        INDEX_DTYPE
+    ) - jnp.asarray(1, dtype=INDEX_DTYPE)
     leaf_bound = jnp.asarray(max(num_leaves - 1, 0), dtype=INDEX_DTYPE)
     first_leaf_safe = jnp.clip(first_leaf_idx, 0, leaf_bound)
     last_leaf_safe = jnp.clip(last_leaf_idx, 0, leaf_bound)
@@ -378,9 +377,7 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     valid_child = oct_valid_mask & (oct_parent >= 0)
     child_rows = jnp.where(valid_child, oct_parent, 0)
     child_cols = jnp.where(valid_child, octants, 0)
-    child_vals = jnp.where(
-        valid_child, jnp.arange(max_nodes, dtype=INDEX_DTYPE) + 1, 0
-    )
+    child_vals = jnp.where(valid_child, jnp.arange(max_nodes, dtype=INDEX_DTYPE) + 1, 0)
     children_plus = jnp.zeros((max_nodes, 8), dtype=INDEX_DTYPE)
     children_plus = children_plus.at[child_rows, child_cols].max(child_vals)
     oct_children = children_plus - jnp.asarray(1, dtype=INDEX_DTYPE)
