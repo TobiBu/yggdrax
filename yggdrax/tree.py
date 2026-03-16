@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Literal, Optional
 
 import jax
@@ -367,6 +368,88 @@ def _build_octree_result(
     raise ValueError(
         "Unsupported build_mode "
         f"'{build_mode}'. Supported: ('adaptive', 'fixed_depth')"
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("return_reordered", "leaf_size", "return_workspace"),
+)
+def _build_octree_jit_result(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    return_reordered: bool = False,
+    leaf_size: int = 8,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+):
+    """JIT-compiled adaptive octree builder using Morton leaf partitions."""
+
+    return _build_octree_result(
+        positions,
+        masses,
+        build_mode="adaptive",
+        bounds=bounds,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+        leaf_size=leaf_size,
+        target_leaf_particles=32,
+        max_depth=None,
+        refine_local=True,
+        max_refine_levels=2,
+        aspect_threshold=8.0,
+        min_refined_leaf_particles=2,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "return_reordered",
+        "target_leaf_particles",
+        "return_workspace",
+        "max_depth",
+        "refine_local",
+        "max_refine_levels",
+        "aspect_threshold",
+        "min_refined_leaf_particles",
+    ),
+)
+def _build_fixed_depth_octree_jit_result(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    target_leaf_particles: int = 32,
+    return_reordered: bool = False,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    max_depth: Optional[int] = None,
+    refine_local: bool = True,
+    max_refine_levels: int = 2,
+    aspect_threshold: float = 8.0,
+    min_refined_leaf_particles: int = 2,
+):
+    """JIT-compiled fixed-depth octree builder using Morton leaf partitions."""
+
+    return _build_octree_result(
+        positions,
+        masses,
+        build_mode="fixed_depth",
+        bounds=bounds,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+        leaf_size=8,
+        target_leaf_particles=target_leaf_particles,
+        max_depth=max_depth,
+        refine_local=refine_local,
+        max_refine_levels=max_refine_levels,
+        aspect_threshold=aspect_threshold,
+        min_refined_leaf_particles=min_refined_leaf_particles,
     )
 
 
@@ -1280,7 +1363,7 @@ def build_octree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an octree-compatible topology."""
+    """JIT build for an octree through the octree-specific Morton pipeline."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1289,7 +1372,7 @@ def build_octree_jit(
         return_workspace=return_workspace,
     )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_tree_jit(
+    result = _build_octree_jit_result(
         positions,
         masses,
         bounds_resolved,
@@ -1508,7 +1591,7 @@ def build_fixed_depth_octree_jit(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """JIT build for a fixed-depth octree-compatible topology."""
+    """JIT build for a fixed-depth octree through the octree-native path."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1517,7 +1600,7 @@ def build_fixed_depth_octree_jit(
         return_workspace=return_workspace,
     )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_fixed_depth_tree_jit(
+    result = _build_fixed_depth_octree_jit_result(
         positions,
         masses,
         bounds_resolved,
