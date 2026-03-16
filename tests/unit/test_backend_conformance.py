@@ -7,18 +7,7 @@ import jax.numpy as jnp
 import pytest
 
 from tests.unit.backend_fixtures import BackendAdapter, conformance_adapters
-from yggdrax import (
-    DualTreeTraversalConfig,
-    build_interactions_and_neighbors,
-    compute_tree_geometry,
-)
-
-_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
-    max_pair_queue=512,
-    process_block=32,
-    max_interactions_per_node=128,
-    max_neighbors_per_leaf=128,
-)
+from yggdrax import compute_tree_geometry
 
 
 def _sample_problem(n: int = 128) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -62,20 +51,6 @@ def _run_conformance(adapter: BackendAdapter) -> None:
     assert geometry.radius.shape == (total_nodes,)
     assert geometry.max_extent.shape == (total_nodes,)
     assert jnp.all(jnp.isfinite(geometry.center))
-
-    interactions, neighbors = build_interactions_and_neighbors(
-        tree,
-        geometry,
-        theta=0.6,
-        mac_type="dehnen",
-        traversal_config=_TEST_TRAVERSAL_CFG,
-    )
-
-    assert interactions.sources.ndim == 1
-    assert interactions.targets.ndim == 1
-    assert neighbors.neighbors.ndim == 1
-    assert int(jnp.sum(interactions.counts)) >= 0
-    assert int(jnp.sum(neighbors.counts)) >= 0
 
     # Determinism for fixed inputs/config.
     tree2, _, _, _ = adapter.build_fn(

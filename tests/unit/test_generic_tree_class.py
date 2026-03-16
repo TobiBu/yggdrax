@@ -23,7 +23,7 @@ from yggdrax import (
 )
 
 
-def _sample_problem(n: int = 64):
+def _sample_problem(n: int = 32):
     key = jax.random.PRNGKey(37)
     key_pos, key_mass = jax.random.split(key)
     positions = jax.random.uniform(

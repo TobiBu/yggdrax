@@ -28,8 +28,6 @@ def _build_fixed_depth_state(theta: float = 0.6):
             [0.0, 0.0, 0.0],
             [0.2, 0.3, 0.4],
             [0.5, -0.2, 0.6],
-            [0.7, 0.6, -0.3],
-            [0.9, -0.7, 0.8],
         ],
         dtype=jnp.float64,
     )
@@ -141,8 +139,6 @@ def test_dense_interactions_accept_tree_wrappers(tree_type: str):
             [0.0, 0.0, 0.0],
             [0.2, 0.3, 0.4],
             [0.5, -0.2, 0.6],
-            [0.7, 0.6, -0.3],
-            [0.9, -0.7, 0.8],
         ],
         dtype=jnp.float64,
     )

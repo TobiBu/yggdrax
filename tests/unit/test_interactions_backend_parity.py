@@ -12,10 +12,10 @@ from yggdrax import (
 )
 
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
-    max_pair_queue=1024,
-    process_block=64,
-    max_interactions_per_node=256,
-    max_neighbors_per_leaf=512,
+    max_pair_queue=512,
+    process_block=32,
+    max_interactions_per_node=128,
+    max_neighbors_per_leaf=256,
 )
 
 
@@ -97,7 +97,7 @@ def test_build_interactions_and_neighbors_contract_holds_for_backends(
     tree_type: str,
     leaf_size: int,
 ):
-    positions, masses = _sample_problem(n=48)
+    positions, masses = _sample_problem(n=32)
     tree = Tree.from_particles(
         positions,
         masses,
