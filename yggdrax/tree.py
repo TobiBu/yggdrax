@@ -1040,10 +1040,22 @@ def get_leaf_nodes(tree: object) -> Array:
     if hasattr(topology, "leaf_nodes"):
         return jnp.asarray(getattr(topology, "leaf_nodes"), dtype=INDEX_DTYPE)
 
+    # When leaf_nodes is missing, we need a reliable internal-node count.
+    try:
+        num_internal = get_num_internal_nodes(topology)
+    except (AttributeError, ValueError) as exc:
+        # Run the standard leaf-topology checks for consistency, then
+        # surface a clear, user-facing error about the missing fields.
+        require_leaf_topology(tree)
+        raise ValueError(
+            "Tree topology is missing 'leaf_nodes' and does not expose a "
+            "derivable internal-node count; expected either a statically "
+            "shaped 'left_child' buffer or an untraced 'num_internal_nodes'."
+        ) from exc
+
     require_leaf_topology(tree)
     node_ranges = jnp.asarray(topology.node_ranges, dtype=INDEX_DTYPE)
     total_nodes = int(node_ranges.shape[0])
-    num_internal = get_num_internal_nodes(topology)
     return jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
 
 
