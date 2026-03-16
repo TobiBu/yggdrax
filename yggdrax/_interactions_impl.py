@@ -88,7 +88,6 @@ def _compact_pair_rows(
 ) -> Array:
     """Pack valid pair rows into a fixed-size buffer."""
 
-    pair_count = pairs.shape[0]
     prefix = jnp.cumsum(valid_mask.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
     prefix = prefix - valid_mask.astype(INDEX_DTYPE)
     in_bounds = valid_mask & (prefix < as_index(max_pairs))
