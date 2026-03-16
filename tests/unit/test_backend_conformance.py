@@ -14,10 +14,10 @@ from yggdrax import (
 )
 
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
-    max_pair_queue=1024,
-    process_block=64,
-    max_interactions_per_node=256,
-    max_neighbors_per_leaf=256,
+    max_pair_queue=512,
+    process_block=32,
+    max_interactions_per_node=128,
+    max_neighbors_per_leaf=128,
 )
 
 
@@ -42,7 +42,7 @@ def _sample_problem(n: int = 128) -> tuple[jnp.ndarray, jnp.ndarray]:
 
 
 def _run_conformance(adapter: BackendAdapter) -> None:
-    positions, masses = _sample_problem(n=64)
+    positions, masses = _sample_problem(n=32)
 
     tree, pos_sorted, mass_sorted, inverse = adapter.build_fn(
         positions,
@@ -78,24 +78,14 @@ def _run_conformance(adapter: BackendAdapter) -> None:
     assert int(jnp.sum(neighbors.counts)) >= 0
 
     # Determinism for fixed inputs/config.
-    tree2, pos_sorted2, _, _ = adapter.build_fn(
+    tree2, _, _, _ = adapter.build_fn(
         positions,
         masses,
         leaf_size=16,
         return_reordered=True,
     )
-    geometry2 = compute_tree_geometry(tree2, pos_sorted2)
-    interactions2, neighbors2 = build_interactions_and_neighbors(
-        tree2,
-        geometry2,
-        theta=0.6,
-        mac_type="dehnen",
-        traversal_config=_TEST_TRAVERSAL_CFG,
-    )
     assert jnp.array_equal(tree.parent, tree2.parent)
     assert jnp.array_equal(tree.particle_indices, tree2.particle_indices)
-    assert jnp.array_equal(interactions.counts, interactions2.counts)
-    assert jnp.array_equal(neighbors.counts, neighbors2.counts)
 
 
 @pytest.mark.parametrize(

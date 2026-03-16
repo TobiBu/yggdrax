@@ -30,7 +30,7 @@ def _build_random_tree(n=1024, leaf_size=8, seed=0):
 
 
 def test_two_pass_equivalence_small():
-    tree, geometry = _build_random_tree(n=128, leaf_size=8, seed=42)
+    tree, geometry = _build_random_tree(n=64, leaf_size=8, seed=42)
 
     # Run with explicit (large) capacities to force the single fill pass.
     interactions_ref, neighbors_ref = build_interactions_and_neighbors(

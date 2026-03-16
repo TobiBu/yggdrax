@@ -55,6 +55,11 @@ def _build_fixed_depth_state(theta: float = 0.6):
     return tree, geometry, interactions, dense
 
 
+@pytest.fixture(scope="module")
+def fixed_depth_state():
+    return _build_fixed_depth_state()
+
+
 def _node_slot_lookup(level_nodes):
     nodes = jnp.asarray(level_nodes)
     mapping = {}
@@ -67,8 +72,8 @@ def _node_slot_lookup(level_nodes):
     return mapping
 
 
-def test_dense_sources_match_sparse_lists():
-    tree, _geom, interactions, dense = _build_fixed_depth_state()
+def test_dense_sources_match_sparse_lists(fixed_depth_state):
+    tree, _geom, interactions, dense = fixed_depth_state
     node_lookup = _node_slot_lookup(dense.geometry.node_indices)
 
     offsets = jnp.asarray(interactions.offsets)
@@ -84,8 +89,8 @@ def test_dense_sources_match_sparse_lists():
         assert sparse == set(map(int, dense_sources))
 
 
-def test_dense_displacements_align_with_centers():
-    tree, geometry, interactions, dense = _build_fixed_depth_state()
+def test_dense_displacements_align_with_centers(fixed_depth_state):
+    tree, geometry, interactions, dense = fixed_depth_state
     del interactions
     node_lookup = _node_slot_lookup(dense.geometry.node_indices)
     centers = jnp.asarray(geometry.center)
@@ -103,8 +108,8 @@ def test_dense_displacements_align_with_centers():
             assert jnp.allclose(displacements[idx], expected)
 
 
-def test_build_dense_interactions_matches_manual_result():
-    tree, geometry, interactions, dense_manual = _build_fixed_depth_state()
+def test_build_dense_interactions_matches_manual_result(fixed_depth_state):
+    tree, geometry, interactions, dense_manual = fixed_depth_state
     dense_built = build_dense_interactions(tree, geometry)
 
     assert jnp.array_equal(dense_built.m2l_sources, dense_manual.m2l_sources)
