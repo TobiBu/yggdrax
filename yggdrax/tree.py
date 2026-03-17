@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, Literal, Optional
 
 import jax
@@ -453,6 +453,29 @@ def _build_fixed_depth_octree_jit_result(
     )
 
 
+@lru_cache(maxsize=32)
+def _jit_radix_adaptive_builder(
+    *,
+    leaf_size: int,
+    return_reordered: bool,
+):
+    """Return cached JIT radix adaptive builder for fixed static flags."""
+
+    leaf_size_int = int(leaf_size)
+    return_reordered_bool = bool(return_reordered)
+    return jax.jit(
+        lambda positions, masses, bounds: _tree_impl.build_tree(
+            positions,
+            masses,
+            bounds,
+            return_reordered=return_reordered_bool,
+            leaf_size=leaf_size_int,
+            workspace=None,
+            return_workspace=False,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class RadixTree(Tree):
     """Concrete radix-tree container implementing the generic Tree contract."""
@@ -494,15 +517,22 @@ class RadixTree(Tree):
 
         bounds_resolved = infer_bounds(positions) if bounds is None else bounds
         if build_mode == "adaptive":
-            result = _tree_impl.build_tree(
-                positions,
-                masses,
-                bounds_resolved,
-                return_reordered=return_reordered,
-                leaf_size=leaf_size,
-                workspace=workspace,
-                return_workspace=return_workspace,
-            )
+            use_fast_adaptive_path = workspace is None and not return_workspace
+            if use_fast_adaptive_path:
+                result = _jit_radix_adaptive_builder(
+                    leaf_size=int(leaf_size),
+                    return_reordered=bool(return_reordered),
+                )(positions, masses, bounds_resolved)
+            else:
+                result = _tree_impl.build_tree(
+                    positions,
+                    masses,
+                    bounds_resolved,
+                    return_reordered=return_reordered,
+                    leaf_size=leaf_size,
+                    workspace=workspace,
+                    return_workspace=return_workspace,
+                )
         elif build_mode == "fixed_depth":
             result = _tree_impl.build_fixed_depth_tree(
                 positions,
