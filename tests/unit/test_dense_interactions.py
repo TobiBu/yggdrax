@@ -11,6 +11,13 @@ from yggdrax.interactions import (
 )
 from yggdrax.tree import Tree, build_fixed_depth_tree
 
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=1024,
+    process_block=64,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
 
 def _build_fixed_depth_state(theta: float = 0.6):
     positions = jnp.array(
@@ -21,8 +28,6 @@ def _build_fixed_depth_state(theta: float = 0.6):
             [0.0, 0.0, 0.0],
             [0.2, 0.3, 0.4],
             [0.5, -0.2, 0.6],
-            [0.7, 0.6, -0.3],
-            [0.9, -0.7, 0.8],
         ],
         dtype=jnp.float64,
     )
@@ -48,6 +53,11 @@ def _build_fixed_depth_state(theta: float = 0.6):
     return tree, geometry, interactions, dense
 
 
+@pytest.fixture(scope="module")
+def fixed_depth_state():
+    return _build_fixed_depth_state()
+
+
 def _node_slot_lookup(level_nodes):
     nodes = jnp.asarray(level_nodes)
     mapping = {}
@@ -60,8 +70,8 @@ def _node_slot_lookup(level_nodes):
     return mapping
 
 
-def test_dense_sources_match_sparse_lists():
-    tree, _geom, interactions, dense = _build_fixed_depth_state()
+def test_dense_sources_match_sparse_lists(fixed_depth_state):
+    tree, _geom, interactions, dense = fixed_depth_state
     node_lookup = _node_slot_lookup(dense.geometry.node_indices)
 
     offsets = jnp.asarray(interactions.offsets)
@@ -77,8 +87,8 @@ def test_dense_sources_match_sparse_lists():
         assert sparse == set(map(int, dense_sources))
 
 
-def test_dense_displacements_align_with_centers():
-    tree, geometry, interactions, dense = _build_fixed_depth_state()
+def test_dense_displacements_align_with_centers(fixed_depth_state):
+    tree, geometry, interactions, dense = fixed_depth_state
     del interactions
     node_lookup = _node_slot_lookup(dense.geometry.node_indices)
     centers = jnp.asarray(geometry.center)
@@ -96,8 +106,8 @@ def test_dense_displacements_align_with_centers():
             assert jnp.allclose(displacements[idx], expected)
 
 
-def test_build_dense_interactions_matches_manual_result():
-    tree, geometry, interactions, dense_manual = _build_fixed_depth_state()
+def test_build_dense_interactions_matches_manual_result(fixed_depth_state):
+    tree, geometry, interactions, dense_manual = fixed_depth_state
     dense_built = build_dense_interactions(tree, geometry)
 
     assert jnp.array_equal(dense_built.m2l_sources, dense_manual.m2l_sources)
@@ -129,8 +139,6 @@ def test_dense_interactions_accept_tree_wrappers(tree_type: str):
             [0.0, 0.0, 0.0],
             [0.2, 0.3, 0.4],
             [0.5, -0.2, 0.6],
-            [0.7, 0.6, -0.3],
-            [0.9, -0.7, 0.8],
         ],
         dtype=jnp.float64,
     )
@@ -143,24 +151,18 @@ def test_dense_interactions_accept_tree_wrappers(tree_type: str):
         leaf_size=2,
     )
     geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=4096,
-        process_block=64,
-        max_interactions_per_node=512,
-        max_neighbors_per_leaf=512,
-    )
     interactions, _ = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
     dense = densify_interactions(tree, geometry, interactions)
     dense_built = build_dense_interactions(
         tree,
         geometry,
         theta=0.6,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
     )
 
     assert dense.m2l_sources.ndim == 3

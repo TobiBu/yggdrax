@@ -7,8 +7,12 @@ import numpy as np
 from yggdrax.geometry import compute_tree_geometry
 from yggdrax.tree import (
     RadixTreeWorkspace,
+    build_fixed_depth_octree,
+    build_fixed_depth_octree_jit,
     build_fixed_depth_tree,
     build_fixed_depth_tree_jit,
+    build_octree,
+    build_octree_jit,
     build_tree,
     build_tree_jit,
     reorder_particles_by_indices,
@@ -674,6 +678,108 @@ def test_fixed_depth_tree_jit_matches_eager():
     assert jnp.array_equal(tree_eager.left_child, tree_jit.left_child)
     assert jnp.array_equal(tree_eager.right_child, tree_jit.right_child)
     assert jnp.array_equal(tree_eager.node_ranges, tree_jit.node_ranges)
+    assert jnp.array_equal(pos_eager, pos_jit)
+    assert jnp.array_equal(mass_eager, mass_jit)
+    assert jnp.array_equal(inv_eager, inv_jit)
+
+
+def test_build_octree_jit_matches_eager():
+    positions = jnp.array(
+        [
+            [0.1, -0.2, 0.3],
+            [0.4, 0.5, -0.6],
+            [-0.7, 0.8, 0.9],
+            [-0.4, -0.3, 0.2],
+        ]
+    )
+    masses = jnp.array([1.0, 2.0, 3.0, 4.0])
+
+    bounds = (
+        jnp.array([-1.0, -1.0, -1.0]),
+        jnp.array([1.0, 1.0, 1.0]),
+    )
+
+    eager = build_octree(
+        positions,
+        masses,
+        bounds,
+        return_reordered=True,
+        leaf_size=DEFAULT_TEST_LEAF_SIZE,
+    )
+    jitted = build_octree_jit(
+        positions,
+        masses,
+        bounds,
+        return_reordered=True,
+        leaf_size=DEFAULT_TEST_LEAF_SIZE,
+    )
+
+    assert isinstance(jitted, tuple) and isinstance(eager, tuple)
+    assert len(eager) == len(jitted) == 4
+
+    tree_eager, pos_eager, mass_eager, inv_eager = eager
+    tree_jit, pos_jit, mass_jit, inv_jit = jitted
+
+    assert tree_eager.tree_type == tree_jit.tree_type == "octree"
+    assert jnp.array_equal(tree_eager.parent, tree_jit.parent)
+    assert jnp.array_equal(tree_eager.node_ranges, tree_jit.node_ranges)
+    assert jnp.array_equal(tree_eager.oct_children, tree_jit.oct_children)
+    assert jnp.array_equal(tree_eager.oct_parent, tree_jit.oct_parent)
+    assert jnp.array_equal(tree_eager.oct_leaf_mask, tree_jit.oct_leaf_mask)
+    assert jnp.array_equal(tree_eager.oct_leaf_nodes, tree_jit.oct_leaf_nodes)
+    assert jnp.array_equal(tree_eager.radix_leaf_to_oct, tree_jit.radix_leaf_to_oct)
+    assert jnp.array_equal(pos_eager, pos_jit)
+    assert jnp.array_equal(mass_eager, mass_jit)
+    assert jnp.array_equal(inv_eager, inv_jit)
+
+
+def test_build_fixed_depth_octree_jit_matches_eager():
+    positions = jnp.array(
+        [
+            [0.1, -0.2, 0.3],
+            [0.4, 0.5, -0.6],
+            [-0.7, 0.8, 0.9],
+            [-0.4, -0.3, 0.2],
+        ]
+    )
+    masses = jnp.array([1.0, 2.0, 3.0, 4.0])
+
+    bounds = (
+        jnp.array([-1.0, -1.0, -1.0]),
+        jnp.array([1.0, 1.0, 1.0]),
+    )
+
+    eager = build_fixed_depth_octree(
+        positions,
+        masses,
+        bounds,
+        target_leaf_particles=2,
+        return_reordered=True,
+        refine_local=False,
+    )
+    jitted = build_fixed_depth_octree_jit(
+        positions,
+        masses,
+        bounds,
+        target_leaf_particles=2,
+        return_reordered=True,
+        refine_local=False,
+    )
+
+    assert isinstance(jitted, tuple) and isinstance(eager, tuple)
+    assert len(eager) == len(jitted) == 4
+
+    tree_eager, pos_eager, mass_eager, inv_eager = eager
+    tree_jit, pos_jit, mass_jit, inv_jit = jitted
+
+    assert tree_eager.tree_type == tree_jit.tree_type == "octree"
+    assert jnp.array_equal(tree_eager.parent, tree_jit.parent)
+    assert jnp.array_equal(tree_eager.node_ranges, tree_jit.node_ranges)
+    assert jnp.array_equal(tree_eager.oct_children, tree_jit.oct_children)
+    assert jnp.array_equal(tree_eager.oct_parent, tree_jit.oct_parent)
+    assert jnp.array_equal(tree_eager.oct_leaf_mask, tree_jit.oct_leaf_mask)
+    assert jnp.array_equal(tree_eager.oct_leaf_nodes, tree_jit.oct_leaf_nodes)
+    assert jnp.array_equal(tree_eager.radix_leaf_to_oct, tree_jit.radix_leaf_to_oct)
     assert jnp.array_equal(pos_eager, pos_jit)
     assert jnp.array_equal(mass_eager, mass_jit)
     assert jnp.array_equal(inv_eager, inv_jit)

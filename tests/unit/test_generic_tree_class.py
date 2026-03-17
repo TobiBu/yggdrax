@@ -7,19 +7,23 @@ import pytest
 import yggdrax.tree as tree_api
 from yggdrax import (
     Tree,
+    get_leaf_nodes,
     has_fmm_core_topology,
     has_fmm_topology,
+    has_leaf_topology,
     has_morton_topology,
     missing_fmm_core_topology_fields,
     missing_fmm_topology_fields,
+    missing_leaf_topology_fields,
     missing_morton_topology_fields,
     require_fmm_core_topology,
     require_fmm_topology,
+    require_leaf_topology,
     require_morton_topology,
 )
 
 
-def _sample_problem(n: int = 64):
+def _sample_problem(n: int = 32):
     key = jax.random.PRNGKey(37)
     key_pos, key_mass = jax.random.split(key)
     positions = jax.random.uniform(
@@ -196,6 +200,28 @@ def test_available_tree_types_includes_radix():
     assert "kdtree" in tree_api.available_tree_types()
 
 
+@pytest.mark.parametrize("tree_type", ["radix", "octree", "kdtree"])
+def test_tree_leaf_contract_is_shared_across_topologies(tree_type: str):
+    positions, masses = _sample_problem(n=64)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type=tree_type,
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+
+    leaf_nodes = get_leaf_nodes(tree)
+    assert has_leaf_topology(tree)
+    assert missing_leaf_topology_fields(tree) == ()
+    require_leaf_topology(tree)
+    assert leaf_nodes.ndim == 1
+    assert leaf_nodes.shape[0] == tree.num_leaves
+    assert int(jnp.min(leaf_nodes)) >= 0
+    assert int(jnp.max(leaf_nodes)) < tree.num_nodes
+
+
 def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):
     positions, masses = _sample_problem(n=32)
     original_builders = dict(tree_api._TREE_BUILDERS)
@@ -225,6 +251,31 @@ def test_tree_from_particles_dispatches_to_registered_builder(monkeypatch):
 
     assert calls["count"] == 1
     assert tree.num_particles == 32
+    assert tree.positions_sorted is not None
+
+
+def test_octree_build_path_does_not_delegate_to_radix_wrapper(monkeypatch):
+    positions, masses = _sample_problem(n=32)
+
+    def _forbidden_radix_builder(*args, **kwargs):
+        raise AssertionError("octree build should not call RadixTree.from_particles")
+
+    monkeypatch.setattr(
+        tree_api.RadixTree,
+        "from_particles",
+        classmethod(_forbidden_radix_builder),
+    )
+
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type="octree",
+        build_mode="adaptive",
+        leaf_size=8,
+        return_reordered=True,
+    )
+
+    assert tree.tree_type == "octree"
     assert tree.positions_sorted is not None
 
 

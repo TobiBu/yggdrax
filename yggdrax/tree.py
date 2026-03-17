@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Literal, Optional
 
 import jax
@@ -105,6 +106,8 @@ FMM_CORE_REQUIRED_FIELDS: tuple[str, ...] = (
     "num_particles",
     "use_morton_geometry",
 )
+
+LEAF_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = ("node_ranges",)
 
 MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
     "bounds_min",
@@ -258,6 +261,198 @@ def _resolve_tree_build_options(
     )
 
 
+def _build_octree_result(
+    positions: Array,
+    masses: Array,
+    *,
+    build_mode: str,
+    bounds: Optional[tuple[Array, Array]],
+    return_reordered: bool,
+    workspace: Optional[RadixTreeWorkspace],
+    return_workspace: bool,
+    leaf_size: int,
+    target_leaf_particles: int,
+    max_depth: Optional[int],
+    refine_local: bool,
+    max_refine_levels: int,
+    aspect_threshold: float,
+    min_refined_leaf_particles: int,
+):
+    """Build octree topology through its own Morton partition pipeline."""
+
+    from .morton import morton_encode  # local import to avoid circulars
+
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    num_particles = int(positions.shape[0])
+    if num_particles < 1:
+        raise ValueError("Need at least one particle")
+
+    morton_codes = morton_encode(positions, bounds_resolved)
+    orig_idx = jnp.arange(num_particles, dtype=INDEX_DTYPE)
+    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    sorted_codes = morton_codes[sorted_indices]
+
+    if build_mode == "adaptive":
+        if leaf_size < 1:
+            raise ValueError("leaf_size must be >= 1")
+        leaf_starts = jnp.arange(0, num_particles, leaf_size, dtype=INDEX_DTYPE)
+        leaf_ends = jnp.minimum(leaf_starts + leaf_size, num_particles)
+        return _tree_impl._build_tree_from_leaf_partitions(
+            positions,
+            masses,
+            sorted_indices,
+            sorted_codes,
+            leaf_starts,
+            leaf_ends,
+            bounds_resolved,
+            leaf_size=leaf_size,
+            return_reordered=return_reordered,
+            workspace=workspace,
+            return_workspace=return_workspace,
+        )
+
+    if build_mode == "fixed_depth":
+        if target_leaf_particles < 1:
+            raise ValueError("target_leaf_particles must be >= 1")
+        max_allowed_depth = min(
+            _tree_impl.MAX_TREE_LEVELS - 1,
+            _tree_impl._MAX_MORTON_LEVEL,
+        )
+        if max_depth is not None:
+            max_allowed_depth = min(max_allowed_depth, int(max_depth))
+        resolved_depth = _tree_impl._resolve_fixed_depth_level(
+            num_particles,
+            target_leaf_particles,
+            max_allowed_depth=max_allowed_depth,
+        )
+        leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
+            _tree_impl._fixed_depth_leaf_partitions(
+                sorted_codes,
+                resolved_depth,
+                num_particles,
+            )
+        )
+        leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
+            _tree_impl._maybe_refine_fixed_depth_leaf_partitions(
+                positions=positions,
+                sorted_indices=sorted_indices,
+                sorted_codes=sorted_codes,
+                leaf_starts=leaf_starts,
+                leaf_ends=leaf_ends,
+                leaf_codes=leaf_codes,
+                leaf_depths=leaf_depths,
+                resolved_depth=resolved_depth,
+                refine_local=refine_local,
+                max_refine_levels=max_refine_levels,
+                aspect_threshold=aspect_threshold,
+                min_refined_leaf_particles=min_refined_leaf_particles,
+            )
+        )
+        return _tree_impl._build_tree_from_leaf_partitions(
+            positions,
+            masses,
+            sorted_indices,
+            sorted_codes,
+            leaf_starts,
+            leaf_ends,
+            bounds_resolved,
+            leaf_size=None,
+            use_morton_geometry=True,
+            return_reordered=return_reordered,
+            workspace=workspace,
+            return_workspace=return_workspace,
+            leaf_codes_override=leaf_codes,
+            leaf_depths_override=leaf_depths,
+        )
+
+    raise ValueError(
+        "Unsupported build_mode "
+        f"'{build_mode}'. Supported: ('adaptive', 'fixed_depth')"
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("return_reordered", "leaf_size", "return_workspace"),
+)
+def _build_octree_jit_result(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    return_reordered: bool = False,
+    leaf_size: int = 8,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+):
+    """JIT-compiled adaptive octree builder using Morton leaf partitions."""
+
+    return _build_octree_result(
+        positions,
+        masses,
+        build_mode="adaptive",
+        bounds=bounds,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+        leaf_size=leaf_size,
+        target_leaf_particles=32,
+        max_depth=None,
+        refine_local=True,
+        max_refine_levels=2,
+        aspect_threshold=8.0,
+        min_refined_leaf_particles=2,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "return_reordered",
+        "target_leaf_particles",
+        "return_workspace",
+        "max_depth",
+        "refine_local",
+        "max_refine_levels",
+        "aspect_threshold",
+        "min_refined_leaf_particles",
+    ),
+)
+def _build_fixed_depth_octree_jit_result(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    target_leaf_particles: int = 32,
+    return_reordered: bool = False,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+    max_depth: Optional[int] = None,
+    refine_local: bool = True,
+    max_refine_levels: int = 2,
+    aspect_threshold: float = 8.0,
+    min_refined_leaf_particles: int = 2,
+):
+    """JIT-compiled fixed-depth octree builder using Morton leaf partitions."""
+
+    return _build_octree_result(
+        positions,
+        masses,
+        build_mode="fixed_depth",
+        bounds=bounds,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+        leaf_size=8,
+        target_leaf_particles=target_leaf_particles,
+        max_depth=max_depth,
+        refine_local=refine_local,
+        max_refine_levels=max_refine_levels,
+        aspect_threshold=aspect_threshold,
+        min_refined_leaf_particles=min_refined_leaf_particles,
+    )
+
+
 @dataclass(frozen=True)
 class RadixTree(Tree):
     """Concrete radix-tree container implementing the generic Tree contract."""
@@ -376,13 +571,7 @@ class RadixTree(Tree):
 
 @dataclass(frozen=True)
 class OctreeTree(RadixTree):
-    """Oct-tree container backed by Morton/radix topology buffers.
-
-    This exposes a distinct public tree family for downstream FMM consumers
-    while intentionally reusing the existing Morton/radix builder and geometry
-    contracts. That keeps construction JAX-friendly and lets us iterate on
-    octree-specific metadata without destabilizing the traversal core.
-    """
+    """Oct-tree container built from an octree-specific Morton partition path."""
 
     @property
     def tree_type(self) -> TreeType:
@@ -401,6 +590,51 @@ class OctreeTree(RadixTree):
         """Return the number of valid explicit octree leaves."""
 
         return int(jnp.sum(self.topology.oct_leaf_mask))
+
+    @classmethod
+    @jaxtyped(typechecker=beartype)
+    def from_particles(
+        cls,
+        positions: Array,
+        masses: Array,
+        *,
+        build_mode: str = "adaptive",
+        bounds: Optional[tuple[Array, Array]] = None,
+        return_reordered: bool = True,
+        workspace: Optional[RadixTreeWorkspace] = None,
+        return_workspace: bool = False,
+        leaf_size: int = 8,
+        target_leaf_particles: int = 32,
+        max_depth: Optional[int] = None,
+        refine_local: bool = True,
+        max_refine_levels: int = 2,
+        aspect_threshold: float = 8.0,
+        min_refined_leaf_particles: int = 2,
+    ) -> "OctreeTree":
+        """Build an octree from particles using the octree-specific build path."""
+
+        result = _build_octree_result(
+            positions,
+            masses,
+            build_mode=build_mode,
+            bounds=bounds,
+            return_reordered=return_reordered,
+            workspace=workspace,
+            return_workspace=return_workspace,
+            leaf_size=leaf_size,
+            target_leaf_particles=target_leaf_particles,
+            max_depth=max_depth,
+            refine_local=refine_local,
+            max_refine_levels=max_refine_levels,
+            aspect_threshold=aspect_threshold,
+            min_refined_leaf_particles=min_refined_leaf_particles,
+        )
+        return cls._from_build_result(
+            result=result,
+            build_mode=build_mode,
+            return_reordered=return_reordered,
+            return_workspace=return_workspace,
+        )
 
     @classmethod
     def _from_build_result(
@@ -702,6 +936,25 @@ def has_morton_topology(tree_or_topology: object) -> bool:
     return len(missing_morton_topology_fields(tree_or_topology)) == 0
 
 
+def missing_leaf_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
+    """Return fields needed to derive or expose leaf-node indices."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(
+        name for name in LEAF_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
+    )
+
+
+def has_leaf_topology(tree_or_topology: object) -> bool:
+    """Return ``True`` when leaf-node metadata can be resolved."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return (
+        hasattr(topology, "leaf_nodes")
+        or len(missing_leaf_topology_fields(topology)) == 0
+    )
+
+
 def require_fmm_core_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when FMM-core topology fields are missing."""
 
@@ -730,6 +983,21 @@ def require_morton_topology(tree_or_topology: object) -> None:
     )
 
 
+def require_leaf_topology(tree_or_topology: object) -> None:
+    """Raise ``ValueError`` when leaf-node metadata cannot be resolved."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    if hasattr(topology, "leaf_nodes"):
+        return
+    missing = missing_leaf_topology_fields(topology)
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(f"{prefix}topology is missing leaf-required fields: {missing_txt}")
+
+
 # Backward-compatible aliases
 def missing_fmm_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Alias of ``missing_fmm_core_topology_fields`` for compatibility."""
@@ -752,9 +1020,43 @@ def require_fmm_topology(tree_or_topology: object) -> None:
 def get_num_internal_nodes(tree: object) -> int:
     """Return number of internal nodes, deriving it from child buffers when needed."""
 
+    if hasattr(tree, "left_child"):
+        return int(jnp.asarray(tree.left_child).shape[0])
     if hasattr(tree, "num_internal_nodes"):
-        return int(getattr(tree, "num_internal_nodes"))
-    return int(jnp.asarray(tree.left_child).shape[0])
+        num_internal = getattr(tree, "num_internal_nodes")
+        if isinstance(num_internal, jax.core.Tracer):
+            raise ValueError(
+                "tree.num_internal_nodes is traced; expose left_child or another "
+                "statically shaped child buffer to derive internal-node count."
+            )
+        return int(num_internal)
+    raise AttributeError("topology does not expose left_child or num_internal_nodes")
+
+
+def get_leaf_nodes(tree: object) -> Array:
+    """Return leaf-node indices, deriving a stable default when needed."""
+
+    topology = resolve_tree_topology(tree)
+    if hasattr(topology, "leaf_nodes"):
+        return jnp.asarray(getattr(topology, "leaf_nodes"), dtype=INDEX_DTYPE)
+
+    # When leaf_nodes is missing, we need a reliable internal-node count.
+    try:
+        num_internal = get_num_internal_nodes(topology)
+    except (AttributeError, ValueError) as exc:
+        # Run the standard leaf-topology checks for consistency, then
+        # surface a clear, user-facing error about the missing fields.
+        require_leaf_topology(tree)
+        raise ValueError(
+            "Tree topology is missing 'leaf_nodes' and does not expose a "
+            "derivable internal-node count; expected either a statically "
+            "shaped 'left_child' buffer or an untraced 'num_internal_nodes'."
+        ) from exc
+
+    require_leaf_topology(tree)
+    node_ranges = jnp.asarray(topology.node_ranges, dtype=INDEX_DTYPE)
+    total_nodes = int(node_ranges.shape[0])
+    return jnp.arange(num_internal, total_nodes, dtype=INDEX_DTYPE)
 
 
 def get_node_levels(tree: object) -> Array:
@@ -991,7 +1293,7 @@ def build_octree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an octree-compatible topology from Morton/radix construction."""
+    """Build an octree through the octree-specific Morton partition pipeline."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -999,15 +1301,21 @@ def build_octree(
         workspace=workspace,
         return_workspace=return_workspace,
     )
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_tree(
+    result = _build_octree_result(
         positions,
         masses,
-        bounds_resolved,
+        build_mode="adaptive",
+        bounds=bounds,
         return_reordered=resolved.return_reordered,
-        leaf_size=config.leaf_size if config is not None else leaf_size,
         workspace=resolved.workspace,
         return_workspace=resolved.return_workspace,
+        leaf_size=config.leaf_size if config is not None else leaf_size,
+        target_leaf_particles=32,
+        max_depth=None,
+        refine_local=True,
+        max_refine_levels=2,
+        aspect_threshold=8.0,
+        min_refined_leaf_particles=2,
     )
     return _wrap_octree_public_result(
         result=result,
@@ -1067,7 +1375,7 @@ def build_octree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an octree-compatible topology."""
+    """JIT build for an octree through the octree-specific Morton pipeline."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1076,7 +1384,7 @@ def build_octree_jit(
         return_workspace=return_workspace,
     )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_tree_jit(
+    result = _build_octree_jit_result(
         positions,
         masses,
         bounds_resolved,
@@ -1174,7 +1482,7 @@ def build_fixed_depth_octree(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """Build a fixed-depth octree-compatible topology."""
+    """Build a fixed-depth octree through the octree-specific build path."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1182,19 +1490,20 @@ def build_fixed_depth_octree(
         workspace=workspace,
         return_workspace=return_workspace,
     )
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_fixed_depth_tree(
+    result = _build_octree_result(
         positions,
         masses,
-        bounds_resolved,
+        build_mode="fixed_depth",
+        bounds=bounds,
+        return_reordered=resolved.return_reordered,
+        workspace=resolved.workspace,
+        return_workspace=resolved.return_workspace,
+        leaf_size=8,
         target_leaf_particles=(
             config.target_leaf_particles
             if config is not None
             else target_leaf_particles
         ),
-        return_reordered=resolved.return_reordered,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
         max_depth=config.max_depth if config is not None else max_depth,
         refine_local=config.refine_local if config is not None else refine_local,
         max_refine_levels=(
@@ -1294,7 +1603,7 @@ def build_fixed_depth_octree_jit(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """JIT build for a fixed-depth octree-compatible topology."""
+    """JIT build for a fixed-depth octree through the octree-native path."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1303,7 +1612,7 @@ def build_fixed_depth_octree_jit(
         return_workspace=return_workspace,
     )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_fixed_depth_tree_jit(
+    result = _build_fixed_depth_octree_jit_result(
         positions,
         masses,
         bounds_resolved,
@@ -1364,19 +1673,23 @@ __all__ = [
     "build_tree_jit",
     "available_tree_types",
     "get_level_offsets",
+    "get_leaf_nodes",
     "get_node_levels",
     "get_nodes_by_level",
     "get_num_internal_nodes",
     "get_num_levels",
     "has_fmm_core_topology",
     "has_fmm_topology",
+    "has_leaf_topology",
     "has_morton_topology",
     "missing_fmm_core_topology_fields",
     "missing_fmm_topology_fields",
+    "missing_leaf_topology_fields",
     "missing_morton_topology_fields",
     "resolve_tree_topology",
     "require_fmm_core_topology",
     "require_fmm_topology",
+    "require_leaf_topology",
     "require_morton_topology",
     "register_tree_builder",
     "reorder_particles_by_indices",

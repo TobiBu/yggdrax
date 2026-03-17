@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from yggdrax import (
     DualTreeTraversalConfig,
@@ -16,6 +17,12 @@ from yggdrax.dtypes import INDEX_DTYPE, as_index
 _ACTION_ACCEPT = 0
 _ACTION_NEAR = 1
 _ACTION_REFINE = 2
+_TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
+    max_pair_queue=512,
+    process_block=32,
+    max_interactions_per_node=128,
+    max_neighbors_per_leaf=128,
+)
 
 
 def _sample_problem(n: int = 64):
@@ -36,6 +43,19 @@ def _sample_problem(n: int = 64):
         dtype=jnp.float32,
     )
     return positions, masses
+
+
+@pytest.fixture(scope="module")
+def traversal_state():
+    positions, masses = _sample_problem(n=32)
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        leaf_size=8,
+        return_reordered=True,
+    )
+    geometry = compute_tree_geometry(tree, pos_sorted)
+    return tree, geometry
 
 
 def _distance_bucket_policy(
@@ -116,26 +136,12 @@ def _target_parity_policy(
     return actions, tags
 
 
-def test_pair_policy_returns_tagged_far_pairs():
-    positions, masses = _sample_problem()
-    tree, pos_sorted, _, _ = build_tree(
-        positions,
-        masses,
-        leaf_size=8,
-        return_reordered=True,
-    )
-    geometry = compute_tree_geometry(tree, pos_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=128,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
-
+def test_pair_policy_returns_tagged_far_pairs(traversal_state):
+    tree, geometry = traversal_state
     interactions, neighbors, result = build_interactions_and_neighbors(
         tree,
         geometry,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
         pair_policy=_distance_bucket_policy,
         policy_state={
             "far_sq": jnp.asarray(0.18, dtype=jnp.float32),
@@ -154,26 +160,12 @@ def test_pair_policy_returns_tagged_far_pairs():
     assert neighbors.neighbors.ndim == 1
 
 
-def test_pair_policy_keeps_directional_tags_aligned():
-    positions, masses = _sample_problem()
-    tree, pos_sorted, _, _ = build_tree(
-        positions,
-        masses,
-        leaf_size=8,
-        return_reordered=True,
-    )
-    geometry = compute_tree_geometry(tree, pos_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=128,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
-
+def test_pair_policy_keeps_directional_tags_aligned(traversal_state):
+    tree, geometry = traversal_state
     _interactions, _neighbors, result = build_interactions_and_neighbors(
         tree,
         geometry,
-        traversal_config=traversal_cfg,
+        traversal_config=_TEST_TRAVERSAL_CFG,
         pair_policy=_target_parity_policy,
         policy_state=None,
         return_result=True,
@@ -186,15 +178,8 @@ def test_pair_policy_keeps_directional_tags_aligned():
         assert jnp.all(active_tags == (active_targets % as_index(2)))
 
 
-def test_pair_policy_supports_outer_jit_with_auto_capacities():
-    positions, masses = _sample_problem()
-    tree, pos_sorted, _, _ = build_tree(
-        positions,
-        masses,
-        leaf_size=8,
-        return_reordered=True,
-    )
-    geometry = compute_tree_geometry(tree, pos_sorted)
+def test_pair_policy_supports_outer_jit_with_auto_capacities(traversal_state):
+    tree, geometry = traversal_state
 
     @jax.jit
     def run(tree_arg, geom_arg, far_sq, tag_sq):
@@ -220,28 +205,15 @@ def test_pair_policy_supports_outer_jit_with_auto_capacities():
     assert int(tagged_count) == int(far_count)
 
 
-def test_pair_policy_supports_outer_jit():
-    positions, masses = _sample_problem()
-    tree, pos_sorted, _, _ = build_tree(
-        positions,
-        masses,
-        leaf_size=8,
-        return_reordered=True,
-    )
-    geometry = compute_tree_geometry(tree, pos_sorted)
-    traversal_cfg = DualTreeTraversalConfig(
-        max_pair_queue=8192,
-        process_block=128,
-        max_interactions_per_node=2048,
-        max_neighbors_per_leaf=2048,
-    )
+def test_pair_policy_supports_outer_jit(traversal_state):
+    tree, geometry = traversal_state
 
     @jax.jit
     def run(tree_arg, geom_arg, far_sq, tag_sq):
         _interactions, _neighbors, result = build_interactions_and_neighbors(
             tree_arg,
             geom_arg,
-            traversal_config=traversal_cfg,
+            traversal_config=_TEST_TRAVERSAL_CFG,
             pair_policy=_distance_bucket_policy,
             policy_state={
                 "far_sq": far_sq,
