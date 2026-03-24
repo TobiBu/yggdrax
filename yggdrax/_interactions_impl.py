@@ -4426,13 +4426,17 @@ def _run_far_only_compact_with_bounded_count_pass(
         count_process_block = int(resolved_block)
 
     attempt_counter = 0
-    queue_error_msg = "Pair queue capacity exceeded; increase max_pair_queue and rebuild."
+    queue_error_msg = (
+        "Pair queue capacity exceeded; increase max_pair_queue and rebuild."
+    )
     far_error_msg = (
         "Interaction list capacity exceeded during compact far-pair fill; "
         "increase max_interactions_per_node and rebuild."
     )
 
-    def _emit_retry_event(status: str, *, attempt: int, queue_capacity: int, walk_result):
+    def _emit_retry_event(
+        status: str, *, attempt: int, queue_capacity: int, walk_result
+    ):
         if retry_logger is None:
             return
         event = DualTreeRetryEvent(
@@ -4473,8 +4477,12 @@ def _run_far_only_compact_with_bounded_count_pass(
                 interaction_counts=jnp.zeros((total_nodes,), dtype=INDEX_DTYPE),
                 neighbor_offsets=jnp.zeros((1,), dtype=INDEX_DTYPE),
                 neighbor_indices=jnp.zeros((0,), dtype=INDEX_DTYPE),
-                neighbor_counts=jnp.zeros((max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE),
-                leaf_indices=jnp.zeros((max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE),
+                neighbor_counts=jnp.zeros(
+                    (max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE
+                ),
+                leaf_indices=jnp.zeros(
+                    (max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE
+                ),
                 far_pair_count=as_index(0),
                 near_pair_count=as_index(0),
                 queue_overflow=jnp.bool_(True),
@@ -4513,7 +4521,9 @@ def _run_far_only_compact_with_bounded_count_pass(
             )
         far_offsets = jnp.asarray(far_offsets64, dtype=INDEX_DTYPE)
         near_offsets = jnp.zeros((1,), dtype=INDEX_DTYPE)
-        near_counts = jnp.zeros((max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE)
+        near_counts = jnp.zeros(
+            (max(1, total_nodes - num_internal),), dtype=INDEX_DTYPE
+        )
 
         for fill_queue_capacity in fill_queue_candidates:
             attempt_counter += 1
