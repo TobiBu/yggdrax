@@ -3747,6 +3747,18 @@ def _run_dual_tree_walk_raw(
                 max_capacity=queue_max,
                 process_block=process_override,
             )
+        auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
+        queue_candidates.extend(
+            int(cap)
+            for cap in auto_queue_candidates
+            if int(cap) > int(queue_candidates[-1])
+        )
+        seen_queue_caps = set()
+        queue_candidates = [
+            int(cap)
+            for cap in queue_candidates
+            if not (int(cap) in seen_queue_caps or seen_queue_caps.add(int(cap)))
+        ]
     else:
         queue_cache_key = None
         user_supplied_queue = max_pair_queue is not None
@@ -4415,10 +4427,25 @@ def _run_far_only_compact_with_bounded_count_pass(
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     queue_max = max(4, int(traversal_config.max_pair_queue))
     process_override = int(traversal_config.process_block)
+    # Treat the explicit traversal-config queue as the preferred low-memory
+    # target, not as a hard failure ceiling. Larger trees can occasionally
+    # need more queue headroom even when the rest of the minimum-memory path
+    # is still perfectly viable, so append the legacy auto ladder above the
+    # configured cap as an overflow escape hatch.
     queue_candidates = _queue_candidates_bounded(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
+    queue_candidates.extend(
+        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+    )
+    seen_queue_caps = set()
+    queue_candidates = [
+        int(cap)
+        for cap in queue_candidates
+        if not (int(cap) in seen_queue_caps or seen_queue_caps.add(int(cap)))
+    ]
     resolved_block = process_override if process_override is not None else process_block
     if resolved_block is None:
         count_process_block = _DEFAULT_PAIR_BATCH
