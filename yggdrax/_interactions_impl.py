@@ -532,6 +532,36 @@ def _interaction_capacity_candidates(
     return [capacity], False
 
 
+def _neighbor_capacity_candidates(
+    requested: int,
+    *,
+    num_leaves: int,
+) -> list[int]:
+    """Return ascending neighbor-capacity candidates bounded by int32 space."""
+
+    base = max(1, int(requested))
+    safe_num_leaves = max(1, int(num_leaves))
+    int32_max = (1 << 31) - 1
+    hard_cap = max(1, int(int32_max // safe_num_leaves))
+    base = min(base, hard_cap)
+
+    candidates = [int(base)]
+    while candidates[-1] < hard_cap:
+        nxt = min(hard_cap, max(candidates[-1] * 2, candidates[-1] + 1024))
+        if nxt == candidates[-1]:
+            break
+        candidates.append(int(nxt))
+
+    seen = set()
+    unique_candidates = []
+    for cap in candidates:
+        if cap in seen:
+            continue
+        seen.add(cap)
+        unique_candidates.append(cap)
+    return unique_candidates
+
+
 class NodeInteractionList(NamedTuple):
     """Compressed far-field interaction list for all tree nodes.
 
@@ -3726,6 +3756,10 @@ def _run_dual_tree_walk_raw(
         interaction_candidates = [int(config.max_interactions_per_node)]
         allow_auto_interactions = len(interaction_candidates) > 1
         neighbors_limit = int(config.max_neighbors_per_leaf)
+        neighbor_candidates = _neighbor_capacity_candidates(
+            neighbors_limit,
+            num_leaves=(total_nodes - num_internal),
+        )
         process_override = int(config.process_block)
         user_supplied_queue = True
         queue_cache_key = (
@@ -3778,6 +3812,10 @@ def _run_dual_tree_walk_raw(
             total_nodes,
         )
         neighbors_limit = max_neighbors_per_leaf
+        neighbor_candidates = _neighbor_capacity_candidates(
+            neighbors_limit,
+            num_leaves=(total_nodes - num_internal),
+        )
         process_override = None
 
     # If the user did not supply capacities (and no traversal_config override),
@@ -4104,70 +4142,83 @@ def _run_dual_tree_walk_raw(
         block_size = _resolve_process_block(queue_capacity, resolved_block)
         queue_retry = False
         for interaction_capacity in interaction_candidates:
-            attempt_counter += 1
-            attempt_idx = attempt_counter
-            result = _dual_tree_walk_impl(
-                tree,
-                geometry,
-                nodes_by_level,
-                theta_val,
-                mac_type=mac_type,
-                pair_policy=pair_policy,
-                policy_state=policy_state,
-                dehnen_radius_scale=dehnen_scale_val,
-                max_interactions_per_node=interaction_capacity,
-                max_neighbors_per_leaf=neighbors_limit,
-                max_pair_queue=queue_capacity,
-                collect_far=collect_far,
-                collect_near=collect_near,
-                process_block=block_size,
-            )
-
-            overflow_queue = result.queue_overflow
-            overflow_far = result.far_overflow
-
-            if isinstance(overflow_queue, jax_core.Tracer) or isinstance(
-                overflow_far, jax_core.Tracer
-            ):
-                success = True
-                break
-
-            if bool(overflow_queue):
-                # Need a larger queue; try next candidate (outer loop).
-                _emit_retry_event(
-                    "queue_overflow",
-                    attempt=attempt_idx,
-                    queue_capacity=queue_capacity,
-                    interaction_capacity=interaction_capacity,
-                    walk_result=result,
+            for neighbor_capacity in neighbor_candidates:
+                attempt_counter += 1
+                attempt_idx = attempt_counter
+                result = _dual_tree_walk_impl(
+                    tree,
+                    geometry,
+                    nodes_by_level,
+                    theta_val,
+                    mac_type=mac_type,
+                    pair_policy=pair_policy,
+                    policy_state=policy_state,
+                    dehnen_radius_scale=dehnen_scale_val,
+                    max_interactions_per_node=interaction_capacity,
+                    max_neighbors_per_leaf=neighbor_capacity,
+                    max_pair_queue=queue_capacity,
+                    collect_far=collect_far,
+                    collect_near=collect_near,
+                    process_block=block_size,
                 )
-                queue_retry = True
-                break
 
-            if bool(overflow_far):
-                if allow_auto_interactions:
-                    # Re-run with a larger per-node interaction cap.
+                overflow_queue = result.queue_overflow
+                overflow_far = result.far_overflow
+
+                if isinstance(overflow_queue, jax_core.Tracer) or isinstance(
+                    overflow_far, jax_core.Tracer
+                ):
+                    success = True
+                    break
+
+                if bool(overflow_queue):
+                    # Need a larger queue; try next candidate (outer loop).
                     _emit_retry_event(
-                        "interaction_overflow",
+                        "queue_overflow",
+                        attempt=attempt_idx,
+                        queue_capacity=queue_capacity,
+                        interaction_capacity=interaction_capacity,
+                        walk_result=result,
+                    )
+                    queue_retry = True
+                    break
+
+                if bool(overflow_far):
+                    if allow_auto_interactions:
+                        # Re-run with a larger per-node interaction cap.
+                        _emit_retry_event(
+                            "interaction_overflow",
+                            attempt=attempt_idx,
+                            queue_capacity=queue_capacity,
+                            interaction_capacity=interaction_capacity,
+                            walk_result=result,
+                        )
+                        continue
+                    _raise_if_true(overflow_far, far_error_msg)
+
+                if collect_near and bool(result.near_overflow):
+                    _emit_retry_event(
+                        "neighbor_overflow",
                         attempt=attempt_idx,
                         queue_capacity=queue_capacity,
                         interaction_capacity=interaction_capacity,
                         walk_result=result,
                     )
                     continue
-                _raise_if_true(overflow_far, far_error_msg)
 
-            # No queue overflow and far capacity sufficient.
-            success = True
-            if attempt_idx > 1:
-                _emit_retry_event(
-                    "success",
-                    attempt=attempt_idx,
-                    queue_capacity=queue_capacity,
-                    interaction_capacity=interaction_capacity,
-                    walk_result=result,
-                )
-            break
+                # No queue overflow and capacities sufficient.
+                success = True
+                if attempt_idx > 1:
+                    _emit_retry_event(
+                        "success",
+                        attempt=attempt_idx,
+                        queue_capacity=queue_capacity,
+                        interaction_capacity=interaction_capacity,
+                        walk_result=result,
+                    )
+                break
+            if queue_retry or success:
+                break
         else:
             # Ran out of interaction capacities without success.
             if allow_auto_interactions and result is not None:
