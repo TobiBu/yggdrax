@@ -4638,6 +4638,177 @@ def _run_far_only_compact_with_bounded_count_pass(
     raise RuntimeError(queue_error_msg)
 
 
+def _run_near_only_compact_with_bounded_count_pass(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float,
+    *,
+    mac_type: MACType,
+    pair_policy: Optional[PairPolicy],
+    policy_state: object,
+    traversal_config: DualTreeTraversalConfig,
+    dehnen_radius_scale: float,
+    process_block: Optional[int],
+    retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
+) -> NodeNeighborList:
+    """Build compact neighbor lists with a bounded count pass under explicit caps."""
+
+    total_nodes = int(tree.parent.shape[0])
+    num_internal = int(jnp.asarray(tree.left_child).shape[0])
+    num_leaves = max(1, total_nodes - num_internal)
+    queue_max = max(4, int(traversal_config.max_pair_queue))
+    process_override = int(traversal_config.process_block)
+    queue_candidates = _queue_candidates_bounded(
+        max_capacity=queue_max,
+        process_block=process_override,
+    )
+    auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
+    queue_candidates.extend(
+        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+    )
+    seen_queue_caps = set()
+    queue_candidates = [
+        int(cap)
+        for cap in queue_candidates
+        if not (int(cap) in seen_queue_caps or seen_queue_caps.add(int(cap)))
+    ]
+    resolved_block = process_override if process_override is not None else process_block
+    if resolved_block is None:
+        count_process_block = _DEFAULT_PAIR_BATCH
+    else:
+        count_process_block = int(resolved_block)
+
+    attempt_counter = 0
+    queue_error_msg = (
+        "Pair queue capacity exceeded; increase max_pair_queue and rebuild."
+    )
+    near_error_msg = (
+        "Neighbor list capacity exceeded during compact near-neighbor fill; "
+        "increase max_neighbors_per_leaf and rebuild."
+    )
+
+    def _emit_retry_event(
+        status: str, *, attempt: int, queue_capacity: int, walk_result
+    ):
+        if retry_logger is None:
+            return
+        event = DualTreeRetryEvent(
+            attempt=int(attempt),
+            queue_capacity=int(queue_capacity),
+            interaction_capacity=int(traversal_config.max_interactions_per_node),
+            status=status,
+            far_pair_count=int(walk_result.far_pair_count),
+            near_pair_count=int(walk_result.near_pair_count),
+        )
+        try:
+            retry_logger(event)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("retry_logger raised", exc_info=True)
+
+    for queue_capacity in queue_candidates:
+        attempt_counter += 1
+        attempt_idx = attempt_counter
+        far_counts, near_counts, max_wf, count_wf_overflow = _dual_tree_walk_count_impl(
+            tree,
+            geometry,
+            float(theta),
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            dehnen_radius_scale=float(dehnen_radius_scale),
+            collect_far=False,
+            collect_near=True,
+            process_block=int(count_process_block),
+            max_pair_queue=int(queue_capacity),
+        )
+        if bool(count_wf_overflow):
+            dummy = DualTreeWalkResult(
+                interaction_offsets=jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE),
+                interaction_sources=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                interaction_targets=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                interaction_tags=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                interaction_counts=jnp.zeros((total_nodes,), dtype=INDEX_DTYPE),
+                neighbor_offsets=jnp.zeros((num_leaves + 1,), dtype=INDEX_DTYPE),
+                neighbor_indices=jnp.zeros((0,), dtype=INDEX_DTYPE),
+                neighbor_counts=jnp.zeros((num_leaves,), dtype=INDEX_DTYPE),
+                leaf_indices=jnp.zeros((num_leaves,), dtype=INDEX_DTYPE),
+                far_pair_count=as_index(0),
+                near_pair_count=as_index(0),
+                queue_overflow=jnp.bool_(True),
+                far_overflow=jnp.bool_(False),
+                near_overflow=jnp.bool_(False),
+                accept_decisions=as_index(0),
+                near_decisions=as_index(0),
+                refine_decisions=as_index(0),
+            )
+            _emit_retry_event(
+                "queue_overflow",
+                attempt=attempt_idx,
+                queue_capacity=int(queue_capacity),
+                walk_result=dummy,
+            )
+            continue
+
+        observed_wf = int(max_wf)
+        queue_suggest = max(4, observed_wf + observed_wf // 2)
+        fill_queue_candidates = [
+            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+        ]
+        if len(fill_queue_candidates) == 0:
+            fill_queue_candidates = [int(queue_capacity)]
+        elif fill_queue_candidates[0] != int(queue_suggest):
+            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+
+        near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
+        total_near_pairs = int(near_offsets64[-1])
+        if total_near_pairs < 0:
+            raise RuntimeError(
+                "Near-neighbor count-pass produced a negative pair total."
+            )
+        int32_max = (1 << 31) - 1
+        if total_near_pairs > int32_max:
+            raise RuntimeError(
+                "Dual-tree traversal neighbor totals exceed signed int32 capacity."
+            )
+        far_offsets = jnp.zeros((1,), dtype=INDEX_DTYPE)
+        far_counts = jnp.zeros((total_nodes,), dtype=INDEX_DTYPE)
+        near_offsets = jnp.asarray(near_offsets64, dtype=INDEX_DTYPE)
+
+        for fill_queue_capacity in fill_queue_candidates:
+            attempt_counter += 1
+            attempt_idx = attempt_counter
+            result = _dual_tree_walk_compact_fill_impl(
+                tree,
+                geometry,
+                far_offsets,
+                far_counts,
+                near_offsets,
+                near_counts,
+                float(theta),
+                mac_type=mac_type,
+                pair_policy=pair_policy,
+                policy_state=policy_state,
+                dehnen_radius_scale=float(dehnen_radius_scale),
+                max_pair_queue=int(fill_queue_capacity),
+                total_far_pairs=0,
+                total_near_pairs=int(total_near_pairs),
+                collect_far=False,
+                collect_near=True,
+            )
+            if bool(result.queue_overflow):
+                _emit_retry_event(
+                    "queue_overflow",
+                    attempt=attempt_idx,
+                    queue_capacity=int(fill_queue_capacity),
+                    walk_result=result,
+                )
+                continue
+            _raise_if_true(result.near_overflow, near_error_msg)
+            return _result_to_neighbors(result, tree)
+
+    raise RuntimeError(queue_error_msg)
+
+
 def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarPairs:
     """Return exact-length far-pair arrays without retaining traversal buffers."""
     far_pair_count = jnp.asarray(raw.far_pair_count, dtype=INDEX_DTYPE)
@@ -5006,6 +5177,22 @@ def build_leaf_neighbor_lists(
     dehnen_radius_scale: float = 1.0,
 ) -> NodeNeighborList:
     """Construct near-field adjacency for leaf nodes via a MAC walk."""
+
+    tree = tree.topology if hasattr(tree, "topology") else tree
+    resolved_cfg = _resolve_dual_tree_config(traversal_config)
+    if resolved_cfg is not None and max_interactions_per_node is None:
+        return _run_near_only_compact_with_bounded_count_pass(
+            tree,
+            geometry,
+            theta,
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            traversal_config=resolved_cfg,
+            dehnen_radius_scale=dehnen_radius_scale,
+            process_block=process_block,
+            retry_logger=retry_logger,
+        )
 
     raw = _run_dual_tree_walk_raw(
         tree,
