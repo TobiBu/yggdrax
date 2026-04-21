@@ -3670,6 +3670,12 @@ def _result_to_neighbors(
         leaf_count = int(leaf_indices_in.shape[0])
         if leaf_count == 0:
             return jnp.zeros((0, 0), dtype=INDEX_DTYPE)
+        if isinstance(counts_in, jax_core.Tracer) or isinstance(
+            neighbors_in, jax_core.Tracer
+        ):
+            # Under outer jit we may not be able to concretize the per-leaf max
+            # neighbor count; keep core CSR buffers valid and skip dense helpers.
+            return jnp.zeros((leaf_count, 0), dtype=INDEX_DTYPE)
         max_nbr = int(jnp.max(counts_in))
         if max_nbr == 0:
             return jnp.zeros((leaf_count, 0), dtype=INDEX_DTYPE)
@@ -3705,6 +3711,23 @@ def _result_to_neighbors(
                 jnp.zeros((0, 0), dtype=bool),
                 jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
             )
+        if isinstance(counts_in, jax_core.Tracer) or isinstance(
+            offsets_in, jax_core.Tracer
+        ):
+            return (
+                jnp.zeros((0,), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=bool),
+                jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
+            )
+        max_nbr = int(neighbor_leaf_positions_in.shape[1])
+        if max_nbr == 0:
+            return (
+                jnp.zeros((0,), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=bool),
+                jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
+            )
         blocks_per_leaf = (counts_in + as_index(k - 1)) // as_index(k)
         block_offsets = jnp.concatenate(
             [
@@ -3733,7 +3756,6 @@ def _result_to_neighbors(
         edge_idx = edge_start[:, None] + edge_offsets[None, :]
         edge_valid = edge_idx < edge_stop[:, None]
         local_edge_idx = local_block_idx[:, None] * as_index(k) + edge_offsets[None, :]
-        max_nbr = neighbor_leaf_positions_in.shape[1]
         local_edge_valid = local_edge_idx < as_index(max_nbr)
         safe_local_edge_idx = jnp.where(
             edge_valid & local_edge_valid, local_edge_idx, 0
@@ -4027,7 +4049,7 @@ def _run_dual_tree_walk_raw(
         else:
             count_process_block = int(resolved_block)
 
-        far_counts, near_counts, max_wf, count_wf_overflow = _dual_tree_walk_count_impl(
+        count_outputs = _dual_tree_walk_count_impl(
             tree,
             geometry,
             theta_val,
@@ -4039,6 +4061,11 @@ def _run_dual_tree_walk_raw(
             collect_near=collect_near,
             process_block=count_process_block,
         )
+        if len(count_outputs) == 3:
+            far_counts, near_counts, max_wf = count_outputs
+            count_wf_overflow = jnp.bool_(False)
+        else:
+            far_counts, near_counts, max_wf, count_wf_overflow = count_outputs
         if bool(count_wf_overflow):
             raise RuntimeError(
                 "Count-pass traversal wavefront overflowed its conservative buffer."
@@ -4684,7 +4711,7 @@ def _run_far_only_compact_with_bounded_count_pass(
     for queue_capacity in queue_candidates:
         attempt_counter += 1
         attempt_idx = attempt_counter
-        far_counts, near_counts, max_wf, count_wf_overflow = _dual_tree_walk_count_impl(
+        count_outputs = _dual_tree_walk_count_impl(
             tree,
             geometry,
             float(theta),
@@ -4697,6 +4724,11 @@ def _run_far_only_compact_with_bounded_count_pass(
             process_block=int(count_process_block),
             max_pair_queue=int(queue_capacity),
         )
+        if len(count_outputs) == 3:
+            far_counts, near_counts, max_wf = count_outputs
+            count_wf_overflow = jnp.bool_(False)
+        else:
+            far_counts, near_counts, max_wf, count_wf_overflow = count_outputs
         if bool(count_wf_overflow):
             dummy = DualTreeWalkResult(
                 interaction_offsets=jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE),
@@ -4859,7 +4891,7 @@ def _run_near_only_compact_with_bounded_count_pass(
     for queue_capacity in queue_candidates:
         attempt_counter += 1
         attempt_idx = attempt_counter
-        far_counts, near_counts, max_wf, count_wf_overflow = _dual_tree_walk_count_impl(
+        count_outputs = _dual_tree_walk_count_impl(
             tree,
             geometry,
             float(theta),
@@ -4872,6 +4904,11 @@ def _run_near_only_compact_with_bounded_count_pass(
             process_block=int(count_process_block),
             max_pair_queue=int(queue_capacity),
         )
+        if len(count_outputs) == 3:
+            far_counts, near_counts, max_wf = count_outputs
+            count_wf_overflow = jnp.bool_(False)
+        else:
+            far_counts, near_counts, max_wf, count_wf_overflow = count_outputs
         if bool(count_wf_overflow):
             dummy = DualTreeWalkResult(
                 interaction_offsets=jnp.zeros((total_nodes + 1,), dtype=INDEX_DTYPE),
@@ -5426,7 +5463,12 @@ def build_leaf_neighbor_lists(
 
     tree = tree.topology if hasattr(tree, "topology") else tree
     resolved_cfg = _resolve_dual_tree_config(traversal_config)
-    if resolved_cfg is not None and max_interactions_per_node is None:
+    is_octree_topology = hasattr(tree, "oct_children") and hasattr(tree, "oct_parent")
+    if (
+        resolved_cfg is not None
+        and max_interactions_per_node is None
+        and not is_octree_topology
+    ):
         return _run_near_only_compact_with_bounded_count_pass(
             tree,
             geometry,
