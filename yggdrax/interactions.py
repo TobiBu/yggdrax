@@ -65,6 +65,40 @@ def build_well_separated_interactions(
     )
 
 
+def build_compact_far_pairs(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_interactions_per_node: int | None = None,
+    mac_type: MACType = "bh",
+    *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
+    max_pair_queue: int | None = None,
+    process_block: int | None = None,
+    traversal_config: DualTreeTraversalConfig | None = None,
+    retry_logger=None,
+    dehnen_radius_scale: float = 1.0,
+) -> CompactTaggedFarPairs:
+    """Construct exact-length far pairs from the generic dual-tree walk."""
+
+    return _call_with_topology(
+        _interactions_impl.build_compact_far_pairs,
+        tree,
+        geometry,
+        theta=theta,
+        max_interactions_per_node=max_interactions_per_node,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_pair_queue=max_pair_queue,
+        process_block=process_block,
+        traversal_config=traversal_config,
+        retry_logger=retry_logger,
+        dehnen_radius_scale=dehnen_radius_scale,
+    )
+
+
 def build_leaf_neighbor_lists(
     tree: object,
     geometry: TreeGeometry,
@@ -149,6 +183,41 @@ def build_interactions_and_neighbors(
         return_compact_far_pairs=return_compact_far_pairs,
         return_interactions=return_interactions,
         return_grouped=return_grouped,
+    )
+
+
+def build_interactions_and_neighbors_split(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_interactions_per_node: int | None = None,
+    max_neighbors_per_leaf: int = _interactions_impl._DEFAULT_MAX_NEIGHBORS,
+    max_pair_queue: int | None = None,
+    process_block: int | None = None,
+    traversal_config: DualTreeTraversalConfig | None = None,
+    retry_logger=None,
+    mac_type: MACType = "bh",
+    dehnen_radius_scale: float = 1.0,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
+):
+    """Construct far and near traversal products with separate walks."""
+
+    return _call_with_topology(
+        _interactions_impl.build_interactions_and_neighbors_split,
+        tree,
+        geometry,
+        theta=theta,
+        max_interactions_per_node=max_interactions_per_node,
+        max_neighbors_per_leaf=max_neighbors_per_leaf,
+        max_pair_queue=max_pair_queue,
+        process_block=process_block,
+        traversal_config=traversal_config,
+        retry_logger=retry_logger,
+        mac_type=mac_type,
+        dehnen_radius_scale=dehnen_radius_scale,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
     )
 
 
@@ -277,6 +346,8 @@ __all__ = [
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",
+    "build_interactions_and_neighbors_split",
+    "build_compact_far_pairs",
     "build_octree_native_far_pairs",
     "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
