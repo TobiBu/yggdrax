@@ -596,6 +596,12 @@ class NodeNeighborList(NamedTuple):
     counts: Array
     particle_order_leaf_indices: Array
     particle_order_to_native_leaf: Array
+    neighbor_leaf_positions: Array
+    target_block_leaf_ids: Array
+    target_block_source_leaf_ids: Array
+    target_block_valid_mask: Array
+    target_block_offsets: Array
+    target_block_size: int
 
 
 class DualTreeWalkResult(NamedTuple):
@@ -645,6 +651,12 @@ class OctreeNativeNeighborList(NamedTuple):
     counts: Array
     particle_order_leaf_indices: Array
     particle_order_to_native_leaf: Array
+    neighbor_leaf_positions: Array
+    target_block_leaf_ids: Array
+    target_block_source_leaf_ids: Array
+    target_block_valid_mask: Array
+    target_block_offsets: Array
+    target_block_size: int
 
 
 class _DualTreeWalkRawOutputs(NamedTuple):
@@ -3639,6 +3651,108 @@ def _result_to_neighbors(
     result: Union[DualTreeWalkResult, _DualTreeWalkRawOutputs],
     tree: object | None = None,
 ) -> NodeNeighborList:
+    def _resolve_target_block_size() -> int:
+        raw = os.environ.get("YGGDRAX_NEARFIELD_TARGET_BLOCK_SIZE", "0")
+        try:
+            val = int(raw)
+        except Exception:
+            return 0
+        return max(0, val)
+
+    def _build_neighbor_leaf_positions(
+        *,
+        leaf_indices_in: Array,
+        offsets_in: Array,
+        counts_in: Array,
+        neighbors_in: Array,
+        total_nodes: int,
+    ) -> Array:
+        leaf_count = int(leaf_indices_in.shape[0])
+        if leaf_count == 0:
+            return jnp.zeros((0, 0), dtype=INDEX_DTYPE)
+        max_nbr = int(jnp.max(counts_in))
+        if max_nbr == 0:
+            return jnp.zeros((leaf_count, 0), dtype=INDEX_DTYPE)
+        leaf_lookup = jnp.full((total_nodes,), -1, dtype=INDEX_DTYPE)
+        leaf_lookup = leaf_lookup.at[leaf_indices_in].set(
+            jnp.arange(leaf_count, dtype=INDEX_DTYPE)
+        )
+        nbr_offsets = jnp.arange(max_nbr, dtype=INDEX_DTYPE)
+        nbr_idx = offsets_in[:-1, None] + nbr_offsets[None, :]
+        nbr_valid = nbr_offsets[None, :] < counts_in[:, None]
+        nbr_safe_idx = jnp.where(nbr_valid, nbr_idx, 0)
+        nbr_nodes = neighbors_in[nbr_safe_idx]
+        nbr_leaf_positions = leaf_lookup[nbr_nodes]
+        return jnp.where(
+            nbr_valid,
+            nbr_leaf_positions,
+            jnp.asarray(-1, dtype=INDEX_DTYPE),
+        )
+
+    def _build_target_blocks(
+        *,
+        counts_in: Array,
+        offsets_in: Array,
+        neighbor_leaf_positions_in: Array,
+        block_size: int,
+    ) -> tuple[Array, Array, Array, Array]:
+        k = int(block_size)
+        leaf_count = int(counts_in.shape[0])
+        if k <= 0 or leaf_count == 0:
+            return (
+                jnp.zeros((0,), dtype=INDEX_DTYPE),
+                jnp.zeros((0, 0), dtype=INDEX_DTYPE),
+                jnp.zeros((0, 0), dtype=bool),
+                jnp.zeros((leaf_count + 1,), dtype=INDEX_DTYPE),
+            )
+        blocks_per_leaf = (counts_in + as_index(k - 1)) // as_index(k)
+        block_offsets = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=INDEX_DTYPE),
+                jnp.cumsum(blocks_per_leaf, dtype=INDEX_DTYPE),
+            ]
+        )
+        total_blocks = int(block_offsets[-1])
+        if total_blocks == 0:
+            return (
+                jnp.zeros((0,), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=INDEX_DTYPE),
+                jnp.zeros((0, k), dtype=bool),
+                jnp.asarray(block_offsets, dtype=INDEX_DTYPE),
+            )
+        block_ids = jnp.arange(total_blocks, dtype=INDEX_DTYPE)
+        block_target_leaf_ids = jnp.searchsorted(
+            block_offsets[1:],
+            block_ids,
+            side="right",
+        )
+        local_block_idx = block_ids - block_offsets[block_target_leaf_ids]
+        edge_start = offsets_in[block_target_leaf_ids] + local_block_idx * as_index(k)
+        edge_stop = offsets_in[block_target_leaf_ids + as_index(1)]
+        edge_offsets = jnp.arange(k, dtype=INDEX_DTYPE)
+        edge_idx = edge_start[:, None] + edge_offsets[None, :]
+        edge_valid = edge_idx < edge_stop[:, None]
+        local_edge_idx = local_block_idx[:, None] * as_index(k) + edge_offsets[None, :]
+        max_nbr = neighbor_leaf_positions_in.shape[1]
+        local_edge_valid = local_edge_idx < as_index(max_nbr)
+        safe_local_edge_idx = jnp.where(edge_valid & local_edge_valid, local_edge_idx, 0)
+        block_source_leaf_ids = neighbor_leaf_positions_in[
+            block_target_leaf_ids[:, None],
+            safe_local_edge_idx,
+        ]
+        source_valid = block_source_leaf_ids >= 0
+        block_source_leaf_ids = jnp.where(
+            edge_valid & local_edge_valid & source_valid,
+            block_source_leaf_ids,
+            0,
+        )
+        return (
+            jnp.asarray(block_target_leaf_ids, dtype=INDEX_DTYPE),
+            jnp.asarray(block_source_leaf_ids, dtype=INDEX_DTYPE),
+            jnp.asarray(edge_valid & local_edge_valid & source_valid, dtype=bool),
+            jnp.asarray(block_offsets, dtype=INDEX_DTYPE),
+        )
+
     traced_total = isinstance(result.near_pair_count, jax_core.Tracer)
     neighbor_offsets = jnp.asarray(result.neighbor_offsets)
     neighbor_counts = jnp.asarray(result.neighbor_counts)
@@ -3664,6 +3778,37 @@ def _result_to_neighbors(
             num_internal=num_internal,
         )
 
+    if tree is not None:
+        total_nodes = int(tree.parent.shape[0])
+    else:
+        max_leaf = int(jnp.max(leaf_indices)) if int(leaf_indices.shape[0]) > 0 else -1
+        max_nbr = (
+            int(jnp.max(neighbor_indices))
+            if int(neighbor_indices.shape[0]) > 0
+            else -1
+        )
+        total_nodes = max(max_leaf, max_nbr) + 1
+
+    neighbor_leaf_positions = _build_neighbor_leaf_positions(
+        leaf_indices_in=leaf_indices,
+        offsets_in=neighbor_offsets,
+        counts_in=neighbor_counts,
+        neighbors_in=neighbor_indices,
+        total_nodes=max(total_nodes, 0),
+    )
+    target_block_size = _resolve_target_block_size()
+    (
+        target_block_leaf_ids,
+        target_block_source_leaf_ids,
+        target_block_valid_mask,
+        target_block_offsets,
+    ) = _build_target_blocks(
+        counts_in=neighbor_counts,
+        offsets_in=neighbor_offsets,
+        neighbor_leaf_positions_in=neighbor_leaf_positions,
+        block_size=target_block_size,
+    )
+
     return NodeNeighborList(
         offsets=neighbor_offsets,
         neighbors=neighbor_indices,
@@ -3671,6 +3816,12 @@ def _result_to_neighbors(
         counts=neighbor_counts,
         particle_order_leaf_indices=particle_order_leaf_indices,
         particle_order_to_native_leaf=particle_order_to_native_leaf,
+        neighbor_leaf_positions=neighbor_leaf_positions,
+        target_block_leaf_ids=target_block_leaf_ids,
+        target_block_source_leaf_ids=target_block_source_leaf_ids,
+        target_block_valid_mask=target_block_valid_mask,
+        target_block_offsets=target_block_offsets,
+        target_block_size=int(target_block_size),
     )
 
 
@@ -4886,6 +5037,92 @@ def _raw_to_octree_native_neighbors(
     particle_order_to_native_leaf = particle_order_to_native_leaf.at[order].set(
         jnp.arange(leaf_indices.shape[0], dtype=INDEX_DTYPE)
     )
+    leaf_lookup = jnp.full((node_ranges.shape[0],), -1, dtype=INDEX_DTYPE)
+    leaf_lookup = leaf_lookup.at[leaf_indices].set(
+        jnp.arange(leaf_indices.shape[0], dtype=INDEX_DTYPE)
+    )
+    if leaf_indices.shape[0] > 0:
+        max_nbr = int(jnp.max(neighbor_counts))
+    else:
+        max_nbr = 0
+    if max_nbr > 0:
+        nbr_offsets = jnp.arange(max_nbr, dtype=INDEX_DTYPE)
+        nbr_idx = neighbor_offsets[:-1, None] + nbr_offsets[None, :]
+        nbr_valid = nbr_offsets[None, :] < neighbor_counts[:, None]
+        nbr_safe_idx = jnp.where(nbr_valid, nbr_idx, 0)
+        nbr_nodes = neighbor_indices[nbr_safe_idx]
+        neighbor_leaf_positions = leaf_lookup[nbr_nodes]
+        neighbor_leaf_positions = jnp.where(
+            nbr_valid,
+            neighbor_leaf_positions,
+            jnp.asarray(-1, dtype=INDEX_DTYPE),
+        )
+    else:
+        neighbor_leaf_positions = jnp.zeros(
+            (leaf_indices.shape[0], 0),
+            dtype=INDEX_DTYPE,
+        )
+    target_block_size_raw = os.environ.get("YGGDRAX_NEARFIELD_TARGET_BLOCK_SIZE", "0")
+    try:
+        target_block_size = max(0, int(target_block_size_raw))
+    except Exception:
+        target_block_size = 0
+    if target_block_size > 0 and int(leaf_indices.shape[0]) > 0:
+        blocks_per_leaf = (neighbor_counts + as_index(target_block_size - 1)) // as_index(
+            target_block_size
+        )
+        block_offsets = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=INDEX_DTYPE),
+                jnp.cumsum(blocks_per_leaf, dtype=INDEX_DTYPE),
+            ]
+        )
+        total_blocks = int(block_offsets[-1])
+        if total_blocks > 0:
+            block_ids = jnp.arange(total_blocks, dtype=INDEX_DTYPE)
+            target_block_leaf_ids = jnp.searchsorted(
+                block_offsets[1:],
+                block_ids,
+                side="right",
+            )
+            local_block_idx = block_ids - block_offsets[target_block_leaf_ids]
+            edge_offsets = jnp.arange(target_block_size, dtype=INDEX_DTYPE)
+            local_edge_idx = (
+                local_block_idx[:, None] * as_index(target_block_size)
+                + edge_offsets[None, :]
+            )
+            edge_start = (
+                neighbor_offsets[target_block_leaf_ids]
+                + local_block_idx * as_index(target_block_size)
+            )
+            edge_stop = neighbor_offsets[target_block_leaf_ids + as_index(1)]
+            edge_idx = edge_start[:, None] + edge_offsets[None, :]
+            edge_valid = edge_idx < edge_stop[:, None]
+            local_edge_valid = local_edge_idx < as_index(neighbor_leaf_positions.shape[1])
+            safe_local_edge_idx = jnp.where(edge_valid & local_edge_valid, local_edge_idx, 0)
+            target_block_source_leaf_ids = neighbor_leaf_positions[
+                target_block_leaf_ids[:, None],
+                safe_local_edge_idx,
+            ]
+            source_valid = target_block_source_leaf_ids >= 0
+            target_block_valid_mask = edge_valid & local_edge_valid & source_valid
+            target_block_source_leaf_ids = jnp.where(
+                target_block_valid_mask,
+                target_block_source_leaf_ids,
+                0,
+            )
+        else:
+            target_block_leaf_ids = jnp.zeros((0,), dtype=INDEX_DTYPE)
+            target_block_source_leaf_ids = jnp.zeros(
+                (0, target_block_size),
+                dtype=INDEX_DTYPE,
+            )
+            target_block_valid_mask = jnp.zeros((0, target_block_size), dtype=bool)
+    else:
+        target_block_leaf_ids = jnp.zeros((0,), dtype=INDEX_DTYPE)
+        target_block_source_leaf_ids = jnp.zeros((0, 0), dtype=INDEX_DTYPE)
+        target_block_valid_mask = jnp.zeros((0, 0), dtype=bool)
+        block_offsets = jnp.zeros((leaf_indices.shape[0] + 1,), dtype=INDEX_DTYPE)
     return OctreeNativeNeighborList(
         offsets=neighbor_offsets,
         neighbors=neighbor_indices,
@@ -4893,6 +5130,12 @@ def _raw_to_octree_native_neighbors(
         counts=neighbor_counts,
         particle_order_leaf_indices=particle_order_leaf_indices,
         particle_order_to_native_leaf=particle_order_to_native_leaf,
+        neighbor_leaf_positions=neighbor_leaf_positions,
+        target_block_leaf_ids=target_block_leaf_ids,
+        target_block_source_leaf_ids=target_block_source_leaf_ids,
+        target_block_valid_mask=target_block_valid_mask,
+        target_block_offsets=jnp.asarray(block_offsets, dtype=INDEX_DTYPE),
+        target_block_size=int(target_block_size),
     )
 
 
