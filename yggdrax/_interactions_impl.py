@@ -3735,7 +3735,9 @@ def _result_to_neighbors(
         local_edge_idx = local_block_idx[:, None] * as_index(k) + edge_offsets[None, :]
         max_nbr = neighbor_leaf_positions_in.shape[1]
         local_edge_valid = local_edge_idx < as_index(max_nbr)
-        safe_local_edge_idx = jnp.where(edge_valid & local_edge_valid, local_edge_idx, 0)
+        safe_local_edge_idx = jnp.where(
+            edge_valid & local_edge_valid, local_edge_idx, 0
+        )
         block_source_leaf_ids = neighbor_leaf_positions_in[
             block_target_leaf_ids[:, None],
             safe_local_edge_idx,
@@ -3783,9 +3785,7 @@ def _result_to_neighbors(
     else:
         max_leaf = int(jnp.max(leaf_indices)) if int(leaf_indices.shape[0]) > 0 else -1
         max_nbr = (
-            int(jnp.max(neighbor_indices))
-            if int(neighbor_indices.shape[0]) > 0
-            else -1
+            int(jnp.max(neighbor_indices)) if int(neighbor_indices.shape[0]) > 0 else -1
         )
         total_nodes = max(max_leaf, max_nbr) + 1
 
@@ -5068,9 +5068,9 @@ def _raw_to_octree_native_neighbors(
     except Exception:
         target_block_size = 0
     if target_block_size > 0 and int(leaf_indices.shape[0]) > 0:
-        blocks_per_leaf = (neighbor_counts + as_index(target_block_size - 1)) // as_index(
-            target_block_size
-        )
+        blocks_per_leaf = (
+            neighbor_counts + as_index(target_block_size - 1)
+        ) // as_index(target_block_size)
         block_offsets = jnp.concatenate(
             [
                 jnp.zeros((1,), dtype=INDEX_DTYPE),
@@ -5091,15 +5091,18 @@ def _raw_to_octree_native_neighbors(
                 local_block_idx[:, None] * as_index(target_block_size)
                 + edge_offsets[None, :]
             )
-            edge_start = (
-                neighbor_offsets[target_block_leaf_ids]
-                + local_block_idx * as_index(target_block_size)
-            )
+            edge_start = neighbor_offsets[
+                target_block_leaf_ids
+            ] + local_block_idx * as_index(target_block_size)
             edge_stop = neighbor_offsets[target_block_leaf_ids + as_index(1)]
             edge_idx = edge_start[:, None] + edge_offsets[None, :]
             edge_valid = edge_idx < edge_stop[:, None]
-            local_edge_valid = local_edge_idx < as_index(neighbor_leaf_positions.shape[1])
-            safe_local_edge_idx = jnp.where(edge_valid & local_edge_valid, local_edge_idx, 0)
+            local_edge_valid = local_edge_idx < as_index(
+                neighbor_leaf_positions.shape[1]
+            )
+            safe_local_edge_idx = jnp.where(
+                edge_valid & local_edge_valid, local_edge_idx, 0
+            )
             target_block_source_leaf_ids = neighbor_leaf_positions[
                 target_block_leaf_ids[:, None],
                 safe_local_edge_idx,
