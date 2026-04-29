@@ -72,6 +72,7 @@ from .tree import (
     TreeBuildRequest,
     TreeType,
     available_tree_types,
+    build_static_radix_tree,
     build_fixed_depth_octree,
     build_fixed_depth_octree_jit,
     build_fixed_depth_tree,
@@ -100,6 +101,7 @@ from .tree import (
     require_leaf_topology,
     require_morton_topology,
     resolve_tree_topology,
+    rebuild_static_radix_tree_from_template,
 )
 from .types import PreparedTreeArtifacts, TraversalArtifacts, TraversalResult
 
@@ -149,6 +151,7 @@ __all__ = [
     "build_fixed_depth_octree_jit",
     "build_fixed_depth_tree_jit",
     "available_tree_types",
+    "build_static_radix_tree",
     "build_interactions_and_neighbors",
     "build_octree_native_far_pairs",
     "build_octree_native_neighbor_lists",
@@ -184,6 +187,7 @@ __all__ = [
     "require_fmm_topology",
     "require_leaf_topology",
     "require_morton_topology",
+    "rebuild_static_radix_tree_from_template",
     "register_tree_builder",
     "TreeLevelIndexProtocol",
     "TreeRangesProtocol",

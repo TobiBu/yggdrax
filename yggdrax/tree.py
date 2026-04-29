@@ -69,7 +69,7 @@ class FixedDepthTreeBuildConfig:
 
 
 TreeType = Literal["radix", "octree", "kdtree"]
-TreeBuildMode = Literal["adaptive", "fixed_depth"]
+TreeBuildMode = Literal["adaptive", "fixed_depth", "static_radix"]
 
 
 @dataclass(frozen=True)
@@ -548,10 +548,21 @@ class RadixTree(Tree):
                 aspect_threshold=aspect_threshold,
                 min_refined_leaf_particles=min_refined_leaf_particles,
             )
+        elif build_mode == "static_radix":
+            result = _tree_impl.build_static_radix_tree(
+                positions,
+                masses,
+                bounds_resolved,
+                leaf_size=leaf_size,
+                return_reordered=return_reordered,
+                workspace=workspace,
+                return_workspace=return_workspace,
+            )
         else:
             raise ValueError(
                 "Unsupported build_mode "
-                f"'{build_mode}'. Supported: ('adaptive', 'fixed_depth')"
+                f"'{build_mode}'. Supported: "
+                "('adaptive', 'fixed_depth', 'static_radix')"
             )
 
         return cls._from_build_result(
@@ -1496,6 +1507,69 @@ def build_fixed_depth_tree(
 
 
 @jaxtyped(typechecker=beartype)
+def build_static_radix_tree(
+    positions: Array,
+    masses: Array,
+    bounds: Optional[tuple[Array, Array]] = None,
+    *,
+    leaf_size: int = 8,
+    return_reordered: bool = False,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+):
+    """Build a fixed-shape radix tree from Morton-sorted count buckets.
+
+    The tree structure is static for a fixed particle count and ``leaf_size``.
+    Leaves are not fixed spatial cells; each leaf owns a contiguous chunk of
+    the current Morton-sorted particle order.
+    """
+
+    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    result = _tree_impl.build_static_radix_tree(
+        positions,
+        masses,
+        bounds_resolved,
+        leaf_size=leaf_size,
+        return_reordered=return_reordered,
+        workspace=workspace,
+        return_workspace=return_workspace,
+    )
+    return _wrap_radix_public_result(
+        result=result,
+        build_mode="static_radix",
+        return_reordered=return_reordered,
+        return_workspace=return_workspace,
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def rebuild_static_radix_tree_from_template(
+    positions: Array,
+    masses: Array,
+    template: RadixTreeTopology | RadixTree,
+    *,
+    bounds: Optional[tuple[Array, Array]] = None,
+    return_reordered: bool = False,
+):
+    """Refresh particles using an existing static-radix data structure."""
+
+    topology = template.topology if isinstance(template, RadixTree) else template
+    result = _tree_impl.rebuild_static_radix_tree_from_template(
+        positions,
+        masses,
+        topology,
+        bounds=bounds,
+        return_reordered=return_reordered,
+    )
+    return _wrap_radix_public_result(
+        result=result,
+        build_mode="static_radix",
+        return_reordered=return_reordered,
+        return_workspace=False,
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def build_fixed_depth_octree(
     positions: Array,
     masses: Array,
@@ -1693,6 +1767,7 @@ __all__ = [
     "RadixTreeWorkspace",
     "TreeBuildConfig",
     "FixedDepthTreeBuildConfig",
+    "build_static_radix_tree",
     "build_fixed_depth_tree",
     "build_fixed_depth_octree",
     "build_fixed_depth_tree_jit",
@@ -1722,5 +1797,6 @@ __all__ = [
     "require_leaf_topology",
     "require_morton_topology",
     "register_tree_builder",
+    "rebuild_static_radix_tree_from_template",
     "reorder_particles_by_indices",
 ]
