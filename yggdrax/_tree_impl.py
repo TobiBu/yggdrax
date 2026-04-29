@@ -490,7 +490,9 @@ def build_fixed_depth_tree(
     )
 
 
-def _static_radix_leaf_partitions(n: int, leaf_size: int) -> tuple[np.ndarray, np.ndarray]:
+def _static_radix_leaf_partitions(
+    n: int, leaf_size: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Return fixed-size sorted-order leaf partitions for static radix trees."""
 
     if n < 1:
@@ -505,7 +507,17 @@ def _static_radix_leaf_partitions(n: int, leaf_size: int) -> tuple[np.ndarray, n
 def _build_balanced_bucket_structure(
     leaf_starts_np: np.ndarray,
     leaf_ends_np: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    int,
+]:
     """Build a deterministic balanced binary tree over leaf bucket indices."""
 
     num_leaves = int(leaf_starts_np.shape[0])
@@ -517,7 +529,9 @@ def _build_balanced_bucket_structure(
         right_child = np.empty((0,), dtype=np.int64)
         left_is_leaf = np.empty((0,), dtype=np.bool_)
         right_is_leaf = np.empty((0,), dtype=np.bool_)
-        node_ranges = np.array([[int(leaf_starts_np[0]), int(leaf_ends_np[0]) - 1]], dtype=np.int64)
+        node_ranges = np.array(
+            [[int(leaf_starts_np[0]), int(leaf_ends_np[0]) - 1]], dtype=np.int64
+        )
         node_level = np.array([0], dtype=np.int64)
         level_offsets = np.zeros((MAX_TREE_LEVELS + 1,), dtype=np.int64)
         level_offsets[1] = 1
@@ -571,8 +585,12 @@ def _build_balanced_bucket_structure(
         right_is_leaf[node] = right >= leaf_offset
         parent[left] = node
         parent[right] = node
-        node_ranges[node, 0] = min(int(node_ranges[left, 0]), int(node_ranges[right, 0]))
-        node_ranges[node, 1] = max(int(node_ranges[left, 1]), int(node_ranges[right, 1]))
+        node_ranges[node, 0] = min(
+            int(node_ranges[left, 0]), int(node_ranges[right, 0])
+        )
+        node_ranges[node, 1] = max(
+            int(node_ranges[left, 1]), int(node_ranges[right, 1])
+        )
         return node
 
     root = build(0, num_leaves, 0)
@@ -757,7 +775,9 @@ def rebuild_static_radix_tree_from_template(
     if bounds is None:
         bounds_min = jnp.min(positions, axis=0)
         bounds_max = jnp.max(positions, axis=0)
-        span = jnp.maximum(bounds_max - bounds_min, jnp.asarray(1.0e-6, dtype=positions.dtype))
+        span = jnp.maximum(
+            bounds_max - bounds_min, jnp.asarray(1.0e-6, dtype=positions.dtype)
+        )
         pad = span * jnp.asarray(1.0e-6, dtype=positions.dtype)
         bounds_resolved = (bounds_min - pad, bounds_max + pad)
     else:

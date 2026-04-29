@@ -529,7 +529,9 @@ def test_static_radix_refresh_preserves_structure_and_updates_order():
     assert _max_leaf_count(refreshed) <= 2
     assert np.array_equal(np.asarray(tree.parent), np.asarray(refreshed.parent))
     assert np.array_equal(np.asarray(tree.left_child), np.asarray(refreshed.left_child))
-    assert np.array_equal(np.asarray(tree.right_child), np.asarray(refreshed.right_child))
+    assert np.array_equal(
+        np.asarray(tree.right_child), np.asarray(refreshed.right_child)
+    )
     assert not np.array_equal(
         np.asarray(tree.particle_indices),
         np.asarray(refreshed.particle_indices),
