@@ -627,20 +627,47 @@ def _static_radix_node_ranges_from_leaf_ranges(
     num_leaves = int(leaf_starts_np.shape[0])
     num_internal = int(template.num_internal_nodes)
     total_nodes = int(num_internal + num_leaves)
-    node_ranges = np.zeros((total_nodes, 2), dtype=np.int64)
-    node_ranges[:, 1] = -1
-    node_ranges[num_internal:, 0] = leaf_starts_np
-    node_ranges[num_internal:, 1] = leaf_ends_np - 1
 
-    left = np.asarray(jax.device_get(template.left_child), dtype=np.int64)
-    right = np.asarray(jax.device_get(template.right_child), dtype=np.int64)
-    levels = np.asarray(jax.device_get(template.node_level), dtype=np.int64)
-    for node in np.argsort(-levels[:num_internal], kind="stable"):
-        l = int(left[node])
-        r = int(right[node])
-        node_ranges[node, 0] = min(int(node_ranges[l, 0]), int(node_ranges[r, 0]))
-        node_ranges[node, 1] = max(int(node_ranges[l, 1]), int(node_ranges[r, 1]))
-    return node_ranges
+    leaf_starts = jnp.asarray(leaf_starts_np, dtype=jnp.int64)
+    leaf_ends = jnp.asarray(leaf_ends_np, dtype=jnp.int64) - 1
+
+    node_ranges = jnp.zeros((total_nodes, 2), dtype=jnp.int64)
+    node_ranges = node_ranges.at[:, 1].set(-1)
+    node_ranges = node_ranges.at[num_internal:, 0].set(leaf_starts)
+    node_ranges = node_ranges.at[num_internal:, 1].set(leaf_ends)
+
+    left = template.left_child.astype(jnp.int64)
+    right = template.right_child.astype(jnp.int64)
+    nodes_by_level = template.nodes_by_level.astype(jnp.int64)
+    level_offsets = template.level_offsets.astype(jnp.int64)
+    num_levels = jnp.asarray(template.num_levels, dtype=jnp.int64)
+    num_internal_jnp = jnp.int64(num_internal)
+
+    def level_body(level_idx, ranges):
+        level = num_levels - 1 - jnp.int64(level_idx)
+        start = level_offsets[level]
+        end = level_offsets[level + 1]
+
+        def node_body(idx, acc):
+            node = nodes_by_level[idx]
+
+            def update_node(r):
+                l = left[node]
+                rr = right[node]
+                start_val = jnp.minimum(r[l, 0], r[rr, 0])
+                end_val = jnp.maximum(r[l, 1], r[rr, 1])
+                r = r.at[node, 0].set(start_val)
+                r = r.at[node, 1].set(end_val)
+                return r
+
+            return lax.cond(node < num_internal_jnp, update_node, lambda r: r, acc)
+
+        return lax.fori_loop(start, end, node_body, ranges)
+
+    node_ranges = lax.fori_loop(
+        0, num_levels, level_body, node_ranges
+    )
+    return np.asarray(jax.device_get(node_ranges))
 
 
 def build_static_radix_tree(
