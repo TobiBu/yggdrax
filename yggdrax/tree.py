@@ -1553,7 +1553,15 @@ def rebuild_static_radix_tree_from_template(
 ):
     """Refresh particles using an existing static-radix data structure."""
 
-    topology = template.topology if isinstance(template, RadixTree) else template
+    if isinstance(template, RadixTree):
+        if template.build_mode != "static_radix":
+            raise ValueError(
+                "rebuild_static_radix_tree_from_template requires a "
+                "RadixTree built with build_mode='static_radix'."
+            )
+        topology = template.topology
+    else:
+        topology = template
     result = _tree_impl.rebuild_static_radix_tree_from_template(
         positions,
         masses,
