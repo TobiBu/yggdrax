@@ -490,6 +490,368 @@ def build_fixed_depth_tree(
     )
 
 
+def _static_radix_leaf_partitions(
+    n: int, leaf_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return fixed-size sorted-order leaf partitions for static radix trees."""
+
+    if n < 1:
+        raise ValueError("Need at least one particle")
+    if leaf_size < 1:
+        raise ValueError("leaf_size must be >= 1")
+    leaf_starts = np.arange(0, int(n), int(leaf_size), dtype=np.int64)
+    leaf_ends = np.minimum(leaf_starts + int(leaf_size), int(n)).astype(np.int64)
+    return leaf_starts, leaf_ends
+
+
+def _build_balanced_bucket_structure(
+    leaf_starts_np: np.ndarray,
+    leaf_ends_np: np.ndarray,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    int,
+]:
+    """Build a deterministic balanced binary tree over leaf bucket indices."""
+
+    num_leaves = int(leaf_starts_np.shape[0])
+    if num_leaves < 1:
+        raise ValueError("static_radix requires at least one leaf")
+    if num_leaves == 1:
+        parent = np.array([-1], dtype=np.int64)
+        left_child = np.empty((0,), dtype=np.int64)
+        right_child = np.empty((0,), dtype=np.int64)
+        left_is_leaf = np.empty((0,), dtype=np.bool_)
+        right_is_leaf = np.empty((0,), dtype=np.bool_)
+        node_ranges = np.array(
+            [[int(leaf_starts_np[0]), int(leaf_ends_np[0]) - 1]], dtype=np.int64
+        )
+        node_level = np.array([0], dtype=np.int64)
+        level_offsets = np.zeros((MAX_TREE_LEVELS + 1,), dtype=np.int64)
+        level_offsets[1] = 1
+        nodes_by_level = np.array([0], dtype=np.int64)
+        return (
+            parent,
+            left_child,
+            right_child,
+            left_is_leaf,
+            right_is_leaf,
+            node_ranges,
+            node_level,
+            level_offsets,
+            nodes_by_level,
+            1,
+        )
+
+    num_internal = num_leaves - 1
+    total_nodes = num_internal + num_leaves
+    leaf_offset = num_internal
+
+    parent = np.full((total_nodes,), -1, dtype=np.int64)
+    left_child = np.full((num_internal,), -1, dtype=np.int64)
+    right_child = np.full((num_internal,), -1, dtype=np.int64)
+    left_is_leaf = np.zeros((num_internal,), dtype=np.bool_)
+    right_is_leaf = np.zeros((num_internal,), dtype=np.bool_)
+    node_ranges = np.zeros((total_nodes, 2), dtype=np.int64)
+    node_ranges[:, 1] = -1
+    node_level = np.zeros((total_nodes,), dtype=np.int64)
+
+    next_internal = 0
+
+    def build(lo: int, hi: int, depth: int) -> int:
+        nonlocal next_internal
+        if hi - lo == 1:
+            leaf_node = leaf_offset + lo
+            node_level[leaf_node] = depth
+            node_ranges[leaf_node, 0] = int(leaf_starts_np[lo])
+            node_ranges[leaf_node, 1] = int(leaf_ends_np[lo]) - 1
+            return leaf_node
+
+        node = next_internal
+        next_internal += 1
+        node_level[node] = depth
+        mid = (lo + hi) // 2
+        left = build(lo, mid, depth + 1)
+        right = build(mid, hi, depth + 1)
+        left_child[node] = left
+        right_child[node] = right
+        left_is_leaf[node] = left >= leaf_offset
+        right_is_leaf[node] = right >= leaf_offset
+        parent[left] = node
+        parent[right] = node
+        node_ranges[node, 0] = min(
+            int(node_ranges[left, 0]), int(node_ranges[right, 0])
+        )
+        node_ranges[node, 1] = max(
+            int(node_ranges[left, 1]), int(node_ranges[right, 1])
+        )
+        return node
+
+    root = build(0, num_leaves, 0)
+    if root != 0 or next_internal != num_internal:
+        raise ValueError("static_radix balanced topology construction failed")
+
+    level_counts = np.bincount(node_level, minlength=MAX_TREE_LEVELS).astype(np.int64)
+    num_levels = int(np.max(node_level)) + 1
+    level_offsets = np.zeros((MAX_TREE_LEVELS + 1,), dtype=np.int64)
+    level_offsets[1:] = np.cumsum(level_counts[:MAX_TREE_LEVELS])
+    nodes_by_level = np.argsort(node_level, kind="stable").astype(np.int64)
+
+    return (
+        parent,
+        left_child,
+        right_child,
+        left_is_leaf,
+        right_is_leaf,
+        node_ranges,
+        node_level,
+        level_offsets,
+        nodes_by_level,
+        num_levels,
+    )
+
+
+def _static_radix_node_ranges_from_leaf_ranges(
+    template: RadixTree,
+    leaf_starts_np: np.ndarray,
+    leaf_ends_np: np.ndarray,
+) -> np.ndarray:
+    """Recompute node ranges for an existing static radix bucket topology."""
+
+    num_leaves = int(leaf_starts_np.shape[0])
+    num_internal = int(template.num_internal_nodes)
+    total_nodes = int(num_internal + num_leaves)
+
+    leaf_starts = jnp.asarray(leaf_starts_np, dtype=jnp.int64)
+    leaf_ends = jnp.asarray(leaf_ends_np, dtype=jnp.int64) - 1
+
+    node_ranges = jnp.zeros((total_nodes, 2), dtype=jnp.int64)
+    node_ranges = node_ranges.at[:, 1].set(-1)
+    node_ranges = node_ranges.at[num_internal:, 0].set(leaf_starts)
+    node_ranges = node_ranges.at[num_internal:, 1].set(leaf_ends)
+
+    left = template.left_child.astype(jnp.int64)
+    right = template.right_child.astype(jnp.int64)
+    nodes_by_level = template.nodes_by_level.astype(jnp.int64)
+    level_offsets = template.level_offsets.astype(jnp.int64)
+    num_levels = jnp.asarray(template.num_levels, dtype=jnp.int64)
+    num_internal_jnp = jnp.int64(num_internal)
+
+    def level_body(level_idx, ranges):
+        level = num_levels - 1 - jnp.int64(level_idx)
+        start = level_offsets[level]
+        end = level_offsets[level + 1]
+
+        def node_body(idx, acc):
+            node = nodes_by_level[idx]
+
+            def update_node(r):
+                l = left[node]
+                rr = right[node]
+                start_val = jnp.minimum(r[l, 0], r[rr, 0])
+                end_val = jnp.maximum(r[l, 1], r[rr, 1])
+                r = r.at[node, 0].set(start_val)
+                r = r.at[node, 1].set(end_val)
+                return r
+
+            return lax.cond(node < num_internal_jnp, update_node, lambda r: r, acc)
+
+        return lax.fori_loop(start, end, node_body, ranges)
+
+    node_ranges = lax.fori_loop(0, num_levels, level_body, node_ranges)
+    return np.asarray(jax.device_get(node_ranges))
+
+
+def build_static_radix_tree(
+    positions: Array,
+    masses: Array,
+    bounds: Bounds,
+    *,
+    leaf_size: int = 8,
+    return_reordered: bool = False,
+    return_workspace: bool = False,
+):
+    """Build a fixed-shape radix tree from equal-size Morton-order buckets.
+
+    ``static_radix`` is fixed in data-structure shape, not in spatial geometry:
+    particles are Morton-sorted and split into count buckets of at most
+    ``leaf_size`` particles.  Refreshes may change particle order, node ranges,
+    and geometry, while preserving the balanced parent/child structure for a
+    fixed particle count and leaf size.
+    """
+
+    from .morton import morton_encode  # local import to avoid circulars
+
+    n = positions.shape[0]
+    if n < 1:
+        raise ValueError("Need at least one particle")
+    if leaf_size < 1:
+        raise ValueError("leaf_size must be >= 1")
+
+    morton_codes = morton_encode(positions, bounds)
+    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
+    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    sorted_codes = morton_codes[sorted_indices]
+
+    leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(int(n), int(leaf_size))
+    (
+        parent_np,
+        left_np,
+        right_np,
+        left_is_leaf_np,
+        right_is_leaf_np,
+        node_ranges_np,
+        node_level_np,
+        level_offsets_np,
+        nodes_by_level_np,
+        num_levels,
+    ) = _build_balanced_bucket_structure(leaf_starts_np, leaf_ends_np)
+
+    leaf_starts = jnp.asarray(leaf_starts_np, dtype=INDEX_DTYPE)
+    leaf_codes = sorted_codes[leaf_starts]
+    leaf_depths = jnp.full((leaf_starts.shape[0],), -1, dtype=INDEX_DTYPE)
+
+    positions_sorted = None
+    masses_sorted = None
+    inverse = None
+    if return_reordered:
+        positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
+            positions,
+            masses,
+            sorted_indices,
+        )
+
+    parent = jnp.asarray(parent_np, dtype=INDEX_DTYPE)
+    left_child = jnp.asarray(left_np, dtype=INDEX_DTYPE)
+    right_child = jnp.asarray(right_np, dtype=INDEX_DTYPE)
+    left_is_leaf = jnp.asarray(left_is_leaf_np, dtype=jnp.bool_)
+    right_is_leaf = jnp.asarray(right_is_leaf_np, dtype=jnp.bool_)
+    node_ranges = jnp.asarray(node_ranges_np, dtype=INDEX_DTYPE)
+    node_level = jnp.asarray(node_level_np, dtype=INDEX_DTYPE)
+    level_offsets = jnp.asarray(level_offsets_np, dtype=INDEX_DTYPE)
+    nodes_by_level = jnp.asarray(nodes_by_level_np, dtype=INDEX_DTYPE)
+    bounds_min = jnp.asarray(bounds[0], dtype=positions.dtype)
+    bounds_max = jnp.asarray(bounds[1], dtype=positions.dtype)
+
+    tree = RadixTree(
+        parent=parent,
+        left_child=left_child,
+        right_child=right_child,
+        left_is_leaf=left_is_leaf,
+        right_is_leaf=right_is_leaf,
+        particle_indices=jnp.asarray(sorted_indices, dtype=INDEX_DTYPE),
+        morton_codes=sorted_codes,
+        node_ranges=node_ranges,
+        num_particles=int(n),
+        num_internal_nodes=int(leaf_starts_np.shape[0] - 1),
+        node_level=node_level,
+        level_offsets=level_offsets,
+        nodes_by_level=nodes_by_level,
+        num_levels=as_index(num_levels),
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
+        leaf_codes=leaf_codes,
+        leaf_depths=leaf_depths,
+        use_morton_geometry=jnp.asarray(False, dtype=jnp.bool_),
+        leaf_size=int(leaf_size),
+    )
+
+    updated_workspace = RadixTreeWorkspace(
+        parent=parent,
+        left_child=left_child,
+        right_child=right_child,
+        left_is_leaf=left_is_leaf,
+        right_is_leaf=right_is_leaf,
+        node_ranges=node_ranges,
+    )
+    outputs = [tree]
+    if return_reordered:
+        outputs.extend([positions_sorted, masses_sorted, inverse])
+    if return_workspace:
+        outputs.append(updated_workspace)
+    return tuple(outputs) if len(outputs) > 1 else outputs[0]
+
+
+def rebuild_static_radix_tree_from_template(
+    positions: Array,
+    masses: Array,
+    template: RadixTree,
+    *,
+    bounds: Optional[Bounds] = None,
+    return_reordered: bool = False,
+):
+    """Refresh particles against a fixed-shape static radix bucket topology."""
+
+    from .morton import morton_encode  # local import to avoid circulars
+
+    if template.leaf_size is None or int(template.leaf_size) < 1:
+        raise ValueError("static_radix template must declare a positive leaf_size")
+    n = positions.shape[0]
+    if int(n) != int(template.num_particles):
+        raise ValueError(
+            "static_radix template particle count mismatch: "
+            f"positions={int(n)} template={int(template.num_particles)}"
+        )
+
+    if bounds is None:
+        bounds_min = jnp.min(positions, axis=0)
+        bounds_max = jnp.max(positions, axis=0)
+        span = jnp.maximum(
+            bounds_max - bounds_min, jnp.asarray(1.0e-6, dtype=positions.dtype)
+        )
+        pad = span * jnp.asarray(1.0e-6, dtype=positions.dtype)
+        bounds_resolved = (bounds_min - pad, bounds_max + pad)
+    else:
+        bounds_resolved = bounds
+
+    morton_codes = morton_encode(positions, bounds_resolved)
+    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
+    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    sorted_codes = morton_codes[sorted_indices]
+
+    leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(
+        int(n),
+        int(template.leaf_size),
+    )
+    expected_leaves = int(template.parent.shape[0]) - int(template.num_internal_nodes)
+    if int(leaf_starts_np.shape[0]) != expected_leaves:
+        raise ValueError(
+            "static_radix template leaf count mismatch: "
+            f"refresh={int(leaf_starts_np.shape[0])} template={expected_leaves}"
+        )
+    node_ranges_np = _static_radix_node_ranges_from_leaf_ranges(
+        template,
+        leaf_starts_np,
+        leaf_ends_np,
+    )
+
+    leaf_starts = jnp.asarray(leaf_starts_np, dtype=INDEX_DTYPE)
+    rebuilt = template._replace(
+        particle_indices=jnp.asarray(sorted_indices, dtype=INDEX_DTYPE),
+        morton_codes=sorted_codes,
+        node_ranges=jnp.asarray(node_ranges_np, dtype=INDEX_DTYPE),
+        bounds_min=jnp.asarray(bounds_resolved[0], dtype=positions.dtype),
+        bounds_max=jnp.asarray(bounds_resolved[1], dtype=positions.dtype),
+        leaf_codes=sorted_codes[leaf_starts],
+        leaf_depths=jnp.full((leaf_starts.shape[0],), -1, dtype=INDEX_DTYPE),
+        use_morton_geometry=jnp.asarray(False, dtype=jnp.bool_),
+    )
+    if return_reordered:
+        positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
+            positions,
+            masses,
+            sorted_indices,
+        )
+        return rebuilt, positions_sorted, masses_sorted, inverse
+    return rebuilt
+
+
 # ---------------------------------------------
 # Reordering helpers for memory locality
 # ---------------------------------------------
@@ -1003,8 +1365,10 @@ __all__ = [
     "RadixTreeWorkspace",
     "build_tree",
     "build_tree_jit",
+    "build_static_radix_tree",
     "build_fixed_depth_tree",
     "build_fixed_depth_tree_jit",
     "inverse_permutation",
+    "rebuild_static_radix_tree_from_template",
     "reorder_particles_by_indices",
 ]
