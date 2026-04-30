@@ -674,9 +674,7 @@ def build_static_radix_tree(
     bounds: Bounds,
     *,
     leaf_size: int = 8,
-    target_leaf_particles: int = 32,
     return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
     return_workspace: bool = False,
 ):
     """Build a fixed-shape radix tree from equal-size Morton-order buckets.
@@ -833,11 +831,6 @@ def rebuild_static_radix_tree_from_template(
         leaf_ends_np,
     )
 
-    positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
-        positions,
-        masses,
-        sorted_indices,
-    )
     leaf_starts = jnp.asarray(leaf_starts_np, dtype=INDEX_DTYPE)
     rebuilt = template._replace(
         particle_indices=jnp.asarray(sorted_indices, dtype=INDEX_DTYPE),
@@ -850,6 +843,11 @@ def rebuild_static_radix_tree_from_template(
         use_morton_geometry=jnp.asarray(False, dtype=jnp.bool_),
     )
     if return_reordered:
+        positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
+            positions,
+            masses,
+            sorted_indices,
+        )
         return rebuilt, positions_sorted, masses_sorted, inverse
     return rebuilt
 

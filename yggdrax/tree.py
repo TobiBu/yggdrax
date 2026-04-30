@@ -555,7 +555,6 @@ class RadixTree(Tree):
                 bounds_resolved,
                 leaf_size=leaf_size,
                 return_reordered=return_reordered,
-                workspace=workspace,
                 return_workspace=return_workspace,
             )
         else:
@@ -1514,7 +1513,6 @@ def build_static_radix_tree(
     *,
     leaf_size: int = 8,
     return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
     return_workspace: bool = False,
 ):
     """Build a fixed-shape radix tree from Morton-sorted count buckets.
@@ -1531,7 +1529,6 @@ def build_static_radix_tree(
         bounds_resolved,
         leaf_size=leaf_size,
         return_reordered=return_reordered,
-        workspace=workspace,
         return_workspace=return_workspace,
     )
     return _wrap_radix_public_result(
