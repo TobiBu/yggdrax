@@ -664,9 +664,7 @@ def _static_radix_node_ranges_from_leaf_ranges(
 
         return lax.fori_loop(start, end, node_body, ranges)
 
-    node_ranges = lax.fori_loop(
-        0, num_levels, level_body, node_ranges
-    )
+    node_ranges = lax.fori_loop(0, num_levels, level_body, node_ranges)
     return np.asarray(jax.device_get(node_ranges))
 
 
