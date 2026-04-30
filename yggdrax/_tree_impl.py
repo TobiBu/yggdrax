@@ -694,11 +694,15 @@ def build_static_radix_tree(
     leaf_codes = sorted_codes[leaf_starts]
     leaf_depths = jnp.full((leaf_starts.shape[0],), -1, dtype=INDEX_DTYPE)
 
-    positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
-        positions,
-        masses,
-        sorted_indices,
-    )
+    positions_sorted = None
+    masses_sorted = None
+    inverse = None
+    if return_reordered:
+        positions_sorted, masses_sorted, inverse = reorder_particles_by_indices(
+            positions,
+            masses,
+            sorted_indices,
+        )
 
     parent = jnp.asarray(parent_np, dtype=INDEX_DTYPE)
     left_child = jnp.asarray(left_np, dtype=INDEX_DTYPE)
