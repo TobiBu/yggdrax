@@ -800,13 +800,10 @@ def rebuild_static_radix_tree_from_template(
         )
 
     if bounds is None:
-        bounds_min = jnp.min(positions, axis=0)
-        bounds_max = jnp.max(positions, axis=0)
-        span = jnp.maximum(
-            bounds_max - bounds_min, jnp.asarray(1.0e-6, dtype=positions.dtype)
+        bounds_resolved = (
+            jnp.asarray(template.bounds_min, dtype=positions.dtype),
+            jnp.asarray(template.bounds_max, dtype=positions.dtype),
         )
-        pad = span * jnp.asarray(1.0e-6, dtype=positions.dtype)
-        bounds_resolved = (bounds_min - pad, bounds_max + pad)
     else:
         bounds_resolved = bounds
 
