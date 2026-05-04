@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from yggdrax.geometry import compute_tree_geometry
 from yggdrax.tree import (
@@ -569,8 +570,6 @@ def test_static_radix_geometry_uses_particle_ranges():
 
 
 def test_static_radix_rejects_workspace():
-    import pytest
-
     positions = jnp.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=jnp.float32)
     masses = jnp.ones((2,), dtype=jnp.float32)
     _, workspace = build_tree(
