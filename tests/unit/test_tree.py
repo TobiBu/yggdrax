@@ -568,6 +568,27 @@ def test_static_radix_geometry_uses_particle_ranges():
     assert float(np.max(leaf_half_extents)) < 0.01
 
 
+def test_static_radix_rejects_workspace():
+    import pytest
+
+    positions = jnp.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=jnp.float32)
+    masses = jnp.ones((2,), dtype=jnp.float32)
+    _, workspace = build_tree(
+        positions,
+        masses,
+        return_workspace=True,
+    )
+    from yggdrax.tree import RadixTree
+
+    with pytest.raises(ValueError, match="workspace is not supported"):
+        RadixTree.from_particles(
+            positions,
+            masses,
+            build_mode="static_radix",
+            workspace=workspace,
+        )
+
+
 def test_fixed_depth_morton_geometry_contains_particles():
     coords = jnp.linspace(-0.75, 0.75, 4)
     grid = jnp.meshgrid(coords, coords, coords)

@@ -549,6 +549,12 @@ class RadixTree(Tree):
                 min_refined_leaf_particles=min_refined_leaf_particles,
             )
         elif build_mode == "static_radix":
+            if workspace is not None:
+                raise ValueError(
+                    "workspace is not supported for build_mode='static_radix'. "
+                    "Use rebuild_static_radix_tree_from_template to refresh "
+                    "particle data against a fixed topology."
+                )
             result = _tree_impl.build_static_radix_tree(
                 positions,
                 masses,
