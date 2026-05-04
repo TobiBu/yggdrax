@@ -13,8 +13,10 @@ from yggdrax.tree import (
     build_fixed_depth_tree_jit,
     build_octree,
     build_octree_jit,
+    build_static_radix_tree,
     build_tree,
     build_tree_jit,
+    rebuild_static_radix_tree_from_template,
     reorder_particles_by_indices,
 )
 
@@ -460,6 +462,110 @@ def test_fixed_depth_tree_depth_scales_with_target():
 
     assert tree_tight.num_internal_nodes >= tree_loose.num_internal_nodes
     assert max_tight <= max_loose
+
+
+def test_static_radix_tree_uses_fixed_count_buckets():
+    key = jax.random.PRNGKey(42)
+    positions = jax.random.uniform(
+        key,
+        (130, 3),
+        minval=-1.0,
+        maxval=1.0,
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((positions.shape[0],), dtype=jnp.float32)
+
+    tree, *_ = build_static_radix_tree(
+        positions,
+        masses,
+        leaf_size=32,
+        return_reordered=True,
+    )
+
+    assert tree.build_mode == "static_radix"
+    assert tree.leaf_size == 32
+    assert int(tree.parent.shape[0] - tree.num_internal_nodes) == 5
+    assert _max_leaf_count(tree) <= 32
+    assert not bool(np.asarray(tree.use_morton_geometry))
+
+
+def test_static_radix_refresh_preserves_structure_and_updates_order():
+    positions = jnp.array(
+        [
+            [-0.8, 0.0, 0.0],
+            [-0.6, 0.0, 0.0],
+            [-0.4, 0.0, 0.0],
+            [-0.2, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.6, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((positions.shape[0],), dtype=jnp.float32)
+    bounds = (
+        jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32),
+        jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
+    )
+    tree, *_ = build_static_radix_tree(
+        positions,
+        masses,
+        bounds=bounds,
+        leaf_size=2,
+        return_reordered=True,
+    )
+    moved = positions.at[0, 0].set(0.95)
+
+    refreshed, *_ = rebuild_static_radix_tree_from_template(
+        moved,
+        masses,
+        tree,
+        bounds=bounds,
+        return_reordered=True,
+    )
+
+    assert refreshed.build_mode == "static_radix"
+    assert _max_leaf_count(refreshed) <= 2
+    assert np.array_equal(np.asarray(tree.parent), np.asarray(refreshed.parent))
+    assert np.array_equal(np.asarray(tree.left_child), np.asarray(refreshed.left_child))
+    assert np.array_equal(
+        np.asarray(tree.right_child), np.asarray(refreshed.right_child)
+    )
+    assert not np.array_equal(
+        np.asarray(tree.particle_indices),
+        np.asarray(refreshed.particle_indices),
+    )
+    assert tree.node_ranges.shape == refreshed.node_ranges.shape
+
+
+def test_static_radix_geometry_uses_particle_ranges():
+    positions = jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0e-3, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+            [0.501, 0.5, 0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    masses = jnp.ones((positions.shape[0],), dtype=jnp.float32)
+    tree, pos_sorted, *_ = build_static_radix_tree(
+        positions,
+        masses,
+        bounds=(
+            jnp.array([-10.0, -10.0, -10.0], dtype=jnp.float32),
+            jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32),
+        ),
+        leaf_size=2,
+        return_reordered=True,
+    )
+
+    geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=2)
+    leaf_half_extents = np.asarray(geometry.half_extent)[tree.num_internal_nodes :]
+
+    assert not bool(np.asarray(tree.use_morton_geometry))
+    assert float(np.max(leaf_half_extents)) < 0.01
 
 
 def test_fixed_depth_morton_geometry_contains_particles():
