@@ -7,11 +7,13 @@ import jax
 import jax.numpy as jnp
 
 from yggdrax import (
+    CompactTaggedFarPairs,
     DualTreeTraversalConfig,
     NodeInteractionList,
     NodeNeighborList,
     Tree,
     _interactions_impl,
+    build_compact_far_pairs_and_leaf_neighbor_lists,
     build_interactions_and_neighbors,
     build_leaf_neighbor_lists,
     build_tree,
@@ -19,6 +21,7 @@ from yggdrax import (
     infer_bounds,
 )
 from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
+from yggdrax.interactions import build_compact_far_pairs
 
 _TEST_N = 16
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
@@ -139,6 +142,50 @@ def test_interactions_accepts_expanse_traversal_config():
     assert isinstance(neighbors, NodeNeighborList)
     assert interactions.sources.ndim == 1
     assert neighbors.neighbors.ndim == 1
+
+
+def test_shared_count_far_pairs_and_neighbors_match_split_builders():
+    positions, masses = _sample_problem(n=48)
+    tree, pos_sorted, _, _ = build_tree(
+        positions,
+        masses,
+        infer_bounds(positions),
+        leaf_size=8,
+        return_reordered=True,
+    )
+    geometry = compute_tree_geometry(tree, pos_sorted)
+
+    shared_far, shared_neighbors = build_compact_far_pairs_and_leaf_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_TEST_TRAVERSAL_CFG,
+    )
+    split_far = build_compact_far_pairs(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_TEST_TRAVERSAL_CFG,
+    )
+    split_neighbors = build_leaf_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_TEST_TRAVERSAL_CFG,
+    )
+
+    assert isinstance(shared_far, CompactTaggedFarPairs)
+    assert isinstance(shared_neighbors, NodeNeighborList)
+    assert jnp.array_equal(shared_far.sources, split_far.sources)
+    assert jnp.array_equal(shared_far.targets, split_far.targets)
+    assert jnp.array_equal(shared_far.tags, split_far.tags)
+    assert jnp.array_equal(shared_neighbors.offsets, split_neighbors.offsets)
+    assert jnp.array_equal(shared_neighbors.neighbors, split_neighbors.neighbors)
+    assert jnp.array_equal(shared_neighbors.leaf_indices, split_neighbors.leaf_indices)
+    assert jnp.array_equal(shared_neighbors.counts, split_neighbors.counts)
 
 
 def test_interactions_can_derive_missing_level_fields():

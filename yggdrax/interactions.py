@@ -99,6 +99,44 @@ def build_compact_far_pairs(
     )
 
 
+def build_compact_far_pairs_and_leaf_neighbor_lists(
+    tree: object,
+    geometry: TreeGeometry,
+    theta: float = 0.5,
+    max_neighbors_per_leaf: int = _interactions_impl._DEFAULT_MAX_NEIGHBORS,
+    max_interactions_per_node: int | None = None,
+    mac_type: MACType = "bh",
+    *,
+    pair_policy: PairPolicy | None = None,
+    policy_state: object = None,
+    max_pair_queue: int | None = None,
+    process_block: int | None = None,
+    traversal_config: DualTreeTraversalConfig | None = None,
+    retry_logger=None,
+    dehnen_radius_scale: float = 1.0,
+    timing_callback=None,
+) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
+    """Construct compact far pairs and near neighbors with one shared count walk."""
+
+    return _call_with_topology(
+        _interactions_impl.build_compact_far_pairs_and_leaf_neighbor_lists,
+        tree,
+        geometry,
+        theta=theta,
+        max_neighbors_per_leaf=max_neighbors_per_leaf,
+        max_interactions_per_node=max_interactions_per_node,
+        mac_type=mac_type,
+        pair_policy=pair_policy,
+        policy_state=policy_state,
+        max_pair_queue=max_pair_queue,
+        process_block=process_block,
+        traversal_config=traversal_config,
+        retry_logger=retry_logger,
+        dehnen_radius_scale=dehnen_radius_scale,
+        timing_callback=timing_callback,
+    )
+
+
 def build_leaf_neighbor_lists(
     tree: object,
     geometry: TreeGeometry,
@@ -348,6 +386,7 @@ __all__ = [
     "build_interactions_and_neighbors",
     "build_interactions_and_neighbors_split",
     "build_compact_far_pairs",
+    "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_octree_native_far_pairs",
     "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
