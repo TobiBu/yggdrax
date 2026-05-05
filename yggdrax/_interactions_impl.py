@@ -5126,9 +5126,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
         total_far_pairs = int(far_offsets64[-1])
         total_near_pairs = int(near_offsets64[-1])
         if total_far_pairs < 0 or total_near_pairs < 0:
-            raise RuntimeError(
-                "Dual-tree count-pass produced a negative pair total."
-            )
+            raise RuntimeError("Dual-tree count-pass produced a negative pair total.")
         int32_max = (1 << 31) - 1
         if total_far_pairs > int32_max:
             raise RuntimeError(

@@ -20,8 +20,8 @@ from yggdrax import (
     compute_tree_geometry,
     infer_bounds,
 )
-from yggdrax.interactions import build_compact_far_pairs
 from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
+from yggdrax.interactions import build_compact_far_pairs
 
 _TEST_N = 16
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
