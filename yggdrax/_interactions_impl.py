@@ -5186,6 +5186,13 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             )
             _record_stage("dual_split_shared_combined_fill", stage_t0)
             if not bool(result.queue_overflow):
+                _emit_retry_event(
+                    "success",
+                    attempt=attempt_idx,
+                    queue_capacity=int(queue_capacity),
+                    far_pair_count=int(result.far_pair_count),
+                    near_pair_count=int(result.near_pair_count),
+                )
                 _raise_if_true(result.far_overflow, far_error_msg)
                 _raise_if_true(result.near_overflow, near_error_msg)
                 return _raw_to_compact_far_pairs(result), _result_to_neighbors(result, tree)
@@ -5302,6 +5309,13 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                     near_pair_count=int(result.near_pair_count),
                 )
                 continue
+            _emit_retry_event(
+                "success",
+                attempt=attempt_idx,
+                queue_capacity=int(fill_queue_capacity),
+                far_pair_count=int(result.far_pair_count),
+                near_pair_count=int(result.near_pair_count),
+            )
             _raise_if_true(result.far_overflow, far_error_msg)
             _raise_if_true(result.near_overflow, near_error_msg)
             return _raw_to_compact_far_pairs(result), _result_to_neighbors(result, tree)
