@@ -4666,10 +4666,19 @@ def _run_far_only_compact_with_bounded_count_pass(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    steady_single_queue_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_STEADY_SINGLE_QUEUE",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if steady_single_queue_mode:
+        queue_candidates = [int(queue_max)]
     auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
-    queue_candidates.extend(
-        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
-    )
+    if not steady_single_queue_mode:
+        queue_candidates.extend(
+            int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+        )
     seen_queue_caps = set()
     queue_candidates = [
         int(cap)
@@ -4762,15 +4771,18 @@ def _run_far_only_compact_with_bounded_count_pass(
             )
             continue
 
-        observed_wf = int(max_wf)
-        queue_suggest = max(4, observed_wf + observed_wf // 2)
-        fill_queue_candidates = [
-            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
-        ]
-        if len(fill_queue_candidates) == 0:
+        if steady_single_queue_mode:
             fill_queue_candidates = [int(queue_capacity)]
-        elif fill_queue_candidates[0] != int(queue_suggest):
-            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+        else:
+            observed_wf = int(max_wf)
+            queue_suggest = max(4, observed_wf + observed_wf // 2)
+            fill_queue_candidates = [
+                int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+            ]
+            if len(fill_queue_candidates) == 0:
+                fill_queue_candidates = [int(queue_capacity)]
+            elif fill_queue_candidates[0] != int(queue_suggest):
+                fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
 
         far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
         total_far_pairs = int(far_offsets64[-1])
@@ -4846,10 +4858,19 @@ def _run_near_only_compact_with_bounded_count_pass(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    steady_single_queue_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_STEADY_SINGLE_QUEUE",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if steady_single_queue_mode:
+        queue_candidates = [int(queue_max)]
     auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
-    queue_candidates.extend(
-        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
-    )
+    if not steady_single_queue_mode:
+        queue_candidates.extend(
+            int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+        )
     seen_queue_caps = set()
     queue_candidates = [
         int(cap)
@@ -4938,15 +4959,18 @@ def _run_near_only_compact_with_bounded_count_pass(
             )
             continue
 
-        observed_wf = int(max_wf)
-        queue_suggest = max(4, observed_wf + observed_wf // 2)
-        fill_queue_candidates = [
-            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
-        ]
-        if len(fill_queue_candidates) == 0:
+        if steady_single_queue_mode:
             fill_queue_candidates = [int(queue_capacity)]
-        elif fill_queue_candidates[0] != int(queue_suggest):
-            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+        else:
+            observed_wf = int(max_wf)
+            queue_suggest = max(4, observed_wf + observed_wf // 2)
+            fill_queue_candidates = [
+                int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+            ]
+            if len(fill_queue_candidates) == 0:
+                fill_queue_candidates = [int(queue_capacity)]
+            elif fill_queue_candidates[0] != int(queue_suggest):
+                fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
 
         near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
         total_near_pairs = int(near_offsets64[-1])
