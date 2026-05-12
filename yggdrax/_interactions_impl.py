@@ -5111,6 +5111,100 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
         if timing_callback is not None:
             timing_callback(name, float(time.perf_counter() - start))
 
+    one_shot_shared_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_ONE_SHOT",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Steady-state fast path: one count + one fill at configured queue capacity.
+    # If overflow happens, fall back to the existing retry ladder below.
+    if one_shot_shared_mode:
+        queue_capacity = int(queue_max)
+        attempt_counter += 1
+        attempt_idx = attempt_counter
+        stage_t0 = time.perf_counter()
+        count_outputs = _dual_tree_walk_count_impl(
+            tree,
+            geometry,
+            float(theta),
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            dehnen_radius_scale=float(dehnen_radius_scale),
+            collect_far=True,
+            collect_near=True,
+            process_block=int(count_process_block),
+            max_pair_queue=int(queue_capacity),
+        )
+        _record_stage("dual_split_shared_count", stage_t0)
+        if len(count_outputs) == 3:
+            far_counts, near_counts, _max_wf = count_outputs
+            count_wf_overflow = jnp.bool_(False)
+        else:
+            far_counts, near_counts, _max_wf, count_wf_overflow = count_outputs
+        if not bool(count_wf_overflow):
+            far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
+            near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
+            total_far_pairs = int(far_offsets64[-1])
+            total_near_pairs = int(near_offsets64[-1])
+            if total_far_pairs < 0 or total_near_pairs < 0:
+                raise RuntimeError("Dual-tree count-pass produced a negative pair total.")
+            int32_max = (1 << 31) - 1
+            if total_far_pairs > int32_max:
+                raise RuntimeError(
+                    "Dual-tree traversal far-pair totals exceed signed int32 capacity."
+                )
+            if total_near_pairs > int32_max:
+                raise RuntimeError(
+                    "Dual-tree traversal neighbor totals exceed signed int32 capacity."
+                )
+
+            far_offsets = jnp.asarray(far_offsets64, dtype=INDEX_DTYPE)
+            near_offsets = jnp.asarray(near_offsets64, dtype=INDEX_DTYPE)
+            attempt_counter += 1
+            attempt_idx = attempt_counter
+            stage_t0 = time.perf_counter()
+            result = _dual_tree_walk_compact_fill_impl(
+                tree,
+                geometry,
+                far_offsets,
+                far_counts,
+                near_offsets,
+                near_counts,
+                float(theta),
+                mac_type=mac_type,
+                pair_policy=pair_policy,
+                policy_state=policy_state,
+                dehnen_radius_scale=float(dehnen_radius_scale),
+                max_pair_queue=int(queue_capacity),
+                total_far_pairs=int(total_far_pairs),
+                total_near_pairs=int(total_near_pairs),
+                collect_far=True,
+                collect_near=True,
+            )
+            _record_stage("dual_split_shared_combined_fill", stage_t0)
+            if not bool(result.queue_overflow):
+                _raise_if_true(result.far_overflow, far_error_msg)
+                _raise_if_true(result.near_overflow, near_error_msg)
+                return _raw_to_compact_far_pairs(result), _result_to_neighbors(result, tree)
+            _emit_retry_event(
+                "queue_overflow",
+                attempt=attempt_idx,
+                queue_capacity=int(queue_capacity),
+                far_pair_count=int(result.far_pair_count),
+                near_pair_count=int(result.near_pair_count),
+            )
+        else:
+            _emit_retry_event(
+                "queue_overflow",
+                attempt=attempt_idx,
+                queue_capacity=int(queue_capacity),
+                far_pair_count=0,
+                near_pair_count=0,
+            )
+
     for queue_capacity in queue_candidates:
         attempt_counter += 1
         attempt_idx = attempt_counter
