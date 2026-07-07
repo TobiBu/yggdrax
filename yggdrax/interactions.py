@@ -115,6 +115,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     retry_logger=None,
     dehnen_radius_scale: float = 1.0,
     timing_callback=None,
+    compact_far_pair_capacity: int | None = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Construct compact far pairs and near neighbors with one shared count walk."""
 
@@ -134,6 +135,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         timing_callback=timing_callback,
+        compact_far_pair_capacity=compact_far_pair_capacity,
     )
 
 

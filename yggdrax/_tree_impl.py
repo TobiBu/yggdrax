@@ -6,9 +6,10 @@ hierarchical octree structure implicitly through the Morton code ordering.
 """
 
 import math
+import os
 from collections import deque
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -621,11 +622,13 @@ def _static_radix_node_ranges_from_leaf_ranges(
     template: RadixTree,
     leaf_starts_np: np.ndarray,
     leaf_ends_np: np.ndarray,
-) -> np.ndarray:
+    *,
+    return_numpy: bool = True,
+) -> Union[np.ndarray, Array]:
     """Recompute node ranges for an existing static radix bucket topology."""
 
     num_leaves = int(leaf_starts_np.shape[0])
-    num_internal = int(template.num_internal_nodes)
+    num_internal = int(template.left_child.shape[0])
     total_nodes = int(num_internal + num_leaves)
 
     leaf_starts = jnp.asarray(leaf_starts_np, dtype=jnp.int64)
@@ -665,7 +668,9 @@ def _static_radix_node_ranges_from_leaf_ranges(
         return lax.fori_loop(start, end, node_body, ranges)
 
     node_ranges = lax.fori_loop(0, num_levels, level_body, node_ranges)
-    return np.asarray(jax.device_get(node_ranges))
+    if bool(return_numpy):
+        return np.asarray(jax.device_get(node_ranges))
+    return node_ranges
 
 
 def build_static_radix_tree(
@@ -793,10 +798,11 @@ def rebuild_static_radix_tree_from_template(
     if template.leaf_size is None or int(template.leaf_size) < 1:
         raise ValueError("static_radix template must declare a positive leaf_size")
     n = positions.shape[0]
-    if int(n) != int(template.num_particles):
+    template_particle_count = int(template.particle_indices.shape[0])
+    if int(n) != template_particle_count:
         raise ValueError(
             "static_radix template particle count mismatch: "
-            f"positions={int(n)} template={int(template.num_particles)}"
+            f"positions={int(n)} template={template_particle_count}"
         )
 
     if bounds is None:
@@ -816,23 +822,33 @@ def rebuild_static_radix_tree_from_template(
         int(n),
         int(template.leaf_size),
     )
-    expected_leaves = int(template.parent.shape[0]) - int(template.num_internal_nodes)
+    expected_leaves = int(template.leaf_codes.shape[0])
     if int(leaf_starts_np.shape[0]) != expected_leaves:
         raise ValueError(
             "static_radix template leaf count mismatch: "
             f"refresh={int(leaf_starts_np.shape[0])} template={expected_leaves}"
         )
-    node_ranges_np = _static_radix_node_ranges_from_leaf_ranges(
-        template,
-        leaf_starts_np,
-        leaf_ends_np,
+    reuse_node_ranges = (
+        os.environ.get("YGGDRAX_STATIC_RADIX_REUSE_NODE_RANGES", "1")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
     )
+    if reuse_node_ranges:
+        node_ranges = jnp.asarray(template.node_ranges, dtype=INDEX_DTYPE)
+    else:
+        node_ranges = _static_radix_node_ranges_from_leaf_ranges(
+            template,
+            leaf_starts_np,
+            leaf_ends_np,
+            return_numpy=False,
+        )
 
     leaf_starts = jnp.asarray(leaf_starts_np, dtype=INDEX_DTYPE)
     rebuilt = template._replace(
         particle_indices=jnp.asarray(sorted_indices, dtype=INDEX_DTYPE),
         morton_codes=sorted_codes,
-        node_ranges=jnp.asarray(node_ranges_np, dtype=INDEX_DTYPE),
+        node_ranges=jnp.asarray(node_ranges, dtype=INDEX_DTYPE),
         bounds_min=jnp.asarray(bounds_resolved[0], dtype=positions.dtype),
         bounds_max=jnp.asarray(bounds_resolved[1], dtype=positions.dtype),
         leaf_codes=sorted_codes[leaf_starts],

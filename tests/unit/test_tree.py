@@ -490,7 +490,7 @@ def test_static_radix_tree_uses_fixed_count_buckets():
     assert not bool(np.asarray(tree.use_morton_geometry))
 
 
-def test_static_radix_refresh_preserves_structure_and_updates_order():
+def test_static_radix_refresh_preserves_structure_and_updates_order(monkeypatch):
     positions = jnp.array(
         [
             [-0.8, 0.0, 0.0],
@@ -517,6 +517,7 @@ def test_static_radix_refresh_preserves_structure_and_updates_order():
         return_reordered=True,
     )
     moved = positions.at[0, 0].set(0.95)
+    monkeypatch.setenv("YGGDRAX_STATIC_RADIX_REUSE_NODE_RANGES", "1")
 
     refreshed, *_ = rebuild_static_radix_tree_from_template(
         moved,
@@ -538,6 +539,7 @@ def test_static_radix_refresh_preserves_structure_and_updates_order():
         np.asarray(refreshed.particle_indices),
     )
     assert tree.node_ranges.shape == refreshed.node_ranges.shape
+    assert np.array_equal(np.asarray(tree.node_ranges), np.asarray(refreshed.node_ranges))
 
 
 def test_static_radix_geometry_uses_particle_ranges():
