@@ -5156,7 +5156,9 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             total_far_pairs = int(far_offsets64[-1])
             total_near_pairs = int(near_offsets64[-1])
             if total_far_pairs < 0 or total_near_pairs < 0:
-                raise RuntimeError("Dual-tree count-pass produced a negative pair total.")
+                raise RuntimeError(
+                    "Dual-tree count-pass produced a negative pair total."
+                )
             int32_max = (1 << 31) - 1
             if total_far_pairs > int32_max:
                 raise RuntimeError(
@@ -5201,7 +5203,9 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                 )
                 _raise_if_true(result.far_overflow, far_error_msg)
                 _raise_if_true(result.near_overflow, near_error_msg)
-                return _raw_to_compact_far_pairs(result), _result_to_neighbors(result, tree)
+                return _raw_to_compact_far_pairs(result), _result_to_neighbors(
+                    result, tree
+                )
             _emit_retry_event(
                 "queue_overflow",
                 attempt=attempt_idx,
@@ -5363,7 +5367,9 @@ def _raw_to_compact_far_pairs(
             f"cap={cap}. Increase "
             "JACCPOT_STATIC_STRICT_FUSED_COMPACT_FAR_PAIR_CAP."
         )
-        _raise_if_true(far_pair_count > jnp.asarray(cap, dtype=INDEX_DTYPE), overflow_msg)
+        _raise_if_true(
+            far_pair_count > jnp.asarray(cap, dtype=INDEX_DTYPE), overflow_msg
+        )
         if not isinstance(raw.far_pair_count, jax_core.Tracer):
             far_total = int(far_pair_count)
             if far_total > cap:
@@ -5887,9 +5893,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             retry_logger=retry_logger,
         )
         return (
-            _raw_to_compact_far_pairs(
-                raw, fixed_capacity=compact_far_pair_capacity
-            ),
+            _raw_to_compact_far_pairs(raw, fixed_capacity=compact_far_pair_capacity),
             _result_to_neighbors(raw, tree),
         )
 

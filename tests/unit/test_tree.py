@@ -539,7 +539,9 @@ def test_static_radix_refresh_preserves_structure_and_updates_order(monkeypatch)
         np.asarray(refreshed.particle_indices),
     )
     assert tree.node_ranges.shape == refreshed.node_ranges.shape
-    assert np.array_equal(np.asarray(tree.node_ranges), np.asarray(refreshed.node_ranges))
+    assert np.array_equal(
+        np.asarray(tree.node_ranges), np.asarray(refreshed.node_ranges)
+    )
 
 
 def test_static_radix_geometry_uses_particle_ranges():

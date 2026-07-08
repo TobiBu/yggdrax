@@ -828,12 +828,9 @@ def rebuild_static_radix_tree_from_template(
             "static_radix template leaf count mismatch: "
             f"refresh={int(leaf_starts_np.shape[0])} template={expected_leaves}"
         )
-    reuse_node_ranges = (
-        os.environ.get("YGGDRAX_STATIC_RADIX_REUSE_NODE_RANGES", "1")
-        .strip()
-        .lower()
-        in {"1", "true", "yes", "on"}
-    )
+    reuse_node_ranges = os.environ.get(
+        "YGGDRAX_STATIC_RADIX_REUSE_NODE_RANGES", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if reuse_node_ranges:
         node_ranges = jnp.asarray(template.node_ranges, dtype=INDEX_DTYPE)
     else:
