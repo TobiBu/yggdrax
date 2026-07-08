@@ -628,11 +628,16 @@ class DualTreeWalkResult(NamedTuple):
 
 
 class CompactTaggedFarPairs(NamedTuple):
-    """Exact-length far-pair payload for downstream adaptive-order consumers."""
+    """Compact far-pair payload plus the number of active entries.
+
+    When built under tracing, ``sources``/``targets``/``tags`` may be fixed-capacity
+    padded arrays.  ``far_pair_count`` records how many leading entries are valid.
+    """
 
     sources: Array
     targets: Array
     tags: Array
+    far_pair_count: Array
 
 
 class CompactTaggedOctreeFarPairs(NamedTuple):
@@ -4666,10 +4671,19 @@ def _run_far_only_compact_with_bounded_count_pass(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    steady_single_queue_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_STEADY_SINGLE_QUEUE",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if steady_single_queue_mode:
+        queue_candidates = [int(queue_max)]
     auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
-    queue_candidates.extend(
-        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
-    )
+    if not steady_single_queue_mode:
+        queue_candidates.extend(
+            int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+        )
     seen_queue_caps = set()
     queue_candidates = [
         int(cap)
@@ -4762,15 +4776,18 @@ def _run_far_only_compact_with_bounded_count_pass(
             )
             continue
 
-        observed_wf = int(max_wf)
-        queue_suggest = max(4, observed_wf + observed_wf // 2)
-        fill_queue_candidates = [
-            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
-        ]
-        if len(fill_queue_candidates) == 0:
+        if steady_single_queue_mode:
             fill_queue_candidates = [int(queue_capacity)]
-        elif fill_queue_candidates[0] != int(queue_suggest):
-            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+        else:
+            observed_wf = int(max_wf)
+            queue_suggest = max(4, observed_wf + observed_wf // 2)
+            fill_queue_candidates = [
+                int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+            ]
+            if len(fill_queue_candidates) == 0:
+                fill_queue_candidates = [int(queue_capacity)]
+            elif fill_queue_candidates[0] != int(queue_suggest):
+                fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
 
         far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
         total_far_pairs = int(far_offsets64[-1])
@@ -4846,10 +4863,19 @@ def _run_near_only_compact_with_bounded_count_pass(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    steady_single_queue_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_STEADY_SINGLE_QUEUE",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if steady_single_queue_mode:
+        queue_candidates = [int(queue_max)]
     auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
-    queue_candidates.extend(
-        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
-    )
+    if not steady_single_queue_mode:
+        queue_candidates.extend(
+            int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+        )
     seen_queue_caps = set()
     queue_candidates = [
         int(cap)
@@ -4938,15 +4964,18 @@ def _run_near_only_compact_with_bounded_count_pass(
             )
             continue
 
-        observed_wf = int(max_wf)
-        queue_suggest = max(4, observed_wf + observed_wf // 2)
-        fill_queue_candidates = [
-            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
-        ]
-        if len(fill_queue_candidates) == 0:
+        if steady_single_queue_mode:
             fill_queue_candidates = [int(queue_capacity)]
-        elif fill_queue_candidates[0] != int(queue_suggest):
-            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+        else:
+            observed_wf = int(max_wf)
+            queue_suggest = max(4, observed_wf + observed_wf // 2)
+            fill_queue_candidates = [
+                int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+            ]
+            if len(fill_queue_candidates) == 0:
+                fill_queue_candidates = [int(queue_capacity)]
+            elif fill_queue_candidates[0] != int(queue_suggest):
+                fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
 
         near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
         total_near_pairs = int(near_offsets64[-1])
@@ -5011,6 +5040,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
     timing_callback: Optional[Callable[[str, float], None]] = None,
+    compact_far_pair_capacity: Optional[int] = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Build compact far pairs and near neighbors from one shared count pass."""
 
@@ -5023,10 +5053,19 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
         max_capacity=queue_max,
         process_block=process_override,
     )
+    steady_single_queue_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_STEADY_SINGLE_QUEUE",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if steady_single_queue_mode:
+        queue_candidates = [int(queue_max)]
     auto_queue_candidates = _auto_pair_queue_candidates(total_nodes, num_internal)
-    queue_candidates.extend(
-        int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
-    )
+    if not steady_single_queue_mode:
+        queue_candidates.extend(
+            int(cap) for cap in auto_queue_candidates if int(cap) > int(queue_max)
+        )
     seen_queue_caps = set()
     queue_candidates = [
         int(cap)
@@ -5078,6 +5117,111 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
         if timing_callback is not None:
             timing_callback(name, float(time.perf_counter() - start))
 
+    one_shot_shared_mode = str(
+        os.environ.get(
+            "YGGDRAX_DUAL_TREE_SHARED_COUNT_FILL_ONE_SHOT",
+            "0",
+        )
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Steady-state fast path: one count + one fill at configured queue capacity.
+    # If overflow happens, fall back to the existing retry ladder below.
+    if one_shot_shared_mode:
+        queue_capacity = int(queue_max)
+        attempt_counter += 1
+        attempt_idx = attempt_counter
+        stage_t0 = time.perf_counter()
+        count_outputs = _dual_tree_walk_count_impl(
+            tree,
+            geometry,
+            float(theta),
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            dehnen_radius_scale=float(dehnen_radius_scale),
+            collect_far=True,
+            collect_near=True,
+            process_block=int(count_process_block),
+            max_pair_queue=int(queue_capacity),
+        )
+        _record_stage("dual_split_shared_count", stage_t0)
+        if len(count_outputs) == 3:
+            far_counts, near_counts, _max_wf = count_outputs
+            count_wf_overflow = jnp.bool_(False)
+        else:
+            far_counts, near_counts, _max_wf, count_wf_overflow = count_outputs
+        if not bool(count_wf_overflow):
+            far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
+            near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
+            total_far_pairs = int(far_offsets64[-1])
+            total_near_pairs = int(near_offsets64[-1])
+            if total_far_pairs < 0 or total_near_pairs < 0:
+                raise RuntimeError(
+                    "Dual-tree count-pass produced a negative pair total."
+                )
+            int32_max = (1 << 31) - 1
+            if total_far_pairs > int32_max:
+                raise RuntimeError(
+                    "Dual-tree traversal far-pair totals exceed signed int32 capacity."
+                )
+            if total_near_pairs > int32_max:
+                raise RuntimeError(
+                    "Dual-tree traversal neighbor totals exceed signed int32 capacity."
+                )
+
+            far_offsets = jnp.asarray(far_offsets64, dtype=INDEX_DTYPE)
+            near_offsets = jnp.asarray(near_offsets64, dtype=INDEX_DTYPE)
+            attempt_counter += 1
+            attempt_idx = attempt_counter
+            stage_t0 = time.perf_counter()
+            result = _dual_tree_walk_compact_fill_impl(
+                tree,
+                geometry,
+                far_offsets,
+                far_counts,
+                near_offsets,
+                near_counts,
+                float(theta),
+                mac_type=mac_type,
+                pair_policy=pair_policy,
+                policy_state=policy_state,
+                dehnen_radius_scale=float(dehnen_radius_scale),
+                max_pair_queue=int(queue_capacity),
+                total_far_pairs=int(total_far_pairs),
+                total_near_pairs=int(total_near_pairs),
+                collect_far=True,
+                collect_near=True,
+            )
+            _record_stage("dual_split_shared_combined_fill", stage_t0)
+            if not bool(result.queue_overflow):
+                _emit_retry_event(
+                    "success",
+                    attempt=attempt_idx,
+                    queue_capacity=int(queue_capacity),
+                    far_pair_count=int(result.far_pair_count),
+                    near_pair_count=int(result.near_pair_count),
+                )
+                _raise_if_true(result.far_overflow, far_error_msg)
+                _raise_if_true(result.near_overflow, near_error_msg)
+                return _raw_to_compact_far_pairs(result), _result_to_neighbors(
+                    result, tree
+                )
+            _emit_retry_event(
+                "queue_overflow",
+                attempt=attempt_idx,
+                queue_capacity=int(queue_capacity),
+                far_pair_count=int(result.far_pair_count),
+                near_pair_count=int(result.near_pair_count),
+            )
+        else:
+            _emit_retry_event(
+                "queue_overflow",
+                attempt=attempt_idx,
+                queue_capacity=int(queue_capacity),
+                far_pair_count=0,
+                near_pair_count=0,
+            )
+
     for queue_capacity in queue_candidates:
         attempt_counter += 1
         attempt_idx = attempt_counter
@@ -5111,15 +5255,18 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             )
             continue
 
-        observed_wf = int(max_wf)
-        queue_suggest = max(4, observed_wf + observed_wf // 2)
-        fill_queue_candidates = [
-            int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
-        ]
-        if len(fill_queue_candidates) == 0:
+        if steady_single_queue_mode:
             fill_queue_candidates = [int(queue_capacity)]
-        elif fill_queue_candidates[0] != int(queue_suggest):
-            fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
+        else:
+            observed_wf = int(max_wf)
+            queue_suggest = max(4, observed_wf + observed_wf // 2)
+            fill_queue_candidates = [
+                int(cap) for cap in queue_candidates if int(cap) >= int(queue_suggest)
+            ]
+            if len(fill_queue_candidates) == 0:
+                fill_queue_candidates = [int(queue_capacity)]
+            elif fill_queue_candidates[0] != int(queue_suggest):
+                fill_queue_candidates = [int(queue_suggest), *fill_queue_candidates]
 
         far_offsets64 = _exclusive_cumsum(far_counts, dtype=jnp.int64)
         near_offsets64 = _exclusive_cumsum(near_counts, dtype=jnp.int64)
@@ -5172,6 +5319,13 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                     near_pair_count=int(result.near_pair_count),
                 )
                 continue
+            _emit_retry_event(
+                "success",
+                attempt=attempt_idx,
+                queue_capacity=int(fill_queue_capacity),
+                far_pair_count=int(result.far_pair_count),
+                near_pair_count=int(result.near_pair_count),
+            )
             _raise_if_true(result.far_overflow, far_error_msg)
             _raise_if_true(result.near_overflow, near_error_msg)
             return _raw_to_compact_far_pairs(result), _result_to_neighbors(result, tree)
@@ -5179,14 +5333,66 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
     raise RuntimeError(queue_error_msg)
 
 
-def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarPairs:
-    """Return exact-length far-pair arrays without retaining traversal buffers."""
+def _compact_prefix_with_fixed_capacity(
+    values: Array,
+    *,
+    capacity: int,
+    fill_value: int,
+) -> Array:
+    """Return a fixed-capacity prefix, padding with sentinel values if needed."""
+
+    values_arr = jnp.asarray(values, dtype=INDEX_DTYPE)
+    cap = int(capacity)
+    if cap <= 0:
+        raise ValueError("compact far-pair capacity must be positive")
+    take = min(int(values_arr.shape[0]), cap)
+    prefix = values_arr[:take]
+    if take < cap:
+        padding = jnp.full((cap - take,), fill_value, dtype=INDEX_DTYPE)
+        prefix = jnp.concatenate([prefix, padding], axis=0)
+    return prefix
+
+
+def _raw_to_compact_far_pairs(
+    raw: _DualTreeWalkRawOutputs,
+    *,
+    fixed_capacity: Optional[int] = None,
+) -> CompactTaggedFarPairs:
+    """Return compact far-pair arrays without retaining traversal buffers."""
     far_pair_count = jnp.asarray(raw.far_pair_count, dtype=INDEX_DTYPE)
+    if fixed_capacity is not None:
+        cap = int(fixed_capacity)
+        overflow_msg = (
+            "strict fused compact far-pair cap exceeded: "
+            f"cap={cap}. Increase "
+            "JACCPOT_STATIC_STRICT_FUSED_COMPACT_FAR_PAIR_CAP."
+        )
+        _raise_if_true(
+            far_pair_count > jnp.asarray(cap, dtype=INDEX_DTYPE), overflow_msg
+        )
+        if not isinstance(raw.far_pair_count, jax_core.Tracer):
+            far_total = int(far_pair_count)
+            if far_total > cap:
+                raise RuntimeError(overflow_msg)
+        return CompactTaggedFarPairs(
+            sources=_compact_prefix_with_fixed_capacity(
+                raw.interaction_sources, capacity=cap, fill_value=-1
+            ),
+            targets=_compact_prefix_with_fixed_capacity(
+                raw.interaction_targets, capacity=cap, fill_value=-1
+            ),
+            tags=_compact_prefix_with_fixed_capacity(
+                raw.interaction_tags, capacity=cap, fill_value=-1
+            ),
+            far_pair_count=far_pair_count,
+        )
+
     if isinstance(raw.far_pair_count, jax_core.Tracer):
         return CompactTaggedFarPairs(
             sources=jnp.asarray(raw.interaction_sources, dtype=INDEX_DTYPE),
             targets=jnp.asarray(raw.interaction_targets, dtype=INDEX_DTYPE),
             tags=jnp.asarray(raw.interaction_tags, dtype=INDEX_DTYPE),
+            far_pair_count=far_pair_count,
         )
 
     far_total = int(far_pair_count)
@@ -5194,6 +5400,7 @@ def _raw_to_compact_far_pairs(raw: _DualTreeWalkRawOutputs) -> CompactTaggedFarP
         sources=jax.device_put(raw.interaction_sources[:far_total]),
         targets=jax.device_put(raw.interaction_targets[:far_total]),
         tags=jax.device_put(raw.interaction_tags[:far_total]),
+        far_pair_count=far_pair_count,
     )
 
 
@@ -5641,6 +5848,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
     timing_callback: Optional[Callable[[str, float], None]] = None,
+    compact_far_pair_capacity: Optional[int] = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Build compact far pairs and near neighbors with one shared count walk."""
 
@@ -5664,6 +5872,29 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             process_block=process_block,
             retry_logger=retry_logger,
             timing_callback=timing_callback,
+        )
+
+    if max_interactions_per_node is not None and not is_octree_topology:
+        raw = _run_dual_tree_walk_raw(
+            tree,
+            geometry,
+            theta,
+            mac_type=mac_type,
+            pair_policy=pair_policy,
+            policy_state=policy_state,
+            max_interactions_per_node=int(max_interactions_per_node),
+            max_neighbors_per_leaf=int(max_neighbors_per_leaf),
+            max_pair_queue=max_pair_queue,
+            traversal_config=None,
+            collect_far=True,
+            collect_near=True,
+            dehnen_radius_scale=dehnen_radius_scale,
+            process_block=process_block,
+            retry_logger=retry_logger,
+        )
+        return (
+            _raw_to_compact_far_pairs(raw, fixed_capacity=compact_far_pair_capacity),
+            _result_to_neighbors(raw, tree),
         )
 
     far_pairs = build_compact_far_pairs(
