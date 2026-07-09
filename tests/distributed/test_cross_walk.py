@@ -11,14 +11,13 @@ Single-device (no shard_map needed for the kernel itself):
     JAX_PLATFORMS=cpu pytest tests/distributed/test_cross_walk.py -q
 """
 
-import numpy as np
-
 import jax.numpy as jnp
+import numpy as np
 
 from yggdrax._tree_impl import build_tree
 from yggdrax.bounds import infer_bounds
-from yggdrax.geometry import compute_tree_geometry
 from yggdrax.distributed import dual_tree_walk_cross
+from yggdrax.geometry import compute_tree_geometry
 
 _LEAF = 8
 _THETA = 0.5
@@ -117,13 +116,13 @@ def _run_partition_check(seed):
 
         cov_set = set(covered)
         # complete coverage of all source particles
-        assert cov_set == set(range(n_source)), (
-            f"leaf_row {leaf_row}: covered {len(cov_set)} of {n_source} source parts"
-        )
+        assert cov_set == set(
+            range(n_source)
+        ), f"leaf_row {leaf_row}: covered {len(cov_set)} of {n_source} source parts"
         # disjoint tiling (no source particle counted twice)
-        assert len(covered) == n_source, (
-            f"leaf_row {leaf_row}: overlap, {len(covered)} entries for {n_source} parts"
-        )
+        assert (
+            len(covered) == n_source
+        ), f"leaf_row {leaf_row}: overlap, {len(covered)} entries for {n_source} parts"
 
 
 def test_cross_walk_partitions_sources_seed0():
@@ -144,7 +143,11 @@ def test_cross_walk_offsets_index_sources_consistently():
     t_tree, t_geom = _build(tgt, bounds)
     s_tree, s_geom = _build(src, bounds)
     res = dual_tree_walk_cross(
-        t_tree, t_geom, s_tree, s_geom, _THETA,
+        t_tree,
+        t_geom,
+        s_tree,
+        s_geom,
+        _THETA,
         mac_type=_MAC,
         max_interactions_per_node=256,
         max_neighbors_per_leaf=256,
@@ -172,7 +175,11 @@ def test_cross_walk_produces_far_and_near():
     t_tree, t_geom = _build(tgt, bounds)
     s_tree, s_geom = _build(src, bounds)
     res = dual_tree_walk_cross(
-        t_tree, t_geom, s_tree, s_geom, _THETA,
+        t_tree,
+        t_geom,
+        s_tree,
+        s_geom,
+        _THETA,
         mac_type=_MAC,
         max_interactions_per_node=256,
         max_neighbors_per_leaf=256,

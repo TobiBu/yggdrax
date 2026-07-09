@@ -71,9 +71,7 @@ def make_mesh(
     if n <= 0:
         raise ValueError(f"num_devices must be positive, got {n}")
     if n > len(pool):
-        raise ValueError(
-            f"requested {n} devices but only {len(pool)} are available"
-        )
+        raise ValueError(f"requested {n} devices but only {len(pool)} are available")
 
     # Auto axis types keep arrays free of sharding-in-types annotations, so the
     # classic data-parallel ``shard_map`` (Manual inside the body) composes

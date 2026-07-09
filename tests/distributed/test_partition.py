@@ -6,10 +6,9 @@ Run on forced host CPU devices (buffer-fallback exchange) or a multi-GPU node:
         pytest tests/distributed/test_partition.py -q
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from yggdrax.distributed import device_count, make_mesh, sfc_decompose
 from yggdrax.morton import morton_encode

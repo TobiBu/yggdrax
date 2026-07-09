@@ -33,8 +33,6 @@ import jax.numpy as jnp
 from jax import lax
 from jaxtyping import Array
 
-from ..dtypes import INDEX_DTYPE, as_index
-from ..geometry import TreeGeometry
 from .._interactions_impl import (
     _ACTION_ACCEPT,
     _ACTION_NEAR,
@@ -49,6 +47,8 @@ from .._interactions_impl import (
     _per_key_prefix,
     _resolve_leaf_ordering,
 )
+from ..dtypes import INDEX_DTYPE, as_index
+from ..geometry import TreeGeometry
 
 # One target and one source child at most, expanded per split case.
 _MAX_CROSS_REFINEMENT_PAIRS = 4
@@ -284,6 +284,7 @@ def dual_tree_walk_cross_impl(
 
         # ---- far update (forward only: target_node <- source_node) ----
         if collect_far:
+
             def _far(carry):
                 buf, cnts, tot, ofl = carry
                 prefix = _per_key_prefix(
@@ -312,6 +313,7 @@ def dual_tree_walk_cross_impl(
 
         # ---- near update (forward only: target_leaf <- source_leaf node) ----
         if collect_near:
+
             def _near(carry):
                 buf, cnts, ofl = carry
                 lt = jnp.where(near, t_leaf_position[st_t], as_index(0))
@@ -432,7 +434,10 @@ def dual_tree_walk_cross_impl(
     if collect_far:
         level_counts = far_counts[nbl]
         write_off = jnp.concatenate(
-            [jnp.zeros((1,), dtype=INDEX_DTYPE), jnp.cumsum(level_counts, dtype=INDEX_DTYPE)]
+            [
+                jnp.zeros((1,), dtype=INDEX_DTYPE),
+                jnp.cumsum(level_counts, dtype=INDEX_DTYPE),
+            ]
         )
         node_rep = jnp.repeat(jnp.arange(num_nbl, dtype=INDEX_DTYPE), Kf)
         slot_rep = jnp.tile(jnp.arange(Kf, dtype=INDEX_DTYPE), num_nbl)
@@ -442,13 +447,17 @@ def dual_tree_walk_cross_impl(
         src_vals = far_buffer[node_ids, slot_rep]
         safe = jnp.where(valid_s, write_pos, as_index(max_far))
         interaction_sources = (
-            jnp.full((max_far,), -1, dtype=INDEX_DTYPE).at[safe].set(src_vals, mode="drop")
+            jnp.full((max_far,), -1, dtype=INDEX_DTYPE)
+            .at[safe]
+            .set(src_vals, mode="drop")
         )
         interaction_targets = (
-            jnp.full((max_far,), -1, dtype=INDEX_DTYPE).at[safe].set(node_ids, mode="drop")
+            jnp.full((max_far,), -1, dtype=INDEX_DTYPE)
+            .at[safe]
+            .set(node_ids, mode="drop")
         )
-        far_node_offsets = jnp.zeros((t_total,), dtype=INDEX_DTYPE).at[nbl].set(
-            write_off[:-1]
+        far_node_offsets = (
+            jnp.zeros((t_total,), dtype=INDEX_DTYPE).at[nbl].set(write_off[:-1])
         )
         interaction_offsets = jnp.concatenate(
             [far_node_offsets, jnp.sum(far_counts, dtype=INDEX_DTYPE)[None]]
@@ -467,13 +476,18 @@ def dual_tree_walk_cross_impl(
         n_slot_rep = jnp.tile(jnp.arange(Kn, dtype=INDEX_DTYPE), t_leaves)
         n_valid = n_slot_rep < near_counts[n_node_rep]
         n_write_off = jnp.concatenate(
-            [jnp.zeros((1,), dtype=INDEX_DTYPE), jnp.cumsum(near_counts, dtype=INDEX_DTYPE)]
+            [
+                jnp.zeros((1,), dtype=INDEX_DTYPE),
+                jnp.cumsum(near_counts, dtype=INDEX_DTYPE),
+            ]
         )
         n_write_pos = n_write_off[n_node_rep] + n_slot_rep
         n_vals = nbr_buffer[n_node_rep, n_slot_rep]
         n_safe = jnp.where(n_valid, n_write_pos, as_index(max_near))
         neighbor_indices = (
-            jnp.full((max_near,), -1, dtype=INDEX_DTYPE).at[n_safe].set(n_vals, mode="drop")
+            jnp.full((max_near,), -1, dtype=INDEX_DTYPE)
+            .at[n_safe]
+            .set(n_vals, mode="drop")
         )
         neighbor_offsets = n_write_off
     else:
@@ -484,7 +498,9 @@ def dual_tree_walk_cross_impl(
         interaction_offsets=interaction_offsets,
         interaction_sources=interaction_sources,
         interaction_targets=interaction_targets,
-        interaction_tags=jnp.full((interaction_sources.shape[0],), -1, dtype=INDEX_DTYPE),
+        interaction_tags=jnp.full(
+            (interaction_sources.shape[0],), -1, dtype=INDEX_DTYPE
+        ),
         interaction_counts=far_counts,
         neighbor_offsets=neighbor_offsets,
         neighbor_indices=neighbor_indices,

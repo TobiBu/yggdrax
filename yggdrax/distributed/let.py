@@ -52,10 +52,10 @@ class CoarseFrontier:
     leaf-up level cut without changing the force path.
     """
 
-    mass: Array          # [num_leaves]
-    com: Array           # [num_leaves, 3]
-    node_range: Array    # [num_leaves, 2] particle range in the local tree
-    node_id: Array       # [num_leaves] local node id (-1 = empty/padding leaf)
+    mass: Array  # [num_leaves]
+    com: Array  # [num_leaves, 3]
+    node_range: Array  # [num_leaves, 2] particle range in the local tree
+    node_id: Array  # [num_leaves] local node id (-1 = empty/padding leaf)
 
 
 def build_coarse_frontier(
@@ -78,9 +78,7 @@ def build_coarse_frontier(
     f_com = jnp.where(nonempty[:, None], node_com[leaf_ids], node_com[root])
     f_range = node_ranges[leaf_ids]
     f_nodeid = jnp.where(nonempty, leaf_ids, as_index(-1))
-    return CoarseFrontier(
-        mass=f_mass, com=f_com, node_range=f_range, node_id=f_nodeid
-    )
+    return CoarseFrontier(mass=f_mass, com=f_com, node_range=f_range, node_id=f_nodeid)
 
 
 @dataclass
@@ -90,9 +88,9 @@ class GlobalCoarseTree:
     tree: object
     geometry: object
     moments: object
-    tag_domain: Array     # [ncoarse] origin GPU of each coarse particle
-    tag_node_id: Array    # [ncoarse] origin local node id (-1 = padding)
-    tag_range: Array      # [ncoarse, 2] origin particle range
+    tag_domain: Array  # [ncoarse] origin GPU of each coarse particle
+    tag_node_id: Array  # [ncoarse] origin local node id (-1 = padding)
+    tag_range: Array  # [ncoarse, 2] origin particle range
     positions_sorted: Array
     masses_sorted: Array
 
@@ -114,18 +112,22 @@ def gather_global_coarse_tree(
     n_top = frontier.mass.shape[0]
     me = jax.lax.axis_index(axis_name)
 
-    coms = jax.lax.all_gather(frontier.com, axis_name, tiled=True)          # [ncoarse,3]
-    masses = jax.lax.all_gather(frontier.mass, axis_name, tiled=True)       # [ncoarse]
+    coms = jax.lax.all_gather(frontier.com, axis_name, tiled=True)  # [ncoarse,3]
+    masses = jax.lax.all_gather(frontier.mass, axis_name, tiled=True)  # [ncoarse]
     domain = jax.lax.all_gather(
         jnp.broadcast_to(me, (n_top,)).astype(INDEX_DTYPE), axis_name, tiled=True
     )
     node_id = jax.lax.all_gather(frontier.node_id, axis_name, tiled=True)
-    node_range = jax.lax.all_gather(frontier.node_range, axis_name, tiled=True)  # [ncoarse,2]
+    node_range = jax.lax.all_gather(
+        frontier.node_range, axis_name, tiled=True
+    )  # [ncoarse,2]
 
     tree, pos_sorted, mass_sorted, _inv = build_tree(
         coms, masses, bounds, return_reordered=True, leaf_size=int(coarse_leaf_size)
     )
-    geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=int(coarse_leaf_size))
+    geometry = compute_tree_geometry(
+        tree, pos_sorted, max_leaf_size=int(coarse_leaf_size)
+    )
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
 
     # Reorder origin tags into the coarse tree's Morton-sorted particle order.
@@ -146,11 +148,11 @@ def gather_global_coarse_tree(
 class CoarseTreeMetrics:
     """Global-view diagnostics for the coarse-tree driver (testing)."""
 
-    frontier_mass_sum: Array   # [ndev] per-domain frontier mass total
-    domain_mass: Array         # [ndev] per-domain root mass
-    coarse_root_mass: Array    # [ndev] coarse-tree total mass (should be global)
-    coarse_root_com: Array     # [ndev, 3] coarse-tree COM (should be replicated)
-    n_coarse_valid: Array      # [ndev] non-empty coarse leaves (== global count)
+    frontier_mass_sum: Array  # [ndev] per-domain frontier mass total
+    domain_mass: Array  # [ndev] per-domain root mass
+    coarse_root_mass: Array  # [ndev] coarse-tree total mass (should be global)
+    coarse_root_com: Array  # [ndev, 3] coarse-tree COM (should be replicated)
+    n_coarse_valid: Array  # [ndev] non-empty coarse leaves (== global count)
 
 
 def build_distributed_coarse_tree(
@@ -185,8 +187,13 @@ def build_distributed_coarse_tree(
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
         p, m, c, cnt = sfc_partition(
-            pos, mass, ndev, output_capacity=output_capacity, bounds=bounds,
-            num_samples=num_samples, axis_name=axis_name,
+            pos,
+            mass,
+            ndev,
+            output_capacity=output_capacity,
+            bounds=bounds,
+            num_samples=num_samples,
+            axis_name=axis_name,
         )
         if equalize:
             p, m, c, cnt = equalize_domain(
@@ -265,12 +272,18 @@ def build_remote_coarse_tree(
     # raw RadixTree, so jaccpot's Tree-typed stages (e.g. compute_node_multipoles
     # for the remote M2L source) accept it directly.
     tree = Tree.from_particles(
-        r_coms, r_mass, tree_type="radix", bounds=bounds, return_reordered=True,
+        r_coms,
+        r_mass,
+        tree_type="radix",
+        bounds=bounds,
+        return_reordered=True,
         leaf_size=int(coarse_leaf_size),
     )
     pos_sorted = tree.positions_sorted
     mass_sorted = tree.masses_sorted
-    geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=int(coarse_leaf_size))
+    geometry = compute_tree_geometry(
+        tree, pos_sorted, max_leaf_size=int(coarse_leaf_size)
+    )
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
 
     pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
@@ -290,12 +303,12 @@ def build_remote_coarse_tree(
 class ClassifyMetrics:
     """Global-view diagnostics for the remote classification driver (testing)."""
 
-    remote_root_mass: Array   # [ndev] mass of the remote coarse tree
-    own_domain_mass: Array    # [ndev] own domain total mass
-    total_mass: Array         # [ndev] global total mass (replicated)
-    far_count: Array          # [ndev] remote far (M2L) interactions
-    near_count: Array         # [ndev] remote near (import) interactions
-    overflow: Array           # [ndev] bool: any walk capacity overflow
+    remote_root_mass: Array  # [ndev] mass of the remote coarse tree
+    own_domain_mass: Array  # [ndev] own domain total mass
+    total_mass: Array  # [ndev] global total mass (replicated)
+    far_count: Array  # [ndev] remote far (M2L) interactions
+    near_count: Array  # [ndev] remote near (import) interactions
+    overflow: Array  # [ndev] bool: any walk capacity overflow
 
 
 def classify_against_remote(
@@ -336,8 +349,13 @@ def classify_against_remote(
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
         p, m, c, cnt = sfc_partition(
-            pos, mass, ndev, output_capacity=output_capacity, bounds=bounds,
-            num_samples=num_samples, axis_name=axis_name,
+            pos,
+            mass,
+            ndev,
+            output_capacity=output_capacity,
+            bounds=bounds,
+            num_samples=num_samples,
+            axis_name=axis_name,
         )
         if equalize:
             p, m, c, cnt = equalize_domain(
@@ -357,7 +375,11 @@ def classify_against_remote(
         rroot = as_index(jnp.argmin(jnp.asarray(rct.tree.parent)))
 
         res = dual_tree_walk_cross_impl(
-            tree, geom, rct.tree, rct.geometry, theta,
+            tree,
+            geom,
+            rct.tree,
+            rct.geometry,
+            theta,
             mac_type=mac_type,
             max_interactions_per_node=max_interactions_per_node,
             max_neighbors_per_leaf=max_neighbors_per_leaf,
@@ -396,13 +418,13 @@ class HaloImport:
     imported halo particles.
     """
 
-    positions: Array   # [max_req_leaves * leaf_size, 3]
-    masses: Array      # [max_req_leaves * leaf_size]
-    gid: Array         # [max_req_leaves * leaf_size] source global id (-1 = pad)
-    valid: Array       # [max_req_leaves * leaf_size] bool
+    positions: Array  # [max_req_leaves * leaf_size, 3]
+    masses: Array  # [max_req_leaves * leaf_size]
+    gid: Array  # [max_req_leaves * leaf_size] source global id (-1 = pad)
+    valid: Array  # [max_req_leaves * leaf_size] bool
     coarse_to_halo: Array  # [n_remote] coarse sorted position -> halo block (-1)
-    needed_mass: Array   # scalar: total mass of the requested remote leaves
-    imported_mass: Array # scalar: total mass actually received (== needed_mass)
+    needed_mass: Array  # scalar: total mass of the requested remote leaves
+    imported_mass: Array  # scalar: total mass actually received (== needed_mass)
     request_overflow: Array  # scalar bool
 
 
@@ -449,7 +471,9 @@ def import_near_halo(
     dest = jnp.where(valid_req, rct.tag_domain[safe_pos], as_index(ndev))
     start = jnp.where(valid_req, rct.tag_range[safe_pos, 0], as_index(0))
     count = jnp.where(
-        valid_req, rct.tag_range[safe_pos, 1] - rct.tag_range[safe_pos, 0] + 1, as_index(0)
+        valid_req,
+        rct.tag_range[safe_pos, 1] - rct.tag_range[safe_pos, 0] + 1,
+        as_index(0),
     )
     request_overflow = jnp.sum(needed.astype(INDEX_DTYPE)) > as_index(max_req_leaves)
 
@@ -485,9 +509,7 @@ def import_near_halo(
     safe_idx = jnp.clip(idx, 0, n_local - 1)
     resp_pos = jnp.where(in_leaf[..., None], positions_sorted[safe_idx], 0.0)
     resp_mass = jnp.where(in_leaf, masses_sorted[safe_idx], 0.0)
-    resp_gid = jnp.where(
-        in_leaf, me * as_index(_GID_STRIDE) + safe_idx, as_index(-1)
-    )
+    resp_gid = jnp.where(in_leaf, me * as_index(_GID_STRIDE) + safe_idx, as_index(-1))
     R = max_recv_leaves
     resp_posm = jnp.concatenate([resp_pos, resp_mass[..., None]], axis=-1).reshape(
         (R * leaf_size, 4)
@@ -501,7 +523,11 @@ def import_near_halo(
         resp_posm, send_sizes_b, output_capacity=cap_b, axis_name=axis_name
     )
     halo_gid, _, _ = ragged_all_to_all_exchange(
-        resp_gid, send_sizes_b, output_capacity=cap_b, axis_name=axis_name, fill_value=-1.0
+        resp_gid,
+        send_sizes_b,
+        output_capacity=cap_b,
+        axis_name=axis_name,
+        fill_value=-1.0,
     )
     halo_pos = halo_posm[:, :3]
     halo_mass = halo_posm[:, 3]
@@ -526,12 +552,12 @@ def import_near_halo(
 class ImportMetrics:
     """Global-view diagnostics for the halo-import driver (testing)."""
 
-    needed_mass: Array       # [ndev] mass of requested remote leaves
-    imported_mass: Array     # [ndev] mass actually received (== needed_mass)
+    needed_mass: Array  # [ndev] mass of requested remote leaves
+    imported_mass: Array  # [ndev] mass actually received (== needed_mass)
     request_overflow: Array  # [ndev] bool
-    wrong_domain: Array      # [ndev] bool: any halo particle sourced from self
-    n_halo_valid: Array      # [ndev] imported particle count
-    n_mapped: Array          # [ndev] coarse positions mapped to a halo block
+    wrong_domain: Array  # [ndev] bool: any halo particle sourced from self
+    n_halo_valid: Array  # [ndev] imported particle count
+    n_mapped: Array  # [ndev] coarse positions mapped to a halo block
 
 
 def distributed_let_import(
@@ -570,8 +596,13 @@ def distributed_let_import(
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
         p, m, c, cnt = sfc_partition(
-            pos, mass, ndev, output_capacity=output_capacity, bounds=bounds,
-            num_samples=num_samples, axis_name=axis_name,
+            pos,
+            mass,
+            ndev,
+            output_capacity=output_capacity,
+            bounds=bounds,
+            num_samples=num_samples,
+            axis_name=axis_name,
         )
         if equalize:
             p, m, c, cnt = equalize_domain(
@@ -586,19 +617,31 @@ def distributed_let_import(
         fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
         rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
         res = dual_tree_walk_cross_impl(
-            tree, geom, rct.tree, rct.geometry, theta,
+            tree,
+            geom,
+            rct.tree,
+            rct.geometry,
+            theta,
             mac_type=mac_type,
             max_interactions_per_node=max_interactions_per_node,
             max_neighbors_per_leaf=max_neighbors_per_leaf,
             max_pair_queue=max_pair_queue,
         )
         halo = import_near_halo(
-            rct, res, pos_sorted, mass_sorted, ndev,
-            leaf_size=leaf_size, max_req_leaves=max_req, max_recv_leaves=max_recv,
+            rct,
+            res,
+            pos_sorted,
+            mass_sorted,
+            ndev,
+            leaf_size=leaf_size,
+            max_req_leaves=max_req,
+            max_recv_leaves=max_recv,
             axis_name=axis_name,
         )
         me = jax.lax.axis_index(axis_name)
-        halo_domain = jnp.where(halo.valid, halo.gid // as_index(_GID_STRIDE), as_index(-1))
+        halo_domain = jnp.where(
+            halo.valid, halo.gid // as_index(_GID_STRIDE), as_index(-1)
+        )
         wrong = jnp.any(halo.valid & (halo_domain == me))
         return (
             halo.needed_mass[None],

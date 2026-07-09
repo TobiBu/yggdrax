@@ -13,10 +13,9 @@ leaves each GPU classified, no more, no less. Invariants:
         pytest tests/distributed/test_import.py -q
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from yggdrax.distributed import device_count, distributed_let_import, make_mesh
 

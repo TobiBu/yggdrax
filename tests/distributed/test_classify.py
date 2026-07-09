@@ -14,10 +14,9 @@ test_cross_walk (the cross walk is correct for any two trees).
         pytest tests/distributed/test_classify.py -q
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from yggdrax.distributed import classify_against_remote, device_count, make_mesh
 
@@ -52,9 +51,9 @@ def metrics():
 
 def test_remote_tree_excludes_own_domain(metrics):
     _, _, m = metrics
-    remote = np.asarray(m.remote_root_mass)   # [ndev]
-    own = np.asarray(m.own_domain_mass)       # [ndev]
-    total = np.asarray(m.total_mass)          # [ndev], replicated
+    remote = np.asarray(m.remote_root_mass)  # [ndev]
+    own = np.asarray(m.own_domain_mass)  # [ndev]
+    total = np.asarray(m.total_mass)  # [ndev], replicated
     # remote mass == global total - own domain mass
     np.testing.assert_allclose(remote, total - own, rtol=1e-3, atol=1e-3)
 

@@ -40,13 +40,13 @@ class DistributedTreeMoments:
     rows).
     """
 
-    node_mass: Array          # [ndev * total_nodes]
-    node_com: Array           # [ndev * total_nodes, 3]
-    domain_mass: Array        # [ndev]
-    domain_com: Array         # [ndev, 3]
-    top_mass: Array           # [ndev, ndev]  (each row = all domains' masses)
-    top_com: Array            # [ndev, ndev, 3]
-    counts: Array             # [ndev]
+    node_mass: Array  # [ndev * total_nodes]
+    node_com: Array  # [ndev * total_nodes, 3]
+    domain_mass: Array  # [ndev]
+    domain_com: Array  # [ndev, 3]
+    top_mass: Array  # [ndev, ndev]  (each row = all domains' masses)
+    top_com: Array  # [ndev, ndev, 3]
+    counts: Array  # [ndev]
 
 
 def sanitize_padding(positions: Array, masses: Array, count: Array):
@@ -92,8 +92,8 @@ def build_local_moments(
     _geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
 
-    node_mass = moments.mass            # [total_nodes]
-    node_com = moments.center_of_mass   # [total_nodes, 3]
+    node_mass = moments.mass  # [total_nodes]
+    node_com = moments.center_of_mass  # [total_nodes, 3]
     # Root (node 0) of the local LBVH spans the whole domain -> its moment is
     # the domain's aggregate (coarsest) multipole.
     domain_mass = node_mass[0]
@@ -101,7 +101,7 @@ def build_local_moments(
 
     # Shared top tree: every device learns every domain's coarse moment.
     top_mass = jax.lax.all_gather(domain_mass[None], axis_name, tiled=True)  # [ndev]
-    top_com = jax.lax.all_gather(domain_com[None], axis_name, tiled=True)    # [ndev,3]
+    top_com = jax.lax.all_gather(domain_com[None], axis_name, tiled=True)  # [ndev,3]
     return node_mass, node_com, domain_mass, domain_com, top_mass, top_com
 
 

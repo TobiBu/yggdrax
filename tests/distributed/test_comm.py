@@ -9,11 +9,10 @@ They also run unchanged on a real multi-GPU node (they just pick up whatever
 devices JAX exposes).
 """
 
-import numpy as np
-import pytest
-
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from jax.sharding import PartitionSpec as P
 
 try:  # stable location across recent JAX versions
@@ -77,9 +76,7 @@ def test_exchange_sizes_transposes_matrix():
     def fn(send_local):
         return exchange_sizes(send_local)
 
-    recv = shard_map(
-        fn, mesh=mesh, in_specs=P(AXIS_NAME), out_specs=P(AXIS_NAME)
-    )(send)
+    recv = shard_map(fn, mesh=mesh, in_specs=P(AXIS_NAME), out_specs=P(AXIS_NAME))(send)
     recv = np.asarray(recv).reshape(ndev, ndev)  # recv[i] = sizes i got per source
     # device i receives from source s exactly full[s, i]
     np.testing.assert_array_equal(recv, full.T)
@@ -156,9 +153,7 @@ def test_ragged_conserves_total_rows():
     operand_j = jnp.asarray(operand.reshape(ndev * c_in, feat))
 
     def fn(op, ss):
-        out, recv_sizes, _ = ragged_all_to_all_exchange(
-            op, ss, output_capacity=c_out
-        )
+        out, recv_sizes, _ = ragged_all_to_all_exchange(op, ss, output_capacity=c_out)
         return jnp.sum(recv_sizes)[None]
 
     recv_totals = shard_map(

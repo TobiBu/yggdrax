@@ -11,10 +11,9 @@ Invariants:
         pytest tests/distributed/test_let.py -q
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from yggdrax.distributed import build_distributed_coarse_tree, device_count, make_mesh
 
