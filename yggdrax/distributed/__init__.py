@@ -16,13 +16,16 @@ from .comm import (
     exchange_sizes,
     ragged_all_to_all_exchange,
 )
-from .cross_walk import dual_tree_walk_cross
+from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
 from .let import (
+    ClassifyMetrics,
     CoarseFrontier,
     CoarseTreeMetrics,
     GlobalCoarseTree,
     build_coarse_frontier,
     build_distributed_coarse_tree,
+    build_remote_coarse_tree,
+    classify_against_remote,
     gather_global_coarse_tree,
 )
 from .local_tree import (
@@ -42,6 +45,7 @@ from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
 
 __all__ = [
     "AXIS_NAME",
+    "ClassifyMetrics",
     "CoarseFrontier",
     "CoarseTreeMetrics",
     "DistributedTreeMoments",
@@ -53,9 +57,12 @@ __all__ = [
     "build_coarse_frontier",
     "build_distributed_coarse_tree",
     "build_local_moments",
+    "build_remote_coarse_tree",
+    "classify_against_remote",
     "device_count",
     "distributed_tree_moments",
     "dual_tree_walk_cross",
+    "dual_tree_walk_cross_impl",
     "equalize_domain",
     "gather_global_coarse_tree",
     "exchange_pytree",

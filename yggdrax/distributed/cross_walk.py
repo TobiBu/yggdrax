@@ -92,18 +92,7 @@ def _children_full(tree, total_nodes, num_internal):
     return left, right
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "max_interactions_per_node",
-        "max_neighbors_per_leaf",
-        "max_pair_queue",
-        "mac_type",
-        "collect_far",
-        "collect_near",
-    ),
-)
-def dual_tree_walk_cross(
+def dual_tree_walk_cross_impl(
     target_tree: object,
     target_geometry: TreeGeometry,
     source_tree: object,
@@ -118,7 +107,10 @@ def dual_tree_walk_cross(
     collect_far: bool = True,
     collect_near: bool = True,
 ) -> DualTreeWalkResult:
-    """Dual walk of target-tree nodes against source-tree nodes.
+    """Dual walk of target-tree nodes against source-tree nodes (un-jitted impl).
+
+    Call this raw form inside another transform (e.g. ``shard_map``); use the
+    jitted :func:`dual_tree_walk_cross` wrapper standalone.
 
     Far list is keyed by target node (``target_node <- source_node``); near list
     is keyed by target leaf (``target_leaf <- source_leaf``). Fixed-capacity,
@@ -498,4 +490,17 @@ def dual_tree_walk_cross(
     )
 
 
-__all__ = ["dual_tree_walk_cross"]
+dual_tree_walk_cross = partial(
+    jax.jit,
+    static_argnames=(
+        "max_interactions_per_node",
+        "max_neighbors_per_leaf",
+        "max_pair_queue",
+        "mac_type",
+        "collect_far",
+        "collect_near",
+    ),
+)(dual_tree_walk_cross_impl)
+
+
+__all__ = ["dual_tree_walk_cross", "dual_tree_walk_cross_impl"]

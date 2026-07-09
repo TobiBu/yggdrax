@@ -217,11 +217,169 @@ def build_distributed_coarse_tree(
     return CoarseTreeMetrics(*outs)
 
 
+def build_remote_coarse_tree(
+    frontier: CoarseFrontier,
+    ndev: int,
+    *,
+    bounds: tuple[Array, Array],
+    axis_name: str = AXIS_NAME,
+    coarse_leaf_size: int = 1,
+) -> GlobalCoarseTree:
+    """Coarse tree over *other* domains' frontiers only (own domain excluded).
+
+    Cross-walking the local tree against this yields purely remote far (M2L) and
+    near (import) interactions -- the local self-walk already covers own-domain
+    pairs at full resolution, so excluding own domain here prevents any
+    double-counting. Own-domain frontier nodes are dropped structurally (not
+    just mass-zeroed), so they never clog the near list.
+    """
+
+    n_top = frontier.mass.shape[0]
+    me = jax.lax.axis_index(axis_name)
+
+    coms = jax.lax.all_gather(frontier.com, axis_name, tiled=True)
+    masses = jax.lax.all_gather(frontier.mass, axis_name, tiled=True)
+    domain = jax.lax.all_gather(
+        jnp.broadcast_to(me, (n_top,)).astype(INDEX_DTYPE), axis_name, tiled=True
+    )
+    node_id = jax.lax.all_gather(frontier.node_id, axis_name, tiled=True)
+    node_range = jax.lax.all_gather(frontier.node_range, axis_name, tiled=True)
+
+    # Compact to the (ndev-1)*n_top remote coarse particles (static size).
+    keep = domain != me
+    n_remote = (ndev - 1) * n_top
+    idx = jnp.nonzero(keep, size=n_remote, fill_value=0)[0]
+    r_coms = coms[idx]
+    r_mass = masses[idx]
+    r_domain = domain[idx]
+    r_node_id = node_id[idx]
+    r_range = node_range[idx]
+
+    tree, pos_sorted, mass_sorted, _inv = build_tree(
+        r_coms, r_mass, bounds, return_reordered=True, leaf_size=int(coarse_leaf_size)
+    )
+    geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=int(coarse_leaf_size))
+    moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
+
+    pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
+    return GlobalCoarseTree(
+        tree=tree,
+        geometry=geometry,
+        moments=moments,
+        tag_domain=r_domain[pidx],
+        tag_node_id=r_node_id[pidx],
+        tag_range=r_range[pidx],
+        positions_sorted=pos_sorted,
+        masses_sorted=mass_sorted,
+    )
+
+
+@dataclass
+class ClassifyMetrics:
+    """Global-view diagnostics for the remote classification driver (testing)."""
+
+    remote_root_mass: Array   # [ndev] mass of the remote coarse tree
+    own_domain_mass: Array    # [ndev] own domain total mass
+    total_mass: Array         # [ndev] global total mass (replicated)
+    far_count: Array          # [ndev] remote far (M2L) interactions
+    near_count: Array         # [ndev] remote near (import) interactions
+    overflow: Array           # [ndev] bool: any walk capacity overflow
+
+
+def classify_against_remote(
+    mesh,
+    positions: Array,
+    masses: Array,
+    *,
+    leaf_size: int,
+    output_capacity: int,
+    theta: float = 0.5,
+    mac_type: str = "bh",
+    max_interactions_per_node: int = 256,
+    max_neighbors_per_leaf: int = 256,
+    max_pair_queue: int = 8192,
+    num_samples: int = 8,
+    equalize: bool = True,
+    axis_name: str = AXIS_NAME,
+) -> ClassifyMetrics:
+    """Cross-walk each GPU's local tree against the remote-only coarse tree.
+
+    Produces the far (remote M2L) and near (remote import) classifications that
+    Phase-3 stage 3 turns into an actual particle import. This driver surfaces
+    the invariants; the far/near *lists* are consumed by later stages.
+    """
+
+    try:  # stable across recent JAX versions
+        from jax import shard_map
+    except ImportError:  # pragma: no cover
+        from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    from .cross_walk import dual_tree_walk_cross_impl
+    from .local_tree import sanitize_padding
+    from .partition import equalize_domain, global_bounds, sfc_partition
+
+    ndev = mesh.size
+
+    def fn(pos, mass):
+        bounds = global_bounds(pos, axis_name=axis_name)
+        p, m, c, cnt = sfc_partition(
+            pos, mass, ndev, output_capacity=output_capacity, bounds=bounds,
+            num_samples=num_samples, axis_name=axis_name,
+        )
+        if equalize:
+            p, m, c, cnt = equalize_domain(
+                p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
+            )
+        p, m = sanitize_padding(p, m, cnt)
+        tree, pos_sorted, mass_sorted, _ = build_tree(
+            p, m, bounds, return_reordered=True, leaf_size=leaf_size
+        )
+        geom = compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
+        moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
+        root = as_index(jnp.argmin(jnp.asarray(tree.parent)))
+        own_mass = moments.mass[root]
+
+        fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
+        rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
+        rroot = as_index(jnp.argmin(jnp.asarray(rct.tree.parent)))
+
+        res = dual_tree_walk_cross_impl(
+            tree, geom, rct.tree, rct.geometry, theta,
+            mac_type=mac_type,
+            max_interactions_per_node=max_interactions_per_node,
+            max_neighbors_per_leaf=max_neighbors_per_leaf,
+            max_pair_queue=max_pair_queue,
+        )
+        total = jax.lax.psum(own_mass, axis_name)
+        overflow = res.queue_overflow | res.far_overflow | res.near_overflow
+        return (
+            rct.moments.mass[rroot][None],
+            own_mass[None],
+            total[None],
+            res.far_pair_count[None],
+            res.near_pair_count[None],
+            overflow[None],
+        )
+
+    outs = shard_map(
+        fn,
+        mesh=mesh,
+        in_specs=(P(axis_name), P(axis_name)),
+        out_specs=(P(axis_name),) * 6,
+        check_vma=False,
+    )(positions, masses)
+    return ClassifyMetrics(*outs)
+
+
 __all__ = [
+    "ClassifyMetrics",
     "CoarseFrontier",
     "CoarseTreeMetrics",
     "GlobalCoarseTree",
     "build_coarse_frontier",
     "build_distributed_coarse_tree",
+    "build_remote_coarse_tree",
+    "classify_against_remote",
     "gather_global_coarse_tree",
 ]
