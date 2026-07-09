@@ -75,7 +75,13 @@ def make_mesh(
             f"requested {n} devices but only {len(pool)} are available"
         )
 
-    return jax.make_mesh((n,), (axis_name,), devices=pool[:n])
+    # Auto axis types keep arrays free of sharding-in-types annotations, so the
+    # classic data-parallel ``shard_map`` (Manual inside the body) composes
+    # cleanly. Newer JAX defaults ``make_mesh`` to Explicit, which propagates
+    # Explicit shardings into the body and conflicts with Manual collectives.
+    return jax.make_mesh(
+        (n,), (axis_name,), devices=pool[:n], axis_types=(jax.sharding.AxisType.Auto,)
+    )
 
 
 __all__ = [

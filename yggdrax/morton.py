@@ -39,12 +39,19 @@ def _compact3_u64(x: jnp.ndarray) -> jnp.ndarray:
     return x
 
 
-@jax.jit
 @jaxtyped(typechecker=beartype)
-def morton_encode(
+def morton_encode_impl(
     positions: Array,
     bounds: Bounds,
 ) -> Array:
+    """Un-jitted Morton encode.
+
+    Prefer :func:`morton_encode` for standalone use. This raw implementation is
+    for calling *inside* another transform (e.g. ``shard_map``), where nesting a
+    separately-``jit``-compiled function would clash with the enclosing mesh's
+    sharding-in-types.
+    """
+
     min_c, max_c = bounds
     norm = (positions - min_c) / (max_c - min_c)
     norm = jnp.clip(norm, min=0.0, max=jnp.nextafter(1.0, 0.0))
@@ -55,6 +62,9 @@ def morton_encode(
     y = _spread3_u64(coords[:, 1])
     z = _spread3_u64(coords[:, 2])
     return x | (y << U64(1)) | (z << U64(2))
+
+
+morton_encode = jax.jit(morton_encode_impl)
 
 
 @jax.jit
@@ -92,5 +102,6 @@ __all__ = [
     "get_common_prefix_length",
     "morton_decode",
     "morton_encode",
+    "morton_encode_impl",
     "sort_by_morton",
 ]
