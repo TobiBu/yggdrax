@@ -43,7 +43,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["yggdrax"]
+packages = ["yggdrax", "yggdrax.distributed"]
 
 [tool.setuptools.package-dir]
 yggdrax = "yggdrax"
