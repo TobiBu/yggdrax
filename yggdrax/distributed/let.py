@@ -30,6 +30,7 @@ from jaxtyping import Array
 from .._tree_impl import build_tree
 from ..dtypes import INDEX_DTYPE, as_index
 from ..geometry import compute_tree_geometry
+from ..tree import Tree
 from ..tree_moments import compute_tree_mass_moments
 from .comm import _COUNT_DTYPE, ragged_all_to_all_exchange
 from .sharding import AXIS_NAME
@@ -260,9 +261,15 @@ def build_remote_coarse_tree(
     r_node_id = node_id[idx]
     r_range = node_range[idx]
 
-    tree, pos_sorted, mass_sorted, _inv = build_tree(
-        r_coms, r_mass, bounds, return_reordered=True, leaf_size=int(coarse_leaf_size)
+    # Build a Tree wrapper (identical adaptive-radix topology) rather than the
+    # raw RadixTree, so jaccpot's Tree-typed stages (e.g. compute_node_multipoles
+    # for the remote M2L source) accept it directly.
+    tree = Tree.from_particles(
+        r_coms, r_mass, tree_type="radix", bounds=bounds, return_reordered=True,
+        leaf_size=int(coarse_leaf_size),
     )
+    pos_sorted = tree.positions_sorted
+    mass_sorted = tree.masses_sorted
     geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=int(coarse_leaf_size))
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
 
