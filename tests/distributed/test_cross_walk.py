@@ -134,6 +134,39 @@ def test_cross_walk_partitions_sources_seed1():
     _run_partition_check(1)
 
 
+def test_cross_walk_offsets_index_sources_consistently():
+    """interaction_offsets[t]:+counts[t] must select exactly target t's sources.
+
+    (Sources are laid out level-major; offsets are scattered by node to match --
+    the contract jaccpot's accumulate_m2l_contributions relies on.)
+    """
+    tgt, src, bounds = _two_domains(5)
+    t_tree, t_geom = _build(tgt, bounds)
+    s_tree, s_geom = _build(src, bounds)
+    res = dual_tree_walk_cross(
+        t_tree, t_geom, s_tree, s_geom, _THETA,
+        mac_type=_MAC,
+        max_interactions_per_node=256,
+        max_neighbors_per_leaf=256,
+        max_pair_queue=8192,
+    )
+    offsets = np.asarray(res.interaction_offsets)
+    counts = np.asarray(res.interaction_counts)
+    sources = np.asarray(res.interaction_sources)
+    targets = np.asarray(res.interaction_targets)
+    n_nodes = counts.shape[0]
+    far_total = int(res.far_pair_count)
+    assert offsets.shape[0] == n_nodes + 1
+    assert int(offsets[-1]) == far_total
+    for t in range(n_nodes):
+        o, c = int(offsets[t]), int(counts[t])
+        if c == 0:
+            continue
+        # every flat entry in this node's slice is tagged with target node t
+        np.testing.assert_array_equal(targets[o : o + c], t)
+        assert np.all(sources[o : o + c] >= 0)
+
+
 def test_cross_walk_produces_far_and_near():
     tgt, src, bounds = _two_domains(2)
     t_tree, t_geom = _build(tgt, bounds)

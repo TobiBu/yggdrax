@@ -46,7 +46,6 @@ from .._interactions_impl import (
     _compute_leaf_effective_extents,
     _compute_mac_ok,
     _default_pair_actions_only,
-    _exclusive_cumsum,
     _per_key_prefix,
     _resolve_leaf_ordering,
 )
@@ -422,10 +421,11 @@ def dual_tree_walk_cross_impl(
         n_refine,
     ) = lax.while_loop(cond_fun, body_fun, init)
 
-    interaction_offsets = _exclusive_cumsum(far_counts)
-    neighbor_offsets = _exclusive_cumsum(near_counts)
-
     # ---- compact far_buffer -> flat (target-node level order) ----
+    # Sources are laid out in *level* order, so offsets must be scattered by
+    # node (offsets[node] = that node's level-major start) to stay consistent --
+    # exactly as yggdrax's _result_to_interactions does, so this feeds jaccpot's
+    # accumulate_m2l_contributions directly.
     nbl = jnp.asarray(target_tree.nodes_by_level, dtype=INDEX_DTYPE)
     num_nbl = nbl.shape[0]
     max_far = max(t_total * Kf, 1)
@@ -447,11 +447,20 @@ def dual_tree_walk_cross_impl(
         interaction_targets = (
             jnp.full((max_far,), -1, dtype=INDEX_DTYPE).at[safe].set(node_ids, mode="drop")
         )
+        far_node_offsets = jnp.zeros((t_total,), dtype=INDEX_DTYPE).at[nbl].set(
+            write_off[:-1]
+        )
+        interaction_offsets = jnp.concatenate(
+            [far_node_offsets, jnp.sum(far_counts, dtype=INDEX_DTYPE)[None]]
+        )
     else:
         interaction_sources = jnp.zeros((0,), dtype=INDEX_DTYPE)
         interaction_targets = jnp.zeros((0,), dtype=INDEX_DTYPE)
+        interaction_offsets = jnp.zeros((t_total + 1,), dtype=INDEX_DTYPE)
 
     # ---- compact nbr_buffer -> flat (target-leaf order) ----
+    # Neighbours are laid out in leaf-row order, so CSR offsets = prefix sum of
+    # near_counts (length t_leaves+1).
     max_near = max(t_leaves * Kn, 1)
     if collect_near:
         n_node_rep = jnp.repeat(jnp.arange(t_leaves, dtype=INDEX_DTYPE), Kn)
@@ -466,8 +475,10 @@ def dual_tree_walk_cross_impl(
         neighbor_indices = (
             jnp.full((max_near,), -1, dtype=INDEX_DTYPE).at[n_safe].set(n_vals, mode="drop")
         )
+        neighbor_offsets = n_write_off
     else:
         neighbor_indices = jnp.full((0,), -1, dtype=INDEX_DTYPE)
+        neighbor_offsets = jnp.zeros((t_leaves + 1,), dtype=INDEX_DTYPE)
 
     return DualTreeWalkResult(
         interaction_offsets=interaction_offsets,
