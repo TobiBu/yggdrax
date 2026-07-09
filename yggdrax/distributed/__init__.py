@@ -16,6 +16,7 @@ from .comm import (
     exchange_sizes,
     ragged_all_to_all_exchange,
 )
+from .cross_walk import dual_tree_walk_cross
 from .local_tree import (
     DistributedTreeMoments,
     build_local_moments,
@@ -41,6 +42,7 @@ __all__ = [
     "build_local_moments",
     "device_count",
     "distributed_tree_moments",
+    "dual_tree_walk_cross",
     "equalize_domain",
     "exchange_pytree",
     "exchange_sizes",
