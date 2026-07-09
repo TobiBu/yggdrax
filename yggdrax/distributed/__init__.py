@@ -16,6 +16,12 @@ from .comm import (
     exchange_sizes,
     ragged_all_to_all_exchange,
 )
+from .local_tree import (
+    DistributedTreeMoments,
+    build_local_moments,
+    distributed_tree_moments,
+    sanitize_padding,
+)
 from .partition import (
     ShardedDomain,
     equalize_domain,
@@ -27,17 +33,21 @@ from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
 
 __all__ = [
     "AXIS_NAME",
+    "DistributedTreeMoments",
     "ShardedArray",
     "ShardedDomain",
     "all_to_all_dense",
     "available_devices",
+    "build_local_moments",
     "device_count",
+    "distributed_tree_moments",
     "equalize_domain",
     "exchange_pytree",
     "exchange_sizes",
     "global_bounds",
     "make_mesh",
     "ragged_all_to_all_exchange",
+    "sanitize_padding",
     "sfc_decompose",
     "sfc_partition",
 ]
