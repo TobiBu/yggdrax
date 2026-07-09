@@ -179,9 +179,7 @@ def ragged_all_to_all_exchange(
     if method == "auto":
         method = "native" if jax.default_backend() in ("gpu", "tpu") else "buf"
     impl = _ragged_native if method == "native" else _ragged_through_buf
-    output = impl(
-        operand, send_sizes, full, me, output_capacity, axis_name, fill_value
-    )
+    output = impl(operand, send_sizes, full, me, output_capacity, axis_name, fill_value)
 
     recv_sizes = full[:, me]
     recv_offsets = _exclusive_cumsum(recv_sizes)

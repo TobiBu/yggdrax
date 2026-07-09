@@ -30,9 +30,9 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
+from ..morton import morton_encode_impl
 from .comm import _COUNT_DTYPE, _exclusive_cumsum, ragged_all_to_all_exchange
 from .sharding import AXIS_NAME
-from ..morton import morton_encode_impl
 
 # Padding sentinel for Morton codes: sorts padding rows to the tail so the
 # valid (leading ``count``) rows stay contiguous after a re-sort. Built as a
@@ -124,7 +124,10 @@ def _route(positions, masses, codes, send_sizes, output_capacity, axis_name):
         positions, send_sizes, output_capacity=output_capacity, axis_name=axis_name
     )
     mass_out, _, _ = ragged_all_to_all_exchange(
-        masses[:, None], send_sizes, output_capacity=output_capacity, axis_name=axis_name
+        masses[:, None],
+        send_sizes,
+        output_capacity=output_capacity,
+        axis_name=axis_name,
     )
     code_out, _, _ = ragged_all_to_all_exchange(
         codes[:, None],
@@ -215,9 +218,7 @@ def equalize_domain(
     target_ends = jnp.cumsum(target_sizes)
 
     valid = j < count
-    dest = jnp.searchsorted(target_ends, global_rank, side="right").astype(
-        _COUNT_DTYPE
-    )
+    dest = jnp.searchsorted(target_ends, global_rank, side="right").astype(_COUNT_DTYPE)
     dest = jnp.minimum(dest, ndev - 1)
     dest = jnp.where(valid, dest, ndev)  # drop padding rows from routing
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)

@@ -11,10 +11,9 @@ session via a fixture and shared across the assertions.
         pytest tests/distributed/test_local_tree.py -q
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from yggdrax.distributed import device_count, distributed_tree_moments, make_mesh
 
@@ -49,8 +48,8 @@ def built():
 
 def test_domain_moments_reconstruct_global_mass_and_com(built):
     pts, mass, res = built
-    domain_mass = np.asarray(res.domain_mass)      # [ndev]
-    domain_com = np.asarray(res.domain_com)        # [ndev, 3]
+    domain_mass = np.asarray(res.domain_mass)  # [ndev]
+    domain_com = np.asarray(res.domain_com)  # [ndev, 3]
     counts = np.asarray(res.counts)
 
     assert int(counts.sum()) == _N
