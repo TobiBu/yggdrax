@@ -379,12 +379,21 @@ def classify_against_remote(
 
 @dataclass
 class HaloImport:
-    """Remote particles imported for this GPU's near field (padded)."""
+    """Remote particles imported for this GPU's near field (padded).
+
+    ``positions``/``masses``/``gid`` are laid out as ``max_req_leaves`` blocks of
+    ``leaf_size`` rows each (block ``h`` = imported remote leaf ``h``).
+    ``coarse_to_halo[p]`` maps a remote coarse-tree sorted position ``p`` (a near
+    source names one via its node range) to its halo block index ``h`` (or -1) --
+    the link the combined near-field P2P uses to point a local target leaf at its
+    imported halo particles.
+    """
 
     positions: Array   # [max_req_leaves * leaf_size, 3]
     masses: Array      # [max_req_leaves * leaf_size]
     gid: Array         # [max_req_leaves * leaf_size] source global id (-1 = pad)
     valid: Array       # [max_req_leaves * leaf_size] bool
+    coarse_to_halo: Array  # [n_remote] coarse sorted position -> halo block (-1)
     needed_mass: Array   # scalar: total mass of the requested remote leaves
     imported_mass: Array # scalar: total mass actually received (== needed_mass)
     request_overflow: Array  # scalar bool
@@ -443,6 +452,15 @@ def import_near_halo(
     send_sizes_a = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
     reqbuf = jnp.stack([start, count], axis=1)
 
+    # Halo blocks come back in this sorted-request order, so request slot h holds
+    # coarse position sorted_req_pos[h]. Invert to map coarse position -> block.
+    sorted_req_pos = req_pos[order]
+    coarse_to_halo = (
+        jnp.full((n_remote,), -1, dtype=INDEX_DTYPE)
+        .at[sorted_req_pos]
+        .set(jnp.arange(max_req_leaves, dtype=INDEX_DTYPE), mode="drop")
+    )
+
     # 3. Round A: exchange requests.
     recv_req, recv_sizes_a, _ = ragged_all_to_all_exchange(
         reqbuf, send_sizes_a, output_capacity=max_recv_leaves, axis_name=axis_name
@@ -490,6 +508,7 @@ def import_near_halo(
         masses=halo_mass,
         gid=halo_gid,
         valid=halo_valid,
+        coarse_to_halo=coarse_to_halo,
         needed_mass=needed_mass,
         imported_mass=imported_mass,
         request_overflow=request_overflow,
@@ -505,6 +524,7 @@ class ImportMetrics:
     request_overflow: Array  # [ndev] bool
     wrong_domain: Array      # [ndev] bool: any halo particle sourced from self
     n_halo_valid: Array      # [ndev] imported particle count
+    n_mapped: Array          # [ndev] coarse positions mapped to a halo block
 
 
 def distributed_let_import(
@@ -579,13 +599,14 @@ def distributed_let_import(
             halo.request_overflow[None],
             wrong[None],
             jnp.sum(halo.valid.astype(INDEX_DTYPE))[None],
+            jnp.sum((halo.coarse_to_halo >= 0).astype(INDEX_DTYPE))[None],
         )
 
     outs = shard_map(
         fn,
         mesh=mesh,
         in_specs=(P(axis_name), P(axis_name)),
-        out_specs=(P(axis_name),) * 5,
+        out_specs=(P(axis_name),) * 6,
         check_vma=False,
     )(positions, masses)
     return ImportMetrics(*outs)

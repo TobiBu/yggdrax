@@ -68,3 +68,11 @@ def test_import_is_all_remote(metrics):
     assert not bool(np.asarray(m.wrong_domain).any())
     # and the import is non-trivial
     assert (np.asarray(m.n_halo_valid) > 0).all()
+
+
+def test_near_to_halo_mapping_built(metrics):
+    _, _, m = metrics
+    # every device maps some near coarse leaves to halo blocks (the link the
+    # combined near-field P2P uses); non-trivial and within request capacity
+    n_mapped = np.asarray(m.n_mapped)
+    assert (n_mapped > 0).all()
