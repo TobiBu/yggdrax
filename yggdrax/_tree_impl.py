@@ -359,7 +359,10 @@ def build_tree(
     Returns:
         RadixTree, and when return_reordered=True also the reordered arrays.
     """
-    from .morton import morton_encode  # local import to avoid circulars
+    # Use the un-jitted encoder so this builder is safe to call inside another
+    # transform (e.g. shard_map), where a nested top-level jit would clash with
+    # the enclosing mesh's sharding-in-types.
+    from .morton import morton_encode_impl as morton_encode  # avoid circulars
 
     n = positions.shape[0]
     assert n >= 1, "Need at least one particle"
