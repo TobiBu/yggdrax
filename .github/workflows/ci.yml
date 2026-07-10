@@ -13,7 +13,7 @@ jobs:
       matrix:
         # jax>=0.8 (a hard dependency) requires Python >=3.11, so 3.10 cannot
         # resolve the dependency set; test the supported interpreters only.
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout
