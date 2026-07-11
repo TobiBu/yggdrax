@@ -29,9 +29,13 @@ W/X lists (Phase 2).
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+
+from .morton import _compact3_u64, _spread3_u64
 
 
 class OctreeUVLists(NamedTuple):
@@ -303,9 +307,210 @@ def build_uniform_octree_execution_view(
     )
 
 
+_U64 = jnp.uint64
+
+
+def _neighbor_offsets_26() -> np.ndarray:
+    """The 26 (dx,dy,dz) colleague offsets (all of {-1,0,1}^3 except origin)."""
+    offs = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if not (dx == dy == dz == 0)
+    ]
+    return np.asarray(offs, np.int64)
+
+
+def _cell_coords(cell_code: jnp.ndarray) -> jnp.ndarray:
+    """De-interleave Morton cell codes -> integer (x, y, z) cell coords (stacked -1)."""
+    c = cell_code.astype(_U64)
+    x = _compact3_u64(c)
+    y = _compact3_u64(c >> _U64(1))
+    z = _compact3_u64(c >> _U64(2))
+    return jnp.stack([x, y, z], axis=-1).astype(jnp.int64)
+
+
+def _encode_coords(coords: jnp.ndarray) -> jnp.ndarray:
+    """Interleave integer (x, y, z) cell coords (..., 3) -> Morton cell codes (uint64)."""
+    x = _spread3_u64(coords[..., 0].astype(_U64))
+    y = _spread3_u64(coords[..., 1].astype(_U64))
+    z = _spread3_u64(coords[..., 2].astype(_U64))
+    return x | (y << _U64(1)) | (z << _U64(2))
+
+
+def build_uniform_octree_execution_view_device(
+    positions: jnp.ndarray,
+    depth: int,
+    *,
+    bounds: Optional[tuple] = None,
+    v_capacity: int = 216,
+    u_capacity: int = 26,
+    index_dtype=jnp.int64,
+) -> UniformOctreeExecutionView:
+    """On-device (JAX), STATIC-SHAPE uniform-octree execution view + U/V lists.
+
+    Unlike :func:`build_uniform_octree_execution_view` (host numpy, occupied-only nodes),
+    this builds a DENSE node space -- every cell at every level ``0..L`` gets a slot, so
+    the node count is ``(8^(L+1)-1)/7`` and depends ONLY on ``depth`` (never on the data).
+    Together with fixed-capacity U/V lists and ``searchsorted`` particle ranges, every
+    array shape is a function of ``(N, depth)`` alone: the build compiles once and is
+    reused across all timesteps (positions/masses change, shapes do not) -- no
+    recompilation inside a time-integration loop. Empty cells carry empty particle ranges
+    and contribute nothing.
+
+    Node id of cell ``c`` at level ``l`` is ``level_offsets[l] + c``. Parent/children are
+    arithmetic; colleagues and V lists use geometric (integer-coord) tests. Invalid far /
+    near list entries use the out-of-range sentinel ``num_nodes`` (dropped downstream).
+
+    ``v_capacity`` (max V-list sources per node; 216 = 27 parent-near cells * 8 children)
+    and ``u_capacity`` (max U-list neighbours per leaf; 26 colleagues) are static caps.
+    """
+    L = int(depth)
+    idt = index_dtype
+    pts = jnp.asarray(positions)
+    n_particles = int(pts.shape[0])
+
+    if bounds is None:
+        lo = jnp.min(pts, axis=0)
+        span = jnp.max(jnp.max(pts, axis=0) - lo) * (1.0 + 1e-6)
+    else:
+        lo = jnp.asarray(bounds[0])
+        span = jnp.max(jnp.asarray(bounds[1]) - lo) * (1.0 + 1e-6)
+
+    # level-L integer cell coords -> Morton leaf code; sort particles by it
+    g = jnp.clip(((pts - lo) / span * (2**L)).astype(jnp.int64), 0, 2**L - 1)
+    leaf_code = _encode_coords(g)  # (N,) uint64 in [0, 8^L)
+    perm = jnp.argsort(leaf_code)
+    sorted_code = leaf_code[perm]
+
+    # ---- dense node tables (STATIC: derived from L only) ----
+    level_sizes = [8**l for l in range(L + 1)]
+    off_np = np.concatenate([[0], np.cumsum(level_sizes)]).astype(np.int64)
+    num_nodes = int(off_np[L + 1])
+    node_level_np = np.concatenate([np.full(8**l, l, np.int64) for l in range(L + 1)])
+    node_cell_np = np.concatenate(
+        [np.arange(8**l, dtype=np.int64) for l in range(L + 1)]
+    )
+    off = jnp.asarray(off_np, idt)
+    node_level = jnp.asarray(node_level_np, idt)
+    node_cell = jnp.asarray(node_cell_np)  # uint-safe as int64
+
+    # ---- particle ranges via searchsorted (a cell c at level l owns leaf codes in
+    #      [c<<3(L-l), (c+1)<<3(L-l)) ) ----
+    shift = (3 * (L - node_level)).astype(_U64)
+    cell_u = node_cell.astype(_U64)
+    lo_code = cell_u << shift
+    hi_code = (cell_u + _U64(1)) << shift
+    start = jnp.searchsorted(sorted_code, lo_code, side="left").astype(idt)
+    end_excl = jnp.searchsorted(sorted_code, hi_code, side="left").astype(idt)
+    count = end_excl - start
+    node_ranges = jnp.stack([start, end_excl - 1], axis=-1).astype(idt)
+
+    # ---- parent / children (arithmetic) ----
+    parent = jnp.where(
+        node_level == 0,
+        jnp.asarray(-1, idt),
+        off[jnp.clip(node_level - 1, 0, L)] + (node_cell >> 3).astype(idt),
+    ).astype(idt)
+    child_base = off[jnp.clip(node_level + 1, 0, L)] + (node_cell * 8).astype(idt)
+    children = child_base[:, None] + jnp.arange(8, dtype=idt)[None, :]
+    children = jnp.where((node_level < L)[:, None], children, jnp.asarray(-1, idt))
+    child_counts = jnp.where(node_level < L, jnp.asarray(8, idt), jnp.asarray(0, idt))
+
+    leaf_mask = node_level == L
+    leaf_indices = jnp.arange(off_np[L], num_nodes, dtype=idt)  # all level-L cells
+    leaf_nodes = (
+        jnp.full((num_nodes,), -1, idt)
+        .at[jnp.arange(leaf_indices.shape[0], dtype=idt)]
+        .set(leaf_indices)
+    )
+    nodes_by_level = jnp.arange(num_nodes, dtype=idt)  # dense = already level-major
+    level_offsets = off
+
+    # ---- centres ----
+    coord = _cell_coords(node_cell).astype(jnp.float64)  # (M,3) at each node's level
+    csz = span / jnp.power(2.0, node_level.astype(jnp.float64))
+    centers = lo + (coord + 0.5) * csz[:, None]
+
+    # ---- colleagues: same-level cells within +/-1 coord (26 offsets) ----
+    neigh = jnp.asarray(_neighbor_offsets_26(), idt)  # (26,3)
+    ncoord = coord.astype(idt)[:, None, :] + neigh[None, :, :]  # (M,26,3)
+    two_l = jnp.power(2, node_level).astype(idt)[:, None, None]
+    in_bounds = jnp.all((ncoord >= 0) & (ncoord < two_l), axis=-1)  # (M,26)
+    ncode = _encode_coords(ncoord)  # (M,26) uint64
+    colleague = off[node_level][:, None] + ncode.astype(idt)  # (M,26) node ids
+    colleague = jnp.where(in_bounds, colleague, jnp.asarray(-1, idt))
+
+    sentinel = jnp.asarray(num_nodes, idt)  # out-of-range invalid marker
+
+    # ---- V list: children of (parent's colleagues + parent) that are NOT adjacent to
+    #      self at this level (|dcoord|_inf > 1). Geometric test, fixed capacity. ----
+    safe_parent = jnp.clip(parent, 0, num_nodes - 1)
+    # parent-near set: parent + parent's 26 colleagues  (M, 27) node ids (-1 invalid)
+    pnear = jnp.concatenate([parent[:, None], colleague[safe_parent]], axis=1)  # (M,27)
+    pnear = jnp.where(parent[:, None] >= 0, pnear, jnp.asarray(-1, idt))
+    pnear_cell = node_cell[
+        jnp.clip(pnear, 0, num_nodes - 1)
+    ]  # (M,27) cells at level l-1
+    # their 8 children (cells at level l): 8*pc + [0..7]
+    cand_cell = pnear_cell[:, :, None] * 8 + jnp.arange(8, dtype=idt)[None, None, :]
+    cand_valid0 = (pnear >= 0)[:, :, None] & jnp.broadcast_to(
+        (node_level >= 1)[:, None, None], cand_cell.shape
+    )
+    cand_cell = jnp.reshape(cand_cell, (num_nodes, 27 * 8))  # (M,216)
+    cand_valid0 = jnp.reshape(cand_valid0, (num_nodes, 27 * 8))
+    cand_coord = _cell_coords(cand_cell.astype(_U64)).astype(idt)  # (M,216,3)
+    dcoord = jnp.abs(cand_coord - coord.astype(idt)[:, None, :])
+    well_sep = jnp.max(dcoord, axis=-1) > 1  # (M,216) not adjacent at this level
+    cand_node = off[node_level][:, None] + cand_cell.astype(idt)  # (M,216) node ids
+    v_ok = cand_valid0 & well_sep  # (M,216)
+    if int(27 * 8) != int(v_capacity):
+        v_capacity = 27 * 8
+    v_tgt_full = jnp.broadcast_to(
+        jnp.arange(num_nodes, dtype=idt)[:, None], (num_nodes, v_capacity)
+    )
+    v_src = jnp.where(v_ok, cand_node, sentinel).reshape(-1)
+    v_tgt = jnp.where(v_ok, v_tgt_full, sentinel).reshape(-1)
+
+    # ---- U list (leaves only): occupied colleague leaves, self excluded, as ROW ids ----
+    num_leaves = int(leaf_indices.shape[0])
+    leaf_coll = colleague[leaf_indices]  # (num_leaves, 26) node ids (-1 invalid)
+    coll_row = leaf_coll - jnp.asarray(int(off_np[L]), idt)  # node id -> leaf row
+    coll_count = count[jnp.clip(leaf_coll, 0, num_nodes - 1)]  # occupancy of colleague
+    coll_ok = (leaf_coll >= 0) & (coll_count > 0)  # valid + occupied
+    u_capacity = 26
+    u_neighbors = jnp.where(coll_ok, coll_row, sentinel).reshape(-1)  # (num_leaves*26,)
+    u_offsets = jnp.arange(0, (num_leaves + 1) * u_capacity, u_capacity, dtype=idt)
+
+    return UniformOctreeExecutionView(
+        valid_mask=jnp.ones((num_nodes,), bool),
+        parent=parent,
+        children=children,
+        child_counts=child_counts,
+        node_depths=node_level,
+        node_ranges=node_ranges,
+        nodes_by_level=nodes_by_level,
+        level_offsets=level_offsets,
+        num_levels=L + 1,
+        leaf_mask=leaf_mask,
+        leaf_nodes=leaf_nodes,
+        num_valid_nodes=num_nodes,
+        num_leaf_nodes=num_leaves,
+        centers=centers,
+        v_src=v_src,
+        v_tgt=v_tgt,
+        u_offsets=u_offsets,
+        u_neighbors=u_neighbors,
+        leaf_indices=leaf_indices,
+        perm=perm.astype(idt),
+    )
+
+
 __all__ = [
     "OctreeUVLists",
     "build_uniform_octree_uv",
     "UniformOctreeExecutionView",
     "build_uniform_octree_execution_view",
+    "build_uniform_octree_execution_view_device",
 ]
