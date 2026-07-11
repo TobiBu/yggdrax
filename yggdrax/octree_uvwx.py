@@ -198,4 +198,114 @@ def build_uniform_octree_uv(positions: np.ndarray, depth: int) -> OctreeUVLists:
     )
 
 
-__all__ = ["OctreeUVLists", "build_uniform_octree_uv"]
+class UniformOctreeExecutionView(NamedTuple):
+    """Kernel-ready uniform-octree execution view + U/V interaction lists.
+
+    The node-topology fields map 1:1 onto the execution view consumed by the FMM
+    operators (jaccpot ``runtime/_octree_fmm``): natural node layout, root at index 0,
+    NO reserved sentinel node (the operators drop invalid scatter slots out of range),
+    and ``num_valid_nodes`` is the TOTAL node count (the operators derive their per-level
+    batch width from ``level_offsets`` themselves). Nodes are level-major, so ``parent <
+    child index`` and the deepest level is the last, densest block.
+    """
+
+    # --- node topology / geometry (execution view) ---
+    valid_mask: np.ndarray  # (num_nodes,) bool; all True for a uniform octree
+    parent: np.ndarray  # (num_nodes,) parent id (-1 at root)
+    children: np.ndarray  # (num_nodes, 8) child ids (-1 padded)
+    child_counts: np.ndarray  # (num_nodes,) number of children
+    node_depths: np.ndarray  # (num_nodes,) octree level (0..depth)
+    node_ranges: (
+        np.ndarray
+    )  # (num_nodes, 2) inclusive particle span (internal = child span rollup)
+    nodes_by_level: np.ndarray  # (num_nodes,) node ids sorted by level (stable)
+    level_offsets: np.ndarray  # (depth + 2,) CSR offsets into nodes_by_level per level
+    num_levels: int  # depth + 1
+    leaf_mask: np.ndarray  # (num_nodes,) bool
+    leaf_nodes: np.ndarray  # (num_nodes,) leaf ids, -1 padded to num_nodes
+    num_valid_nodes: int  # total node count
+    num_leaf_nodes: int  # number of leaves
+    centers: np.ndarray  # (num_nodes, 3) cell geometric centers
+    # --- interaction lists + particle permutation ---
+    v_src: np.ndarray  # V-list M2L source node ids
+    v_tgt: np.ndarray  # V-list M2L target node ids
+    u_offsets: np.ndarray  # (num_leaves + 1,) CSR offsets into u_neighbors
+    u_neighbors: np.ndarray  # near source-leaf node ids (self INCLUDED)
+    leaf_indices: np.ndarray  # (num_leaves,) leaf node ids, CSR row order
+    perm: np.ndarray  # (num_particles,) Morton sort permutation applied to inputs
+
+
+def build_uniform_octree_execution_view(
+    positions: np.ndarray, depth: int
+) -> UniformOctreeExecutionView:
+    """Build a uniform-octree execution view (topology + geometry + U/V lists).
+
+    Wraps :func:`build_uniform_octree_uv` and derives the node-topology fields the FMM
+    operators consume (child table, particle-span rollup for internal nodes, level-major
+    ordering + per-level CSR offsets) in the natural node layout (root at index 0, no
+    reserved sentinel node). ``positions`` (N, 3); ``depth`` = octree levels.
+    """
+    uv = build_uniform_octree_uv(positions, depth)
+    L = int(depth)
+    parent = np.asarray(uv.parent, np.int64)
+    level = np.asarray(uv.level, np.int64)
+    is_leaf = np.asarray(uv.is_leaf, bool)
+    leaf_ranges = np.asarray(uv.node_ranges, np.int64)
+    num_nodes = int(parent.shape[0])
+
+    # child table from parent pointers (level-major order => parent < child)
+    children = np.full((num_nodes, 8), -1, np.int64)
+    slot = np.zeros(num_nodes, np.int64)
+    for c in range(num_nodes):
+        p = int(parent[c])
+        if p >= 0:
+            children[p, slot[p]] = c
+            slot[p] += 1
+    child_counts = (children >= 0).sum(1).astype(np.int64)
+
+    # particle-span rollup: leaves from the U/V build; internal = min/max over children
+    node_ranges = np.full((num_nodes, 2), -1, np.int64)
+    node_ranges[is_leaf] = leaf_ranges[is_leaf]
+    for c in sorted(range(num_nodes), key=lambda x: -int(level[x])):
+        if not is_leaf[c]:
+            ch = children[c][children[c] >= 0]
+            node_ranges[c, 0] = node_ranges[ch, 0].min()
+            node_ranges[c, 1] = node_ranges[ch, 1].max()
+
+    nodes_by_level = np.argsort(level, kind="stable").astype(np.int64)
+    counts = np.bincount(level, minlength=L + 1)
+    level_offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    leaf_indices = np.asarray(uv.leaf_indices, np.int64)
+    leaf_nodes = np.full(num_nodes, -1, np.int64)
+    leaf_nodes[: len(leaf_indices)] = leaf_indices
+
+    return UniformOctreeExecutionView(
+        valid_mask=np.ones(num_nodes, bool),
+        parent=parent,
+        children=children,
+        child_counts=child_counts,
+        node_depths=level,
+        node_ranges=node_ranges,
+        nodes_by_level=nodes_by_level,
+        level_offsets=level_offsets,
+        num_levels=L + 1,
+        leaf_mask=is_leaf,
+        leaf_nodes=leaf_nodes,
+        num_valid_nodes=num_nodes,
+        num_leaf_nodes=int(len(leaf_indices)),
+        centers=np.asarray(uv.centers),
+        v_src=np.asarray(uv.v_src, np.int64),
+        v_tgt=np.asarray(uv.v_tgt, np.int64),
+        u_offsets=np.asarray(uv.u_offsets, np.int64),
+        u_neighbors=np.asarray(uv.u_neighbors, np.int64),
+        leaf_indices=leaf_indices,
+        perm=np.asarray(uv.perm, np.int64),
+    )
+
+
+__all__ = [
+    "OctreeUVLists",
+    "build_uniform_octree_uv",
+    "UniformOctreeExecutionView",
+    "build_uniform_octree_execution_view",
+]
