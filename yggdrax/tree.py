@@ -17,6 +17,7 @@ from .dtypes import INDEX_DTYPE, as_index
 from .kdtree import KDTree as KDTreeTopology
 from .kdtree import build_kdtree
 from .octree import OctreeTopology, augment_radix_topology_with_octree
+from .protocols import MortonLeafBoundsProtocol
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -1051,11 +1052,25 @@ _TREE_BUILDERS: dict[str, TreeBuilder] = {
 }
 
 
-def resolve_tree_topology(tree_or_topology: object) -> object:
-    """Return a topology payload from a tree container or topology object."""
+def resolve_tree_topology(tree_or_topology: object) -> MortonLeafBoundsProtocol:
+    """Return a topology payload from a tree container or topology object.
+
+    Parameters
+    ----------
+    tree_or_topology
+        A tree container (with a ``.topology`` attribute) or a topology object.
+
+    Returns
+    -------
+    MortonLeafBoundsProtocol
+        The concrete topology payload. The return is typed to the broad
+        FMM-core/Morton contract so downstream field accesses type-check; a
+        given backend may expose additional fields beyond it.
+    """
 
     topology = getattr(tree_or_topology, "topology", None)
-    return tree_or_topology if topology is None else topology
+    resolved = tree_or_topology if topology is None else topology
+    return cast(MortonLeafBoundsProtocol, resolved)
 
 
 def _missing_required_fields(
