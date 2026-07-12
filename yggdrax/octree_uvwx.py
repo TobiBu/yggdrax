@@ -29,11 +29,13 @@ W/X lists (Phase 2).
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import Array
+from jax.typing import ArrayLike
 
 from .morton import _compact3_u64, _spread3_u64
 
@@ -159,32 +161,32 @@ def build_uniform_octree_uv(positions: np.ndarray, depth: int) -> OctreeUVLists:
 
     v_src: list[int] = []
     v_tgt: list[int] = []
-    for C in range(num_nodes):
-        p = int(parent_a[C])
+    for cnode in range(num_nodes):
+        p = int(parent_a[cnode])
         if p < 0:
             continue
-        near_self = coll[C] | {C}
+        near_self = coll[cnode] | {cnode}
         for pc in coll[p] | {p}:
             for s in children[pc]:
                 if s not in near_self:
                     v_src.append(s)
-                    v_tgt.append(C)
+                    v_tgt.append(cnode)
 
     leaf_indices = np.array(
-        [C for C in range(num_nodes) if is_leaf_a[C]], dtype=np.int64
+        [cnode for cnode in range(num_nodes) if is_leaf_a[cnode]], dtype=np.int64
     )
     u_off = np.zeros(len(leaf_indices) + 1, np.int64)
     u_nb: list[int] = []
-    for r, C in enumerate(leaf_indices):
-        near = [s for s in coll[int(C)] if is_leaf_a[s]] + [int(C)]
+    for r, cnode in enumerate(leaf_indices):
+        near = [s for s in coll[int(cnode)] if is_leaf_a[s]] + [int(cnode)]
         u_nb.extend(near)
         u_off[r + 1] = u_off[r] + len(near)
 
     leaf_of = np.zeros(pts.shape[0], np.int64)
-    for C in range(num_nodes):
-        if is_leaf_a[C]:
-            s, e = nranges_a[C]
-            leaf_of[s : e + 1] = C
+    for cnode in range(num_nodes):
+        if is_leaf_a[cnode]:
+            s, e = nranges_a[cnode]
+            leaf_of[s : e + 1] = cnode
 
     return OctreeUVLists(
         centers=centers_a,
@@ -213,30 +215,32 @@ class UniformOctreeExecutionView(NamedTuple):
     child index`` and the deepest level is the last, densest block.
     """
 
+    # Array fields are ``ArrayLike``: the host builders populate them with numpy arrays,
+    # the device builders with jax arrays -- both must type-check. num_valid_nodes /
+    # num_leaf_nodes are python ints for the host builds but traced jax scalars for the
+    # device builds (data-dependent), hence ArrayLike; num_levels is always a static int.
     # --- node topology / geometry (execution view) ---
-    valid_mask: np.ndarray  # (num_nodes,) bool; all True for a uniform octree
-    parent: np.ndarray  # (num_nodes,) parent id (-1 at root)
-    children: np.ndarray  # (num_nodes, 8) child ids (-1 padded)
-    child_counts: np.ndarray  # (num_nodes,) number of children
-    node_depths: np.ndarray  # (num_nodes,) octree level (0..depth)
-    node_ranges: (
-        np.ndarray
-    )  # (num_nodes, 2) inclusive particle span (internal = child span rollup)
-    nodes_by_level: np.ndarray  # (num_nodes,) node ids sorted by level (stable)
-    level_offsets: np.ndarray  # (depth + 2,) CSR offsets into nodes_by_level per level
+    valid_mask: ArrayLike  # (num_nodes,) bool; all True for a uniform octree
+    parent: ArrayLike  # (num_nodes,) parent id (-1 at root)
+    children: ArrayLike  # (num_nodes, 8) child ids (-1 padded)
+    child_counts: ArrayLike  # (num_nodes,) number of children
+    node_depths: ArrayLike  # (num_nodes,) octree level (0..depth)
+    node_ranges: ArrayLike  # (num_nodes, 2) inclusive particle span (child span rollup)
+    nodes_by_level: ArrayLike  # (num_nodes,) node ids sorted by level (stable)
+    level_offsets: ArrayLike  # (depth + 2,) CSR offsets into nodes_by_level per level
     num_levels: int  # depth + 1
-    leaf_mask: np.ndarray  # (num_nodes,) bool
-    leaf_nodes: np.ndarray  # (num_nodes,) leaf ids, -1 padded to num_nodes
-    num_valid_nodes: int  # total node count
-    num_leaf_nodes: int  # number of leaves
-    centers: np.ndarray  # (num_nodes, 3) cell geometric centers
+    leaf_mask: ArrayLike  # (num_nodes,) bool
+    leaf_nodes: ArrayLike  # (num_nodes,) leaf ids, -1 padded to num_nodes
+    num_valid_nodes: ArrayLike  # total node count (int host / traced jax scalar device)
+    num_leaf_nodes: ArrayLike  # number of leaves (int host / traced jax scalar device)
+    centers: ArrayLike  # (num_nodes, 3) cell geometric centers
     # --- interaction lists + particle permutation ---
-    v_src: np.ndarray  # V-list M2L source node ids
-    v_tgt: np.ndarray  # V-list M2L target node ids
-    u_offsets: np.ndarray  # (num_leaves + 1,) CSR offsets into u_neighbors
-    u_neighbors: np.ndarray  # near source-leaf node ids (self INCLUDED)
-    leaf_indices: np.ndarray  # (num_leaves,) leaf node ids, CSR row order
-    perm: np.ndarray  # (num_particles,) Morton sort permutation applied to inputs
+    v_src: ArrayLike  # V-list M2L source node ids
+    v_tgt: ArrayLike  # V-list M2L target node ids
+    u_offsets: ArrayLike  # (num_leaves + 1,) CSR offsets into u_neighbors
+    u_neighbors: ArrayLike  # near source-leaf node ids (self INCLUDED)
+    leaf_indices: ArrayLike  # (num_leaves,) leaf node ids, CSR row order
+    perm: ArrayLike  # (num_particles,) Morton sort permutation applied to inputs
 
 
 def build_uniform_octree_execution_view(
@@ -343,7 +347,7 @@ def build_uniform_octree_execution_view_device(
     positions: jnp.ndarray,
     depth: int,
     *,
-    bounds: Optional[tuple] = None,
+    bounds: Optional[tuple[ArrayLike, ArrayLike]] = None,
     v_capacity: int = 216,
     u_capacity: int = 26,
     index_dtype=jnp.int64,
@@ -514,7 +518,7 @@ def build_sparse_uniform_octree_execution_view_device(
     node_capacity: int,
     leaf_capacity: int,
     level_batch_width_cap: Optional[int] = None,
-    bounds: Optional[tuple] = None,
+    bounds: Optional[tuple[ArrayLike, ArrayLike]] = None,
     index_dtype=jnp.int64,
 ) -> UniformOctreeExecutionView:
     """On-device (JAX), STATIC-SHAPE *sparse* uniform-octree execution view + U/V lists.
@@ -593,8 +597,9 @@ def build_sparse_uniform_octree_execution_view_device(
     shifts = (three_L - 3 * levels_col).astype(_U64)  # (L+1,)
     cells_all = (sorted_code[:, None] >> shifts[None, :]).astype(jnp.int64)  # (N, L+1)
     keys_all = (levels_col[None, :] << three_L) | cells_all  # (N, L+1)
-    node_key = jnp.unique(
-        keys_all.reshape(-1), size=node_capacity, fill_value=fill_key
+    node_key = cast(
+        Array,
+        jnp.unique(keys_all.reshape(-1), size=node_capacity, fill_value=fill_key),
     ).astype(jnp.int64)
     valid_mask = node_key != jnp.asarray(fill_key, jnp.int64)
     node_level = (node_key >> three_L).astype(idt)  # padding -> L+1
@@ -744,7 +749,7 @@ def build_adaptive_octree_execution_view_device(
     node_capacity: int,
     leaf_capacity: int,
     level_batch_width_cap: Optional[int] = None,
-    bounds: Optional[tuple] = None,
+    bounds: Optional[tuple[ArrayLike, ArrayLike]] = None,
     interactions: bool = False,
     u_capacity: int = 256,
     index_dtype=jnp.int64,
@@ -897,8 +902,9 @@ def build_adaptive_octree_execution_view_device(
     active_keys = jnp.where(active, keys_all, jnp.asarray(fill_key, jnp.int64))
 
     # ---- compact the ACTIVE keys -> node set (level-major / within-level Morton-sorted) ----
-    node_key = jnp.unique(
-        active_keys.reshape(-1), size=node_capacity, fill_value=fill_key
+    node_key = cast(
+        Array,
+        jnp.unique(active_keys.reshape(-1), size=node_capacity, fill_value=fill_key),
     ).astype(jnp.int64)
 
     if interactions:
@@ -912,7 +918,7 @@ def build_adaptive_octree_execution_view_device(
         # times resolves the whole ripple (each pass advances the interface one level).
         _neigh_bal = jnp.asarray(_neighbor_offsets_26(), idt)  # (26,3)
 
-        def _balance_pass(nk):
+        def _balance_pass(nk: Array) -> Array:
             lvl = nk >> three_L  # padding -> L+1
             cll = nk & cell_mask
             vld = nk != jnp.asarray(fill_key, jnp.int64)
@@ -927,8 +933,12 @@ def build_adaptive_octree_execution_view_device(
                 ((lvl - 2) << three_L) | (cll >> 6),
                 jnp.asarray(fill_key, jnp.int64),
             )
-            par_sorted = jnp.unique(par_key, size=node_capacity, fill_value=fill_key)
-            gp_sorted = jnp.unique(gp_key, size=node_capacity, fill_value=fill_key)
+            par_sorted = cast(
+                Array, jnp.unique(par_key, size=node_capacity, fill_value=fill_key)
+            )
+            gp_sorted = cast(
+                Array, jnp.unique(gp_key, size=node_capacity, fill_value=fill_key)
+            )
 
             def _member(sorted_keys, q):
                 pos = jnp.clip(
@@ -961,9 +971,10 @@ def build_adaptive_octree_execution_view_device(
                 needs[:, None], child_keys, jnp.asarray(fill_key, jnp.int64)
             )
             merged = jnp.concatenate([nk, child_keys.reshape(-1)])
-            return jnp.unique(merged, size=node_capacity, fill_value=fill_key).astype(
-                jnp.int64
-            )
+            return cast(
+                Array,
+                jnp.unique(merged, size=node_capacity, fill_value=fill_key),
+            ).astype(jnp.int64)
 
         for _ in range(L):
             node_key = _balance_pass(node_key)
@@ -1103,8 +1114,8 @@ def build_adaptive_octree_execution_view_device(
         # For each leaf B and level l = 0..L: the leaf colleagues of ancestor(B)@l are
         # near sources of B -- U (l == depth(B)) or X (l < depth(B), coarser). Each X pair
         # also emits its transpose so the coarser leaf gets its finer (W) neighbour.
-        tgt_chunks: list = []
-        src_chunks: list = []
+        tgt_chunks: list[Any] = []
+        src_chunks: list[Any] = []
         for lam in range(L + 1):
             valid_lam = real_row & (lam <= lB)  # (R,)
             shift = jnp.clip(lB - lam, 0, L)  # (R,)
