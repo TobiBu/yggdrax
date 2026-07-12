@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -120,6 +120,31 @@ MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
 FMM_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
     FMM_CORE_REQUIRED_FIELDS + MORTON_TOPOLOGY_REQUIRED_FIELDS
 )
+
+
+class _AdaptiveOctreeRefinement(TypedDict):
+    """Keyword arguments controlling adaptive-octree local refinement."""
+
+    target_leaf_particles: int
+    max_depth: Optional[int]
+    refine_local: bool
+    max_refine_levels: int
+    aspect_threshold: float
+    min_refined_leaf_particles: int
+
+
+# Local-refinement defaults for the adaptive octree build path. Defined once so
+# the JIT (``build_octree_jit``) and eager (``build_octree``) entry points share
+# a single source of truth and cannot silently drift apart. Typed as a
+# ``TypedDict`` so unpacking it at each call site stays type-checked per field.
+_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS: _AdaptiveOctreeRefinement = {
+    "target_leaf_particles": 32,
+    "max_depth": None,
+    "refine_local": True,
+    "max_refine_levels": 2,
+    "aspect_threshold": 8.0,
+    "min_refined_leaf_particles": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -396,12 +421,7 @@ def _build_octree_jit_result(
         workspace=workspace,
         return_workspace=return_workspace,
         leaf_size=leaf_size,
-        target_leaf_particles=32,
-        max_depth=None,
-        refine_local=True,
-        max_refine_levels=2,
-        aspect_threshold=8.0,
-        min_refined_leaf_particles=2,
+        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
 
 
@@ -952,22 +972,38 @@ def resolve_tree_topology(tree_or_topology: object) -> object:
     return tree_or_topology if topology is None else topology
 
 
+def _missing_required_fields(
+    tree_or_topology: object, required_fields: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return the ``required_fields`` absent from the resolved topology payload."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(name for name in required_fields if not hasattr(topology, name))
+
+
+def _require_fields(
+    tree_or_topology: object, missing: tuple[str, ...], description: str
+) -> None:
+    """Raise ``ValueError`` naming ``description`` when ``missing`` is non-empty."""
+
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(f"{prefix}topology is missing {description}: {missing_txt}")
+
+
 def missing_fmm_core_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return FMM-core required topology fields missing on the provided object."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in FMM_CORE_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, FMM_CORE_REQUIRED_FIELDS)
 
 
 def missing_morton_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return Morton-geometry required fields missing on the provided object."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in MORTON_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, MORTON_TOPOLOGY_REQUIRED_FIELDS)
 
 
 def has_fmm_core_topology(tree_or_topology: object) -> bool:
@@ -985,10 +1021,7 @@ def has_morton_topology(tree_or_topology: object) -> bool:
 def missing_leaf_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return fields needed to derive or expose leaf-node indices."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in LEAF_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, LEAF_TOPOLOGY_REQUIRED_FIELDS)
 
 
 def has_leaf_topology(tree_or_topology: object) -> bool:
@@ -1004,28 +1037,20 @@ def has_leaf_topology(tree_or_topology: object) -> bool:
 def require_fmm_core_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when FMM-core topology fields are missing."""
 
-    missing = missing_fmm_core_topology_fields(tree_or_topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(
-        f"{prefix}topology is missing FMM-core-required fields: {missing_txt}"
+    _require_fields(
+        tree_or_topology,
+        missing_fmm_core_topology_fields(tree_or_topology),
+        "FMM-core-required fields",
     )
 
 
 def require_morton_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when Morton-geometry fields are missing."""
 
-    missing = missing_morton_topology_fields(tree_or_topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(
-        f"{prefix}topology is missing Morton-geometry-required fields: {missing_txt}"
+    _require_fields(
+        tree_or_topology,
+        missing_morton_topology_fields(tree_or_topology),
+        "Morton-geometry-required fields",
     )
 
 
@@ -1035,13 +1060,11 @@ def require_leaf_topology(tree_or_topology: object) -> None:
     topology = resolve_tree_topology(tree_or_topology)
     if hasattr(topology, "leaf_nodes"):
         return
-    missing = missing_leaf_topology_fields(topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(f"{prefix}topology is missing leaf-required fields: {missing_txt}")
+    _require_fields(
+        tree_or_topology,
+        missing_leaf_topology_fields(topology),
+        "leaf-required fields",
+    )
 
 
 # Backward-compatible aliases
@@ -1356,12 +1379,7 @@ def build_octree(
         workspace=resolved.workspace,
         return_workspace=resolved.return_workspace,
         leaf_size=config.leaf_size if config is not None else leaf_size,
-        target_leaf_particles=32,
-        max_depth=None,
-        refine_local=True,
-        max_refine_levels=2,
-        aspect_threshold=8.0,
-        min_refined_leaf_particles=2,
+        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
     return _wrap_octree_public_result(
         result=result,
