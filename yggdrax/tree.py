@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Callable, Literal, Optional, TypedDict
+from typing import Callable, Literal, Optional, TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,39 @@ class FixedDepthTreeBuildConfig:
 
 TreeType = Literal["radix", "octree", "kdtree"]
 TreeBuildMode = Literal["adaptive", "fixed_depth", "static_radix"]
+
+_VALID_BUILD_MODES: tuple[TreeBuildMode, ...] = (
+    "adaptive",
+    "fixed_depth",
+    "static_radix",
+)
+
+
+def _normalize_build_mode(build_mode: str) -> TreeBuildMode:
+    """Validate a build-mode string and narrow it to ``TreeBuildMode``.
+
+    Parameters
+    ----------
+    build_mode
+        Requested build mode.
+
+    Returns
+    -------
+    TreeBuildMode
+        The validated build mode.
+
+    Raises
+    ------
+    ValueError
+        If ``build_mode`` is not one of the supported modes.
+    """
+
+    if build_mode not in _VALID_BUILD_MODES:
+        supported = ", ".join(f"'{name}'" for name in _VALID_BUILD_MODES)
+        raise ValueError(
+            f"Unsupported build_mode '{build_mode}'. Supported: ({supported})"
+        )
+    return cast(TreeBuildMode, build_mode)
 
 
 @dataclass(frozen=True)
@@ -654,7 +687,7 @@ class RadixTree(Tree):
         cls,
         *,
         result,
-        build_mode: str,
+        build_mode: TreeBuildMode,
         return_reordered: bool,
         return_workspace: bool,
     ) -> "RadixTree":
@@ -662,7 +695,7 @@ class RadixTree(Tree):
             topology, pos_sorted, mass_sorted, inv, workspace = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -672,7 +705,7 @@ class RadixTree(Tree):
             topology, pos_sorted, mass_sorted, inv = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -681,10 +714,10 @@ class RadixTree(Tree):
             topology, workspace = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 workspace=workspace,
             )
-        return cls(topology=result, build_mode=build_mode)  # type: ignore[arg-type]
+        return cls(topology=result, build_mode=build_mode)
 
 
 @dataclass(frozen=True)
@@ -731,6 +764,7 @@ class OctreeTree(RadixTree):
     ) -> "OctreeTree":
         """Build an octree from particles using the octree-specific build path."""
 
+        build_mode = _normalize_build_mode(build_mode)
         result = _build_octree_result(
             positions,
             masses,
@@ -759,7 +793,7 @@ class OctreeTree(RadixTree):
         cls,
         *,
         result,
-        build_mode: str,
+        build_mode: TreeBuildMode,
         return_reordered: bool,
         return_workspace: bool,
     ) -> "OctreeTree":
@@ -767,7 +801,7 @@ class OctreeTree(RadixTree):
             topology, pos_sorted, mass_sorted, inv, workspace = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -777,7 +811,7 @@ class OctreeTree(RadixTree):
             topology, pos_sorted, mass_sorted, inv = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -786,12 +820,12 @@ class OctreeTree(RadixTree):
             topology, workspace = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 workspace=workspace,
             )
         return cls(
             topology=augment_radix_topology_with_octree(result),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
         )
 
 
@@ -1275,7 +1309,7 @@ def register_tree_builder(
 def _wrap_radix_public_result(
     *,
     result,
-    build_mode: str,
+    build_mode: TreeBuildMode,
     return_reordered: bool,
     return_workspace: bool,
 ):
@@ -1285,7 +1319,7 @@ def _wrap_radix_public_result(
         topology, pos_sorted, mass_sorted, inv, workspace = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1296,7 +1330,7 @@ def _wrap_radix_public_result(
         topology, pos_sorted, mass_sorted, inv = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1306,20 +1340,20 @@ def _wrap_radix_public_result(
         topology, workspace = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             workspace=workspace,
         )
         return tree, workspace
     return RadixTree(
         topology=result,
-        build_mode=build_mode,  # type: ignore[arg-type]
+        build_mode=build_mode,
     )
 
 
 def _wrap_octree_public_result(
     *,
     result,
-    build_mode: str,
+    build_mode: TreeBuildMode,
     return_reordered: bool,
     return_workspace: bool,
 ):
@@ -1329,7 +1363,7 @@ def _wrap_octree_public_result(
         topology, pos_sorted, mass_sorted, inv, workspace = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1340,7 +1374,7 @@ def _wrap_octree_public_result(
         topology, pos_sorted, mass_sorted, inv = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1350,13 +1384,13 @@ def _wrap_octree_public_result(
         topology, workspace = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             workspace=workspace,
         )
         return tree, workspace
     return OctreeTree(
         topology=augment_radix_topology_with_octree(result),
-        build_mode=build_mode,  # type: ignore[arg-type]
+        build_mode=build_mode,
     )
 
 
