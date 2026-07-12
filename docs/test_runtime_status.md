@@ -35,7 +35,7 @@ That is a reduction of about `1m 56s` from the first full green baseline, or rou
 
 ### Correctness work needed to keep the suite green
 
-- Fixed far-interaction public list ordering in [yggdrax/_interactions_impl.py](/export/home/tbuck/yggdrax/yggdrax/_interactions_impl.py) by repacking raw pairs into the documented level-major order using JAX.
+- Fixed far-interaction public list ordering in [yggdrax/_interactions_impl.py](../yggdrax/_interactions_impl.py) by repacking raw pairs into the documented level-major order using JAX.
 
 ### Runtime reduction work already landed in this branch history
 
