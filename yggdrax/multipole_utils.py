@@ -120,9 +120,9 @@ def pack_tensor(level: int, tensor: Array) -> Array:
 
     Parameters
     ----------
-    level : int
+    level
         Tensor order ``l``.
-    tensor : Array
+    tensor
         Array of shape ``(l + 1, l + 1, l + 1)`` containing Cartesian
         components.  Only entries with ``i + j + k = l`` are read.
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
@@ -184,7 +186,7 @@ def build_interactions_and_neighbors(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
     pair_policy: PairPolicy | None = None,
@@ -194,14 +196,76 @@ def build_interactions_and_neighbors(
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
     return_grouped: bool = False,
-):
+) -> tuple:
     """Construct both far-field interactions and near-field neighbors.
 
-    When ``pair_policy`` is provided, it overrides the built-in MAC decision
-    for each candidate pair and may attach integer tags to accepted far
-    pairs. Policies are evaluated in both directions; a pair is accepted only
-    when both directed decisions accept, and the directed tags are exposed on
+    Runs a single dual-tree traversal that classifies node/leaf pairs into
+    well-separated far-field interactions (M2L) and near-field neighbor pairs
+    (P2P), using the multipole acceptance criterion selected by ``mac_type``
+    (or a custom ``pair_policy``).
+
+    When ``pair_policy`` is provided it overrides the built-in MAC decision for
+    each candidate pair and may attach integer tags to accepted far pairs.
+    Policies are evaluated in both directions; a pair is accepted only when
+    both directed decisions accept, and the directed tags are exposed on
     ``DualTreeWalkResult.interaction_tags`` when ``return_result=True``.
+
+    Fixed-capacity buffers are grown automatically (subject to internal caps)
+    when the traversal reports overflow, so the capacity arguments are hints
+    rather than hard limits unless they are pinned via ``traversal_config``.
+
+    Parameters
+    ----------
+    tree
+        Tree container exposing FMM-core topology (radix, octree, or kd-tree).
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion. Smaller
+        values accept fewer far pairs (more accurate, more work).
+    max_interactions_per_node
+        Capacity of the per-node far-interaction buffer. ``None`` auto-sizes it
+        and grows on overflow.
+    max_neighbors_per_leaf
+        Capacity of the per-leaf near-neighbor buffer.
+    max_pair_queue
+        Capacity of the traversal wavefront queue. ``None`` auto-sizes it.
+    process_block
+        Number of pairs processed per traversal iteration. ``None`` auto-sizes.
+    traversal_config
+        Bundled capacity/queue/block settings. When given, it takes precedence
+        over the equivalent individual keyword arguments.
+    retry_logger
+        Optional callable invoked with a :class:`DualTreeRetryEvent` on each
+        capacity-driven retry (for diagnostics/tuning).
+    mac_type
+        Multipole acceptance criterion: ``"bh"`` (Barnes-Hut opening angle),
+        ``"dehnen"``, or ``"engblom"``.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC decision.
+    policy_state
+        Opaque state threaded to ``pair_policy`` on every evaluation.
+    return_result
+        If ``True``, also return the raw :class:`DualTreeWalkResult` (including
+        ``interaction_tags``).
+    return_compact_far_pairs
+        If ``True``, also return exact-length :class:`CompactTaggedFarPairs`.
+    return_interactions
+        If ``True`` (default), include the sparse :class:`NodeInteractionList`
+        in the result.
+    return_grouped
+        If ``True``, also return displacement-grouped interaction buffers.
+
+    Returns
+    -------
+    tuple
+        By default ``(interactions, neighbors)`` where ``interactions`` is a
+        :class:`NodeInteractionList` and ``neighbors`` is a
+        :class:`NodeNeighborList`. Additional elements are appended, in
+        declaration order, for each enabled ``return_*`` flag
+        (``return_compact_far_pairs``, ``return_grouped``, ``return_result``).
     """
 
     return _call_with_topology(

@@ -70,6 +70,16 @@ profile = "black"
 line_length = 88
 skip_gitignore = true
 
+[tool.pydoclint]
+style = "numpy"
+# Types live in the (type-checked) signatures and are rendered by Sphinx
+# autodoc, so docstrings describe parameters/returns without repeating the
+# type hints. Short summary-only docstrings remain allowed.
+arg-type-hints-in-docstring = false
+check-return-types-in-docstring = false
+skip-checking-short-docstrings = true
+allow-init-docstring = true
+
 [tool.basedpyright]
 # Static type checking for the JAX-first public API. JAX ships no high-quality
 # type stubs, so the "unknown-type" family of diagnostics (which fire on almost

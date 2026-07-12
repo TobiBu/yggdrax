@@ -666,17 +666,17 @@ def compute_tree_multipole_moments(
 
     Parameters
     ----------
-    tree : object
+    tree
         Tree/topology exposing the FMM-core topology contract.
-    positions_sorted : Array
+    positions_sorted
         Particle positions in Morton order.
-    masses_sorted : Array
+    masses_sorted
         Particle masses reordered identically to ``positions_sorted``.
-    expansion_centers : Optional[Array]
+    expansion_centers
         Optional array ``(num_nodes, 3)`` specifying the expansion center for
         each node. When omitted, the node center-of-mass is used, which yields
         zero dipole moments.
-    max_order : int
+    max_order
         Highest multipole order to accumulate (``0`` ≤ ``max_order`` ≤ ``4``).
 
     Returns
