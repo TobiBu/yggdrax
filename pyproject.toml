@@ -40,7 +40,14 @@ dev = [
   "pydoclint>=0.6.0",
   "pytest>=8.3.0",
   "pytest-cov>=5.0.0",
-  "basedpyright>=1.39.0",
+  # The basedpyright baseline is sensitive to the jax type-stub version, so the
+  # dev/CI toolchain pins jax/jaxlib and basedpyright to keep the baselined
+  # type-check reproducible across machines. Runtime installs still allow the
+  # broader `jax>=0.8` range declared above. Bump these together and regenerate
+  # .basedpyright/baseline.json when moving to a newer jax.
+  "jax==0.8.3",
+  "jaxlib==0.8.3",
+  "basedpyright==1.39.9",
 ]
 docs = [
   "sphinx>=7.0",
@@ -95,6 +102,9 @@ allow-init-docstring = true
 include = ["yggdrax"]
 exclude = ["**/__pycache__", "**/.ipynb_checkpoints"]
 pythonVersion = "3.11"
+# Pin the analysis platform so the baseline is identical on dev machines
+# (e.g. macOS) and the Linux CI runners.
+pythonPlatform = "Linux"
 typeCheckingMode = "standard"
 
 # --- JAX has no usable stubs: silence the untyped-value noise ---------------
