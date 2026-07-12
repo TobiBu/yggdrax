@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Callable
 
+from jaxtyping import Array
+
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
@@ -45,10 +47,46 @@ def build_well_separated_interactions(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
 ) -> NodeInteractionList:
-    """Construct far-field interaction lists from a dual-tree walk."""
+    """Construct only the far-field interaction list from a dual-tree walk.
+
+    Like :func:`build_interactions_and_neighbors` but returns the sparse
+    far-field (M2L) list alone, skipping near-field neighbor collection.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_interactions_per_node
+        Capacity of the per-node far-interaction buffer; auto-sized when ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    NodeInteractionList
+        Sparse far-field interaction list.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_well_separated_interactions,
@@ -79,10 +117,46 @@ def build_compact_far_pairs(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
 ) -> CompactTaggedFarPairs:
-    """Construct exact-length far pairs from the generic dual-tree walk."""
+    """Construct exact-length tagged far pairs from the dual-tree walk.
+
+    Returns far-field pairs packed to their exact count (rather than the padded
+    per-node layout of :func:`build_well_separated_interactions`).
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_interactions_per_node
+        Per-node far-interaction capacity; auto-sized when ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    CompactTaggedFarPairs
+        Exact-length far pairs with per-pair tags.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_compact_far_pairs,
@@ -114,12 +188,55 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
-    timing_callback=None,
+    timing_callback: Callable[..., object] | None = None,
     compact_far_pair_capacity: int | None = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
-    """Construct compact far pairs and near neighbors with one shared count walk."""
+    """Construct compact far pairs and near neighbors from one count walk.
+
+    Produces both exact-length far pairs and the near-field neighbor list while
+    sharing a single bounded count pass (cheaper than two separate walks).
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_neighbors_per_leaf
+        Per-leaf near-neighbor capacity.
+    max_interactions_per_node
+        Per-node far-interaction capacity; auto-sized when ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+    timing_callback
+        Optional callable invoked with per-stage timing diagnostics.
+    compact_far_pair_capacity
+        Optional explicit capacity for the compact far-pair buffer.
+
+    Returns
+    -------
+    tuple
+        ``(compact_far_pairs, neighbors)`` as
+        (:class:`CompactTaggedFarPairs`, :class:`NodeNeighborList`).
+    """
 
     return _call_with_topology(
         _interactions_impl.build_compact_far_pairs_and_leaf_neighbor_lists,
@@ -154,10 +271,49 @@ def build_leaf_neighbor_lists(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
 ) -> NodeNeighborList:
-    """Construct near-field neighbor lists from a dual-tree walk."""
+    """Construct only the near-field neighbor list from a dual-tree walk.
+
+    Like :func:`build_interactions_and_neighbors` but returns the leaf-leaf
+    near-field (P2P) neighbor list alone, skipping far-field collection.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_neighbors_per_leaf
+        Per-leaf near-neighbor capacity.
+    max_interactions_per_node
+        Per-node far-interaction capacity used during the walk; auto-sized when
+        ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    NodeNeighborList
+        Near-field leaf neighbor list.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_leaf_neighbor_lists,
@@ -299,13 +455,53 @@ def build_interactions_and_neighbors_split(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
     pair_policy: PairPolicy | None = None,
     policy_state: object = None,
-):
-    """Construct far and near traversal products with separate walks."""
+) -> tuple:
+    """Construct far and near products using two separate dual-tree walks.
+
+    Same outputs as :func:`build_interactions_and_neighbors` but runs the
+    far-field and near-field collection as independent walks instead of one
+    shared traversal.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_interactions_per_node
+        Per-node far-interaction capacity; auto-sized when ``None``.
+    max_neighbors_per_leaf
+        Per-leaf near-neighbor capacity.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+
+    Returns
+    -------
+    tuple
+        ``(interactions, neighbors)`` as
+        (:class:`NodeInteractionList`, :class:`NodeNeighborList`).
+    """
 
     return _call_with_topology(
         _interactions_impl.build_interactions_and_neighbors_split,
@@ -337,10 +533,46 @@ def build_octree_native_far_pairs(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
 ) -> CompactTaggedOctreeFarPairs:
-    """Construct exact-length far-field pairs in explicit octree node space."""
+    """Construct exact-length far-field pairs in explicit octree node space.
+
+    Like :func:`build_compact_far_pairs` but emits pairs indexed in the explicit
+    octree cell space (requires an octree-augmented ``tree``).
+
+    Parameters
+    ----------
+    tree
+        Octree-augmented tree exposing the explicit ``oct_*`` buffers.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_interactions_per_node
+        Per-node far-interaction capacity; auto-sized when ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    CompactTaggedOctreeFarPairs
+        Exact-length far pairs in octree node space.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_octree_native_far_pairs,
@@ -372,10 +604,49 @@ def build_octree_native_neighbor_lists(
     max_pair_queue: int | None = None,
     process_block: int | None = None,
     traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger=None,
+    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
 ) -> OctreeNativeNeighborList:
-    """Construct exact-length near neighbors in explicit octree leaf space."""
+    """Construct exact-length near neighbors in explicit octree leaf space.
+
+    Like :func:`build_leaf_neighbor_lists` but emits neighbor pairs indexed in
+    the explicit octree leaf space (requires an octree-augmented ``tree``).
+
+    Parameters
+    ----------
+    tree
+        Octree-augmented tree exposing the explicit ``oct_*`` buffers.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_neighbors_per_leaf
+        Per-leaf near-neighbor capacity.
+    max_interactions_per_node
+        Per-node far-interaction capacity used during the walk; auto-sized when
+        ``None``.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    pair_policy
+        Optional JAX-traceable callable overriding the built-in MAC.
+    policy_state
+        Opaque state threaded to ``pair_policy``.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    OctreeNativeNeighborList
+        Exact-length near neighbors in octree leaf space.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_octree_native_neighbor_lists,
@@ -398,12 +669,36 @@ def build_octree_native_neighbor_lists(
 def build_grouped_interactions_from_pairs(
     tree: object,
     geometry: TreeGeometry,
-    interaction_sources,
-    interaction_targets,
+    interaction_sources: Array,
+    interaction_targets: Array,
     *,
-    level_offsets=None,
+    level_offsets: Array | None = None,
 ):
-    """Group interaction pairs by tree level for level-major processing."""
+    """Group far-field pairs into displacement classes for class-major M2L.
+
+    Thin wrapper over
+    :func:`yggdrax.grouped_interactions.build_grouped_interactions_from_pairs`
+    that first resolves ``tree`` to its topology payload.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing level-order metadata.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    interaction_sources
+        Far-pair source node indices, shape ``(num_pairs,)``.
+    interaction_targets
+        Far-pair target node indices, shape ``(num_pairs,)``.
+    level_offsets
+        Optional precomputed level offsets passed through for diagnostics;
+        derived from ``tree`` when omitted.
+
+    Returns
+    -------
+    GroupedInteractionBuffers
+        Class keys, per-class displacements, and CSR-style class offsets/ids.
+    """
 
     return _call_with_topology(
         _interactions_impl.build_grouped_interactions_from_pairs,
@@ -424,7 +719,31 @@ def diagnose_leaf_neighbor_growth(
     top_k: int = 10,
     sample_neighbors: int = 20,
 ) -> dict:
-    """Return a compact report of highest per-leaf neighbor counts."""
+    """Return a compact report of the highest per-leaf neighbor counts.
+
+    Diagnostic helper for tuning ``max_neighbors_per_leaf``: runs the near-field
+    walk and summarizes which leaves accumulate the most neighbors.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_neighbors_per_leaf
+        Per-leaf near-neighbor capacity used for the probe walk.
+    top_k
+        Number of highest-count leaves to report.
+    sample_neighbors
+        Number of sample neighbor ids to include per reported leaf.
+
+    Returns
+    -------
+    dict
+        Report with the top per-leaf neighbor counts and sampled neighbor ids.
+    """
 
     return _call_with_topology(
         _interactions_impl.diagnose_leaf_neighbor_growth,
