@@ -188,18 +188,21 @@ pytest --cov=yggdrax --cov-report=term-missing
 
 ## Documentation
 
-The reference documentation is built with Sphinx (autodoc + napoleon, numpy
-docstring style):
+Hosted documentation: **https://tobias-buck.de/yggdrax/**
+
+It includes a concepts guide (trees/backends, Morton ordering, MAC variants,
+buffer glossary), the backend contract, and the full API reference generated
+from docstrings. The site is built with Sphinx (autodoc + napoleon, numpy
+docstring style) and published to GitHub Pages on every push to `main` by the
+`Docs` workflow.
+
+To build it locally:
 
 ```bash
 pip install -e ".[docs]"
 python -m sphinx -b html docs docs/_build/html
 # open docs/_build/html/index.html
 ```
-
-It includes a concepts guide (trees/backends, Morton ordering, MAC variants,
-buffer glossary), the backend contract, and the full API reference generated
-from docstrings.
 
 ## Project Structure
 
