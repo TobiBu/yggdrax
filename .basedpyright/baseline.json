@@ -1936,14 +1936,6 @@
                 }
             },
             {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 11,
-                    "endColumn": 5,
-                    "lineCount": 23
-                }
-            },
-            {
                 "code": "reportCallIssue",
                 "range": {
                     "startColumn": 30,

@@ -552,7 +552,7 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
         parent,
         left_child,
         right_child,
-        num_internal,
+        num_internal,  # pyright: ignore[reportReturnType]
         num_particles,
         use_morton_geometry,
         split_dim_arr.astype(jnp.int32),
