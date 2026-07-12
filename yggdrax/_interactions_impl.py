@@ -986,6 +986,77 @@ def _compute_leaf_effective_extents_from_mask(
     )
 
 
+def _build_mac_extents(
+    parent: Array,
+    geometry: TreeGeometry,
+    num_internal: int,
+    mac_type: str,
+    dehnen_radius_scale: float,
+) -> tuple[Array, Array]:
+    """Per-node MAC extent proxies (box or sphere) for a radix-style tree.
+
+    Internal nodes use the far proxy and leaves the depth-padded leaf proxy.
+    ``dehnen``/``engblom`` select bounding-sphere radii over box half-extents,
+    and ``dehnen`` additionally scales the radius by ``dehnen_radius_scale``.
+
+    This is the single source of truth for the MAC extent selection shared by
+    the radix dual-tree walk, its count and compact-fill passes, and the
+    distributed cross-walk.
+
+    Parameters
+    ----------
+    parent : Array
+        Per-node parent index (root's parent is negative), length ``n_nodes``.
+    geometry : TreeGeometry
+        Node geometry providing ``max_extent`` (box) and ``radius`` (sphere).
+    num_internal : int
+        Number of internal nodes; nodes with index ``>= num_internal`` are
+        leaves and use the leaf proxy.
+    mac_type : str
+        MAC variant: ``"bh"`` (box), ``"dehnen"`` or ``"engblom"`` (sphere).
+    dehnen_radius_scale : float
+        Multiplicative radius scale applied only for ``mac_type == "dehnen"``.
+
+    Returns
+    -------
+    mac_extents : Array
+        Per-node effective extent used by the MAC test (far proxy for internal
+        nodes, leaf proxy for leaves), length ``n_nodes``.
+    extents_leaf : Array
+        The depth-padded leaf proxy for every node, length ``n_nodes`` (used by
+        the count pass's refine-split heuristic).
+    """
+
+    extents_box = jnp.asarray(geometry.max_extent)
+    extents_sphere = jnp.asarray(geometry.radius)
+    effective_extents_box_far = _compute_effective_extents(parent, extents_box)
+    effective_extents_box_leaf = _compute_leaf_effective_extents(
+        parent, extents_box, num_internal
+    )
+    effective_extents_sphere_far = _compute_effective_extents(parent, extents_sphere)
+    effective_extents_sphere_leaf = _compute_leaf_effective_extents(
+        parent, extents_sphere, num_internal
+    )
+
+    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
+    extents_far = jnp.where(
+        use_sphere, effective_extents_sphere_far, effective_extents_box_far
+    )
+    extents_leaf = jnp.where(
+        use_sphere, effective_extents_sphere_leaf, effective_extents_box_leaf
+    )
+    dehnen_scale = jnp.asarray(dehnen_radius_scale, dtype=extents_box.dtype)
+    is_dehnen = jnp.asarray(mac_type == "dehnen")
+    extents_far = jnp.where(is_dehnen, dehnen_scale * extents_far, extents_far)
+    extents_leaf = jnp.where(is_dehnen, dehnen_scale * extents_leaf, extents_leaf)
+
+    node_indices = jnp.arange(parent.shape[0], dtype=INDEX_DTYPE)
+    mac_extents = jnp.where(
+        node_indices >= as_index(num_internal), extents_leaf, extents_far
+    )
+    return mac_extents, extents_leaf
+
+
 def _exclusive_cumsum(values: Array, *, dtype=None) -> Array:
     resolved_dtype = values.dtype if dtype is None else dtype
     zeros = jnp.zeros((1,), dtype=resolved_dtype)
@@ -1111,27 +1182,7 @@ def _dual_tree_walk_impl(
         )
 
     centers = jnp.asarray(geometry.center)
-    # NOTE: We maintain two extent measures:
-    # - max_extent: conservative box half-extent (L_inf radius)
-    # - radius: bounding-sphere radius (L2 norm of half-extents)
-    # Different MAC variants prefer different measures.
-    extents_box = jnp.asarray(geometry.max_extent)
-    extents_sphere = jnp.asarray(geometry.radius)
-
     theta_sq = (jnp.asarray(theta, dtype=centers.dtype)) ** 2
-    # Far/leaf effective extents are built from a per-node base extent.
-    effective_extents_box_far = _compute_effective_extents(parent, extents_box)
-    effective_extents_box_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_box,
-        num_internal,
-    )
-    effective_extents_sphere_far = _compute_effective_extents(parent, extents_sphere)
-    effective_extents_sphere_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_sphere,
-        num_internal,
-    )
     # Root is the unique node whose parent is -1.
     root_idx = as_index(jnp.argmin(parent))
 
@@ -1187,29 +1238,9 @@ def _dual_tree_walk_impl(
     near_overflow = jnp.bool_(False)
 
     num_internal_val = as_index(num_internal)
-    node_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
-    # Choose the geometric proxy required by the MAC.
-    # - bh: historically uses box max half-extent
-    # - dehnen/engblom: use bounding-sphere radii
-    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
-    extents_far = jnp.where(
-        use_sphere,
-        effective_extents_sphere_far,
-        effective_extents_box_far,
-    )
-    extents_leaf = jnp.where(
-        use_sphere,
-        effective_extents_sphere_leaf,
-        effective_extents_box_leaf,
-    )
-    dehnen_scale = jnp.asarray(dehnen_radius_scale, dtype=centers.dtype)
-    is_dehnen = jnp.asarray(mac_type == "dehnen")
-    extents_far = jnp.where(is_dehnen, dehnen_scale * extents_far, extents_far)
-    extents_leaf = jnp.where(is_dehnen, dehnen_scale * extents_leaf, extents_leaf)
-    mac_extents = jnp.where(
-        node_indices >= num_internal_val,
-        extents_leaf,
-        extents_far,
+    # Choose the geometric proxy required by the MAC (see _build_mac_extents).
+    mac_extents, _ = _build_mac_extents(
+        parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
@@ -2608,21 +2639,7 @@ def _dual_tree_walk_count_impl(
         )
 
     centers = jnp.asarray(geometry.center)
-    extents_box = jnp.asarray(geometry.max_extent)
-    extents_sphere = jnp.asarray(geometry.radius)
     theta_sq = (jnp.asarray(theta, dtype=centers.dtype)) ** 2
-    effective_extents_box_far = _compute_effective_extents(parent, extents_box)
-    effective_extents_box_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_box,
-        num_internal,
-    )
-    effective_extents_sphere_far = _compute_effective_extents(parent, extents_sphere)
-    effective_extents_sphere_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_sphere,
-        num_internal,
-    )
 
     root_idx = as_index(jnp.argmax(parent < 0))
     num_leaves = total_nodes - num_internal
@@ -2664,26 +2681,8 @@ def _dual_tree_walk_count_impl(
     max_wf = as_index(1)
 
     num_internal_val = as_index(num_internal)
-    node_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
-    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
-    extents_far = jnp.where(
-        use_sphere,
-        effective_extents_sphere_far,
-        effective_extents_box_far,
-    )
-    extents_leaf = jnp.where(
-        use_sphere,
-        effective_extents_sphere_leaf,
-        effective_extents_box_leaf,
-    )
-    dehnen_scale = jnp.asarray(dehnen_radius_scale, dtype=centers.dtype)
-    is_dehnen = jnp.asarray(mac_type == "dehnen")
-    extents_far = jnp.where(is_dehnen, dehnen_scale * extents_far, extents_far)
-    extents_leaf = jnp.where(is_dehnen, dehnen_scale * extents_leaf, extents_leaf)
-    mac_extents = jnp.where(
-        node_indices >= num_internal_val,
-        extents_leaf,
-        extents_far,
+    mac_extents, extents_leaf = _build_mac_extents(
+        parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
@@ -2997,21 +2996,7 @@ def _dual_tree_walk_compact_fill_impl(
         )
 
     centers = jnp.asarray(geometry.center)
-    extents_box = jnp.asarray(geometry.max_extent)
-    extents_sphere = jnp.asarray(geometry.radius)
     theta_sq = (jnp.asarray(theta, dtype=centers.dtype)) ** 2
-    effective_extents_box_far = _compute_effective_extents(parent, extents_box)
-    effective_extents_box_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_box,
-        num_internal,
-    )
-    effective_extents_sphere_far = _compute_effective_extents(parent, extents_sphere)
-    effective_extents_sphere_leaf = _compute_leaf_effective_extents(
-        parent,
-        extents_sphere,
-        num_internal,
-    )
 
     root_idx = as_index(jnp.argmin(parent))
     num_leaves = total_nodes - num_internal
@@ -3025,26 +3010,8 @@ def _dual_tree_walk_compact_fill_impl(
     stack_size = as_index(1)
 
     num_internal_val = as_index(num_internal)
-    node_indices = jnp.arange(total_nodes, dtype=INDEX_DTYPE)
-    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
-    extents_far = jnp.where(
-        use_sphere,
-        effective_extents_sphere_far,
-        effective_extents_box_far,
-    )
-    extents_leaf = jnp.where(
-        use_sphere,
-        effective_extents_sphere_leaf,
-        effective_extents_box_leaf,
-    )
-    dehnen_scale = jnp.asarray(dehnen_radius_scale, dtype=centers.dtype)
-    is_dehnen = jnp.asarray(mac_type == "dehnen")
-    extents_far = jnp.where(is_dehnen, dehnen_scale * extents_far, extents_far)
-    extents_leaf = jnp.where(is_dehnen, dehnen_scale * extents_leaf, extents_leaf)
-    mac_extents = jnp.where(
-        node_indices >= num_internal_val,
-        extents_leaf,
-        extents_far,
+    mac_extents, _ = _build_mac_extents(
+        parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
