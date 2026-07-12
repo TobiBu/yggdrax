@@ -9,3 +9,6 @@ dist/
 *.egg-info/
 .ipynb_checkpoints/
 .venv/
+
+# Sphinx build output
+docs/_build/

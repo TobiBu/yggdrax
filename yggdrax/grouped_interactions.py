@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,11 @@ import numpy as np
 from .dtypes import INDEX_DTYPE
 from .geometry import TreeGeometry
 from .tree import get_node_levels, get_nodes_by_level
+
+if TYPE_CHECKING:
+    # Imported for typing only; a runtime import would be circular because
+    # _interactions_impl imports this module.
+    from ._interactions_impl import NodeInteractionList
 
 
 class GroupedInteractionBuffers(NamedTuple):
@@ -36,9 +41,28 @@ def _safe_cell_size(root_extent: np.ndarray, level: np.ndarray) -> np.ndarray:
 def build_grouped_interactions(
     tree: object,
     geometry: TreeGeometry,
-    interactions,
+    interactions: NodeInteractionList,
 ) -> GroupedInteractionBuffers:
-    """Group sparse far-field pairs into displacement classes."""
+    """Group sparse far-field pairs into displacement classes.
+
+    Host-side (NumPy) grouping of a :class:`NodeInteractionList` into classes
+    keyed by ``(target_level, source_level, displacement xyz)`` so a solver can
+    execute one translation stencil per class ("class-major" M2L).
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing level-order metadata.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    interactions
+        Sparse far-field list with ``sources``/``targets`` arrays.
+
+    Returns
+    -------
+    GroupedInteractionBuffers
+        Class keys, per-class displacements, and CSR-style class offsets/ids.
+    """
     return build_grouped_interactions_from_pairs(
         tree,
         geometry,
@@ -56,7 +80,31 @@ def build_grouped_interactions_from_pairs(
     *,
     level_offsets: jnp.ndarray | None = None,
 ) -> GroupedInteractionBuffers:
-    """Group far-field source/target arrays into displacement classes."""
+    """Group far-field source/target node arrays into displacement classes.
+
+    Lower-level entry point for :func:`build_grouped_interactions` that takes
+    the source/target node-index arrays directly. Runs eagerly on the host
+    (NumPy ``lexsort`` + boundary detection); not JAX-traceable.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing level-order metadata.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    sources
+        Far-pair source node indices, shape ``(num_pairs,)``.
+    targets
+        Far-pair target node indices, shape ``(num_pairs,)``.
+    level_offsets
+        Optional precomputed level offsets passed through for diagnostics;
+        derived from ``tree`` when omitted.
+
+    Returns
+    -------
+    GroupedInteractionBuffers
+        Class keys, per-class displacements, and CSR-style class offsets/ids.
+    """
 
     src = np.asarray(jax.device_get(sources), dtype=np.int64)
     tgt = np.asarray(jax.device_get(targets), dtype=np.int64)

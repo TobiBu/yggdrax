@@ -40,8 +40,7 @@ from .._interactions_impl import (
     _DEFAULT_PAIR_BATCH,
     DualTreeWalkResult,
     MACType,
-    _compute_effective_extents,
-    _compute_leaf_effective_extents,
+    _build_mac_extents,
     _compute_mac_ok,
     _default_pair_actions_only,
     _per_key_prefix,
@@ -52,34 +51,6 @@ from ..geometry import TreeGeometry
 
 # One target and one source child at most, expanded per split case.
 _MAX_CROSS_REFINEMENT_PAIRS = 4
-
-
-def _build_mac_extents(parent, geometry, num_internal, mac_type, dehnen_radius_scale):
-    """Per-node MAC extent proxy (box or sphere) for one tree.
-
-    Mirrors the extent selection in ``_dual_tree_walk_impl`` (internal nodes use
-    the far proxy, leaves the leaf proxy; dehnen scales the radius).
-    """
-
-    extents_box = jnp.asarray(geometry.max_extent)
-    extents_sphere = jnp.asarray(geometry.radius)
-    eff_box_far = _compute_effective_extents(parent, extents_box)
-    eff_box_leaf = _compute_leaf_effective_extents(parent, extents_box, num_internal)
-    eff_sph_far = _compute_effective_extents(parent, extents_sphere)
-    eff_sph_leaf = _compute_leaf_effective_extents(parent, extents_sphere, num_internal)
-
-    use_sphere = (mac_type == "dehnen") | (mac_type == "engblom")
-    extents_far = jnp.where(use_sphere, eff_sph_far, eff_box_far)
-    extents_leaf = jnp.where(use_sphere, eff_sph_leaf, eff_box_leaf)
-
-    scale = jnp.asarray(dehnen_radius_scale, dtype=extents_box.dtype)
-    is_dehnen = jnp.asarray(mac_type == "dehnen")
-    extents_far = jnp.where(is_dehnen, scale * extents_far, extents_far)
-    extents_leaf = jnp.where(is_dehnen, scale * extents_leaf, extents_leaf)
-
-    total = parent.shape[0]
-    node_idx = jnp.arange(total, dtype=INDEX_DTYPE)
-    return jnp.where(node_idx >= as_index(num_internal), extents_leaf, extents_far)
 
 
 def _children_full(tree, total_nodes, num_internal):
@@ -158,10 +129,10 @@ def dual_tree_walk_cross_impl(
 
     t_centers = jnp.asarray(target_geometry.center)
     s_centers = jnp.asarray(source_geometry.center)
-    t_extents = _build_mac_extents(
+    t_extents, _ = _build_mac_extents(
         t_parent, target_geometry, t_internal, mac_type, dehnen_radius_scale
     )
-    s_extents = _build_mac_extents(
+    s_extents, _ = _build_mac_extents(
         s_parent, source_geometry, s_internal, mac_type, dehnen_radius_scale
     )
     theta_sq = jnp.asarray(theta, dtype=t_centers.dtype) ** 2

@@ -120,9 +120,9 @@ def pack_tensor(level: int, tensor: Array) -> Array:
 
     Parameters
     ----------
-    level : int
+    level
         Tensor order ``l``.
-    tensor : Array
+    tensor
         Array of shape ``(l + 1, l + 1, l + 1)`` containing Cartesian
         components.  Only entries with ``i + j + k = l`` are read.
 
@@ -147,7 +147,28 @@ def pack_tensor(level: int, tensor: Array) -> Array:
 
 @jaxtyped(typechecker=beartype)
 def unpack_tensor(level: int, data: Array) -> Array:
-    """Unpack a packed triangular buffer back into Cartesian components."""
+    """Unpack a packed triangular buffer back into Cartesian components.
+
+    Inverse of :func:`pack_tensor`.
+
+    Parameters
+    ----------
+    level
+        Tensor order ``l``.
+    data
+        Packed representation whose last axis has length ``level_size(level)``.
+
+    Returns
+    -------
+    Array
+        Dense tensor of shape ``(l + 1, l + 1, l + 1)`` with the symmetric
+        components filled in (entries with ``i + j + k != l`` are zero).
+
+    Raises
+    ------
+    ValueError
+        If ``data``'s last axis does not have length ``level_size(level)``.
+    """
 
     lvl = int(level)
     expected = level_size(lvl)

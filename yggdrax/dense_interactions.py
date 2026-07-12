@@ -151,7 +151,27 @@ def densify_interactions(
     geometry: TreeGeometry,
     interactions: NodeInteractionList,
 ) -> DenseInteractionBuffers:
-    """Convert sparse far-field interactions into dense level-major tensors."""
+    """Convert sparse far-field interactions into dense level-major tensors.
+
+    Regroups a :class:`NodeInteractionList` into padded ``(num_levels,
+    max_nodes, max_interactions)`` buffers (source ids, validity mask, counts,
+    and target-minus-source displacements) so a batched M2L kernel can process
+    one tree level at a time.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    interactions
+        Sparse far-field list from :func:`build_interactions_and_neighbors`.
+
+    Returns
+    -------
+    DenseInteractionBuffers
+        Level-major M2L buffers plus the original sparse list.
+    """
 
     topology = resolve_tree_topology(tree)
     require_fmm_core_topology(topology)
@@ -187,7 +207,33 @@ def build_dense_interactions(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> DenseInteractionBuffers:
-    """Build sparse far-field interactions and emit their dense view."""
+    """Build sparse far-field interactions and return their dense view.
+
+    Convenience wrapper: runs :func:`build_interactions_and_neighbors` and then
+    :func:`densify_interactions`.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    max_pair_queue
+        Traversal wavefront capacity; auto-sized when ``None``.
+    process_block
+        Pairs processed per traversal iteration; auto-sized when ``None``.
+    traversal_config
+        Bundled traversal settings; overrides the individual arguments.
+    retry_logger
+        Optional callable invoked on each capacity-driven retry.
+
+    Returns
+    -------
+    DenseInteractionBuffers
+        Level-major M2L buffers plus the original sparse list.
+    """
 
     interactions, _neighbors = build_interactions_and_neighbors(
         tree,

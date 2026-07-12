@@ -33,7 +33,49 @@ def build_prepared_tree_artifacts(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     dehnen_radius_scale: float = 1.0,
 ) -> PreparedTreeArtifacts:
-    """Build a prepared tree + traversal bundle with stable public fields."""
+    """Build a tree, geometry, and interactions in one call.
+
+    End-to-end convenience: reorders particles into a tree, computes per-node
+    geometry, and runs the dual-tree walk, returning everything a downstream
+    solver needs in a single bundle with stable public field names. A
+    KD-tree-tuned traversal configuration is chosen automatically when
+    ``traversal_config`` is omitted and ``tree_type == "kdtree"``.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred from ``positions``
+        when omitted.
+    tree_type
+        Backend to build: ``"radix"``, ``"octree"``, or ``"kdtree"``.
+    leaf_size
+        Maximum particles per leaf.
+    theta
+        Opening-angle parameter of the multipole acceptance criterion.
+    mac_type
+        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
+    traversal_config
+        Optional traversal capacity/queue settings; a KD-tree-tuned default is
+        used when omitted for KD-trees.
+    dehnen_radius_scale
+        Effective-radius scale applied for the Dehnen MAC.
+
+    Returns
+    -------
+    PreparedTreeArtifacts
+        Bundle of the tree, reordered particle buffers, inverse permutation,
+        geometry, far-field interactions, near-field neighbors, and the raw
+        traversal result.
+
+    Raises
+    ------
+    RuntimeError
+        If the tree build did not return reordered particle buffers.
+    """
 
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
     tree = Tree.from_particles(

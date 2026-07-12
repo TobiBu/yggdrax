@@ -54,11 +54,21 @@ jobs:
             yggdrax/tree_moments.py \
             yggdrax/types.py
 
+      - name: basedpyright (static type check)
+        # Config + baseline are in pyproject.toml / .basedpyright/baseline.json.
+        # The gate enforces "no new type errors" over the committed baseline.
+        run: basedpyright yggdrax
+
       - name: Unit tests with coverage
         run: pytest
 
       - name: Tree backend smoke script
         run: python examples/kdtree_jaccpot_smoke.py --n-points 512 --leaf-size 16 --seed 0
+
+      - name: Build documentation
+        run: |
+          pip install -e ".[docs]"
+          python -m sphinx -b html docs docs/_build/html
 
       - name: Upload coverage XML artifact
         uses: actions/upload-artifact@v4

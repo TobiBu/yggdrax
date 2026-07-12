@@ -166,12 +166,12 @@ def compute_tree_geometry(
 
     Parameters
     ----------
-    tree : object
+    tree
         Topology object exposing tree-structure arrays.
-    positions_sorted : Array
+    positions_sorted
         Particle positions reordered into Morton order. This should be the
         ``positions`` output from ``build_tree(..., return_reordered=True)``.
-    max_leaf_size : int | None, optional
+    max_leaf_size
         Optional explicit upper bound for particles per leaf. Passing the known
         tree leaf cap keeps JIT-staged leaf gathers bounded by leaf occupancy
         instead of the full particle count.

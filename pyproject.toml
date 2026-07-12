@@ -40,6 +40,19 @@ dev = [
   "pydoclint>=0.6.0",
   "pytest>=8.3.0",
   "pytest-cov>=5.0.0",
+  # The basedpyright baseline is sensitive to the jax type-stub version, so the
+  # dev/CI toolchain pins jax/jaxlib and basedpyright to keep the baselined
+  # type-check reproducible across machines. Runtime installs still allow the
+  # broader `jax>=0.8` range declared above. Bump these together and regenerate
+  # .basedpyright/baseline.json when moving to a newer jax.
+  "jax==0.8.3",
+  "jaxlib==0.8.3",
+  "basedpyright==1.39.9",
+]
+docs = [
+  "sphinx>=7.0",
+  "furo>=2024.1.29",
+  "myst-parser>=2.0",
 ]
 
 [tool.setuptools]
@@ -68,6 +81,48 @@ exclude = '''
 profile = "black"
 line_length = 88
 skip_gitignore = true
+
+[tool.pydoclint]
+style = "numpy"
+# Types live in the (type-checked) signatures and are rendered by Sphinx
+# autodoc, so docstrings describe parameters/returns without repeating the
+# type hints. Short summary-only docstrings remain allowed.
+arg-type-hints-in-docstring = false
+check-return-types = false
+skip-checking-short-docstrings = true
+allow-init-docstring = true
+
+[tool.basedpyright]
+# Static type checking for the JAX-first public API. JAX ships no high-quality
+# type stubs, so the "unknown-type" family of diagnostics (which fire on almost
+# every jnp.* call) is disabled to keep the gate focused on real type errors
+# rather than JAX-stub noise. Pre-existing findings are captured in
+# basedpyright-baseline.json; the gate enforces "no new type errors" and the
+# baseline is burned down incrementally.
+include = ["yggdrax"]
+exclude = ["**/__pycache__", "**/.ipynb_checkpoints"]
+pythonVersion = "3.11"
+# Pin the analysis platform so the baseline is identical on dev machines
+# (e.g. macOS) and the Linux CI runners.
+pythonPlatform = "Linux"
+typeCheckingMode = "standard"
+
+# --- JAX has no usable stubs: silence the untyped-value noise ---------------
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+reportMissingParameterType = false
+reportAny = false
+reportExplicitAny = false
+
+# --- Keep the high-signal, bug-catching diagnostics as errors ---------------
+reportPossiblyUnboundVariable = "error"
+reportUnboundVariable = "error"
+reportOptionalMemberAccess = "error"
+reportSelfClsParameterName = "error"
 
 [tool.pytest.ini_options]
 minversion = "7.4"

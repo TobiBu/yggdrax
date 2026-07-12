@@ -477,7 +477,23 @@ def compute_explicit_octree_box_geometry(
 
 
 def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
-    """Derive explicit octree cells from octree leaves and map compat nodes onto them."""
+    """Derive explicit octree cells and map the radix nodes onto them.
+
+    Builds the compressed set of octree cells (Morton leaves plus their
+    consecutive-pair least-common-ancestors) and the mappings that link the
+    radix/compat nodes to octree cells.
+
+    Parameters
+    ----------
+    topology
+        Radix topology exposing the Morton leaf contract.
+
+    Returns
+    -------
+    ExplicitOctreeMetadata
+        Octree cell tables (children, depths, ranges, level offsets) and the
+        ``radix_node_to_oct`` / ``radix_leaf_to_oct`` mappings.
+    """
 
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
@@ -535,7 +551,23 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
 
 
 def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
-    """Return an octree-augmented topology preserving radix compatibility."""
+    """Return an octree-augmented topology that preserves radix compatibility.
+
+    Attaches the explicit octree buffers (see
+    :func:`build_explicit_octree_metadata`) to a radix topology without
+    disturbing its FMM-core fields, so the result works with both the radix
+    traversal core and octree-style level scheduling.
+
+    Parameters
+    ----------
+    topology
+        Radix topology exposing the Morton leaf contract.
+
+    Returns
+    -------
+    OctreeTopology
+        The topology extended with ``oct_*`` and ``radix_*_to_oct`` fields.
+    """
 
     metadata = build_explicit_octree_metadata(topology)
     base_fields = tuple(getattr(topology, name) for name in topology._fields)
@@ -545,7 +577,27 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
 def build_explicit_octree_traversal_view(
     topology: object,
 ) -> ExplicitOctreeTraversalView:
-    """Package explicit octree structure, mappings, and box geometry."""
+    """Package explicit octree structure, mappings, and box geometry.
+
+    Convenience view that bundles the octree cell tables, the radix<->octree
+    mappings, and per-cell box geometry for downstream octree-native traversal.
+
+    Parameters
+    ----------
+    topology
+        Octree-augmented topology (see :func:`augment_radix_topology_with_octree`)
+        exposing the ``oct_*`` fields.
+
+    Returns
+    -------
+    ExplicitOctreeTraversalView
+        Bundled octree structure, mappings, and box geometry.
+
+    Raises
+    ------
+    ValueError
+        If ``topology`` is missing any required ``oct_*`` field.
+    """
 
     required = (
         "oct_valid_mask",

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 
+import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike, DTypeLike
 
 
-def _resolve_index_dtype() -> jnp.dtype:
+def _resolve_index_dtype() -> DTypeLike:
     """Resolve index dtype from environment.
 
     Supported values:
@@ -30,15 +32,15 @@ def _resolve_index_dtype() -> jnp.dtype:
 
 
 # Keep tree/index contracts consistent across yggdrax artifacts.
-INDEX_DTYPE = _resolve_index_dtype()
+INDEX_DTYPE: DTypeLike = _resolve_index_dtype()
 
 
-def as_index(x):
+def as_index(x: ArrayLike) -> jax.Array:
     """Convert a scalar/array to yggdrax index dtype."""
     return jnp.asarray(x, dtype=INDEX_DTYPE)
 
 
-def complex_dtype_for_real(real_dtype):
+def complex_dtype_for_real(real_dtype: DTypeLike) -> DTypeLike:
     """Return complex dtype paired with a real floating dtype."""
     dtype = jnp.asarray(0, dtype=real_dtype).dtype
     if dtype == jnp.float64:

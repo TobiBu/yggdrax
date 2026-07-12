@@ -500,7 +500,33 @@ def tree_moments_from_raw(
     centers: Array,
     max_order: int,
 ) -> TreeMultipoleMoments:
-    """Build ``TreeMultipoleMoments`` from raw central coefficients."""
+    """Build ``TreeMultipoleMoments`` from raw central packed coefficients.
+
+    Like :func:`multipole_from_packed`, but treats ``packed`` as coefficients
+    already expressed about ``centers`` (the "central"/raw convention) rather
+    than converting from mass moments.
+
+    Parameters
+    ----------
+    packed
+        Raw packed coefficients of shape
+        ``(num_nodes, >= total_coefficients(max_order))``.
+    centers
+        Per-node expansion centers of shape ``(num_nodes, 3)``.
+    max_order
+        Highest multipole order to reconstruct (``0`` ≤ ``max_order`` ≤ ``4``).
+
+    Returns
+    -------
+    TreeMultipoleMoments
+        Per-node moment tensors through ``max_order``.
+
+    Raises
+    ------
+    ValueError
+        If ``packed`` is not rank-2, lacks enough coefficients, or its row
+        count does not match ``centers``.
+    """
 
     order = _validate_order(max_order)
     if packed.ndim != 2:
@@ -522,7 +548,32 @@ def multipole_from_packed(
     centers: Array,
     max_order: int,
 ) -> TreeMultipoleMoments:
-    """Reconstruct multipole tensors from packed triangular coefficients."""
+    """Reconstruct multipole tensors from packed triangular coefficients.
+
+    Inverse of the packing done by :func:`pack_multipole_expansions`: expands
+    the packed per-node coefficient rows back into named Cartesian moment
+    tensors (dipole, quadrupole, octupole, hexadecapole) up to ``max_order``.
+
+    Parameters
+    ----------
+    packed
+        Packed coefficients of shape ``(num_nodes, >= total_coefficients(max_order))``.
+    centers
+        Per-node expansion centers of shape ``(num_nodes, 3)``.
+    max_order
+        Highest multipole order to reconstruct (``0`` ≤ ``max_order`` ≤ ``4``).
+
+    Returns
+    -------
+    TreeMultipoleMoments
+        Per-node moment tensors through ``max_order``.
+
+    Raises
+    ------
+    ValueError
+        If ``packed`` is not rank-2, lacks enough coefficients, or its row
+        count does not match ``centers``.
+    """
 
     order = _validate_order(max_order)
     if packed.ndim != 2:
@@ -567,6 +618,26 @@ def translate_packed_moments(
     delta: Array,
     max_order: int,
 ) -> Array:
+    """Translate a packed multipole expansion to a shifted center (M2M).
+
+    Applies the multipole-to-multipole shift stencil so a child's packed
+    coefficients are re-expressed about a parent center offset by ``delta``.
+
+    Parameters
+    ----------
+    packed_child
+        Packed child coefficients of length ``>= total_coefficients(max_order)``.
+    delta
+        Translation vector ``parent_center - child_center`` of shape ``(3,)``.
+    max_order
+        Highest multipole order to translate (``0`` ≤ ``max_order`` ≤ ``4``).
+
+    Returns
+    -------
+    Array
+        Packed coefficients expressed about the translated center.
+    """
+
     order = _validate_order(max_order)
     total = total_coefficients(order)
     dtype = packed_child.dtype
@@ -617,7 +688,25 @@ def compute_tree_mass_moments(
     positions_sorted: Array,
     masses_sorted: Array,
 ) -> TreeMassMoments:
-    """Compute total mass and centre of mass for every tree node."""
+    """Compute total mass and center of mass for every tree node.
+
+    Uses prefix sums over the Morton-sorted masses and mass-weighted positions
+    for O(1)-per-node range queries.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    positions_sorted
+        Particle positions in Morton order, shape ``(n_particles, 3)``.
+    masses_sorted
+        Particle masses reordered identically to ``positions_sorted``.
+
+    Returns
+    -------
+    TreeMassMoments
+        Per-node total mass and center of mass.
+    """
 
     topology = resolve_tree_topology(tree)
     require_fmm_core_topology(topology)
@@ -666,17 +755,17 @@ def compute_tree_multipole_moments(
 
     Parameters
     ----------
-    tree : object
+    tree
         Tree/topology exposing the FMM-core topology contract.
-    positions_sorted : Array
+    positions_sorted
         Particle positions in Morton order.
-    masses_sorted : Array
+    masses_sorted
         Particle masses reordered identically to ``positions_sorted``.
-    expansion_centers : Optional[Array]
+    expansion_centers
         Optional array ``(num_nodes, 3)`` specifying the expansion center for
         each node. When omitted, the node center-of-mass is used, which yields
         zero dipole moments.
-    max_order : int
+    max_order
         Highest multipole order to accumulate (``0`` ≤ ``max_order`` ≤ ``4``).
 
     Returns
@@ -790,7 +879,29 @@ def pack_multipole_expansions(
     moments: TreeMultipoleMoments,
     max_order: int,
 ) -> Array:
-    """Pack multipole coefficients (triangular layout) up to ``max_order``."""
+    """Pack multipole coefficients into the triangular layout up to ``max_order``.
+
+    Flattens the named moment tensors on ``moments`` into the contiguous packed
+    representation consumed by :func:`translate_packed_moments` and
+    :func:`multipole_from_packed`.
+
+    Parameters
+    ----------
+    moments
+        Per-node multipole moments to pack.
+    max_order
+        Highest order to include (must not exceed ``moments.max_order``).
+
+    Returns
+    -------
+    Array
+        Packed coefficients of shape ``(num_nodes, total_coefficients(max_order))``.
+
+    Raises
+    ------
+    ValueError
+        If ``max_order`` exceeds the order stored on ``moments``.
+    """
 
     order = _validate_order(max_order)
     if order > moments.max_order:

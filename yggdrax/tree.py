@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +17,7 @@ from .dtypes import INDEX_DTYPE, as_index
 from .kdtree import KDTree as KDTreeTopology
 from .kdtree import build_kdtree
 from .octree import OctreeTopology, augment_radix_topology_with_octree
+from .protocols import MortonLeafBoundsProtocol
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
 RadixTreeTopology = _tree_impl.RadixTree
@@ -71,6 +72,39 @@ class FixedDepthTreeBuildConfig:
 TreeType = Literal["radix", "octree", "kdtree"]
 TreeBuildMode = Literal["adaptive", "fixed_depth", "static_radix"]
 
+_VALID_BUILD_MODES: tuple[TreeBuildMode, ...] = (
+    "adaptive",
+    "fixed_depth",
+    "static_radix",
+)
+
+
+def _normalize_build_mode(build_mode: str) -> TreeBuildMode:
+    """Validate a build-mode string and narrow it to ``TreeBuildMode``.
+
+    Parameters
+    ----------
+    build_mode
+        Requested build mode.
+
+    Returns
+    -------
+    TreeBuildMode
+        The validated build mode.
+
+    Raises
+    ------
+    ValueError
+        If ``build_mode`` is not one of the supported modes.
+    """
+
+    if build_mode not in _VALID_BUILD_MODES:
+        supported = ", ".join(f"'{name}'" for name in _VALID_BUILD_MODES)
+        raise ValueError(
+            f"Unsupported build_mode '{build_mode}'. Supported: ({supported})"
+        )
+    return cast(TreeBuildMode, build_mode)
+
 
 @dataclass(frozen=True)
 class TreeBuildRequest:
@@ -120,6 +154,31 @@ MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
 FMM_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
     FMM_CORE_REQUIRED_FIELDS + MORTON_TOPOLOGY_REQUIRED_FIELDS
 )
+
+
+class _AdaptiveOctreeRefinement(TypedDict):
+    """Keyword arguments controlling adaptive-octree local refinement."""
+
+    target_leaf_particles: int
+    max_depth: Optional[int]
+    refine_local: bool
+    max_refine_levels: int
+    aspect_threshold: float
+    min_refined_leaf_particles: int
+
+
+# Local-refinement defaults for the adaptive octree build path. Defined once so
+# the JIT (``build_octree_jit``) and eager (``build_octree``) entry points share
+# a single source of truth and cannot silently drift apart. Typed as a
+# ``TypedDict`` so unpacking it at each call site stays type-checked per field.
+_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS: _AdaptiveOctreeRefinement = {
+    "target_leaf_particles": 32,
+    "max_depth": None,
+    "refine_local": True,
+    "max_refine_levels": 2,
+    "aspect_threshold": 8.0,
+    "min_refined_leaf_particles": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -202,7 +261,59 @@ class Tree:
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
     ) -> "Tree":
-        """Build and return a concrete tree instance selected by keywords."""
+        """Build a concrete tree, dispatching on ``tree_type``.
+
+        Primary entry point that normalizes arguments into a
+        :class:`TreeBuildRequest` and dispatches to the registered backend
+        builder (see :func:`available_tree_types` and
+        :func:`register_tree_builder`).
+
+        Parameters
+        ----------
+        positions
+            Particle positions of shape ``(n, 3)``.
+        masses
+            Particle masses of shape ``(n,)``.
+        tree_type
+            Backend identifier: ``"radix"``, ``"octree"``, ``"kdtree"``, or any
+            registered type.
+        build_mode
+            Construction mode: ``"adaptive"``, ``"fixed_depth"``, or
+            ``"static_radix"``.
+        bounds
+            Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+        return_reordered
+            If ``True`` (default), populate the reordered particle buffers on
+            the returned tree.
+        workspace
+            Optional reusable :class:`RadixTreeWorkspace`.
+        return_workspace
+            If ``True``, retain the workspace on the returned tree.
+        leaf_size
+            Maximum particles per leaf (adaptive/static modes).
+        target_leaf_particles
+            Target per-leaf occupancy (fixed-depth mode).
+        max_depth
+            Optional hard cap on the fixed-depth Morton depth.
+        refine_local
+            Whether to locally refine elongated buckets (fixed-depth mode).
+        max_refine_levels
+            Maximum additional local refinement depth.
+        aspect_threshold
+            Axis aspect-ratio above which a bucket is refined.
+        min_refined_leaf_particles
+            Smallest occupancy a locally refined leaf may have.
+
+        Returns
+        -------
+        Tree
+            A concrete tree container of the requested backend type.
+
+        Raises
+        ------
+        ValueError
+            If ``tree_type`` is not registered.
+        """
 
         request = TreeBuildRequest(
             positions=positions,
@@ -396,12 +507,7 @@ def _build_octree_jit_result(
         workspace=workspace,
         return_workspace=return_workspace,
         leaf_size=leaf_size,
-        target_leaf_particles=32,
-        max_depth=None,
-        refine_local=True,
-        max_refine_levels=2,
-        aspect_threshold=8.0,
-        min_refined_leaf_particles=2,
+        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
 
 
@@ -582,7 +688,7 @@ class RadixTree(Tree):
         cls,
         *,
         result,
-        build_mode: str,
+        build_mode: TreeBuildMode,
         return_reordered: bool,
         return_workspace: bool,
     ) -> "RadixTree":
@@ -590,7 +696,7 @@ class RadixTree(Tree):
             topology, pos_sorted, mass_sorted, inv, workspace = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -600,7 +706,7 @@ class RadixTree(Tree):
             topology, pos_sorted, mass_sorted, inv = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -609,10 +715,10 @@ class RadixTree(Tree):
             topology, workspace = result
             return cls(
                 topology=topology,
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 workspace=workspace,
             )
-        return cls(topology=result, build_mode=build_mode)  # type: ignore[arg-type]
+        return cls(topology=result, build_mode=build_mode)
 
 
 @dataclass(frozen=True)
@@ -659,6 +765,7 @@ class OctreeTree(RadixTree):
     ) -> "OctreeTree":
         """Build an octree from particles using the octree-specific build path."""
 
+        build_mode = _normalize_build_mode(build_mode)
         result = _build_octree_result(
             positions,
             masses,
@@ -687,7 +794,7 @@ class OctreeTree(RadixTree):
         cls,
         *,
         result,
-        build_mode: str,
+        build_mode: TreeBuildMode,
         return_reordered: bool,
         return_workspace: bool,
     ) -> "OctreeTree":
@@ -695,7 +802,7 @@ class OctreeTree(RadixTree):
             topology, pos_sorted, mass_sorted, inv, workspace = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -705,7 +812,7 @@ class OctreeTree(RadixTree):
             topology, pos_sorted, mass_sorted, inv = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 positions_sorted=pos_sorted,
                 masses_sorted=mass_sorted,
                 inverse_permutation=inv,
@@ -714,12 +821,12 @@ class OctreeTree(RadixTree):
             topology, workspace = result
             return cls(
                 topology=augment_radix_topology_with_octree(topology),
-                build_mode=build_mode,  # type: ignore[arg-type]
+                build_mode=build_mode,
                 workspace=workspace,
             )
         return cls(
             topology=augment_radix_topology_with_octree(result),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
         )
 
 
@@ -945,29 +1052,59 @@ _TREE_BUILDERS: dict[str, TreeBuilder] = {
 }
 
 
-def resolve_tree_topology(tree_or_topology: object) -> object:
-    """Return a topology payload from a tree container or topology object."""
+def resolve_tree_topology(tree_or_topology: object) -> MortonLeafBoundsProtocol:
+    """Return a topology payload from a tree container or topology object.
+
+    Parameters
+    ----------
+    tree_or_topology
+        A tree container (with a ``.topology`` attribute) or a topology object.
+
+    Returns
+    -------
+    MortonLeafBoundsProtocol
+        The concrete topology payload. The return is typed to the broad
+        FMM-core/Morton contract so downstream field accesses type-check; a
+        given backend may expose additional fields beyond it.
+    """
 
     topology = getattr(tree_or_topology, "topology", None)
-    return tree_or_topology if topology is None else topology
+    resolved = tree_or_topology if topology is None else topology
+    return cast(MortonLeafBoundsProtocol, resolved)
+
+
+def _missing_required_fields(
+    tree_or_topology: object, required_fields: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return the ``required_fields`` absent from the resolved topology payload."""
+
+    topology = resolve_tree_topology(tree_or_topology)
+    return tuple(name for name in required_fields if not hasattr(topology, name))
+
+
+def _require_fields(
+    tree_or_topology: object, missing: tuple[str, ...], description: str
+) -> None:
+    """Raise ``ValueError`` naming ``description`` when ``missing`` is non-empty."""
+
+    if not missing:
+        return
+    tree_type = getattr(tree_or_topology, "tree_type", None)
+    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
+    missing_txt = ", ".join(missing)
+    raise ValueError(f"{prefix}topology is missing {description}: {missing_txt}")
 
 
 def missing_fmm_core_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return FMM-core required topology fields missing on the provided object."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in FMM_CORE_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, FMM_CORE_REQUIRED_FIELDS)
 
 
 def missing_morton_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return Morton-geometry required fields missing on the provided object."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in MORTON_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, MORTON_TOPOLOGY_REQUIRED_FIELDS)
 
 
 def has_fmm_core_topology(tree_or_topology: object) -> bool:
@@ -985,10 +1122,7 @@ def has_morton_topology(tree_or_topology: object) -> bool:
 def missing_leaf_topology_fields(tree_or_topology: object) -> tuple[str, ...]:
     """Return fields needed to derive or expose leaf-node indices."""
 
-    topology = resolve_tree_topology(tree_or_topology)
-    return tuple(
-        name for name in LEAF_TOPOLOGY_REQUIRED_FIELDS if not hasattr(topology, name)
-    )
+    return _missing_required_fields(tree_or_topology, LEAF_TOPOLOGY_REQUIRED_FIELDS)
 
 
 def has_leaf_topology(tree_or_topology: object) -> bool:
@@ -1004,28 +1138,20 @@ def has_leaf_topology(tree_or_topology: object) -> bool:
 def require_fmm_core_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when FMM-core topology fields are missing."""
 
-    missing = missing_fmm_core_topology_fields(tree_or_topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(
-        f"{prefix}topology is missing FMM-core-required fields: {missing_txt}"
+    _require_fields(
+        tree_or_topology,
+        missing_fmm_core_topology_fields(tree_or_topology),
+        "FMM-core-required fields",
     )
 
 
 def require_morton_topology(tree_or_topology: object) -> None:
     """Raise ``ValueError`` when Morton-geometry fields are missing."""
 
-    missing = missing_morton_topology_fields(tree_or_topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(
-        f"{prefix}topology is missing Morton-geometry-required fields: {missing_txt}"
+    _require_fields(
+        tree_or_topology,
+        missing_morton_topology_fields(tree_or_topology),
+        "Morton-geometry-required fields",
     )
 
 
@@ -1035,13 +1161,11 @@ def require_leaf_topology(tree_or_topology: object) -> None:
     topology = resolve_tree_topology(tree_or_topology)
     if hasattr(topology, "leaf_nodes"):
         return
-    missing = missing_leaf_topology_fields(topology)
-    if not missing:
-        return
-    tree_type = getattr(tree_or_topology, "tree_type", None)
-    prefix = f"tree_type='{tree_type}' " if tree_type is not None else ""
-    missing_txt = ", ".join(missing)
-    raise ValueError(f"{prefix}topology is missing leaf-required fields: {missing_txt}")
+    _require_fields(
+        tree_or_topology,
+        missing_leaf_topology_fields(topology),
+        "leaf-required fields",
+    )
 
 
 # Backward-compatible aliases
@@ -1200,7 +1324,7 @@ def register_tree_builder(
 def _wrap_radix_public_result(
     *,
     result,
-    build_mode: str,
+    build_mode: TreeBuildMode,
     return_reordered: bool,
     return_workspace: bool,
 ):
@@ -1210,7 +1334,7 @@ def _wrap_radix_public_result(
         topology, pos_sorted, mass_sorted, inv, workspace = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1221,7 +1345,7 @@ def _wrap_radix_public_result(
         topology, pos_sorted, mass_sorted, inv = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1231,20 +1355,20 @@ def _wrap_radix_public_result(
         topology, workspace = result
         tree = RadixTree(
             topology=topology,
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             workspace=workspace,
         )
         return tree, workspace
     return RadixTree(
         topology=result,
-        build_mode=build_mode,  # type: ignore[arg-type]
+        build_mode=build_mode,
     )
 
 
 def _wrap_octree_public_result(
     *,
     result,
-    build_mode: str,
+    build_mode: TreeBuildMode,
     return_reordered: bool,
     return_workspace: bool,
 ):
@@ -1254,7 +1378,7 @@ def _wrap_octree_public_result(
         topology, pos_sorted, mass_sorted, inv, workspace = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1265,7 +1389,7 @@ def _wrap_octree_public_result(
         topology, pos_sorted, mass_sorted, inv = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             positions_sorted=pos_sorted,
             masses_sorted=mass_sorted,
             inverse_permutation=inv,
@@ -1275,13 +1399,13 @@ def _wrap_octree_public_result(
         topology, workspace = result
         tree = OctreeTree(
             topology=augment_radix_topology_with_octree(topology),
-            build_mode=build_mode,  # type: ignore[arg-type]
+            build_mode=build_mode,
             workspace=workspace,
         )
         return tree, workspace
     return OctreeTree(
         topology=augment_radix_topology_with_octree(result),
-        build_mode=build_mode,  # type: ignore[arg-type]
+        build_mode=build_mode,
     )
 
 
@@ -1297,10 +1421,37 @@ def build_tree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an LBVH tree, inferring bounds when not provided.
+    """Build an adaptive LBVH radix tree, inferring bounds when not provided.
 
-    Passing ``config`` overrides the individual keyword flags so callers can
-    reuse one validated options object across repeated builds.
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred from ``positions``
+        when omitted.
+    return_reordered
+        If ``True``, also return the Morton-sorted positions/masses and the
+        inverse permutation.
+    leaf_size
+        Maximum number of particles per leaf.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace` to avoid reallocating
+        scratch buffers across repeated builds.
+    return_workspace
+        If ``True``, also return the (possibly newly allocated) workspace.
+    config
+        Optional :class:`TreeBuildConfig`; when given it overrides the
+        equivalent individual keyword arguments.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered particle
+        buffers and/or workspace when ``return_reordered`` / ``return_workspace``
+        are set.
     """
 
     resolved = _resolve_tree_build_options(
@@ -1339,7 +1490,39 @@ def build_octree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an octree through the octree-specific Morton partition pipeline."""
+    """Build an octree through the octree-specific Morton partition pipeline.
+
+    Produces an :class:`OctreeTree` that carries the same compatibility fields
+    as :func:`build_tree` plus explicit octree buffers (``oct_children``,
+    ``oct_node_depths``, ``radix_node_to_oct``, …) for level-wise FMM scheduling.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    return_reordered
+        If ``True``, also return the reordered particle buffers and inverse
+        permutation.
+    leaf_size
+        Maximum number of particles per leaf.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace`.
+    return_workspace
+        If ``True``, also return the workspace.
+    config
+        Optional :class:`TreeBuildConfig` overriding the individual keyword
+        arguments.
+
+    Returns
+    -------
+    OctreeTree or tuple
+        The octree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
+    """
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1356,12 +1539,7 @@ def build_octree(
         workspace=resolved.workspace,
         return_workspace=resolved.return_workspace,
         leaf_size=config.leaf_size if config is not None else leaf_size,
-        target_leaf_particles=32,
-        max_depth=None,
-        refine_local=True,
-        max_refine_levels=2,
-        aspect_threshold=8.0,
-        min_refined_leaf_particles=2,
+        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
     return _wrap_octree_public_result(
         result=result,
@@ -1383,7 +1561,7 @@ def build_tree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an LBVH tree, inferring bounds when not provided."""
+    """JIT-compiled variant of :func:`build_tree` (see it for parameters/returns)."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1421,7 +1599,7 @@ def build_octree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an octree through the octree-specific Morton pipeline."""
+    """JIT-compiled variant of :func:`build_octree` (see it for parameters/returns)."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1464,10 +1642,47 @@ def build_fixed_depth_tree(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """Build a fixed-depth tree, inferring bounds when not provided.
+    """Build a fixed-depth Morton tree, inferring bounds when not provided.
 
-    Passing ``config`` overrides the individual keyword flags so callers can
-    package build settings once and reuse them consistently.
+    Resolves a uniform Morton depth from ``target_leaf_particles`` and, when
+    ``refine_local`` is set, locally refines elongated leaf buckets by axis
+    aspect ratio.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    target_leaf_particles
+        Target per-leaf occupancy used to resolve the Morton depth.
+    return_reordered
+        If ``True``, also return the reordered particle buffers.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace`.
+    return_workspace
+        If ``True``, also return the workspace.
+    max_depth
+        Optional hard cap on the Morton depth.
+    refine_local
+        Whether to locally refine elongated Morton buckets.
+    max_refine_levels
+        Maximum additional local refinement depth.
+    aspect_threshold
+        Axis aspect-ratio above which a bucket is refined.
+    min_refined_leaf_particles
+        Smallest occupancy a locally refined leaf may have.
+    config
+        Optional :class:`FixedDepthTreeBuildConfig` overriding the individual
+        keyword arguments.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
     """
 
     resolved = _resolve_tree_build_options(
@@ -1523,9 +1738,32 @@ def build_static_radix_tree(
 ):
     """Build a fixed-shape radix tree from Morton-sorted count buckets.
 
-    The tree structure is static for a fixed particle count and ``leaf_size``.
-    Leaves are not fixed spatial cells; each leaf owns a contiguous chunk of
-    the current Morton-sorted particle order.
+    The tree *structure* (node count, parent/child topology) is static for a
+    fixed particle count and ``leaf_size``, so it can be rebuilt cheaply for new
+    particle values via :func:`rebuild_static_radix_tree_from_template`. Leaves
+    are not fixed spatial cells; each leaf owns a contiguous chunk of the current
+    Morton-sorted particle order.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    leaf_size
+        Fixed number of particles per bucket that determines the static shape.
+    return_reordered
+        If ``True``, also return the reordered particle buffers.
+    return_workspace
+        If ``True``, also return the reusable workspace/template.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
     """
 
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
