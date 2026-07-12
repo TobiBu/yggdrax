@@ -48,6 +48,15 @@ from .octree import (
     OctreeTopology,
     build_explicit_octree_metadata,
 )
+from .octree_uvwx import (
+    OctreeUVLists,
+    UniformOctreeExecutionView,
+    build_adaptive_octree_execution_view_device,
+    build_sparse_uniform_octree_execution_view_device,
+    build_uniform_octree_execution_view,
+    build_uniform_octree_execution_view_device,
+    build_uniform_octree_uv,
+)
 from .protocols import (
     MortonLeafBoundsProtocol,
     TopologyContainerProtocol,
@@ -130,6 +139,8 @@ __all__ = [
     "KDParticleTree",
     "OctreeTree",
     "OctreeTopology",
+    "OctreeUVLists",
+    "UniformOctreeExecutionView",
     "RadixTree",
     "RadixTreeWorkspace",
     "Tree",
@@ -184,6 +195,11 @@ __all__ = [
     "morton_decode",
     "morton_encode",
     "build_explicit_octree_metadata",
+    "build_adaptive_octree_execution_view_device",
+    "build_sparse_uniform_octree_execution_view_device",
+    "build_uniform_octree_execution_view",
+    "build_uniform_octree_execution_view_device",
+    "build_uniform_octree_uv",
     "resolve_tree_topology",
     "require_fmm_core_topology",
     "require_fmm_topology",

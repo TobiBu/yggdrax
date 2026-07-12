@@ -396,9 +396,9 @@ def build_tree(
 
     # Encode and sort by Morton codes (stable tie-break by original index)
     morton_codes = morton_encode(positions, bounds)
-    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
-    # jnp.lexsort sorts by last key first; provide (idx, codes) to break ties
-    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    # Stable sort by Morton code (ties break by input order == original index),
+    # identical to lexsort((orig_idx, codes)) with one fewer sort key.
+    sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]
 
     # Determine leaf groups in Morton order
@@ -454,8 +454,9 @@ def build_fixed_depth_tree(
         raise ValueError("target_leaf_particles must be >= 1")
 
     morton_codes = morton_encode(positions, bounds)
-    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
-    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    # Stable sort by Morton code (ties break by input order == original index),
+    # identical to lexsort((orig_idx, codes)) with one fewer sort key.
+    sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]
 
     max_allowed_depth = min(MAX_TREE_LEVELS - 1, _MAX_MORTON_LEVEL)
@@ -727,8 +728,9 @@ def build_static_radix_tree(
         raise ValueError("leaf_size must be >= 1")
 
     morton_codes = morton_encode(positions, bounds)
-    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
-    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    # Stable sort by Morton code (ties break by input order == original index),
+    # identical to lexsort((orig_idx, codes)) with one fewer sort key.
+    sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(int(n), int(leaf_size))
@@ -841,8 +843,9 @@ def rebuild_static_radix_tree_from_template(
         bounds_resolved = bounds
 
     morton_codes = morton_encode(positions, bounds_resolved)
-    orig_idx = jnp.arange(n, dtype=INDEX_DTYPE)
-    sorted_indices = jnp.lexsort((orig_idx, morton_codes))
+    # Stable sort by Morton code (ties break by input order == original index),
+    # identical to lexsort((orig_idx, codes)) with one fewer sort key.
+    sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(
