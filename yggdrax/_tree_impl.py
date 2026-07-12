@@ -194,12 +194,36 @@ def _refine_leaf_partitions_by_aspect(
         return leaf_starts_np, leaf_ends_np, leaf_codes_np, leaf_depths_np
 
     starts_arr = np.asarray(new_starts, dtype=np.int64)
-    order = np.argsort(starts_arr)
+    ends_arr = np.asarray(new_ends, dtype=np.int64)
+    codes_arr = np.asarray(new_codes, dtype=np.uint64)
+    depths_arr = np.asarray(new_depths, dtype=np.int64)
+
+    # Order leaves by particle ``start`` and break ties by Morton ``code``.
+    #
+    # The LBVH builder requires the per-leaf code sequence to be monotonically
+    # non-decreasing in Morton-sort order; a non-monotonic sequence drives the
+    # Karras split/parent assignment into an inconsistent state and produces a
+    # malformed (cyclic) parent array.  Empty buckets are intentionally
+    # preserved here (see above) so the Morton layout stays stable, but they
+    # carry a *synthetic* cell code and share a particle ``start`` with their
+    # neighbours.  Sorting on ``start`` alone (with an unstable sort, and no
+    # code tie-break) can therefore interleave those zero-width buckets in an
+    # order that scrambles the codes -- which is exactly what happens when many
+    # particles share identical codes (e.g. out-of-bounds points clipped to the
+    # same boundary cell) and almost every bucket is empty.
+    #
+    # Using ``code`` as the tie-break restores monotonicity: for this Morton
+    # partition a lower code always implies a lower-or-equal ``start`` (bucket
+    # order matches code order and ``start`` is a running particle count), so
+    # ordering by ``(start, code)`` yields both a contiguous ``[0, n)``
+    # partition and a non-decreasing code sequence.  ``np.lexsort`` sorts by its
+    # last key first, so ``start`` is the primary key and ``code`` the tie-break.
+    order = np.lexsort((codes_arr, starts_arr))
     return (
         starts_arr[order],
-        np.asarray(new_ends, dtype=np.int64)[order],
-        np.asarray(new_codes, dtype=np.uint64)[order],
-        np.asarray(new_depths, dtype=np.int64)[order],
+        ends_arr[order],
+        codes_arr[order],
+        depths_arr[order],
     )
 
 

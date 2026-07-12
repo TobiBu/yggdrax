@@ -7,6 +7,7 @@ import pytest
 
 from yggdrax.geometry import compute_tree_geometry
 from yggdrax.tree import (
+    MAX_TREE_LEVELS,
     RadixTreeWorkspace,
     build_fixed_depth_octree,
     build_fixed_depth_octree_jit,
@@ -463,6 +464,96 @@ def test_fixed_depth_tree_depth_scales_with_target():
 
     assert tree_tight.num_internal_nodes >= tree_loose.num_internal_nodes
     assert max_tight <= max_loose
+
+
+def _assert_valid_forest(tree):
+    """Assert the parent pointers describe a single-rooted acyclic tree.
+
+    Walking ``parent`` from every node must reach a root (``parent < 0``)
+    without revisiting a node.  A cycle -- as produced by a malformed build --
+    would loop forever, so the walk is bounded by the node count and any
+    over-run is reported as a failure.
+    """
+
+    parent = np.asarray(jax.device_get(tree.parent))
+    total_nodes = int(parent.shape[0])
+
+    roots = np.flatnonzero(parent < 0)
+    assert roots.size == 1, f"expected exactly one root, found {roots.size}"
+
+    for start in range(total_nodes):
+        seen = set()
+        node = start
+        while node >= 0:
+            assert node not in seen, (
+                f"cycle detected in parent array starting from node {start} "
+                f"(revisited node {node})"
+            )
+            assert (
+                node < total_nodes
+            ), f"parent pointer {node} out of range [0, {total_nodes})"
+            seen.add(node)
+            node = int(parent[node])
+
+
+def test_fixed_depth_tree_degenerate_tied_codes_is_valid():
+    """Out-of-bounds points that clip to identical Morton codes must still
+    yield a valid (acyclic) tree rather than a cyclic parent array.
+
+    Regression test: 128 collinear particles, most of which fall outside the
+    supplied bounds and clip to the same boundary cell, share identical Morton
+    codes.  The fixed-depth builder previously emitted a malformed topology
+    whose ``node_level`` field, once materialized, exceeded ``MAX_TREE_LEVELS``
+    (indicating a cycle in the parent pointers).
+    """
+
+    positions = jnp.array(
+        [[float(i), 0.0, 0.0] for i in range(128)],
+        dtype=jnp.float64,
+    )
+    masses = jnp.ones((positions.shape[0],))
+    # ~118 of the 128 x-coordinates lie beyond x = 10 and clip to the same
+    # boundary cell, producing many tied Morton codes.
+    bounds = (
+        jnp.array([-10.0, -1.0, -1.0]),
+        jnp.array([10.0, 1.0, 1.0]),
+    )
+
+    # Exercise both the local-refinement path (default) and the plain path,
+    # since the tied-code layout stresses the refinement re-partitioning.
+    for refine_local in (True, False):
+        tree = build_fixed_depth_tree(
+            positions,
+            masses,
+            bounds,
+            target_leaf_particles=8,
+            refine_local=refine_local,
+        )
+
+        node_level = np.asarray(jax.device_get(jax.block_until_ready(tree.node_level)))
+        num_levels = int(tree.num_levels)
+
+        assert node_level.min() >= 0
+        # A valid tree's deepest node sits at level ``num_levels - 1`` and, in
+        # particular, must never exceed the level cap (a cycle would blow this
+        # far past ``MAX_TREE_LEVELS``).
+        assert int(node_level.max()) <= num_levels, (
+            f"node_level max {int(node_level.max())} exceeds num_levels "
+            f"{num_levels} (refine_local={refine_local})"
+        )
+        assert int(node_level.max()) < MAX_TREE_LEVELS, (
+            f"node_level max {int(node_level.max())} >= MAX_TREE_LEVELS "
+            f"{MAX_TREE_LEVELS} (refine_local={refine_local})"
+        )
+
+        _assert_valid_forest(tree)
+
+        # Every particle must still be covered exactly once by the leaves.
+        num_internal = tree.num_internal_nodes
+        leaf_ranges = np.asarray(jax.device_get(tree.node_ranges))[num_internal:]
+        counts = leaf_ranges[:, 1] - leaf_ranges[:, 0] + 1
+        counts = counts[counts > 0]
+        assert int(counts.sum()) == positions.shape[0]
 
 
 def test_static_radix_tree_uses_fixed_count_buckets():
