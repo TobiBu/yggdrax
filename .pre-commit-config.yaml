@@ -23,12 +23,12 @@ repos:
     hooks:
       - id: basedpyright
         name: basedpyright
-        # Run from the active environment so it sees the installed jax/jaxtyping
-        # stubs. Config + baseline live in pyproject.toml / .basedpyright/.
-        entry: basedpyright
+        # Runs from the active environment so it sees the installed
+        # jax/jaxtyping stubs (config + baseline live in pyproject.toml /
+        # .basedpyright/). If basedpyright is not on PATH (e.g. the dev env is
+        # not activated) the check is skipped locally with a message rather than
+        # hard-failing the commit; CI installs ".[dev]" and enforces it there.
+        entry: "bash -c 'command -v basedpyright >/dev/null 2>&1 && exec basedpyright yggdrax || echo \"[pre-commit] basedpyright not on PATH; skipped locally (enforced in CI). Activate your env or run: pip install -e .[dev]\"'"
         language: system
         types: [python]
         pass_filenames: false
-        # The full project is analysed regardless of which files changed, so a
-        # new error anywhere is caught even when an unrelated file is committed.
-        args: ["yggdrax"]
