@@ -570,7 +570,31 @@ def _build_kdtree_topology(points: Array, leaf_size: int) -> tuple[Array, ...]:
 
 @jaxtyped(typechecker=beartype)
 def build_kdtree(points: Array, *, leaf_size: int = 32) -> KDTree:
-    """Build an experimental KD-tree style container from reference points."""
+    """Build a median-split KD-tree container over reference points.
+
+    The returned container exposes both KD-specific split metadata and the
+    FMM-core topology contract (``parent``/``left_child``/``right_child``/
+    ``node_ranges``), so it can feed the same geometry and dual-tree traversal
+    APIs as the radix and octree backends.
+
+    Parameters
+    ----------
+    points
+        Reference points of shape ``(n_points, dim)``.
+    leaf_size
+        Maximum number of points stored per leaf bucket; larger values yield a
+        shallower tree.
+
+    Returns
+    -------
+    KDTree
+        Immutable KD-tree container with topology and per-node bounding boxes.
+
+    Raises
+    ------
+    ValueError
+        If ``leaf_size`` is less than 1.
+    """
 
     points_arr = _validate_points(points)
     if leaf_size < 1:
@@ -935,21 +959,36 @@ def query_neighbors(
 ) -> tuple[Array, Array]:
     """Return nearest-neighbor indices and distances for each query point.
 
-    Args:
-        tree: Reference point container.
-        queries: Query points with shape ``(n_queries, dim)``.
-        k: Number of nearest neighbors to return.
-        exclude_self: If ``True`` and ``queries.shape[0] == tree.num_points``,
-            masks diagonal elements so self-matches are not returned.
-        backend: Query backend. ``dense`` builds a full pairwise matrix;
-            ``tiled`` computes exact neighbors blockwise with lower memory;
-            ``tree`` uses KD leaf bounding boxes to prune exact search;
-            ``auto`` selects a backend by problem size and device.
-        point_block_size: Block size used by the tiled backend.
-        return_squared: If ``True``, return squared Euclidean distances.
+    Parameters
+    ----------
+    tree
+        Reference-point container built by :func:`build_kdtree`.
+    queries
+        Query points with shape ``(n_queries, dim)``.
+    k
+        Number of nearest neighbors to return per query.
+    exclude_self
+        If ``True`` and ``queries.shape[0] == tree.num_points``, masks diagonal
+        elements so a point is not returned as its own neighbor.
+    backend
+        Query backend. ``"dense"`` builds a full pairwise matrix; ``"tiled"``
+        computes exact neighbors blockwise with lower memory; ``"tree"`` uses KD
+        leaf bounding boxes to prune the exact search; ``"auto"`` selects a
+        backend by problem size and device.
+    point_block_size
+        Block size used by the tiled backend.
+    return_squared
+        If ``True``, return squared Euclidean distances instead of distances.
 
-    Returns:
-        Tuple ``(indices, distances)`` with shapes ``(n_queries, k)``.
+    Returns
+    -------
+    tuple of Array
+        ``(indices, distances)``, each of shape ``(n_queries, k)``.
+
+    Raises
+    ------
+    ValueError
+        If ``k`` is out of range or ``backend`` is not a supported value.
     """
 
     queries_arr = _validate_queries(tree, queries)
@@ -1209,7 +1248,36 @@ def count_neighbors(
     backend: Literal["tiled", "tree", "auto"] = "tiled",
     point_block_size: int = 2048,
 ) -> Array:
-    """Count reference points within radius/radii for each query point."""
+    """Count reference points within a radius (or radii) of each query point.
+
+    Parameters
+    ----------
+    tree
+        Reference-point container built by :func:`build_kdtree`.
+    queries
+        Query points with shape ``(n_queries, dim)``.
+    radius
+        Search radius. A scalar counts within a single radius; an array counts
+        within several radii per query and returns one column per radius.
+    include_self
+        If ``True``, a query coinciding with a reference point counts itself.
+    backend
+        Counting backend: ``"tiled"`` (blockwise, lower memory), ``"tree"`` (KD
+        pruning), or ``"auto"`` (chosen by problem size and device).
+    point_block_size
+        Block size used by the tiled backend.
+
+    Returns
+    -------
+    Array
+        Neighbor counts with shape ``(n_queries,)`` for a scalar ``radius`` or
+        ``(n_queries, n_radii)`` when ``radius`` is an array.
+
+    Raises
+    ------
+    ValueError
+        If ``backend`` is not one of the supported values.
+    """
 
     queries_arr = _validate_queries(tree, queries)
     radius_sq_qr, radius_ndim = _prepare_radius_inputs(queries_arr, radius)
@@ -1251,7 +1319,31 @@ def build_and_query(
     backend: Literal["dense", "tiled", "tree"] = "tiled",
     return_squared: bool = False,
 ) -> tuple[Array, Array]:
-    """Convenience function to build a tree and run nearest-neighbor queries."""
+    """Build a KD-tree and run nearest-neighbor queries in one call.
+
+    Convenience wrapper around :func:`build_kdtree` followed by
+    :func:`query_neighbors`.
+
+    Parameters
+    ----------
+    points
+        Reference points of shape ``(n_points, dim)``.
+    queries
+        Query points of shape ``(n_queries, dim)``.
+    k
+        Number of nearest neighbors to return per query.
+    leaf_size
+        Maximum number of points per KD leaf bucket.
+    backend
+        Query backend passed to :func:`query_neighbors`.
+    return_squared
+        If ``True``, return squared Euclidean distances instead of distances.
+
+    Returns
+    -------
+    tuple of Array
+        ``(indices, distances)``, each of shape ``(n_queries, k)``.
+    """
 
     tree = build_kdtree(points, leaf_size=leaf_size)
     return query_neighbors(

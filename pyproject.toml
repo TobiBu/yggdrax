@@ -76,7 +76,7 @@ style = "numpy"
 # autodoc, so docstrings describe parameters/returns without repeating the
 # type hints. Short summary-only docstrings remain allowed.
 arg-type-hints-in-docstring = false
-check-return-types-in-docstring = false
+check-return-types = false
 skip-checking-short-docstrings = true
 allow-init-docstring = true
 
