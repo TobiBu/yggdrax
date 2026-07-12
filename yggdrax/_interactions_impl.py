@@ -4044,6 +4044,29 @@ def _run_dual_tree_walk_raw(
 
     attempt_counter = 0
 
+    def _emit_retry_event(
+        status: str,
+        *,
+        attempt: int,
+        queue_capacity: int,
+        interaction_capacity: int,
+        walk_result: DualTreeWalkResult,
+    ) -> None:
+        if retry_logger is None:
+            return
+        event = DualTreeRetryEvent(
+            attempt=int(attempt),
+            queue_capacity=int(queue_capacity),
+            interaction_capacity=int(interaction_capacity),
+            status=status,
+            far_pair_count=int(walk_result.far_pair_count),
+            near_pair_count=int(walk_result.near_pair_count),
+        )
+        try:
+            retry_logger(event)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("retry_logger raised", exc_info=True)
+
     if use_count_pass:
         # Choose a process block for the count pass. Prefer an explicit
         # override, else use the provided block size or the default.
@@ -4295,29 +4318,6 @@ def _run_dual_tree_walk_raw(
     result: Optional[_DualTreeWalkRawOutputs] = None
 
     success = False
-
-    def _emit_retry_event(
-        status: str,
-        *,
-        attempt: int,
-        queue_capacity: int,
-        interaction_capacity: int,
-        walk_result: DualTreeWalkResult,
-    ) -> None:
-        if retry_logger is None:
-            return
-        event = DualTreeRetryEvent(
-            attempt=int(attempt),
-            queue_capacity=int(queue_capacity),
-            interaction_capacity=int(interaction_capacity),
-            status=status,
-            far_pair_count=int(walk_result.far_pair_count),
-            near_pair_count=int(walk_result.near_pair_count),
-        )
-        try:
-            retry_logger(event)
-        except Exception:  # pragma: no cover - defensive logging
-            logger.exception("retry_logger raised", exc_info=True)
 
     for queue_capacity in queue_candidates:
         resolved_block = (

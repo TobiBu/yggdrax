@@ -1012,18 +1012,18 @@
                 }
             },
             {
-                "code": "reportUnboundVariable",
+                "code": "reportArgumentType",
                 "range": {
-                    "startColumn": 16,
-                    "endColumn": 33,
+                    "startColumn": 32,
+                    "endColumn": 38,
                     "lineCount": 1
                 }
             },
             {
-                "code": "reportUnboundVariable",
+                "code": "reportArgumentType",
                 "range": {
-                    "startColumn": 16,
-                    "endColumn": 33,
+                    "startColumn": 32,
+                    "endColumn": 38,
                     "lineCount": 1
                 }
             },
