@@ -44,12 +44,25 @@ def morton_encode_impl(
     positions: Array,
     bounds: Bounds,
 ) -> Array:
-    """Un-jitted Morton encode.
+    """Encode 3D positions as 21-bit-per-axis Morton (Z-order) codes.
 
-    Prefer :func:`morton_encode` for standalone use. This raw implementation is
-    for calling *inside* another transform (e.g. ``shard_map``), where nesting a
-    separately-``jit``-compiled function would clash with the enclosing mesh's
-    sharding-in-types.
+    Un-jitted implementation. Prefer :func:`morton_encode` for standalone use;
+    this raw version is for calling *inside* another transform (e.g.
+    ``shard_map``), where nesting a separately-``jit``-compiled function would
+    clash with the enclosing mesh's sharding-in-types.
+
+    Parameters
+    ----------
+    positions
+        Points of shape ``(n, 3)``.
+    bounds
+        ``(min_corner, max_corner)`` axis-aligned box, each of shape ``(3,)``.
+        Positions are normalized into this box and clipped to stay in range.
+
+    Returns
+    -------
+    Array
+        ``uint64`` Morton codes of shape ``(n,)``.
     """
 
     min_c, max_c = bounds
@@ -73,6 +86,24 @@ def morton_decode(
     codes: Array,
     bounds: Bounds,
 ) -> Array:
+    """Decode Morton codes back to approximate 3D positions.
+
+    Inverse of :func:`morton_encode` up to the 21-bit-per-axis quantization
+    (decoded positions land at their cell centers within ``bounds``).
+
+    Parameters
+    ----------
+    codes
+        ``uint64`` Morton codes of shape ``(n,)``.
+    bounds
+        ``(min_corner, max_corner)`` box used at encode time, each shape ``(3,)``.
+
+    Returns
+    -------
+    Array
+        Decoded positions of shape ``(n, 3)``.
+    """
+
     min_c, max_c = bounds
     x = _compact3_u64(codes)
     y = _compact3_u64(codes >> U64(1))
@@ -85,7 +116,23 @@ def morton_decode(
 
 
 def get_common_prefix_length(code1: jnp.ndarray, code2: jnp.ndarray) -> int:
-    """Return number of common leading bits between two Morton codes."""
+    """Return the number of common leading bits of two Morton codes.
+
+    This is the length of the shared binary prefix, which corresponds to the
+    depth of the deepest tree node containing both codes.
+
+    Parameters
+    ----------
+    code1
+        First scalar ``uint64`` Morton code.
+    code2
+        Second scalar ``uint64`` Morton code.
+
+    Returns
+    -------
+    int
+        Number of shared leading bits (``64`` when the codes are equal).
+    """
     c1, c2 = int(code1), int(code2)
     if c1 == c2:
         return 64
@@ -93,7 +140,19 @@ def get_common_prefix_length(code1: jnp.ndarray, code2: jnp.ndarray) -> int:
 
 
 def sort_by_morton(codes: jnp.ndarray) -> jnp.ndarray:
-    """Return indices that sort points by Morton code."""
+    """Return indices that stably sort points by Morton code.
+
+    Parameters
+    ----------
+    codes
+        Morton codes of shape ``(n,)``.
+
+    Returns
+    -------
+    Array
+        Permutation indices of shape ``(n,)`` such that ``codes[result]`` is
+        ascending.
+    """
     return jnp.argsort(codes)
 
 

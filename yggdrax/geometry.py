@@ -23,10 +23,28 @@ def compute_tree_geometry(
 ) -> TreeGeometry:
     """Compute per-node geometric bounds and helper radii.
 
-    ``max_leaf_size`` is optional for correctness, but passing it is important
-    for large JIT-compiled radix trees. It bounds the temporary leaf gather
-    shape used during geometry construction and avoids falling back to a
-    ``num_particles``-sized staging buffer under tracing.
+    Produces, for every node, its bounding-box center and half-extent, the
+    box max half-extent (L-infinity radius), and the bounding-sphere radius,
+    from Morton-sorted particle positions.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    positions_sorted
+        Particle positions in the tree's Morton order (i.e. indexed by
+        ``tree.particle_indices``), shape ``(n_particles, 3)``.
+    max_leaf_size
+        Optional cap on the temporary leaf-gather buffer. Optional for
+        correctness, but important for large JIT-compiled radix trees: it
+        bounds the staging shape used during construction and avoids falling
+        back to a ``num_particles``-sized buffer under tracing. Defaults to the
+        tree's ``leaf_size`` when available.
+
+    Returns
+    -------
+    TreeGeometry
+        Per-node ``center``, ``half_extent``, ``max_extent``, and ``radius``.
     """
 
     topology = resolve_tree_topology(tree)
@@ -51,7 +69,23 @@ def geometry_to_level_major(
     tree: object,
     geometry: TreeGeometry,
 ) -> LevelMajorTreeGeometry:
-    """Convert geometry to padded level-major buffers."""
+    """Convert per-node geometry to padded level-major buffers.
+
+    Regroups the flat per-node geometry into ``(num_levels, max_nodes_per_level)``
+    padded arrays, so batched kernels can process one tree level at a time.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing level-order metadata.
+    geometry
+        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
+
+    Returns
+    -------
+    LevelMajorTreeGeometry
+        Level-major padded geometry buffers and per-level node counts.
+    """
 
     topology = resolve_tree_topology(tree)
     return _geometry_impl.geometry_to_level_major(topology, geometry)
