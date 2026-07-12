@@ -745,6 +745,8 @@ def build_adaptive_octree_execution_view_device(
     leaf_capacity: int,
     level_batch_width_cap: Optional[int] = None,
     bounds: Optional[tuple] = None,
+    interactions: bool = False,
+    u_capacity: int = 256,
     index_dtype=jnp.int64,
 ) -> UniformOctreeExecutionView:
     """On-device (JAX), STATIC-SHAPE *adaptive-depth* octree execution view.
@@ -796,12 +798,39 @@ def build_adaptive_octree_execution_view_device(
     ``num_valid_nodes == node_capacity`` (callers should assert ``num_valid_nodes <
     node_capacity`` and ``num_leaf_nodes < leaf_capacity``).
 
-    STAGE 1 SCOPE: this builds the adaptive node topology + geometry ONLY. The interaction
-    lists (``v_src`` / ``v_tgt`` / ``u_offsets`` / ``u_neighbors``) are NOT built here --
-    cross-level colleague / U / V logic for a variable-depth tree is Stage 2. They are
-    returned as shape-correct PLACEHOLDERS (``v_src`` / ``v_tgt`` full sentinel,
-    ``u_offsets`` all zeros, ``u_neighbors`` empty) so the NamedTuple is well-formed; do
-    NOT feed this view to the FMM's far/near passes until Stage 2 populates them.
+    INTERACTION LISTS (Stage 2, ``interactions=True``). With ``interactions=False``
+    (default) the interaction fields are shape-correct PLACEHOLDERS (Stage-1 topology only:
+    ``v_src`` / ``v_tgt`` full sentinel, ``u_offsets`` all zeros, ``u_neighbors`` empty). With
+    ``interactions=True`` the view is a COMPLETE adaptive FMM interaction structure that drops
+    straight into jaccpot's ``octree_fmm_uvwx`` far (V-list M2L) + near (extended-near P2P)
+    passes:
+
+    * ``v_src`` / ``v_tgt`` -- the V-list M2L pairs (source node -> target node, SAME level),
+      flattened to ``node_capacity * 216`` with sentinel padding. For node ``C`` these are the
+      children of ``colleagues(parent(C)) + parent(C)`` that EXIST as active nodes and are
+      well-separated from ``C`` (``|dcoord|_inf > 1``). Same construction as the sparse builder,
+      valid unchanged on the variable-depth tree (V is always same-level, so M2L stays between
+      COM-centred nodes at matching scale).
+    * ``u_offsets`` / ``u_neighbors`` -- the EXTENDED-NEAR list per leaf: fixed-width CSR (width
+      ``u_capacity``) of source-leaf ROW ids (into ``leaf_indices``), self-EXCLUDED, sentinel
+      (``node_capacity``) padded, matching ``jaccpot`` ``_ulist_near_device`` /
+      ``_compute_leaf_p2p_impl``. This is U (adjacent same-level leaves) + W (finer) + X (coarser
+      level-jump) folded into one leaf-leaf near list -- every leaf-leaf pair handled by P2P
+      rather than M2L.
+
+    EXACT PARTITION (the correctness contract, no 2:1-balancing needed -- the general
+    variable-level lists realise it directly). For ordered leaves ``(B, S)``, ``B != S``, let
+    ``m = min(depth(B), depth(S))``. The pair is NEAR (``S`` in extended-near of ``B``) iff the
+    ancestors of ``B`` and ``S`` at level ``m`` are ADJACENT (``|dcoord|_inf <= 1``); otherwise
+    it is FAR, handled by a single M2L at the coarsest level where ``B``/``S`` ancestors are
+    well-separated (their parents adjacent) -- exactly one V pair on ``B``'s ancestor chain.
+    The extended-near list is built directly from this rule: for each leaf ``B`` and each level
+    ``l = 0..depth(B)``, the leaf colleagues of ``ancestor(B)@l`` are near sources of ``B`` (U at
+    ``l = depth(B)``, X at ``l < depth(B)``), and each X pair also emits the transpose so the
+    coarser leaf gets its finer W neighbour. The directed pairs are grouped by target into the
+    fixed-width CSR (rows wider than ``u_capacity`` overflow detectably: the tail sources drop,
+    which the coverage gate catches). No W subtree descent, so shapes stay a function of ``(N,
+    max_depth, node_capacity, leaf_capacity, u_capacity)`` alone -- still compiles once.
 
     ``level_batch_width_cap`` (default ``leaf_capacity``) is accepted for API parity with
     the sparse builder (the caller passes it STATIC to jaccpot's M2M / L2L kernels); it is
@@ -871,6 +900,74 @@ def build_adaptive_octree_execution_view_device(
     node_key = jnp.unique(
         active_keys.reshape(-1), size=node_capacity, fill_value=fill_key
     ).astype(jnp.int64)
+
+    if interactions:
+        # ---- 2:1 balance (device, static-shape ripple) ----
+        # A correct O(N) extended-near list needs bounded level jumps between adjacent
+        # leaves: a coarse leaf touching a deep clump would otherwise be near to EVERY
+        # leaf in that clump (unbounded row). Balance so no two adjacent leaves differ by
+        # >1 level. Rule: a LEAF C@l (l<L) subdivides iff some same-level neighbour cell
+        # is a GRANDPARENT (has a grandchild in the tree, i.e. refinement reaches l+2
+        # across it). Adding C's 8 children makes C internal; iterating <= max_depth
+        # times resolves the whole ripple (each pass advances the interface one level).
+        _neigh_bal = jnp.asarray(_neighbor_offsets_26(), idt)  # (26,3)
+
+        def _balance_pass(nk):
+            lvl = nk >> three_L  # padding -> L+1
+            cll = nk & cell_mask
+            vld = nk != jnp.asarray(fill_key, jnp.int64)
+            # internal cells = parents of active nodes; grandparents = have a grandchild
+            par_key = jnp.where(
+                (lvl >= 1) & vld,
+                ((lvl - 1) << three_L) | (cll >> 3),
+                jnp.asarray(fill_key, jnp.int64),
+            )
+            gp_key = jnp.where(
+                (lvl >= 2) & vld,
+                ((lvl - 2) << three_L) | (cll >> 6),
+                jnp.asarray(fill_key, jnp.int64),
+            )
+            par_sorted = jnp.unique(par_key, size=node_capacity, fill_value=fill_key)
+            gp_sorted = jnp.unique(gp_key, size=node_capacity, fill_value=fill_key)
+
+            def _member(sorted_keys, q):
+                pos = jnp.clip(
+                    jnp.searchsorted(sorted_keys, q, side="left"), 0, node_capacity - 1
+                )
+                return sorted_keys[pos] == q
+
+            is_internal = vld & _member(par_sorted, nk)
+            subdividable = vld & (~is_internal) & (lvl < L)
+            # same-level neighbour keys; is any a grandparent?
+            coord_b = _cell_coords(cll).astype(idt)  # (M,3)
+            ncoord = coord_b[:, None, :] + _neigh_bal[None, :, :]  # (M,26,3)
+            two_l = jnp.power(2, jnp.minimum(lvl, L)).astype(idt)[:, None, None]
+            inb = jnp.all((ncoord >= 0) & (ncoord < two_l), axis=-1)  # (M,26)
+            ncell = _encode_coords(ncoord).astype(idt)  # (M,26)
+            nkey = (jnp.minimum(lvl, L)[:, None] << three_L) | (
+                ncell & jnp.asarray(cell_mask, idt)
+            )
+            npos = jnp.clip(
+                jnp.searchsorted(gp_sorted, nkey, side="left"), 0, node_capacity - 1
+            )
+            nb_is_gp = (gp_sorted[npos] == nkey) & inb  # (M,26)
+            needs = subdividable & jnp.any(nb_is_gp, axis=1)  # (M,)
+            # add the 8 children of subdividing leaves
+            child_cells = cll[:, None] * 8 + jnp.arange(8, dtype=jnp.int64)[None, :]
+            child_keys = ((lvl + 1)[:, None] << three_L) | (
+                child_cells & jnp.asarray(cell_mask, jnp.int64)
+            )
+            child_keys = jnp.where(
+                needs[:, None], child_keys, jnp.asarray(fill_key, jnp.int64)
+            )
+            merged = jnp.concatenate([nk, child_keys.reshape(-1)])
+            return jnp.unique(merged, size=node_capacity, fill_value=fill_key).astype(
+                jnp.int64
+            )
+
+        for _ in range(L):
+            node_key = _balance_pass(node_key)
+
     valid_mask = node_key != jnp.asarray(fill_key, jnp.int64)
     node_level = (node_key >> three_L).astype(idt)  # padding -> L+1
     node_cell = (node_key & cell_mask).astype(idt)
@@ -894,7 +991,7 @@ def build_adaptive_octree_execution_view_device(
         found = in_level & (node_key_j[pos_safe] == target)
         return jnp.where(found, pos_safe, sentinel)
 
-    # ---- particle ranges + node occupancy via searchsorted (padding forced empty) ----
+    # ---- particle ranges via searchsorted (padding forced empty) ----
     lvl_r = jnp.minimum(node_level, L)  # avoid negative shift for padding (level L+1)
     shift = (3 * (L - lvl_r)).astype(_U64)
     cell_uu = node_cell.astype(_U64)
@@ -902,13 +999,8 @@ def build_adaptive_octree_execution_view_device(
     hi_c = (cell_uu + _U64(1)) << shift
     start = jnp.searchsorted(sorted_code, lo_c, side="left").astype(idt)
     end_excl = jnp.searchsorted(sorted_code, hi_c, side="left").astype(idt)
-    node_occ = (end_excl - start).astype(idt)
     nr = jnp.stack([start, end_excl - 1], axis=-1)
     node_ranges = jnp.where(valid_mask[:, None], nr, jnp.asarray([0, -1], idt))
-
-    # ---- internal / leaf classification ----
-    internal = valid_mask & (node_occ > leaf_size) & (node_level < L)
-    leaf_mask = valid_mask & (~internal)  # active and not internal
 
     # ---- parent / children via cell arithmetic + active-set lookup ----
     parent = lookup_node(node_level - 1, node_cell >> 3)
@@ -921,6 +1013,13 @@ def build_adaptive_octree_execution_view_device(
     children = jnp.where(child_lookup == sentinel, jnp.asarray(-1, idt), child_lookup)
     children = jnp.where(valid_mask[:, None], children, jnp.asarray(-1, idt))
     child_counts = (children >= 0).sum(1).astype(idt)
+
+    # ---- internal / leaf classification (STRUCTURAL: a leaf has no active children) ----
+    # For the unbalanced set (interactions=False) this equals the occupancy rule
+    # (occ <= leaf_size or level == L). After 2:1 balancing a subdivided sparse leaf has
+    # occ <= leaf_size yet IS internal, so the structural test is the correct one.
+    internal = valid_mask & (child_counts > 0)
+    leaf_mask = valid_mask & (child_counts == 0)  # active and not internal
 
     # ---- centres ----
     coord_int = _cell_coords(node_cell)  # (M,3) int cell coords at each node's level
@@ -940,11 +1039,120 @@ def build_adaptive_octree_execution_view_device(
     nodes_by_level = jnp.arange(node_capacity, dtype=idt)  # already level-major
     node_depths = jnp.where(valid_mask, node_level, jnp.asarray(L, idt))
 
-    # ---- Stage 2 placeholders: interaction lists NOT built yet (see docstring) ----
-    v_src = jnp.full((node_capacity,), sentinel, idt)
-    v_tgt = jnp.full((node_capacity,), sentinel, idt)
-    u_offsets = jnp.zeros((leaf_capacity + 1,), idt)
-    u_neighbors = jnp.zeros((0,), idt)
+    if not interactions:
+        # ---- Stage 1: interaction lists left as shape-correct placeholders ----
+        v_src = jnp.full((node_capacity,), sentinel, idt)
+        v_tgt = jnp.full((node_capacity,), sentinel, idt)
+        u_offsets = jnp.zeros((leaf_capacity + 1,), idt)
+        u_neighbors = jnp.zeros((0,), idt)
+    else:
+        u_capacity = int(u_capacity)
+        neigh = jnp.asarray(_neighbor_offsets_26(), idt)  # (26,3)
+
+        # ---- colleagues: same-level active cells within +/-1 coord (26 offsets) ----
+        ncoord = coord_int[:, None, :] + neigh[None, :, :]  # (M,26,3)
+        two_l = jnp.power(2, jnp.minimum(node_level, L)).astype(idt)[:, None, None]
+        in_bounds = jnp.all((ncoord >= 0) & (ncoord < two_l), axis=-1)  # (M,26)
+        ncell = _encode_coords(ncoord).astype(idt)  # (M,26)
+        coll_levels = jnp.broadcast_to(node_level[:, None], ncell.shape)
+        colleague = lookup_node(coll_levels, ncell)  # (M,26) node id / sentinel
+        colleague = jnp.where(in_bounds, colleague, jnp.asarray(-1, idt))
+
+        # ---- V list: children of (parent + parent's colleagues) NOT adjacent to self ----
+        safe_parent = jnp.clip(parent, 0, node_capacity - 1)
+        pnear = jnp.concatenate(
+            [parent[:, None], colleague[safe_parent]], axis=1
+        )  # (M,27)
+        pnear = jnp.where(parent[:, None] >= 0, pnear, jnp.asarray(-1, idt))
+        pnear_valid = (pnear >= 0) & (pnear < node_capacity)  # excludes -1 / sentinel
+        pnear_cell = node_cell[jnp.clip(pnear, 0, node_capacity - 1)]  # (M,27)
+        cand_cell = pnear_cell[:, :, None] * 8 + jnp.arange(8, dtype=idt)[None, None, :]
+        cand_valid0 = pnear_valid[:, :, None] & (node_level >= 1)[:, None, None]
+        cand_cell = cand_cell.reshape(node_capacity, 27 * 8)  # (M,216)
+        cand_valid0 = jnp.broadcast_to(cand_valid0, (node_capacity, 27, 8)).reshape(
+            node_capacity, 27 * 8
+        )
+        cand_coord = _cell_coords(cand_cell.astype(_U64)).astype(jnp.int32)  # (M,216,3)
+        dcoord = jnp.abs(cand_coord - coord_int.astype(jnp.int32)[:, None, :])
+        well_sep = jnp.max(dcoord, axis=-1) > 1  # (M,216) not adjacent at this level
+        cand_levels = jnp.broadcast_to(node_level[:, None], cand_cell.shape)
+        cand_node = lookup_node(cand_levels, cand_cell)  # (M,216) node id / sentinel
+        v_ok = cand_valid0 & well_sep & (cand_node != sentinel) & valid_mask[:, None]
+        v_self = jnp.broadcast_to(
+            jnp.arange(node_capacity, dtype=idt)[:, None], cand_cell.shape
+        )
+        v_src = jnp.where(v_ok, cand_node, sentinel).reshape(-1)
+        v_tgt = jnp.where(v_ok, v_self, sentinel).reshape(-1)
+
+        # ---- extended-near list (U + W + X) as directed leaf-row pairs -> CSR ----
+        # node id -> leaf row (else sentinel); pads write out of range (dropped).
+        leaf_dest = jnp.where(leaf_indices < node_capacity, leaf_indices, node_capacity)
+        leaf_row_of_node = (
+            jnp.full((node_capacity,), sentinel, idt)
+            .at[leaf_dest]
+            .set(jnp.arange(leaf_capacity, dtype=idt), mode="drop")
+        )
+
+        R = leaf_capacity
+        leaf_nid = jnp.clip(leaf_indices, 0, node_capacity - 1)  # (R,)
+        real_row = leaf_indices < node_capacity  # (R,) real leaf vs sentinel pad
+        lB = node_level[leaf_nid]  # (R,)
+        coordB = coord_int[leaf_nid]  # (R,3)
+        row_ids = jnp.broadcast_to(jnp.arange(R, dtype=idt)[:, None], (R, 26))
+
+        # For each leaf B and level l = 0..L: the leaf colleagues of ancestor(B)@l are
+        # near sources of B -- U (l == depth(B)) or X (l < depth(B), coarser). Each X pair
+        # also emits its transpose so the coarser leaf gets its finer (W) neighbour.
+        tgt_chunks: list = []
+        src_chunks: list = []
+        for lam in range(L + 1):
+            valid_lam = real_row & (lam <= lB)  # (R,)
+            shift = jnp.clip(lB - lam, 0, L)  # (R,)
+            anc = coordB >> shift[:, None]  # (R,3) ancestor coord at level lam
+            coll = anc[:, None, :] + neigh[None, :, :]  # (R,26,3)
+            in_b = jnp.all((coll >= 0) & (coll < (2**lam)), axis=-1)  # (R,26)
+            coll_cell = _encode_coords(coll).astype(idt)  # (R,26)
+            s_node = lookup_node(
+                jnp.full(coll_cell.shape, lam, idt), coll_cell
+            )  # (R,26)
+            s_is_leaf = (
+                (s_node < node_capacity)
+                & leaf_mask[jnp.clip(s_node, 0, node_capacity - 1)]
+                & in_b
+                & valid_lam[:, None]
+            )
+            s_row = leaf_row_of_node[jnp.clip(s_node, 0, node_capacity - 1)]  # (R,26)
+            is_x = (lam < lB)[:, None]  # coarser source
+            # direct edge: target = B row, source = S row
+            tgt_chunks.append(jnp.where(s_is_leaf, row_ids, sentinel).reshape(-1))
+            src_chunks.append(jnp.where(s_is_leaf, s_row, sentinel).reshape(-1))
+            # transpose edge (X only): target = coarser S row, source = finer B row
+            t_ok = s_is_leaf & is_x
+            tgt_chunks.append(jnp.where(t_ok, s_row, sentinel).reshape(-1))
+            src_chunks.append(jnp.where(t_ok, row_ids, sentinel).reshape(-1))
+
+        all_tgt = jnp.concatenate(tgt_chunks)  # (P,)
+        all_src = jnp.concatenate(src_chunks)  # (P,)
+        p_edges = int(all_tgt.shape[0])
+
+        # group directed pairs by target row -> fixed-width (u_capacity) CSR
+        valid_e = all_tgt < R  # sentinel targets (>= R) are pads
+        key = jnp.where(valid_e, all_tgt, jnp.asarray(R, idt))  # invalids sort last
+        order = jnp.argsort(key)
+        key_s = key[order]
+        src_s = all_src[order]
+        first = jnp.searchsorted(key_s, key_s, side="left").astype(idt)
+        rank = jnp.arange(p_edges, dtype=idt) - first  # rank within target group
+        place = (key_s < R) & (rank < u_capacity)
+        dest = jnp.where(
+            place, key_s * u_capacity + rank, jnp.asarray(R * u_capacity, idt)
+        )
+        u_neighbors = (
+            jnp.full((R * u_capacity,), sentinel, idt)
+            .at[dest]
+            .set(jnp.where(place, src_s, sentinel), mode="drop")
+        )
+        u_offsets = jnp.arange(0, (R + 1) * u_capacity, u_capacity, dtype=idt)
 
     return UniformOctreeExecutionView(
         valid_mask=valid_mask,
