@@ -177,52 +177,6 @@ def _validate_queries(tree: KDTree, queries: Array) -> Array:
     return queries_arr
 
 
-def _heap_inorder_and_ranges(n: int) -> tuple[Array, Array]:
-    """Return inorder node order and inclusive subtree ranges for heap nodes."""
-
-    left = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
-    right = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
-
-    inorder_nodes: list[int] = []
-    stack: list[int] = []
-    cur = 0 if n > 0 else -1
-    while stack or (cur >= 0):
-        while cur >= 0:
-            stack.append(cur)
-            cur = left[cur]
-        cur = stack.pop()
-        inorder_nodes.append(cur)
-        cur = right[cur]
-
-    inorder_pos = [0] * n
-    for pos, node in enumerate(inorder_nodes):
-        inorder_pos[node] = pos
-
-    subtree_sizes = [1] * n
-    for i in range(n - 1, -1, -1):
-        l = left[i]
-        r = right[i]
-        size = 1
-        if l >= 0:
-            size += subtree_sizes[l]
-        if r >= 0:
-            size += subtree_sizes[r]
-        subtree_sizes[i] = size
-
-    ranges = []
-    for i in range(n):
-        l = left[i]
-        l_size = subtree_sizes[l] if l >= 0 else 0
-        start = inorder_pos[i] - l_size
-        end = start + subtree_sizes[i] - 1
-        ranges.append((start, end))
-
-    return (
-        jnp.asarray(inorder_nodes, dtype=jnp.int32),
-        jnp.asarray(ranges, dtype=jnp.int32),
-    )
-
-
 def _heap_subtree_sizes(n: int) -> list[int]:
     """Return subtree sizes for each heap node index."""
 
@@ -237,24 +191,6 @@ def _heap_subtree_sizes(n: int) -> list[int]:
             total += sizes[right[i]]
         sizes[i] = total
     return sizes
-
-
-def _heap_inorder_nodes(n: int) -> list[int]:
-    """Return heap node indices in inorder traversal."""
-
-    left = [2 * i + 1 if (2 * i + 1) < n else -1 for i in range(n)]
-    right = [2 * i + 2 if (2 * i + 2) < n else -1 for i in range(n)]
-    inorder: list[int] = []
-    stack: list[int] = []
-    cur = 0 if n > 0 else -1
-    while stack or (cur >= 0):
-        while cur >= 0:
-            stack.append(cur)
-            cur = left[cur]
-        cur = stack.pop()
-        inorder.append(cur)
-        cur = right[cur]
-    return inorder
 
 
 def _heap_inorder_nodes_jax(n: int) -> Array:
@@ -751,22 +687,6 @@ def _query_neighbors_tiled(
     if return_squared:
         return best_idx, best_d2
     return best_idx, jnp.sqrt(best_d2)
-
-
-def _point_to_bbox_distance_sq(query: Array, bbox_min: Array, bbox_max: Array) -> Array:
-    clipped = jnp.clip(query[None, :], bbox_min, bbox_max)
-    delta = query[None, :] - clipped
-    return jnp.sum(delta * delta, axis=1)
-
-
-def _point_to_bbox_distance_sq_single(
-    query: Array,
-    bbox_min: Array,
-    bbox_max: Array,
-) -> Array:
-    clipped = jnp.clip(query, bbox_min, bbox_max)
-    delta = query - clipped
-    return jnp.sum(delta * delta)
 
 
 def _topk_merge(
