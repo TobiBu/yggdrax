@@ -1254,19 +1254,21 @@ def _build_tree_from_leaf_partitions(
         parent_safe,
     )
 
-    def _depth_cond(state):
-        _sc, _d, changed = state
-        return changed
-
-    def _depth_body(state):
-        sc, d, _changed = state
+    def _depth_body(_, state):
+        sc, d = state
         new_d = d + d[sc]
         new_sc = sc[sc]
-        changed = jnp.any(new_sc != sc)
-        return new_sc, new_d, changed
+        return new_sc, new_d
 
-    _, node_level, _ = lax.while_loop(
-        _depth_cond, _depth_body, (init_shortcut, init_dist, jnp.bool_(True))
+    # Pointer doubling reaches every node's root in ceil(log2(depth)) rounds,
+    # and stays at that fixed point thereafter (sc[sc] == sc), so a bounded
+    # loop of that many rounds is exact for any well-formed tree.  Using a
+    # fixed bound instead of a change-driven while_loop also guarantees
+    # termination if a degenerate build produced a malformed (e.g. cyclic)
+    # parent array, rather than spinning forever.
+    n_depth_rounds = max(1, int(total_nodes).bit_length() + 1)
+    _, node_level = lax.fori_loop(
+        0, n_depth_rounds, _depth_body, (init_shortcut, init_dist)
     )
 
     max_level = jnp.max(node_level)
