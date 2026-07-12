@@ -566,18 +566,22 @@ def _neighbor_capacity_candidates(
 class NodeInteractionList(NamedTuple):
     """Compressed far-field interaction list for all tree nodes.
 
-    Attributes:
-        offsets: Start index for each node within ``sources``/``targets``;
-            combine with ``counts`` to recover the slice length per node.
-        sources: Source node indices for every far-field pair, written in
-            level-major order.
-        targets: Target node indices matching ``sources``.
-        counts: Interaction counts per node (number of entries for each
-            target).
-        level_offsets: Prefix offsets delimiting the interaction ranges for
-            each tree level (length ``num_levels + 1``).
-        target_levels: Tree level for each pair (monotonically
-            non-decreasing).
+    Attributes
+    ----------
+    offsets
+        Start index for each node within ``sources``/``targets``; combine with
+        ``counts`` to recover the per-node slice length.
+    sources
+        Source node indices for every far-field pair, in level-major order.
+    targets
+        Target node indices matching ``sources``.
+    counts
+        Interaction counts per node (entries per target).
+    level_offsets
+        Prefix offsets delimiting the interaction ranges for each tree level
+        (length ``num_levels + 1``).
+    target_levels
+        Tree level for each pair (monotonically non-decreasing).
     """
 
     offsets: Array
@@ -816,11 +820,11 @@ def _per_key_prefix(keys: Array, mask: Array, num_segments: int = 0) -> Array:
 
     Parameters
     ----------
-    keys : Array
+    keys
         Per-entry key values, shape ``(B,)``.
-    mask : Array
+    mask
         Boolean mask, shape ``(B,)``.  Only masked entries participate.
-    num_segments : int
+    num_segments
         Unused; kept for call-site compatibility.
 
     Returns
@@ -1005,16 +1009,16 @@ def _build_mac_extents(
 
     Parameters
     ----------
-    parent : Array
+    parent
         Per-node parent index (root's parent is negative), length ``n_nodes``.
-    geometry : TreeGeometry
+    geometry
         Node geometry providing ``max_extent`` (box) and ``radius`` (sphere).
-    num_internal : int
+    num_internal
         Number of internal nodes; nodes with index ``>= num_internal`` are
         leaves and use the leaf proxy.
-    mac_type : str
+    mac_type
         MAC variant: ``"bh"`` (box), ``"dehnen"`` or ``"engblom"`` (sphere).
-    dehnen_radius_scale : float
+    dehnen_radius_scale
         Multiplicative radius scale applied only for ``mac_type == "dehnen"``.
 
     Returns

@@ -26,6 +26,9 @@ napoleon_google_docstring = False
 napoleon_numpy_docstring = True
 napoleon_use_param = True
 napoleon_use_rtype = True
+# Render class/NamedTuple "Attributes" as instance-variable fields so they do
+# not collide with the autodoc member listing (avoids duplicate-object warnings).
+napoleon_use_ivar = True
 
 autosummary_generate = True
 autodoc_typehints = "description"
