@@ -18,3 +18,17 @@ repos:
         # strict docstring<->signature checks are exempted here (black/isort
         # still apply). Tighten and re-enable once the API stabilises.
         exclude: '^yggdrax/distributed/'
+
+  - repo: local
+    hooks:
+      - id: basedpyright
+        name: basedpyright
+        # Run from the active environment so it sees the installed jax/jaxtyping
+        # stubs. Config + baseline live in pyproject.toml / .basedpyright/.
+        entry: basedpyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        # The full project is analysed regardless of which files changed, so a
+        # new error anywhere is caught even when an unrelated file is committed.
+        args: ["yggdrax"]

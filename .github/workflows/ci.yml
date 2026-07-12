@@ -54,6 +54,11 @@ jobs:
             yggdrax/tree_moments.py \
             yggdrax/types.py
 
+      - name: basedpyright (static type check)
+        # Config + baseline are in pyproject.toml / .basedpyright/baseline.json.
+        # The gate enforces "no new type errors" over the committed baseline.
+        run: basedpyright yggdrax
+
       - name: Unit tests with coverage
         run: pytest
 

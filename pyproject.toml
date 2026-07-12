@@ -40,6 +40,7 @@ dev = [
   "pydoclint>=0.6.0",
   "pytest>=8.3.0",
   "pytest-cov>=5.0.0",
+  "basedpyright>=1.39.0",
 ]
 
 [tool.setuptools]
@@ -68,6 +69,35 @@ exclude = '''
 profile = "black"
 line_length = 88
 skip_gitignore = true
+
+[tool.basedpyright]
+# Static type checking for the JAX-first public API. JAX ships no high-quality
+# type stubs, so the "unknown-type" family of diagnostics (which fire on almost
+# every jnp.* call) is disabled to keep the gate focused on real type errors
+# rather than JAX-stub noise. Pre-existing findings are captured in
+# basedpyright-baseline.json; the gate enforces "no new type errors" and the
+# baseline is burned down incrementally.
+include = ["yggdrax"]
+exclude = ["**/__pycache__", "**/.ipynb_checkpoints"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+
+# --- JAX has no usable stubs: silence the untyped-value noise ---------------
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+reportMissingParameterType = false
+reportAny = false
+reportExplicitAny = false
+
+# --- Keep the high-signal, bug-catching diagnostics as errors ---------------
+reportPossiblyUnboundVariable = "error"
+reportUnboundVariable = "error"
+reportOptionalMemberAccess = "error"
+reportSelfClsParameterName = "error"
 
 [tool.pytest.ini_options]
 minversion = "7.4"
