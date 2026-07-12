@@ -617,7 +617,25 @@ def compute_tree_mass_moments(
     positions_sorted: Array,
     masses_sorted: Array,
 ) -> TreeMassMoments:
-    """Compute total mass and centre of mass for every tree node."""
+    """Compute total mass and center of mass for every tree node.
+
+    Uses prefix sums over the Morton-sorted masses and mass-weighted positions
+    for O(1)-per-node range queries.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    positions_sorted
+        Particle positions in Morton order, shape ``(n_particles, 3)``.
+    masses_sorted
+        Particle masses reordered identically to ``positions_sorted``.
+
+    Returns
+    -------
+    TreeMassMoments
+        Per-node total mass and center of mass.
+    """
 
     topology = resolve_tree_topology(tree)
     require_fmm_core_topology(topology)
