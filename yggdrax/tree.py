@@ -227,7 +227,59 @@ class Tree:
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
     ) -> "Tree":
-        """Build and return a concrete tree instance selected by keywords."""
+        """Build a concrete tree, dispatching on ``tree_type``.
+
+        Primary entry point that normalizes arguments into a
+        :class:`TreeBuildRequest` and dispatches to the registered backend
+        builder (see :func:`available_tree_types` and
+        :func:`register_tree_builder`).
+
+        Parameters
+        ----------
+        positions
+            Particle positions of shape ``(n, 3)``.
+        masses
+            Particle masses of shape ``(n,)``.
+        tree_type
+            Backend identifier: ``"radix"``, ``"octree"``, ``"kdtree"``, or any
+            registered type.
+        build_mode
+            Construction mode: ``"adaptive"``, ``"fixed_depth"``, or
+            ``"static_radix"``.
+        bounds
+            Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+        return_reordered
+            If ``True`` (default), populate the reordered particle buffers on
+            the returned tree.
+        workspace
+            Optional reusable :class:`RadixTreeWorkspace`.
+        return_workspace
+            If ``True``, retain the workspace on the returned tree.
+        leaf_size
+            Maximum particles per leaf (adaptive/static modes).
+        target_leaf_particles
+            Target per-leaf occupancy (fixed-depth mode).
+        max_depth
+            Optional hard cap on the fixed-depth Morton depth.
+        refine_local
+            Whether to locally refine elongated buckets (fixed-depth mode).
+        max_refine_levels
+            Maximum additional local refinement depth.
+        aspect_threshold
+            Axis aspect-ratio above which a bucket is refined.
+        min_refined_leaf_particles
+            Smallest occupancy a locally refined leaf may have.
+
+        Returns
+        -------
+        Tree
+            A concrete tree container of the requested backend type.
+
+        Raises
+        ------
+        ValueError
+            If ``tree_type`` is not registered.
+        """
 
         request = TreeBuildRequest(
             positions=positions,
@@ -1320,10 +1372,37 @@ def build_tree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an LBVH tree, inferring bounds when not provided.
+    """Build an adaptive LBVH radix tree, inferring bounds when not provided.
 
-    Passing ``config`` overrides the individual keyword flags so callers can
-    reuse one validated options object across repeated builds.
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred from ``positions``
+        when omitted.
+    return_reordered
+        If ``True``, also return the Morton-sorted positions/masses and the
+        inverse permutation.
+    leaf_size
+        Maximum number of particles per leaf.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace` to avoid reallocating
+        scratch buffers across repeated builds.
+    return_workspace
+        If ``True``, also return the (possibly newly allocated) workspace.
+    config
+        Optional :class:`TreeBuildConfig`; when given it overrides the
+        equivalent individual keyword arguments.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered particle
+        buffers and/or workspace when ``return_reordered`` / ``return_workspace``
+        are set.
     """
 
     resolved = _resolve_tree_build_options(
@@ -1362,7 +1441,39 @@ def build_octree(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """Build an octree through the octree-specific Morton partition pipeline."""
+    """Build an octree through the octree-specific Morton partition pipeline.
+
+    Produces an :class:`OctreeTree` that carries the same compatibility fields
+    as :func:`build_tree` plus explicit octree buffers (``oct_children``,
+    ``oct_node_depths``, ``radix_node_to_oct``, …) for level-wise FMM scheduling.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    return_reordered
+        If ``True``, also return the reordered particle buffers and inverse
+        permutation.
+    leaf_size
+        Maximum number of particles per leaf.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace`.
+    return_workspace
+        If ``True``, also return the workspace.
+    config
+        Optional :class:`TreeBuildConfig` overriding the individual keyword
+        arguments.
+
+    Returns
+    -------
+    OctreeTree or tuple
+        The octree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
+    """
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1401,7 +1512,7 @@ def build_tree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an LBVH tree, inferring bounds when not provided."""
+    """JIT-compiled variant of :func:`build_tree` (see it for parameters/returns)."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1439,7 +1550,7 @@ def build_octree_jit(
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
 ):
-    """JIT build for an octree through the octree-specific Morton pipeline."""
+    """JIT-compiled variant of :func:`build_octree` (see it for parameters/returns)."""
 
     resolved = _resolve_tree_build_options(
         config=config,
@@ -1482,10 +1593,47 @@ def build_fixed_depth_tree(
     min_refined_leaf_particles: int = 2,
     config: Optional[FixedDepthTreeBuildConfig] = None,
 ):
-    """Build a fixed-depth tree, inferring bounds when not provided.
+    """Build a fixed-depth Morton tree, inferring bounds when not provided.
 
-    Passing ``config`` overrides the individual keyword flags so callers can
-    package build settings once and reuse them consistently.
+    Resolves a uniform Morton depth from ``target_leaf_particles`` and, when
+    ``refine_local`` is set, locally refines elongated leaf buckets by axis
+    aspect ratio.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    target_leaf_particles
+        Target per-leaf occupancy used to resolve the Morton depth.
+    return_reordered
+        If ``True``, also return the reordered particle buffers.
+    workspace
+        Optional reusable :class:`RadixTreeWorkspace`.
+    return_workspace
+        If ``True``, also return the workspace.
+    max_depth
+        Optional hard cap on the Morton depth.
+    refine_local
+        Whether to locally refine elongated Morton buckets.
+    max_refine_levels
+        Maximum additional local refinement depth.
+    aspect_threshold
+        Axis aspect-ratio above which a bucket is refined.
+    min_refined_leaf_particles
+        Smallest occupancy a locally refined leaf may have.
+    config
+        Optional :class:`FixedDepthTreeBuildConfig` overriding the individual
+        keyword arguments.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
     """
 
     resolved = _resolve_tree_build_options(
@@ -1541,9 +1689,32 @@ def build_static_radix_tree(
 ):
     """Build a fixed-shape radix tree from Morton-sorted count buckets.
 
-    The tree structure is static for a fixed particle count and ``leaf_size``.
-    Leaves are not fixed spatial cells; each leaf owns a contiguous chunk of
-    the current Morton-sorted particle order.
+    The tree *structure* (node count, parent/child topology) is static for a
+    fixed particle count and ``leaf_size``, so it can be rebuilt cheaply for new
+    particle values via :func:`rebuild_static_radix_tree_from_template`. Leaves
+    are not fixed spatial cells; each leaf owns a contiguous chunk of the current
+    Morton-sorted particle order.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, 3)``.
+    masses
+        Particle masses of shape ``(n,)``.
+    bounds
+        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
+    leaf_size
+        Fixed number of particles per bucket that determines the static shape.
+    return_reordered
+        If ``True``, also return the reordered particle buffers.
+    return_workspace
+        If ``True``, also return the reusable workspace/template.
+
+    Returns
+    -------
+    RadixTree or tuple
+        The tree, or a tuple additionally containing the reordered buffers
+        and/or workspace when the corresponding flags are set.
     """
 
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
