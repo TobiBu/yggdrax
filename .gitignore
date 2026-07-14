@@ -12,3 +12,13 @@ dist/
 
 # Sphinx build output
 docs/_build/
+
+# Paper results: keep directory structure + summary JSON for figures,
+# but never commit bulk result files (large NPZ / raw dumps).
+results/**/*.npz
+results/**/*.npy
+results/**/*.h5
+results/**/*.hdf5
+results/**/*.parquet
+results/**/*.csv
+!results/**/.gitkeep
