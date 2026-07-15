@@ -1,0 +1,107 @@
+{
+  "benchmark": "mac_accuracy",
+  "params": {
+    "n": 20000,
+    "thetas": [
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      1.0
+    ],
+    "backend": "radix",
+    "leaf_size": 16,
+    "softening": 0.01,
+    "seed": 0,
+    "approximation": "monopole (center-of-mass), order 0"
+  },
+  "u_total_exact": 188366064.03254038,
+  "metadata": {
+    "jax_version": "0.9.0",
+    "backend": "gpu",
+    "device_kind": "NVIDIA A100-PCIE-40GB",
+    "device_platform": "gpu",
+    "compute_capability": "8.0",
+    "x64_enabled": true,
+    "git_commit": "ebfcc99",
+    "timestamp_utc": "2026-07-15T08:47:22Z",
+    "hostname": "compgpu8"
+  },
+  "records": [
+    {
+      "theta": 0.2,
+      "num_far_pairs": 103180,
+      "covered_particle_pairs": 29819564,
+      "u_far_exact": 14791871.414883265,
+      "u_far_monopole": 16611244.006361762,
+      "far_energy_fraction": 0.0785272628106088,
+      "rel_error_vs_total": 0.009658706842036041
+    },
+    {
+      "theta": 0.3,
+      "num_far_pairs": 292440,
+      "covered_particle_pairs": 144982424,
+      "u_far_exact": 86546735.1643074,
+      "u_far_monopole": 94769698.24384823,
+      "far_energy_fraction": 0.4594603364932889,
+      "rel_error_vs_total": 0.043654164149866774
+    },
+    {
+      "theta": 0.4,
+      "num_far_pairs": 276146,
+      "covered_particle_pairs": 234794962,
+      "u_far_exact": 157041602.57016203,
+      "u_far_monopole": 168394050.03133273,
+      "far_energy_fraction": 0.8337043266086027,
+      "rel_error_vs_total": 0.06026800803784677
+    },
+    {
+      "theta": 0.5,
+      "num_far_pairs": 219278,
+      "covered_particle_pairs": 289801934,
+      "u_far_exact": 209292705.92173535,
+      "u_far_monopole": 221332497.50152028,
+      "far_energy_fraction": 1.111095605233753,
+      "rel_error_vs_total": 0.06391698866577711
+    },
+    {
+      "theta": 0.6,
+      "num_far_pairs": 164592,
+      "covered_particle_pairs": 322745584,
+      "u_far_exact": 245586557.754067,
+      "u_far_monopole": 257141940.51398137,
+      "far_energy_fraction": 1.3037728372964343,
+      "rel_error_vs_total": 0.0613453533642778
+    },
+    {
+      "theta": 0.7,
+      "num_far_pairs": 125844,
+      "covered_particle_pairs": 344508820,
+      "u_far_exact": 273159737.7071623,
+      "u_far_monopole": 283915178.85129577,
+      "far_energy_fraction": 1.4501536628167468,
+      "rel_error_vs_total": 0.057098613804848826
+    },
+    {
+      "theta": 0.8,
+      "num_far_pairs": 95836,
+      "covered_particle_pairs": 357905852,
+      "u_far_exact": 291694079.8671927,
+      "u_far_monopole": 301491526.28368115,
+      "far_energy_fraction": 1.5485489988090546,
+      "rel_error_vs_total": 0.052012800006247153
+    },
+    {
+      "theta": 1.0,
+      "num_far_pairs": 59660,
+      "covered_particle_pairs": 374080396,
+      "u_far_exact": 317848405.32561535,
+      "u_far_monopole": 325996801.337025,
+      "far_energy_fraction": 1.6873973927209458,
+      "rel_error_vs_total": 0.04325830161213114
+    }
+  ]
+}

@@ -40,6 +40,16 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sizes", type=int, nargs="+", default=[1000, 10000, 100000])
     p.add_argument("--k", type=int, default=8, help="Neighbours per query point.")
+    p.add_argument(
+        "--query-backend",
+        choices=("dense", "tiled", "tree", "auto"),
+        default="tree",
+        help=(
+            "kNN query backend. Default 'tree' (KD leaf-pruned exact search) is "
+            "memory-light and scales to large N; 'tiled' materialises a dense "
+            "pairwise reverse-mode residual and OOMs on GPU for N>=1e5."
+        ),
+    )
     p.add_argument("--leaf-size", type=int, default=64)
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
@@ -72,12 +82,14 @@ def main() -> None:
     k = args.k
     leaf_size = args.leaf_size
 
+    query_backend = args.query_backend
+
     def loss(points):
         # Rebuild the tree inside the traced function (the SVGD-style pattern),
         # query k nearest neighbours, and reduce their distances smoothly.
         tree = build_kdtree(points, leaf_size=leaf_size)
         _, distances = query_neighbors(
-            tree, points, k=k, exclude_self=True, backend="tiled"
+            tree, points, k=k, exclude_self=True, backend=query_backend
         )
         return jnp.mean(distances)
 
@@ -117,6 +129,7 @@ def main() -> None:
         "params": {
             "sizes": args.sizes,
             "k": args.k,
+            "query_backend": args.query_backend,
             "leaf_size": args.leaf_size,
             "runs": args.runs,
             "warmup": args.warmup,

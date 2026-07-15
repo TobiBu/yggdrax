@@ -134,11 +134,16 @@ def main() -> None:
     node_com = np.asarray(moments.center_of_mass)
 
     # Generous fixed capacities so the traversal never truncates far pairs.
+    # The tight-theta end (small theta) accepts almost nothing as "far", so the
+    # dual-tree walk opens nearly the whole tree: the pair queue and per-leaf
+    # near lists must be large enough to hold that near-brute-force frontier at
+    # this N. Queues are int32 and cheap in memory, so we size them well above
+    # the worst case (num_leaves^2 pending pairs, ~N near particles per leaf).
     cfg = DualTreeTraversalConfig(
-        max_pair_queue=1 << 16,
+        max_pair_queue=1 << 22,
         process_block=64,
-        max_interactions_per_node=1 << 14,
-        max_neighbors_per_leaf=4096,
+        max_interactions_per_node=1 << 15,
+        max_neighbors_per_leaf=1 << 15,
     )
 
     records = []
