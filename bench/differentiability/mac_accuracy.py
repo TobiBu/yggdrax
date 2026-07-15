@@ -160,8 +160,9 @@ def main() -> None:
         for a, b in zip(src.tolist(), tgt.tolist()):
             sa, ea = node_ranges[a]
             sb, eb = node_ranges[b]
-            pa, ma = pos_sorted[sa:ea], mass_sorted[sa:ea]
-            pb, mb = pos_sorted[sb:eb], mass_sorted[sb:eb]
+            # node_ranges is INCLUSIVE [start, end]; slice end must be +1.
+            pa, ma = pos_sorted[sa : ea + 1], mass_sorted[sa : ea + 1]
+            pb, mb = pos_sorted[sb : eb + 1], mass_sorted[sb : eb + 1]
             d = pa[:, None, :] - pb[None, :, :]
             r = np.sqrt(np.sum(d * d, axis=-1) + eps * eps)
             u_far_exact += float(np.sum((ma[:, None] * mb[None, :]) / r))
