@@ -138,17 +138,13 @@ def build_pair_topology(
     node_to_row[leaf_ids] = np.arange(num_leaves)
 
     # --- near: expand the leaf-neighbour CSR to (target_row, source_row) ---
+    # Vectorized: row r owns neighbours[offsets[r]:offsets[r+1]]; repeat the row
+    # index by its count and map each neighbour node id to its leaf row.
     n_off = np.asarray(neighbors.offsets)
     n_nb = np.asarray(neighbors.neighbors)
-    target_rows = []
-    source_rows = []
-    for row in range(num_leaves):
-        s, e = int(n_off[row]), int(n_off[row + 1])
-        for k in range(s, e):
-            target_rows.append(row)
-            source_rows.append(int(node_to_row[int(n_nb[k])]))
-    near_target_row = np.asarray(target_rows, dtype=np.int64)
-    near_source_row = np.asarray(source_rows, dtype=np.int64)
+    row_counts = (n_off[1:] - n_off[:-1]).astype(np.int64)
+    near_target_row = np.repeat(np.arange(num_leaves, dtype=np.int64), row_counts)
+    near_source_row = node_to_row[n_nb[: int(n_off[-1])]].astype(np.int64)
 
     # --- far: node pairs (inclusive slot spans) ---
     far_src = np.asarray(interactions.sources)

@@ -54,6 +54,15 @@ docs = [
   "furo>=2024.1.29",
   "myst-parser>=2.0",
 ]
+# Extra dependencies for the differentiable-applications paper code under
+# yggdrax/applications/ and the bench/ + examples/ pipeline. Kept out of the
+# core runtime deps so the maintained library stays lean.
+paper = [
+  "optax>=0.2.0",      # gradient-based parameter recovery (SVGD, corrfunc)
+  "scipy>=1.10",       # scipy.spatial.cKDTree CPU baseline in scaling benches
+  "matplotlib>=3.7",   # figure notebooks
+  "nbformat>=5.9",     # figure notebooks
+]
 
 [tool.setuptools]
 packages = ["yggdrax", "yggdrax.distributed"]
