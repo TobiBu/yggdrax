@@ -55,10 +55,14 @@ class OctreeNearfieldTiles(NamedTuple):
     tile_particle_idx: Array  # (num_tiles, W) Morton particle indices per tile
     tile_mask: Array  # (num_tiles, W) bool: real particle vs pad
     tile_leaf_row: Array  # (num_tiles,) owning leaf ROW id (sentinel for unused tiles)
-    tile_source_ids: Array  # (num_tiles, max_source_tiles) source TILE ids (self-excluded)
+    tile_source_ids: (
+        Array  # (num_tiles, max_source_tiles) source TILE ids (self-excluded)
+    )
     tile_source_valid: Array  # (num_tiles, max_source_tiles) bool
     num_tiles_used: Array  # () traced: total real tiles (<= num_tiles cap)
-    num_source_tiles_max: Array  # () traced: max source tiles over target tiles (incl self slot)
+    num_source_tiles_max: (
+        Array  # () traced: max source tiles over target tiles (incl self slot)
+    )
     overflow: Array  # () bool: any capacity exceeded (check eager-only)
 
 
@@ -96,10 +100,7 @@ def _compact_rows_to_width(
         .reshape(m, w)
     )
     packed_valid = (
-        jnp.zeros((m * w,), dtype=bool)
-        .at[dest]
-        .set(place, mode="drop")
-        .reshape(m, w)
+        jnp.zeros((m * w,), dtype=bool).at[dest].set(place, mode="drop").reshape(m, w)
     )
     return packed, packed_valid, counts
 
@@ -218,7 +219,9 @@ def build_octree_nearfield_tiles(
     tile_source_valid = (
         leaf_src_valid[r_of_tile]
         & valid_tile[:, None]
-        & (tile_source_ids != g[:, None])  # drop the self tile (intra-tile handled elsewhere)
+        & (
+            tile_source_ids != g[:, None]
+        )  # drop the self tile (intra-tile handled elsewhere)
     )
     tile_source_ids = jnp.where(tile_source_ids < total_tiles, tile_source_ids, 0)
     tile_source_ids = jnp.where(tile_source_valid, tile_source_ids, 0)
@@ -227,7 +230,9 @@ def build_octree_nearfield_tiles(
     sentinel = jnp.asarray(num_tiles, dtype=idt)
     tile_leaf_row = jnp.where(valid_tile, r_of_tile, sentinel)
 
-    tiles_per_leaf_max = jnp.max(tiles_per_leaf) if r_leaves > 0 else jnp.asarray(0, idt)
+    tiles_per_leaf_max = (
+        jnp.max(tiles_per_leaf) if r_leaves > 0 else jnp.asarray(0, idt)
+    )
     num_source_tiles_max = (
         jnp.max(leaf_src_counts) if r_leaves > 0 else jnp.asarray(0, idt)
     )
