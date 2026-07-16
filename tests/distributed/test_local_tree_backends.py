@@ -120,15 +120,20 @@ def test_coarse_tree_root_is_global(built, tree_type):
         equalize=True,
         tree_type=tree_type,
     )
-    np.testing.assert_allclose(np.asarray(metrics.coarse_root_mass), mass.sum(), rtol=1e-3)
+    np.testing.assert_allclose(
+        np.asarray(metrics.coarse_root_mass), mass.sum(), rtol=1e-3
+    )
 
 
 # ---- cross-tree walk over leaf-only KD trees: complete disjoint source partition ----
 def _kd_build(points, leaf_size=_LEAF):
     pts = jnp.asarray(points)
     tree, ps, _ms = _build_local_tree(
-        pts, jnp.ones(pts.shape[0], jnp.float32), infer_bounds(pts),
-        tree_type="kdtree", leaf_size=leaf_size,
+        pts,
+        jnp.ones(pts.shape[0], jnp.float32),
+        infer_bounds(pts),
+        tree_type="kdtree",
+        leaf_size=leaf_size,
     )
     geom = compute_tree_geometry(tree, ps, max_leaf_size=leaf_size)
     return tree, geom
@@ -150,16 +155,26 @@ def test_kdtree_cross_walk_partitions_sources():
     def build(points):
         pts = jnp.asarray(points)
         tree, ps, _ = _build_local_tree(
-            pts, jnp.ones(pts.shape[0], jnp.float32), bounds,
-            tree_type="kdtree", leaf_size=_LEAF,
+            pts,
+            jnp.ones(pts.shape[0], jnp.float32),
+            bounds,
+            tree_type="kdtree",
+            leaf_size=_LEAF,
         )
         return tree, compute_tree_geometry(tree, ps, max_leaf_size=_LEAF)
 
     t_tree, t_geom = build(tgt)
     s_tree, s_geom = build(src)
     res = dual_tree_walk_cross(
-        t_tree, t_geom, s_tree, s_geom, 0.5, mac_type="bh",
-        max_interactions_per_node=512, max_neighbors_per_leaf=512, max_pair_queue=16384,
+        t_tree,
+        t_geom,
+        s_tree,
+        s_geom,
+        0.5,
+        mac_type="bh",
+        max_interactions_per_node=512,
+        max_neighbors_per_leaf=512,
+        max_pair_queue=16384,
     )
     assert not bool(res.queue_overflow | res.far_overflow | res.near_overflow)
 
@@ -191,9 +206,9 @@ def test_kdtree_cross_walk_partitions_sources():
             node = int(parent[node])
         o, c = int(near_off[row]), int(near_cnt[row])
         covered = []
-        for sn in far_sources + near_idx[o:o + c].tolist():
+        for sn in far_sources + near_idx[o : o + c].tolist():
             covered.extend(src_particles(sn))
-        assert set(covered) == set(range(n_source)), (
-            f"leaf_row {row}: covered {len(set(covered))}/{n_source}"
-        )
+        assert set(covered) == set(
+            range(n_source)
+        ), f"leaf_row {row}: covered {len(set(covered))}/{n_source}"
         assert len(covered) == n_source, f"leaf_row {row}: overlap {len(covered)}"
