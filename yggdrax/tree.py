@@ -14,8 +14,8 @@ from jaxtyping import Array, jaxtyped
 from . import _tree_impl
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
-from .kdtree import KDTree as KDTreeTopology
-from .kdtree import build_kdtree
+from .kdtree import LeafKDTree as KDTreeTopology
+from .kdtree import build_leaf_kdtree
 from .octree import OctreeTopology, augment_radix_topology_with_octree
 from .protocols import MortonLeafBoundsProtocol
 
@@ -884,7 +884,7 @@ class KDParticleTree(Tree):
                 f"'{build_mode}' for kdtree. Supported: ('adaptive',)"
             )
 
-        topology = build_kdtree(positions, leaf_size=leaf_size)
+        topology = build_leaf_kdtree(positions, leaf_size=leaf_size)
         if return_reordered:
             idx = jnp.asarray(topology.particle_indices, dtype=INDEX_DTYPE)
             pos_sorted = positions[idx]

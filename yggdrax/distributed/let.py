@@ -27,12 +27,12 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from .._tree_impl import build_tree
 from ..dtypes import INDEX_DTYPE, as_index
 from ..geometry import compute_tree_geometry
 from ..tree import Tree
 from ..tree_moments import compute_tree_mass_moments
 from .comm import _COUNT_DTYPE, ragged_all_to_all_exchange
+from .local_tree import _build_local_tree, _validate_distributed_tree_type
 from .sharding import AXIS_NAME
 
 # Global particle id = source_domain * _GID_STRIDE + local_sorted_index. Lets an
@@ -106,7 +106,9 @@ def gather_global_coarse_tree(
 
     Each frontier node becomes a "coarse particle" (its COM, weighted by node
     mass). Building over identical gathered input yields the same tree on every
-    device -- no agreement round needed.
+    device -- no agreement round needed. The coarse tree is always radix (an
+    internal representation over remote COMs; the backend is immaterial and
+    radix is robust at ``coarse_leaf_size=1``).
     """
 
     n_top = frontier.mass.shape[0]
@@ -122,8 +124,8 @@ def gather_global_coarse_tree(
         frontier.node_range, axis_name, tiled=True
     )  # [ncoarse,2]
 
-    tree, pos_sorted, mass_sorted, _inv = build_tree(
-        coms, masses, bounds, return_reordered=True, leaf_size=int(coarse_leaf_size)
+    tree, pos_sorted, mass_sorted = _build_local_tree(
+        coms, masses, bounds, tree_type="radix", leaf_size=int(coarse_leaf_size)
     )
     geometry = compute_tree_geometry(
         tree, pos_sorted, max_leaf_size=int(coarse_leaf_size)
@@ -164,6 +166,7 @@ def build_distributed_coarse_tree(
     output_capacity: int,
     num_samples: int = 8,
     equalize: bool = True,
+    tree_type: str = "radix",
     axis_name: str = AXIS_NAME,
 ) -> CoarseTreeMetrics:
     """Decompose, build per-GPU trees, and gather the global coarse tree.
@@ -171,7 +174,11 @@ def build_distributed_coarse_tree(
     Returns global-view :class:`CoarseTreeMetrics`. The full per-device
     :class:`GlobalCoarseTree` is built inside the ``shard_map`` and consumed by
     later LET stages; this driver surfaces the invariants worth testing.
+    ``tree_type`` selects the local per-device backend (``"radix"``,
+    ``"octree"``, or ``"kdtree"``); the coarse tree is always radix.
     """
+
+    _validate_distributed_tree_type(tree_type)
 
     try:  # stable across recent JAX versions
         from jax import shard_map
@@ -200,8 +207,8 @@ def build_distributed_coarse_tree(
                 p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
             )
         p, m = sanitize_padding(p, m, cnt)
-        tree, pos_sorted, mass_sorted, _ = build_tree(
-            p, m, bounds, return_reordered=True, leaf_size=leaf_size
+        tree, pos_sorted, mass_sorted = _build_local_tree(
+            p, m, bounds, tree_type=tree_type, leaf_size=leaf_size
         )
         moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
         node_mass = moments.mass
@@ -209,6 +216,9 @@ def build_distributed_coarse_tree(
         root = as_index(jnp.argmin(jnp.asarray(tree.parent)))
 
         fr = build_coarse_frontier(tree, node_mass, node_com)
+        # Coarse tree is always radix: it is an internal representation over
+        # remote frontier COMs (backend-immaterial), and radix is robust at the
+        # coarse leaf_size=1 that KD/octree bucket builds cannot honour exactly.
         gct = gather_global_coarse_tree(fr, bounds=bounds, axis_name=axis_name)
 
         croot = as_index(jnp.argmin(jnp.asarray(gct.tree.parent)))
@@ -325,6 +335,7 @@ def classify_against_remote(
     max_pair_queue: int = 8192,
     num_samples: int = 8,
     equalize: bool = True,
+    tree_type: str = "radix",
     axis_name: str = AXIS_NAME,
 ) -> ClassifyMetrics:
     """Cross-walk each GPU's local tree against the remote-only coarse tree.
@@ -332,7 +343,11 @@ def classify_against_remote(
     Produces the far (remote M2L) and near (remote import) classifications that
     Phase-3 stage 3 turns into an actual particle import. This driver surfaces
     the invariants; the far/near *lists* are consumed by later stages.
+    ``tree_type`` selects the local per-device backend (``"radix"``,
+    ``"octree"``, or ``"kdtree"``); the coarse tree is always radix.
     """
+
+    _validate_distributed_tree_type(tree_type)
 
     try:  # stable across recent JAX versions
         from jax import shard_map
@@ -362,8 +377,8 @@ def classify_against_remote(
                 p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
             )
         p, m = sanitize_padding(p, m, cnt)
-        tree, pos_sorted, mass_sorted, _ = build_tree(
-            p, m, bounds, return_reordered=True, leaf_size=leaf_size
+        tree, pos_sorted, mass_sorted = _build_local_tree(
+            p, m, bounds, tree_type=tree_type, leaf_size=leaf_size
         )
         geom = compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
         moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
@@ -371,6 +386,7 @@ def classify_against_remote(
         own_mass = moments.mass[root]
 
         fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
+        # Coarse tree is always radix (internal remote-COM representation).
         rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
         rroot = as_index(jnp.argmin(jnp.asarray(rct.tree.parent)))
 
@@ -574,9 +590,16 @@ def distributed_let_import(
     max_pair_queue: int = 8192,
     num_samples: int = 8,
     equalize: bool = True,
+    tree_type: str = "radix",
     axis_name: str = AXIS_NAME,
 ) -> ImportMetrics:
-    """Full LET pipeline through the halo import (decompose -> classify -> import)."""
+    """Full LET pipeline through the halo import (decompose -> classify -> import).
+
+    ``tree_type`` selects the local per-device backend (``"radix"``,
+    ``"octree"``, or ``"kdtree"``); the coarse tree is always radix.
+    """
+
+    _validate_distributed_tree_type(tree_type)
 
     try:  # stable across recent JAX versions
         from jax import shard_map
@@ -609,12 +632,13 @@ def distributed_let_import(
                 p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
             )
         p, m = sanitize_padding(p, m, cnt)
-        tree, pos_sorted, mass_sorted, _ = build_tree(
-            p, m, bounds, return_reordered=True, leaf_size=leaf_size
+        tree, pos_sorted, mass_sorted = _build_local_tree(
+            p, m, bounds, tree_type=tree_type, leaf_size=leaf_size
         )
         geom = compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
         moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
         fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
+        # Coarse tree is always radix (internal remote-COM representation).
         rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
         res = dual_tree_walk_cross_impl(
             tree,

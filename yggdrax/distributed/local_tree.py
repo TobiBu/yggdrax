@@ -29,6 +29,79 @@ from ..tree_moments import compute_tree_mass_moments
 from .partition import equalize_domain, global_bounds, sfc_partition
 from .sharding import AXIS_NAME
 
+# Backends whose topology satisfies the distributed contract (binary parent/
+# child links, compact contiguous ``node_ranges`` tiling, and ``nodes_by_level``)
+# that :mod:`~yggdrax.distributed.cross_walk` and the moment stages consume.
+# ``octree`` rides the radix binary topology (augmented with explicit cell
+# buffers the cross-walk ignores); ``kdtree`` uses the leaf-only bucket build
+# (:func:`yggdrax.kdtree.build_leaf_kdtree`), which stores all points in leaves
+# and exposes the same contract (the heap KD-tree used by the KNN kernels does
+# not, and is not used here).
+DISTRIBUTED_TREE_TYPES: tuple[str, ...] = ("radix", "octree", "kdtree")
+
+
+def _validate_distributed_tree_type(tree_type: str) -> None:
+    """Raise a clear error for tree types the distributed path cannot handle."""
+
+    if tree_type not in DISTRIBUTED_TREE_TYPES:
+        supported = ", ".join(f"'{t}'" for t in DISTRIBUTED_TREE_TYPES)
+        raise ValueError(
+            f"Unsupported tree_type '{tree_type}'. Supported: ({supported})."
+        )
+
+
+def _build_local_tree(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    tree_type: str,
+    leaf_size: int,
+):
+    """Backend-dispatched local tree build, safe to call inside ``shard_map``.
+
+    Returns ``(topology, positions_sorted, masses_sorted)``. Only *un-jitted*
+    impls are used so the build traces inside a manual ``shard_map`` body (a
+    nested top-level ``@jax.jit`` would re-enter with a mesh mismatch). All
+    supported backends expose the parent/child/``node_ranges``/``nodes_by_level``
+    contract downstream stages rely on: ``radix`` directly, ``octree`` by
+    augmenting the radix topology with explicit cell buffers, and ``kdtree`` via
+    the leaf-only bucket build (all points in leaves).
+    """
+
+    _validate_distributed_tree_type(tree_type)
+    if tree_type == "octree":
+        # Local imports: avoid importing the public tree module (which pulls in
+        # the kdtree/octree backends) at package import time.
+        from ..octree import augment_radix_topology_with_octree
+        from ..tree import _ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS, _build_octree_result
+
+        topo, pos_sorted, mass_sorted, _inv = _build_octree_result(
+            positions,
+            masses,
+            build_mode="adaptive",
+            bounds=bounds,
+            return_reordered=True,
+            workspace=None,
+            return_workspace=False,
+            leaf_size=leaf_size,
+            **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
+        )
+        return augment_radix_topology_with_octree(topo), pos_sorted, mass_sorted
+
+    if tree_type == "kdtree":
+        from ..dtypes import INDEX_DTYPE
+        from ..kdtree import build_leaf_kdtree
+
+        topo = build_leaf_kdtree(positions, leaf_size=leaf_size)
+        pidx = jnp.asarray(topo.particle_indices, dtype=INDEX_DTYPE)
+        return topo, positions[pidx], masses[pidx]
+
+    tree, pos_sorted, mass_sorted, _inv = build_tree(
+        positions, masses, bounds, return_reordered=True, leaf_size=leaf_size
+    )
+    return tree, pos_sorted, mass_sorted
+
 
 @dataclass
 class DistributedTreeMoments:
@@ -74,18 +147,21 @@ def build_local_moments(
     *,
     bounds: tuple[Array, Array],
     leaf_size: int,
+    tree_type: str = "radix",
     axis_name: str = AXIS_NAME,
 ):
     """Build this device's local tree and gather the shared top tree.
 
     Returns ``(node_mass, node_com, domain_mass, domain_com, top_mass,
     top_com)`` for this device. ``bounds`` must be the *global* box (shared
-    across devices) so geometry/Morton codes are consistent.
+    across devices) so geometry/Morton codes are consistent. ``tree_type``
+    selects the local backend (``"radix"`` or ``"octree"``; see
+    :data:`DISTRIBUTED_TREE_TYPES`).
     """
 
     positions, masses = sanitize_padding(positions, masses, count)
-    tree, pos_sorted, mass_sorted, _inv = build_tree(
-        positions, masses, bounds, return_reordered=True, leaf_size=leaf_size
+    tree, pos_sorted, mass_sorted = _build_local_tree(
+        positions, masses, bounds, tree_type=tree_type, leaf_size=leaf_size
     )
     # Geometry is computed for completeness / downstream MAC use; keep the leaf
     # cap bounded so no num_particles-sized staging buffer is allocated.
@@ -94,10 +170,12 @@ def build_local_moments(
 
     node_mass = moments.mass  # [total_nodes]
     node_com = moments.center_of_mass  # [total_nodes, 3]
-    # Root (node 0) of the local LBVH spans the whole domain -> its moment is
-    # the domain's aggregate (coarsest) multipole.
-    domain_mass = node_mass[0]
-    domain_com = node_com[0]
+    # The tree root spans the whole domain -> its moment is the domain's
+    # aggregate (coarsest) multipole. Locate it by parent link (== node 0 for
+    # the radix LBVH; robust for the octree-augmented topology too).
+    root = jnp.argmin(jnp.asarray(tree.parent))
+    domain_mass = node_mass[root]
+    domain_com = node_com[root]
 
     # Shared top tree: every device learns every domain's coarse moment.
     top_mass = jax.lax.all_gather(domain_mass[None], axis_name, tiled=True)  # [ndev]
@@ -114,6 +192,7 @@ def distributed_tree_moments(
     output_capacity: int,
     num_samples: int = 8,
     equalize: bool = True,
+    tree_type: str = "radix",
     axis_name: str = AXIS_NAME,
 ) -> DistributedTreeMoments:
     """Decompose, build per-GPU local trees, and gather the shared top tree.
@@ -122,7 +201,11 @@ def distributed_tree_moments(
     the local tree build into one ``shard_map``. ``positions`` (``[N, 3]``) and
     ``masses`` (``[N]``) are sharded evenly over the mesh (``N`` divisible by
     ``mesh.size``). Uses the *global* bounding box for consistent geometry.
+    ``tree_type`` selects the per-device backend (``"radix"`` or ``"octree"``;
+    see :data:`DISTRIBUTED_TREE_TYPES`).
     """
+
+    _validate_distributed_tree_type(tree_type)
 
     try:  # stable across recent JAX versions
         from jax import shard_map
@@ -148,7 +231,14 @@ def distributed_tree_moments(
                 p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
             )
         nm, nc, dm, dc, tm, tc = build_local_moments(
-            p, m, cnt, ndev, bounds=bounds, leaf_size=leaf_size, axis_name=axis_name
+            p,
+            m,
+            cnt,
+            ndev,
+            bounds=bounds,
+            leaf_size=leaf_size,
+            tree_type=tree_type,
+            axis_name=axis_name,
         )
         return nm, nc, dm[None], dc[None], tm, tc, cnt[None]
 
@@ -176,6 +266,7 @@ def distributed_tree_moments(
 
 
 __all__ = [
+    "DISTRIBUTED_TREE_TYPES",
     "DistributedTreeMoments",
     "build_local_moments",
     "distributed_tree_moments",
