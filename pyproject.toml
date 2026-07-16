@@ -109,15 +109,7 @@ allow-init-docstring = true
 # basedpyright-baseline.json; the gate enforces "no new type errors" and the
 # baseline is burned down incrementally.
 include = ["yggdrax"]
-# inference_demo.py is a paper illustration that imports optax (in the `paper`
-# optional-deps extra, not the `dev`/CI install), so basedpyright cannot resolve
-# it in the core type gate. Exclude just that demo; the corrfunc library modules
-# (estimator/baselines/binning) and svgd stay type-checked.
-exclude = [
-  "**/__pycache__",
-  "**/.ipynb_checkpoints",
-  "yggdrax/applications/corrfunc/inference_demo.py",
-]
+exclude = ["**/__pycache__", "**/.ipynb_checkpoints"]
 pythonVersion = "3.11"
 # Pin the analysis platform so the baseline is identical on dev machines
 # (e.g. macOS) and the Linux CI runners.
