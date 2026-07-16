@@ -86,11 +86,19 @@ def main() -> None:
         soft_pair_counts_from_topology,
     )
 
+    # The traversal preallocates its far-interaction and near-neighbour lists as
+    # (num_nodes x max_interactions_per_node) and (num_leaves x
+    # max_neighbors_per_leaf). At theta=0.5 the actual per-node/per-leaf counts
+    # are O(10-100), so the previous 1<<15 caps preallocated ~8.6 GiB at N=1e6
+    # and OOM'd the *build* before the estimator ran. Right-size them (still
+    # >>40x the observed peaks) so the build fits; the near/far list contents --
+    # and hence the result -- are unchanged. The pair queue is only a work
+    # buffer (~a few hundred MB even at 1<<24), so keep it generous.
     cfg = DualTreeTraversalConfig(
-        max_pair_queue=1 << 22,
+        max_pair_queue=1 << 24,
         process_block=64,
-        max_interactions_per_node=1 << 15,
-        max_neighbors_per_leaf=1 << 15,
+        max_interactions_per_node=1 << 13,
+        max_neighbors_per_leaf=1 << 13,
     )
     edges = make_log_edges(args.r_min, args.r_max, args.num_bins)
     sharp = args.sharpness
@@ -100,16 +108,22 @@ def main() -> None:
         key = jax.random.PRNGKey(args.seed)
         pos = jax.random.uniform(key, (n, 3), dtype=jnp.float64)
 
-        # Topology build (host-side, non-JAX) -- time with a plain wall clock.
-        t0 = time.perf_counter()
-        topo = build_pair_topology(
+        # Topology build. The first call pays the capacity-retry compile ladder,
+        # so time it warmed (like accumulate/value_and_grad) rather than as a
+        # single cold call; block on the returned arrays so async dispatch does
+        # not corrupt the measurement.
+        build_fn = lambda: build_pair_topology(
             pos,
             theta=args.theta,
             leaf_size=args.leaf_size,
             backend=args.backend,
             traversal_config=cfg,
         )
-        build_s = time.perf_counter() - t0
+        # Fewer repeats than the JAX kernels: each build also does host-side
+        # numpy work that scales with N, so keep the warmed count bounded.
+        build_t = time_callable(build_fn, warmup=1, runs=min(args.runs, 3))
+        build_s = build_t.min_s
+        topo = build_fn()
 
         accumulate = jax.jit(
             lambda p, t=topo: soft_pair_counts_from_topology(p, t, edges, sharp)
@@ -127,6 +141,7 @@ def main() -> None:
         entry = {
             "n": n,
             "build_s": build_s,
+            "build": build_t.as_dict(),
             "accumulate": acc_t.as_dict(),
             "value_and_grad": vg_t.as_dict(),
             "num_far_pairs": int(topo.far_src_start.shape[0]),

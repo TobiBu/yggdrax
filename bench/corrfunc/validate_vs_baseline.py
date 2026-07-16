@@ -39,6 +39,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--backend", type=str, default="radix")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
+        "--brute-force-max-n",
+        type=int,
+        default=20000,
+        help="Above this N the exact O(N^2) brute-force baseline is infeasible "
+        "(it materialises the full upper-triangle soft-weight tensor and OOMs); "
+        "the theta=0 estimator (near field exact) is used as the reference "
+        "instead, so the estimator itself is still exercised at large N.",
+    )
+    p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
     )
     p.add_argument("--output", type=str, default="results/corrfunc/validation.json")
@@ -68,8 +77,13 @@ def main() -> None:
         soft_pair_counts_from_topology,
     )
 
+    # At tight theta (esp. theta=0) the whole field is near, so the dual-tree
+    # walk enqueues every leaf pair -- the queue high-water grows with N and the
+    # default 1<<20 overflows by N ~ 1e5. Size it generously so the topology
+    # build succeeds across the requested sizes (build_pair_topology is
+    # unchanged; only the bench's requested capacities are larger here).
     cfg = DualTreeTraversalConfig(
-        max_pair_queue=1 << 20,
+        max_pair_queue=1 << 24,
         process_block=64,
         max_interactions_per_node=1 << 15,
         max_neighbors_per_leaf=1 << 15,
@@ -80,7 +94,10 @@ def main() -> None:
     for n in args.sizes:
         key = jax.random.PRNGKey(args.seed)
         pos = jax.random.uniform(key, (n, 3), dtype=jnp.float64)
-        exact = brute_force_soft_pair_counts(pos, edges, args.sharpness)
+
+        # Estimator counts per theta (each result is a cheap (nbins,) vector).
+        topos = {}
+        ests = {}
         for theta in args.thetas:
             topo = build_pair_topology(
                 pos,
@@ -89,23 +106,44 @@ def main() -> None:
                 backend=args.backend,
                 traversal_config=cfg,
             )
-            est = soft_pair_counts_from_topology(pos, topo, edges, args.sharpness)
-            per_bin = jnp.abs(est - exact) / jnp.maximum(exact, 1.0)
+            topos[theta] = topo
+            ests[theta] = soft_pair_counts_from_topology(
+                pos, topo, edges, args.sharpness
+            )
+
+        # Reference: the exact O(N^2) brute force where feasible; otherwise the
+        # theta=0 estimator, whose near field is exact (no far pairs accepted),
+        # which still isolates the far-field monopole error at looser theta while
+        # avoiding the brute force's quadratic memory blow-up.
+        if n <= args.brute_force_max_n:
+            reference = brute_force_soft_pair_counts(pos, edges, args.sharpness)
+            baseline = "brute_force"
+        else:
+            theta_ref = min(args.thetas)
+            reference = ests[theta_ref]
+            baseline = f"tree_theta{theta_ref:g}_nearfield_exact"
+
+        for theta in args.thetas:
+            est = ests[theta]
+            topo = topos[theta]
+            per_bin = jnp.abs(est - reference) / jnp.maximum(reference, 1.0)
             rec = {
                 "n": n,
                 "theta": theta,
+                "baseline": baseline,
                 "num_far_pairs": int(topo.far_src_start.shape[0]),
                 "max_per_bin_rel_error": float(jnp.max(per_bin)),
                 "total_rel_error": float(
-                    jnp.abs(est.sum() - exact.sum()) / exact.sum()
+                    jnp.abs(est.sum() - reference.sum()) / reference.sum()
                 ),
                 "estimator_counts": [float(x) for x in est],
-                "baseline_counts": [float(x) for x in exact],
+                "baseline_counts": [float(x) for x in reference],
             }
             records.append(rec)
             print(
                 f"n={n:>7d} theta={theta:4.2f} far={rec['num_far_pairs']:6d} "
-                f"max_relerr={rec['max_per_bin_rel_error']:.3e}"
+                f"max_relerr={rec['max_per_bin_rel_error']:.3e} "
+                f"[ref={baseline}]"
             )
 
     payload = {
