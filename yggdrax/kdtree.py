@@ -869,11 +869,19 @@ def build_leaf_kdtree(
         Reference points of shape ``(n_points, dim)``.
     leaf_size
         Maximum points per leaf bucket.
+    bounds
+        Accepted for a uniform builder signature but ignored (median splits are
+        data-driven; no fixed box is needed).
 
     Returns
     -------
     LeafKDTree
         Leaf-only KD-tree container.
+
+    Raises
+    ------
+    ValueError
+        If ``leaf_size`` is less than 1.
     """
 
     del bounds  # median splits are data-driven; no fixed box needed
