@@ -786,17 +786,13 @@ def _build_leaf_kdtree_topology(points: Array, leaf_size: int) -> dict:
         seg_max = jax.ops.segment_max(pts, bucket, num_segments=nb)
         seg_min = jax.ops.segment_min(pts, bucket, num_segments=nb)
         wdim = jnp.argmax(seg_max - seg_min, axis=-1).astype(idx)  # [nb]
-        coord = jnp.take_along_axis(
-            pts, wdim[bucket][:, None], axis=-1
-        ).squeeze(-1)
+        coord = jnp.take_along_axis(pts, wdim[bucket][:, None], axis=-1).squeeze(-1)
         # Sort points by (bucket, coord) so each bucket's points are contiguous
         # and ascending along the split dimension.
         bucket, coord_sorted, order = jax.lax.sort(
             (bucket, coord, order), dimension=0, num_keys=2
         )
-        counts = jax.ops.segment_sum(
-            jnp.ones(n, dtype=idx), bucket, num_segments=nb
-        )
+        counts = jax.ops.segment_sum(jnp.ones(n, dtype=idx), bucket, num_segments=nb)
         starts = jnp.cumsum(counts) - counts
         within = row - starts[bucket]
         half = (counts + 1) // 2  # ceil -> left child gets the larger half
