@@ -1,0 +1,61 @@
+{
+  "benchmark": "corrfunc_bin_sensitivity",
+  "params": {
+    "n": 6000,
+    "sharpness": [
+      10.0,
+      30.0,
+      100.0,
+      300.0,
+      1000.0,
+      3000.0
+    ],
+    "num_bins": 10,
+    "theta": 0.0,
+    "leaf_size": 32,
+    "seed": 0
+  },
+  "metadata": {
+    "jax_version": "0.9.0",
+    "backend": "gpu",
+    "device_kind": "NVIDIA A100-PCIE-40GB",
+    "device_platform": "gpu",
+    "compute_capability": "8.0",
+    "x64_enabled": true,
+    "git_commit": "da773a2",
+    "timestamp_utc": "2026-07-16T07:50:57Z",
+    "hostname": "compgpu8"
+  },
+  "records": [
+    {
+      "sharpness": 10.0,
+      "bias": 0.06416119120987526,
+      "grad_fd_error": 1.8681090924801069e-06
+    },
+    {
+      "sharpness": 30.0,
+      "bias": 0.0074729183342130655,
+      "grad_fd_error": 2.553978453500281e-06
+    },
+    {
+      "sharpness": 100.0,
+      "bias": 0.0006000385289341788,
+      "grad_fd_error": 1.8108423588676508e-06
+    },
+    {
+      "sharpness": 300.0,
+      "bias": 3.9123922936308255e-05,
+      "grad_fd_error": 1.1851397470599328e-06
+    },
+    {
+      "sharpness": 1000.0,
+      "bias": 1.1218394698725762e-05,
+      "grad_fd_error": 1.8137417099166203e-05
+    },
+    {
+      "sharpness": 3000.0,
+      "bias": 1.0610734664367093e-05,
+      "grad_fd_error": 3.2379614089658225e-06
+    }
+  ]
+}

@@ -26,82 +26,82 @@
     "device_platform": "gpu",
     "compute_capability": "8.0",
     "x64_enabled": true,
-    "git_commit": "ebfcc99",
-    "timestamp_utc": "2026-07-15T08:47:22Z",
+    "git_commit": "da773a2",
+    "timestamp_utc": "2026-07-16T09:03:50Z",
     "hostname": "compgpu8"
   },
   "records": [
     {
       "theta": 0.2,
       "num_far_pairs": 103180,
-      "covered_particle_pairs": 29819564,
-      "u_far_exact": 14791871.414883265,
+      "covered_particle_pairs": 33439232,
+      "u_far_exact": 16606537.837951027,
       "u_far_monopole": 16611244.006361762,
-      "far_energy_fraction": 0.0785272628106088,
-      "rel_error_vs_total": 0.009658706842036041
+      "far_energy_fraction": 0.0881609854898398,
+      "rel_error_vs_total": 2.4984162805048634e-05
     },
     {
       "theta": 0.3,
       "num_far_pairs": 292440,
-      "covered_particle_pairs": 144982424,
-      "u_far_exact": 86546735.1643074,
+      "covered_particle_pairs": 158125056,
+      "u_far_exact": 94735695.07694472,
       "u_far_monopole": 94769698.24384823,
-      "far_energy_fraction": 0.4594603364932889,
-      "rel_error_vs_total": 0.043654164149866774
+      "far_energy_fraction": 0.5029339842264744,
+      "rel_error_vs_total": 0.0001805164166812798
     },
     {
       "theta": 0.4,
       "num_far_pairs": 276146,
-      "covered_particle_pairs": 234794962,
-      "u_far_exact": 157041602.57016203,
+      "covered_particle_pairs": 250098176,
+      "u_far_exact": 168312475.88364762,
       "u_far_monopole": 168394050.03133273,
-      "far_energy_fraction": 0.8337043266086027,
-      "rel_error_vs_total": 0.06026800803784677
+      "far_energy_fraction": 0.893539272841479,
+      "rel_error_vs_total": 0.00043306180497044614
     },
     {
       "theta": 0.5,
       "num_far_pairs": 219278,
-      "covered_particle_pairs": 289801934,
-      "u_far_exact": 209292705.92173535,
+      "covered_particle_pairs": 303962624,
+      "u_far_exact": 221181992.61465874,
       "u_far_monopole": 221332497.50152028,
-      "far_energy_fraction": 1.111095605233753,
-      "rel_error_vs_total": 0.06391698866577711
+      "far_energy_fraction": 1.174213591766983,
+      "rel_error_vs_total": 0.000799002132547257
     },
     {
       "theta": 0.6,
       "num_far_pairs": 164592,
-      "covered_particle_pairs": 322745584,
-      "u_far_exact": 245586557.754067,
+      "covered_particle_pairs": 334942720,
+      "u_far_exact": 256929815.44586805,
       "u_far_monopole": 257141940.51398137,
-      "far_energy_fraction": 1.3037728372964343,
-      "rel_error_vs_total": 0.0613453533642778
+      "far_energy_fraction": 1.363992058577405,
+      "rel_error_vs_total": 0.0011261320833071198
     },
     {
       "theta": 0.7,
       "num_far_pairs": 125844,
-      "covered_particle_pairs": 344508820,
-      "u_far_exact": 273159737.7071623,
+      "covered_particle_pairs": 354750464,
+      "u_far_exact": 283622572.72340846,
       "u_far_monopole": 283915178.85129577,
-      "far_energy_fraction": 1.4501536628167468,
-      "rel_error_vs_total": 0.057098613804848826
+      "far_energy_fraction": 1.5056988857314153,
+      "rel_error_vs_total": 0.0015533908901805193
     },
     {
       "theta": 0.8,
       "num_far_pairs": 95836,
-      "covered_particle_pairs": 357905852,
-      "u_far_exact": 291694079.8671927,
+      "covered_particle_pairs": 366556160,
+      "u_far_exact": 301140674.3023927,
       "u_far_monopole": 301491526.28368115,
-      "far_energy_fraction": 1.5485489988090546,
-      "rel_error_vs_total": 0.052012800006247153
+      "far_energy_fraction": 1.5986991916461686,
+      "rel_error_vs_total": 0.001862607169133306
     },
     {
       "theta": 1.0,
       "num_far_pairs": 59660,
-      "covered_particle_pairs": 374080396,
-      "u_far_exact": 317848405.32561535,
+      "covered_particle_pairs": 380315136,
+      "u_far_exact": 325564329.69814247,
       "u_far_monopole": 325996801.337025,
-      "far_energy_fraction": 1.6873973927209458,
-      "rel_error_vs_total": 0.04325830161213114
+      "far_energy_fraction": 1.7283597837554274,
+      "rel_error_vs_total": 0.0022959105776495284
     }
   ]
 }
