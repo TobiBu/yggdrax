@@ -81,23 +81,17 @@ def build_pair_topology(
         positions: Particle coordinates, shape ``(n, 3)``.
         theta: Opening angle for the multipole acceptance criterion.
         leaf_size: Target leaf occupancy for the tree build.
-        backend: ``"radix"`` or ``"octree"`` (both give exact coverage).
+        backend: ``"radix"``, ``"octree"``, or ``"kdtree"`` (all give exact
+            coverage). ``"kdtree"`` uses the leaf-only bucket KD-tree, which
+            stores every point in a leaf and so tiles all pairs; the heap
+            KD-tree used by the KNN kernels does not and is not used here.
         mac_type: Acceptance criterion, e.g. ``"dehnen"``.
         traversal_config: Optional explicit capacities; auto-sized if None.
 
     Returns:
         A :class:`PairTopology` describing leaf blocks, near leaf pairs, and
         far node pairs.
-
-    Raises:
-        ValueError: If ``backend`` is ``"kdtree"`` (incomplete pair coverage).
     """
-    if backend == "kdtree":
-        raise ValueError(
-            "kdtree does not cover all pairs (internal-node pivots are absent "
-            "from the near-list); use backend='radix' or 'octree'."
-        )
-
     masses = jnp.ones(positions.shape[0], dtype=positions.dtype)
     tree = Tree.from_particles(
         positions,
