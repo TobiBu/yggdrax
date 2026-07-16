@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from beartype import beartype
 from jaxtyping import Array, jaxtyped
+
+from .dtypes import INDEX_DTYPE
 
 
 @dataclass(frozen=True)
@@ -624,6 +627,280 @@ def build_kdtree(points: Array, *, leaf_size: int = 32) -> KDTree:
         leaf_point_ids=topology[18],
         leaf_valid_mask=topology[19],
         node_to_leaf=topology[20],
+        leaf_size=int(leaf_size),
+    )
+
+
+@dataclass(frozen=True)
+class LeafKDTree:
+    """Leaf-only (bucket) median-split KD-tree satisfying the radix contract.
+
+    Unlike :class:`KDTree` (a left-balanced heap with one pivot point per node,
+    used by the KNN query kernels), this container stores **all** points in
+    leaves and exposes the binary-tree topology contract shared with the radix
+    and octree backends: ``parent``/``left_child``/``right_child``, a compact
+    contiguous ``node_ranges`` (inclusive) whose leaf portion tiles ``[0, N)``,
+    and ``nodes_by_level``. That lets it flow through the generic geometry /
+    dual-tree-walk / moments pipeline (and the multi-GPU distributed path)
+    exactly like radix/octree, giving complete pair coverage -- the heap
+    KD-tree cannot, because its internal-node pivots are absent from the leaves.
+
+    ``split_dim``/``split_value`` (per node; ``-1``/``nan`` on leaves) record the
+    median cut so KD-tree detection in the interaction backends still fires and
+    the tree remains a faithful median-split KD-tree.
+    """
+
+    points: Array
+    particle_indices: Array
+    node_ranges: Array
+    parent: Array
+    left_child: Array
+    right_child: Array
+    leaf_nodes: Array
+    nodes_by_level: Array
+    split_dim: Array
+    split_value: Array
+    num_particles: Array
+    use_morton_geometry: Array
+    num_internal_nodes: int
+    leaf_size: int
+
+    @property
+    def num_points(self) -> int:
+        """Return the number of reference points in the tree."""
+
+        return int(self.points.shape[0])
+
+    @property
+    def dimension(self) -> int:
+        """Return spatial dimensionality of reference points."""
+
+        return int(self.points.shape[1])
+
+
+def _register_leaf_kdtree_pytree() -> None:
+    if getattr(LeafKDTree, "_yggdrax_pytree_registered", False):
+        return
+
+    def flatten(tree: LeafKDTree):
+        children = (
+            tree.points,
+            tree.particle_indices,
+            tree.node_ranges,
+            tree.parent,
+            tree.left_child,
+            tree.right_child,
+            tree.leaf_nodes,
+            tree.nodes_by_level,
+            tree.split_dim,
+            tree.split_value,
+            tree.num_particles,
+            tree.use_morton_geometry,
+        )
+        aux = (tree.leaf_size, tree.num_internal_nodes)
+        return children, aux
+
+    def unflatten(aux, children):
+        leaf_size, num_internal_nodes = aux
+        (
+            points,
+            particle_indices,
+            node_ranges,
+            parent,
+            left_child,
+            right_child,
+            leaf_nodes,
+            nodes_by_level,
+            split_dim,
+            split_value,
+            num_particles,
+            use_morton_geometry,
+        ) = children
+        return LeafKDTree(
+            points=points,
+            particle_indices=particle_indices,
+            node_ranges=node_ranges,
+            parent=parent,
+            left_child=left_child,
+            right_child=right_child,
+            leaf_nodes=leaf_nodes,
+            nodes_by_level=nodes_by_level,
+            split_dim=split_dim,
+            split_value=split_value,
+            num_particles=num_particles,
+            use_morton_geometry=use_morton_geometry,
+            num_internal_nodes=num_internal_nodes,
+            leaf_size=leaf_size,
+        )
+
+    jax.tree_util.register_pytree_node(LeafKDTree, flatten, unflatten)
+    setattr(LeafKDTree, "_yggdrax_pytree_registered", True)
+
+
+_register_leaf_kdtree_pytree()
+
+
+def _leaf_kdtree_depth(n: int, leaf_size: int) -> int:
+    """Resolve the number of median-split levels for a leaf-only KD-tree.
+
+    Chosen so every leaf bucket holds ``<= leaf_size`` points, but never so deep
+    that a leaf would be empty (``2**D <= n``). With balanced median splits this
+    guarantees non-empty leaves of size ``floor(n/2**D)..ceil(n/2**D)``.
+    """
+
+    if n <= leaf_size:
+        return 0
+    need = -(-n // leaf_size)  # ceil(n / leaf_size)
+    depth = max(1, (need - 1).bit_length())  # ceil(log2(need))
+    return min(depth, (n).bit_length() - 1)  # floor(log2(n)) -> 2**D <= n
+
+
+def _build_leaf_kdtree_topology(points: Array, leaf_size: int) -> dict:
+    """Build a leaf-only median-split KD-tree via level-parallel bucket splits.
+
+    All points end up in leaves; internal nodes are pure split planes. Returns a
+    dict of the radix-contract arrays. Tree *structure* (parent/child links,
+    leaf ids, level order) depends only on the static depth and is built as
+    NumPy constants; only the data-dependent arrays (permutation, ranges, split
+    metadata) are traced.
+    """
+
+    points = jnp.asarray(points)
+    n = int(points.shape[0])
+    idx = INDEX_DTYPE
+
+    depth = _leaf_kdtree_depth(n, int(leaf_size))
+    num_leaves = 1 << depth
+    num_internal = num_leaves - 1
+    total = 2 * num_leaves - 1
+
+    order = jnp.arange(n, dtype=idx)
+    bucket = jnp.zeros(n, dtype=idx)
+    split_dim_nodes = -jnp.ones(total, dtype=idx)
+    split_value_nodes = jnp.full(total, jnp.nan, dtype=points.dtype)
+    row = jnp.arange(n, dtype=idx)
+
+    for level in range(depth):
+        nb = 1 << level
+        pts = points[order]
+        seg_max = jax.ops.segment_max(pts, bucket, num_segments=nb)
+        seg_min = jax.ops.segment_min(pts, bucket, num_segments=nb)
+        wdim = jnp.argmax(seg_max - seg_min, axis=-1).astype(idx)  # [nb]
+        coord = jnp.take_along_axis(
+            pts, wdim[bucket][:, None], axis=-1
+        ).squeeze(-1)
+        # Sort points by (bucket, coord) so each bucket's points are contiguous
+        # and ascending along the split dimension.
+        bucket, coord_sorted, order = jax.lax.sort(
+            (bucket, coord, order), dimension=0, num_keys=2
+        )
+        counts = jax.ops.segment_sum(
+            jnp.ones(n, dtype=idx), bucket, num_segments=nb
+        )
+        starts = jnp.cumsum(counts) - counts
+        within = row - starts[bucket]
+        half = (counts + 1) // 2  # ceil -> left child gets the larger half
+        go_right = (within >= half[bucket]).astype(idx)
+        node_ids = (nb - 1) + jnp.arange(nb, dtype=idx)
+        split_dim_nodes = split_dim_nodes.at[node_ids].set(wdim)
+        boundary = jnp.clip(starts + half, 0, n - 1)
+        split_value_nodes = split_value_nodes.at[node_ids].set(coord_sorted[boundary])
+        bucket = bucket * 2 + go_right
+
+    # Final stable grouping by leaf bucket -> contiguous leaf ranges.
+    bucket, order = jax.lax.sort((bucket, order), dimension=0, num_keys=1)
+    particle_indices = order
+    leaf_counts = jax.ops.segment_sum(
+        jnp.ones(n, dtype=idx), bucket, num_segments=num_leaves
+    )
+    leaf_start = jnp.cumsum(leaf_counts) - leaf_counts
+    leaf_end_incl = leaf_start + leaf_counts - 1
+
+    # ---- structural arrays (depend only on depth -> NumPy constants) ----
+    ids_np = np.arange(total)
+    parent_np = np.where(ids_np > 0, (ids_np - 1) // 2, -1)
+    left_np = 2 * np.arange(num_internal) + 1
+    right_np = 2 * np.arange(num_internal) + 2
+    leaf_nodes_np = num_internal + np.arange(num_leaves)
+    levels_np = np.floor(np.log2(ids_np + 1)).astype(np.int64)
+    nodes_by_level_np = np.lexsort((ids_np, levels_np))  # by level, then id
+
+    # ---- node_ranges: leaves from bucket extents, internals bottom-up union ----
+    node_ranges = jnp.zeros((total, 2), dtype=idx)
+    leaf_node_ids = jnp.asarray(leaf_nodes_np, dtype=idx)
+    node_ranges = node_ranges.at[leaf_node_ids, 0].set(leaf_start)
+    node_ranges = node_ranges.at[leaf_node_ids, 1].set(leaf_end_incl)
+    for level in range(depth - 1, -1, -1):
+        nb = 1 << level
+        node_ids_np = np.arange(nb) + (nb - 1)
+        lc = jnp.asarray(2 * node_ids_np + 1, dtype=idx)
+        rc = jnp.asarray(2 * node_ids_np + 2, dtype=idx)
+        node_ids = jnp.asarray(node_ids_np, dtype=idx)
+        node_ranges = node_ranges.at[node_ids, 0].set(node_ranges[lc, 0])
+        node_ranges = node_ranges.at[node_ids, 1].set(node_ranges[rc, 1])
+
+    return {
+        "particle_indices": particle_indices,
+        "node_ranges": node_ranges,
+        "parent": jnp.asarray(parent_np, dtype=idx),
+        "left_child": jnp.asarray(left_np, dtype=idx),
+        "right_child": jnp.asarray(right_np, dtype=idx),
+        "leaf_nodes": leaf_node_ids,
+        "nodes_by_level": jnp.asarray(nodes_by_level_np, dtype=idx),
+        "split_dim": split_dim_nodes,
+        "split_value": split_value_nodes,
+        "num_internal": int(num_internal),
+    }
+
+
+def build_leaf_kdtree(
+    points: Array,
+    *,
+    leaf_size: int = 32,
+    bounds: Optional[tuple[Array, Array]] = None,
+) -> LeafKDTree:
+    """Build a leaf-only (bucket) median-split KD-tree.
+
+    Every point is stored in a leaf; internal nodes are pure split planes. The
+    result satisfies the same topology contract as the radix/octree backends,
+    so it feeds the generic geometry, dual-tree-walk, moments, and distributed
+    pipelines and gives complete pair coverage. ``bounds`` is accepted for a
+    uniform builder signature but ignored (median splits are data-driven).
+
+    Parameters
+    ----------
+    points
+        Reference points of shape ``(n_points, dim)``.
+    leaf_size
+        Maximum points per leaf bucket.
+
+    Returns
+    -------
+    LeafKDTree
+        Leaf-only KD-tree container.
+    """
+
+    del bounds  # median splits are data-driven; no fixed box needed
+    points_arr = _validate_points(points)
+    if leaf_size < 1:
+        raise ValueError(f"leaf_size must be >= 1, received {leaf_size}")
+
+    topo = _build_leaf_kdtree_topology(points_arr, int(leaf_size))
+    n = int(points_arr.shape[0])
+    return LeafKDTree(
+        points=points_arr,
+        particle_indices=topo["particle_indices"],
+        node_ranges=topo["node_ranges"],
+        parent=topo["parent"],
+        left_child=topo["left_child"],
+        right_child=topo["right_child"],
+        leaf_nodes=topo["leaf_nodes"],
+        nodes_by_level=topo["nodes_by_level"],
+        split_dim=topo["split_dim"],
+        split_value=topo["split_value"],
+        num_particles=jnp.asarray(n, dtype=INDEX_DTYPE),
+        use_morton_geometry=jnp.asarray(False),
+        num_internal_nodes=topo["num_internal"],
         leaf_size=int(leaf_size),
     )
 
