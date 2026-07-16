@@ -1480,7 +1480,14 @@ def _dual_tree_walk_impl(
                         accept_mask, pair_tags_rev, as_index(-1)
                     )
 
-                fwd_prefix = _per_key_prefix(accept_targets_a, accept_mask, total_nodes)
+                # fwd/bwd per-key prefixes are INDEPENDENT (only their downstream slot
+                # use is sequential), so batch the two 256k-element argsorts into ONE
+                # vmapped sort -> halves the walk's dominant sort-kernel launch count.
+                _far_prefixes = jax.vmap(_per_key_prefix)(
+                    jnp.stack([accept_targets_a, accept_sources_a], axis=0),
+                    jnp.stack([accept_mask, accept_mask], axis=0),
+                )
+                fwd_prefix = _far_prefixes[0]
                 fwd_slot = far_counts_c[safe_targets] + fwd_prefix
                 fwd_ok = accept_mask & (fwd_slot < as_index(max_interactions_per_node))
                 far_overflow_c = far_overflow_c | jnp.any(
@@ -1505,7 +1512,7 @@ def _dual_tree_walk_impl(
                 )
                 far_counts_after_fwd = far_counts_c + fwd_incr
 
-                bwd_prefix = _per_key_prefix(accept_sources_a, accept_mask, total_nodes)
+                bwd_prefix = _far_prefixes[1]
                 bwd_slot = far_counts_after_fwd[safe_sources] + bwd_prefix
                 bwd_ok = accept_mask & (bwd_slot < as_index(max_interactions_per_node))
                 far_overflow_c = far_overflow_c | jnp.any(
@@ -1576,7 +1583,13 @@ def _dual_tree_walk_impl(
                 safe_pos_t = jnp.where(near_mask, near_pos_t, as_index(0))
                 safe_pos_s = jnp.where(near_mask, near_pos_s, as_index(0))
 
-                fwd_near_prefix = _per_key_prefix(safe_pos_t, near_mask, num_leaves)
+                # Batch the two independent near per-key prefix argsorts into one
+                # vmapped sort (same rationale as the far pair above).
+                _near_prefixes = jax.vmap(_per_key_prefix)(
+                    jnp.stack([safe_pos_t, safe_pos_s], axis=0),
+                    jnp.stack([near_mask, near_mask], axis=0),
+                )
+                fwd_near_prefix = _near_prefixes[0]
                 fwd_near_slot = near_counts_c[safe_pos_t] + fwd_near_prefix
                 fwd_near_ok = near_mask & (
                     fwd_near_slot < as_index(max_neighbors_per_leaf)
@@ -1606,7 +1619,7 @@ def _dual_tree_walk_impl(
                 )
                 near_counts_after_fwd = near_counts_c + fwd_near_incr
 
-                bwd_near_prefix = _per_key_prefix(safe_pos_s, near_mask, num_leaves)
+                bwd_near_prefix = _near_prefixes[1]
                 bwd_near_slot = near_counts_after_fwd[safe_pos_s] + bwd_near_prefix
                 bwd_near_ok = near_mask & (
                     bwd_near_slot < as_index(max_neighbors_per_leaf)
