@@ -1,0 +1,113 @@
+{
+  "benchmark": "svgd_convergence",
+  "params": {
+    "n": 1000,
+    "thetas": [
+      0.2,
+      0.4,
+      0.7,
+      1.0
+    ],
+    "num_steps": 200,
+    "step_size": 0.2,
+    "leaf_size": 16,
+    "seed": 0
+  },
+  "metadata": {
+    "jax_version": "0.9.0",
+    "backend": "gpu",
+    "device_kind": "NVIDIA GeForce RTX 2080 Ti",
+    "device_platform": "gpu",
+    "compute_capability": "7.5",
+    "x64_enabled": true,
+    "git_commit": "be5baba",
+    "timestamp_utc": "2026-07-17T11:51:40Z",
+    "hostname": "compgpu5"
+  },
+  "records": [
+    {
+      "target": "gaussian",
+      "theta": 0.2,
+      "mean_abs_err": 3.903127820947816e-18,
+      "std_abs_err": 0.0,
+      "mmd_to_exact": 0.0
+    },
+    {
+      "target": "gaussian",
+      "theta": 0.4,
+      "mean_abs_err": 2.8140247099628368e-05,
+      "std_abs_err": 1.9082501733547197e-05,
+      "mmd_to_exact": 3.2014146889025596e-10
+    },
+    {
+      "target": "gaussian",
+      "theta": 0.7,
+      "mean_abs_err": 0.00046383525980542815,
+      "std_abs_err": 0.0064378773566696745,
+      "mmd_to_exact": 3.0419189660735313e-05
+    },
+    {
+      "target": "gaussian",
+      "theta": 1.0,
+      "mean_abs_err": 0.007267533673028459,
+      "std_abs_err": 0.021507456231073308,
+      "mmd_to_exact": 0.00024484574211125487
+    },
+    {
+      "target": "gmm",
+      "theta": 0.2,
+      "mean_abs_err": 1.6700323849511145e-13,
+      "std_abs_err": 1.7996715229173788e-13,
+      "mmd_to_exact": 0.0
+    },
+    {
+      "target": "gmm",
+      "theta": 0.4,
+      "mean_abs_err": 6.594874104134257e-05,
+      "std_abs_err": 5.057447077572164e-06,
+      "mmd_to_exact": 2.508317997751419e-10
+    },
+    {
+      "target": "gmm",
+      "theta": 0.7,
+      "mean_abs_err": 0.0013512551541063622,
+      "std_abs_err": 0.0014649903354135851,
+      "mmd_to_exact": 4.341800150520214e-07
+    },
+    {
+      "target": "gmm",
+      "theta": 1.0,
+      "mean_abs_err": 0.0023392572056469343,
+      "std_abs_err": 0.013287585517139155,
+      "mmd_to_exact": 2.0317164570737845e-05
+    },
+    {
+      "target": "banana",
+      "theta": 0.2,
+      "mean_abs_err": 6.071532165918825e-18,
+      "std_abs_err": 0.0,
+      "mmd_to_exact": 0.0
+    },
+    {
+      "target": "banana",
+      "theta": 0.4,
+      "mean_abs_err": 4.7341865427097396e-05,
+      "std_abs_err": 4.2307153375498174e-05,
+      "mmd_to_exact": 4.6418691113103705e-10
+    },
+    {
+      "target": "banana",
+      "theta": 0.7,
+      "mean_abs_err": 0.0034301551900971505,
+      "std_abs_err": 0.006471722152390891,
+      "mmd_to_exact": 1.2891463922581892e-05
+    },
+    {
+      "target": "banana",
+      "theta": 1.0,
+      "mean_abs_err": 0.01165147054438831,
+      "std_abs_err": 0.0309741831526662,
+      "mmd_to_exact": 0.0003010911417371531
+    }
+  ]
+}
