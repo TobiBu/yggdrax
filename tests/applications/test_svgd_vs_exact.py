@@ -42,7 +42,7 @@ def _enable_x64():
         jax.config.update("jax_enable_x64", old)
 
 
-@pytest.mark.parametrize("backend", ["radix", "octree"])
+@pytest.mark.parametrize("backend", ["radix", "octree", "leaf_kdtree"])
 def test_nearfield_phi_is_exact(backend):
     key = jax.random.PRNGKey(0)
     p = jax.random.normal(key, (300, 3)) * 1.2
@@ -56,6 +56,28 @@ def test_nearfield_phi_is_exact(backend):
     tree = svgd_phi_from_topology(p, sc, h, topo)
     rel = float(jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref))
     assert rel < 1e-10, f"{backend}: near-field not exact (rel {rel:.2e})"
+
+
+@pytest.mark.parametrize("dim", [2, 5, 8])
+def test_dimension_general_nearfield_exact(dim):
+    """The leaf-KD-tree Stein update is exact in arbitrary dimension.
+
+    radix/octree are 3-D only; the default leaf-KD-tree tiles all pairs in any
+    dimension, so at theta=0 the tree update equals the exact update to machine
+    precision for d != 3 as well.
+    """
+    key = jax.random.PRNGKey(0)
+    p = jax.random.normal(key, (300, dim)) * 1.2
+    sc = p * 0.5
+    h = float(median_heuristic(p))
+    ref = exact_phi(p, sc, h)
+    topo = build_svgd_topology(
+        p, theta=0.0, leaf_size=16, backend="leaf_kdtree", traversal_config=_CFG
+    )
+    assert int(topo.far_tgt_slot.shape[0]) == 0
+    tree = svgd_phi_from_topology(p, sc, h, topo)
+    rel = float(jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref))
+    assert rel < 1e-10, f"d={dim}: near-field not exact (rel {rel:.2e})"
 
 
 def test_far_monopole_error_shrinks_with_theta():

@@ -24,10 +24,11 @@ The tree partition is a discrete, non-differentiable topology built once per
 step; the update is a smooth function of positions, scores, and bandwidth
 ``h`` given that partition, so gradients flow for bandwidth learning.
 
-Backend: radix or octree (exact pair coverage). Targets in :math:`d<3` are
-padded to 3-D for the tree build only; all kernel/geometry is evaluated in the
-true dimension. (The KD-tree is dimension-general but omits internal-node
-pivots from the pair lists, so it cannot be used for a complete pair sum.)
+Backend: the default ``"leaf_kdtree"`` is a leaf-only bucket KD-tree that
+stores every particle in a leaf and so tiles all pairs exactly, in *arbitrary
+dimension* -- SVGD targets need not be 3-D. The 3-D radix and octree backends
+are also available (targets in :math:`d<3` are padded to 3-D for the tree build
+only). All kernel/geometry is evaluated in the true dimension either way.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from yggdrax import (
     compute_tree_geometry,
 )
 from yggdrax.applications.svgd.kernel import stein_pair_terms
+from yggdrax.kdtree import build_leaf_kdtree
 
 
 class SvgdTopology(NamedTuple):
@@ -80,40 +82,52 @@ def build_svgd_topology(
     *,
     theta: float = 0.4,
     leaf_size: int = 32,
-    backend: str = "radix",
+    backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
 ) -> SvgdTopology:
     """Build the near/far Stein-update partition for ``particles``.
 
     Args:
-        particles: Particle positions, shape ``(n, d)`` with ``d <= 3``.
+        particles: Particle positions, shape ``(n, d)``. Arbitrary ``d`` with
+            the default ``leaf_kdtree`` backend; ``d <= 3`` for radix/octree.
         theta: Opening angle for the multipole acceptance criterion.
         leaf_size: Target leaf occupancy for the tree build.
-        backend: ``"radix"`` or ``"octree"``.
+        backend: ``"leaf_kdtree"`` (default, dimension-general, exact coverage),
+            ``"radix"``, or ``"octree"`` (both 3-D only).
         traversal_config: Optional explicit traversal capacities.
 
     Returns:
         An :class:`SvgdTopology`.
 
     Raises:
-        ValueError: If ``backend`` is ``"kdtree"`` (incomplete pair coverage).
+        ValueError: If a 3-D-only backend is requested for ``d != 3``, or the
+            backend name is unknown.
     """
-    if backend == "kdtree":
-        raise ValueError(
-            "kdtree omits internal-node pivots from the pair lists; use "
-            "backend='radix' or 'octree' for a complete Stein sum."
+    if backend == "leaf_kdtree":
+        tree = build_leaf_kdtree(particles, leaf_size=leaf_size)
+        pos_sorted = particles[tree.particle_indices]
+    elif backend in ("radix", "octree"):
+        if particles.shape[1] > 3:
+            raise ValueError(
+                f"backend={backend!r} is 3-D only; use 'leaf_kdtree' for "
+                f"dimension {particles.shape[1]}."
+            )
+        pts3d = _pad_to_3d(particles)
+        masses = jnp.ones(pts3d.shape[0], dtype=pts3d.dtype)
+        tree = Tree.from_particles(
+            pts3d,
+            masses,
+            tree_type=backend,
+            build_mode="adaptive",
+            leaf_size=leaf_size,
+            return_reordered=True,
         )
-    pts3d = _pad_to_3d(particles)
-    masses = jnp.ones(pts3d.shape[0], dtype=pts3d.dtype)
-    tree = Tree.from_particles(
-        pts3d,
-        masses,
-        tree_type=backend,
-        build_mode="adaptive",
-        leaf_size=leaf_size,
-        return_reordered=True,
-    )
-    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+        pos_sorted = tree.positions_sorted
+    else:
+        raise ValueError(
+            f"unknown backend {backend!r}; use 'leaf_kdtree', 'radix', or " "'octree'."
+        )
+    geometry = compute_tree_geometry(tree, pos_sorted)
     interactions, neighbors = build_interactions_and_neighbors(
         tree,
         geometry,
@@ -252,7 +266,7 @@ def svgd_phi(
     *,
     theta: float = 0.4,
     leaf_size: int = 32,
-    backend: str = "radix",
+    backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
 ) -> Float[Array, "n d"]:
     """Tree-accelerated Stein update (build partition + accumulate).
@@ -287,7 +301,7 @@ def tree_svgd_step(
     *,
     theta: float = 0.4,
     leaf_size: int = 32,
-    backend: str = "radix",
+    backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
 ) -> Float[Array, "n d"]:
     """One tree-accelerated SVGD step.
@@ -327,7 +341,7 @@ def run_tree_svgd(
     *,
     theta: float = 0.4,
     leaf_size: int = 32,
-    backend: str = "radix",
+    backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
 ) -> Float[Array, "n d"]:
     """Run tree-accelerated SVGD for ``num_steps`` steps.

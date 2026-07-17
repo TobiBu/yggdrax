@@ -55,8 +55,11 @@ def _validate_inputs(tree: object, positions_sorted: Array) -> None:
     if not isinstance(num_particles, jax_core.Tracer):
         if positions_sorted.shape[0] != int(num_particles):
             raise ValueError("positions_sorted must match tree.num_particles")
-    if positions_sorted.shape[1] != 3:
-        raise ValueError("positions must have shape (N, 3)")
+    if positions_sorted.ndim != 2 or positions_sorted.shape[1] < 1:
+        raise ValueError("positions must have shape (N, D) with D >= 1")
+    # The Morton-geometry path is 3-D specific (it decodes 3-D Morton codes);
+    # arbitrary D is only reached via the range-based path used by the KD-tree
+    # (use_morton_geometry=False). Morton backends always supply 3-D positions.
 
 
 @jaxtyped(typechecker=beartype)
@@ -86,10 +89,11 @@ def _compute_leaf_bounds(
     else:
         max_count = int(jnp.max(leaf_counts)) if num_leaves > 0 else 0
 
+    dim = positions_sorted.shape[1]
     if max_count == 0:
         # All leaves are empty – return neutral bounds.
-        inf_mins = jnp.full((num_leaves, 3), jnp.inf, dtype=dtype)
-        neg_inf_maxs = jnp.full((num_leaves, 3), -jnp.inf, dtype=dtype)
+        inf_mins = jnp.full((num_leaves, dim), jnp.inf, dtype=dtype)
+        neg_inf_maxs = jnp.full((num_leaves, dim), -jnp.inf, dtype=dtype)
         return inf_mins, neg_inf_maxs
 
     # Build a (num_leaves, max_count) index array and a validity mask.
@@ -219,8 +223,9 @@ def compute_tree_geometry(
     else:
         leaf_min, leaf_max = _leaf_bounds_from_ranges(None)
 
-    mins = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
-    maxs = jnp.zeros((num_nodes, 3), dtype=positions_sorted.dtype)
+    dim = positions_sorted.shape[1]
+    mins = jnp.zeros((num_nodes, dim), dtype=positions_sorted.dtype)
+    maxs = jnp.zeros((num_nodes, dim), dtype=positions_sorted.dtype)
     mins = mins.at[num_internal:].set(leaf_min)
     maxs = maxs.at[num_internal:].set(leaf_max)
 
