@@ -44,7 +44,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sizes", type=int, nargs="+", default=[1000, 10000, 100000])
     p.add_argument("--dim", type=int, default=3)
     p.add_argument("--theta", type=float, default=0.5)
+    # leaf_size=32 keeps the far field non-trivial at these N so the timing and
+    # far-pair sweep actually exercise the far-field (monopole) path; a coarse
+    # leaf (e.g. 64) collapses the far field to ~0 (all-near, near-exact) at
+    # these N. The build is timed once per size, so the finer leaf costs little.
     p.add_argument("--leaf-size", type=int, default=32)
+    p.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Tree backend: 'auto' -> radix for d<=3 else leaf_kdtree.",
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -88,6 +98,9 @@ def main() -> None:
         max_neighbors_per_leaf=1 << 15,
     )
     dim = args.dim
+    backend = args.backend
+    if backend == "auto":
+        backend = "radix" if dim <= 3 else "leaf_kdtree"
 
     records = []
     for n in args.sizes:
@@ -99,7 +112,11 @@ def main() -> None:
 
         t0 = time.perf_counter()
         topo = build_svgd_topology(
-            p, theta=args.theta, leaf_size=args.leaf_size, traversal_config=cfg
+            p,
+            theta=args.theta,
+            leaf_size=args.leaf_size,
+            backend=backend,
+            traversal_config=cfg,
         )
         build_s = time.perf_counter() - t0
 
@@ -142,6 +159,7 @@ def main() -> None:
             "dim": dim,
             "theta": args.theta,
             "leaf_size": args.leaf_size,
+            "backend": backend,
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,

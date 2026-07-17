@@ -11,6 +11,7 @@
     "num_steps": 200,
     "step_size": 0.2,
     "leaf_size": 16,
+    "backend": "auto",
     "seed": 0
   },
   "metadata": {
@@ -20,94 +21,94 @@
     "device_platform": "gpu",
     "compute_capability": "7.5",
     "x64_enabled": true,
-    "git_commit": "be5baba",
-    "timestamp_utc": "2026-07-17T11:51:40Z",
+    "git_commit": "6cd1f2d",
+    "timestamp_utc": "2026-07-17T16:43:36Z",
     "hostname": "compgpu5"
   },
   "records": [
     {
       "target": "gaussian",
       "theta": 0.2,
-      "mean_abs_err": 3.903127820947816e-18,
+      "mean_abs_err": 5.637851296924623e-18,
       "std_abs_err": 0.0,
       "mmd_to_exact": 0.0
     },
     {
       "target": "gaussian",
       "theta": 0.4,
-      "mean_abs_err": 2.8140247099628368e-05,
-      "std_abs_err": 1.9082501733547197e-05,
-      "mmd_to_exact": 3.2014146889025596e-10
+      "mean_abs_err": 1.1334229077397673e-05,
+      "std_abs_err": 1.7248324296614825e-05,
+      "mmd_to_exact": 1.5276024889487871e-10
     },
     {
       "target": "gaussian",
       "theta": 0.7,
-      "mean_abs_err": 0.00046383525980542815,
-      "std_abs_err": 0.0064378773566696745,
-      "mmd_to_exact": 3.0419189660735313e-05
+      "mean_abs_err": 0.0010202981697794433,
+      "std_abs_err": 0.003789457515031125,
+      "mmd_to_exact": 1.148546489115887e-05
     },
     {
       "target": "gaussian",
       "theta": 1.0,
-      "mean_abs_err": 0.007267533673028459,
-      "std_abs_err": 0.021507456231073308,
-      "mmd_to_exact": 0.00024484574211125487
+      "mean_abs_err": 0.007755726577500209,
+      "std_abs_err": 0.02667578500189771,
+      "mmd_to_exact": 0.00044673328714561755
     },
     {
       "target": "gmm",
       "theta": 0.2,
-      "mean_abs_err": 1.6700323849511145e-13,
-      "std_abs_err": 1.7996715229173788e-13,
-      "mmd_to_exact": 0.0
+      "mean_abs_err": 1.537867055922959e-13,
+      "std_abs_err": 2.6778579353958776e-13,
+      "mmd_to_exact": -1.1102230246251565e-16
     },
     {
       "target": "gmm",
       "theta": 0.4,
-      "mean_abs_err": 6.594874104134257e-05,
-      "std_abs_err": 5.057447077572164e-06,
-      "mmd_to_exact": 2.508317997751419e-10
+      "mean_abs_err": 5.500892282162689e-05,
+      "std_abs_err": 1.9615385036253485e-06,
+      "mmd_to_exact": 1.442376218463437e-10
     },
     {
       "target": "gmm",
       "theta": 0.7,
-      "mean_abs_err": 0.0013512551541063622,
-      "std_abs_err": 0.0014649903354135851,
-      "mmd_to_exact": 4.341800150520214e-07
+      "mean_abs_err": 0.0013861679784759329,
+      "std_abs_err": 0.0004896685810056312,
+      "mmd_to_exact": 2.5826446925503177e-07
     },
     {
       "target": "gmm",
       "theta": 1.0,
-      "mean_abs_err": 0.0023392572056469343,
-      "std_abs_err": 0.013287585517139155,
-      "mmd_to_exact": 2.0317164570737845e-05
+      "mean_abs_err": 0.025564242439934264,
+      "std_abs_err": 0.02345795966513542,
+      "mmd_to_exact": 0.00011805343027826432
     },
     {
       "target": "banana",
       "theta": 0.2,
-      "mean_abs_err": 6.071532165918825e-18,
-      "std_abs_err": 0.0,
+      "mean_abs_err": 2.1344905010156623e-13,
+      "std_abs_err": 1.0946799022804043e-13,
       "mmd_to_exact": 0.0
     },
     {
       "target": "banana",
       "theta": 0.4,
-      "mean_abs_err": 4.7341865427097396e-05,
-      "std_abs_err": 4.2307153375498174e-05,
-      "mmd_to_exact": 4.6418691113103705e-10
+      "mean_abs_err": 4.476063257219387e-05,
+      "std_abs_err": 4.302800450739497e-05,
+      "mmd_to_exact": 4.6113357576871294e-10
     },
     {
       "target": "banana",
       "theta": 0.7,
-      "mean_abs_err": 0.0034301551900971505,
-      "std_abs_err": 0.006471722152390891,
-      "mmd_to_exact": 1.2891463922581892e-05
+      "mean_abs_err": 0.002463071309358633,
+      "std_abs_err": 0.004288786088969765,
+      "mmd_to_exact": 5.4382278940057205e-06
     },
     {
       "target": "banana",
       "theta": 1.0,
-      "mean_abs_err": 0.01165147054438831,
-      "std_abs_err": 0.0309741831526662,
-      "mmd_to_exact": 0.0003010911417371531
+      "mean_abs_err": 0.011515452299716176,
+      "std_abs_err": 0.035413764442840945,
+      "mmd_to_exact": 0.0003957475570410818
     }
   ]
 }

@@ -27,6 +27,10 @@ from yggdrax.applications.svgd.sampler import (
     svgd_phi_from_topology,
 )
 
+# Compiled accumulation for the (eager) forward pass that records the frozen
+# partitions; collapses per-op dispatch the same way the sampler's step does.
+_jit_phi = jax.jit(svgd_phi_from_topology)
+
 
 def squared_mmd(
     x: Float[Array, "n d"],
@@ -71,6 +75,7 @@ def learn_bandwidth(
     num_svgd_steps: int = 20,
     theta: float = 0.4,
     leaf_size: int = 32,
+    backend: str = "leaf_kdtree",
     learning_rate: float = 0.1,
     num_outer_steps: int = 40,
     traversal_config: DualTreeTraversalConfig | None = None,
@@ -94,6 +99,8 @@ def learn_bandwidth(
         num_svgd_steps: SVGD steps unrolled per outer gradient step.
         theta: Opening angle for the tree sampler.
         leaf_size: Tree leaf occupancy.
+        backend: Tree backend for the partition build (``"radix"``/``"octree"``
+            for d<=3, ``"leaf_kdtree"`` for arbitrary dimension).
         learning_rate: Adam learning rate for the (log) bandwidth.
         num_outer_steps: Number of outer optimization steps.
         traversal_config: Optional explicit traversal capacities.
@@ -108,10 +115,14 @@ def learn_bandwidth(
         topos = []
         for _ in range(num_svgd_steps):
             topo = build_svgd_topology(
-                p, theta=theta, leaf_size=leaf_size, traversal_config=traversal_config
+                p,
+                theta=theta,
+                leaf_size=leaf_size,
+                backend=backend,
+                traversal_config=traversal_config,
             )
             topos.append(topo)
-            p = p + step_size * svgd_phi_from_topology(p, score_fn(p), h, topo)
+            p = p + step_size * _jit_phi(p, score_fn(p), h, topo)
         return topos
 
     def replay_loss(log_h, topos):
@@ -122,6 +133,13 @@ def learn_bandwidth(
             p = p + step_size * svgd_phi_from_topology(p, score_fn(p), h, topo)
         return squared_mmd(p, target_samples, mmd_bandwidth)
 
+    # Jit the frozen-topology replay's forward+backward pass. The topologies are
+    # fixed (non-differentiable) arguments, so the whole unrolled replay fuses
+    # into one compiled fwd+bwd kernel instead of dispatching every op eagerly.
+    # It (re)compiles only when the padded topology shapes change across outer
+    # steps; with a fixed-shape (radix) partition it is compiled once.
+    replay_value_and_grad = jax.jit(jax.value_and_grad(replay_loss))
+
     optimizer = optax.adam(learning_rate)
     log_h = jnp.log(jnp.asarray(h_init, dtype=init_particles.dtype))
     opt_state = optimizer.init(log_h)
@@ -130,7 +148,7 @@ def learn_bandwidth(
     loss_hist: list[float] = []
     for _ in range(num_outer_steps):
         topos = forward_topologies(jnp.exp(log_h))
-        loss, g = jax.value_and_grad(replay_loss)(log_h, topos)
+        loss, g = replay_value_and_grad(log_h, topos)
         loss_hist.append(float(loss))
         updates, opt_state = optimizer.update(g, opt_state, log_h)
         log_h = jnp.asarray(optax.apply_updates(log_h, updates))

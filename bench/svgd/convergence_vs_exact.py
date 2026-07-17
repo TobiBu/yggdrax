@@ -32,7 +32,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--thetas", type=float, nargs="+", default=[0.2, 0.4, 0.7, 1.0])
     p.add_argument("--num-steps", type=int, default=200)
     p.add_argument("--step-size", type=float, default=0.2)
+    # Convergence is the ACCURACY figure (MMD-to-exact vs theta). A finer tree
+    # (small leaf) keeps the far field non-trivial across the theta sweep so the
+    # accuracy/theta tradeoff shows a clean diagonal; a coarse leaf (e.g. 64)
+    # makes tight-theta MMD collapse to ~0 (all-near, exact) and flattens the
+    # curve. Speed here comes from the radix backend + jitted geometry/phi, not
+    # from enlarging the leaf. (Scaling/bandwidth use leaf_size=64 for speed.)
     p.add_argument("--leaf-size", type=int, default=16)
+    p.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Tree backend: 'auto' -> radix for d<=3 else leaf_kdtree.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
@@ -82,6 +94,9 @@ def main() -> None:
 
     records = []
     for name, tgt in make_targets().items():
+        backend = args.backend
+        if backend == "auto":
+            backend = "radix" if tgt.dim <= 3 else "leaf_kdtree"
         key = jax.random.PRNGKey(args.seed)
         p0 = jax.random.normal(key, (args.n, tgt.dim)) * 0.6
         h = float(median_heuristic(p0))
@@ -96,6 +111,7 @@ def main() -> None:
                 args.num_steps,
                 theta=theta,
                 leaf_size=args.leaf_size,
+                backend=backend,
                 traversal_config=cfg,
             )
             rec = {
@@ -120,6 +136,7 @@ def main() -> None:
             "num_steps": args.num_steps,
             "step_size": args.step_size,
             "leaf_size": args.leaf_size,
+            "backend": args.backend,
             "seed": args.seed,
         },
         "metadata": run_metadata(),

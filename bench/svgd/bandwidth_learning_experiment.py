@@ -40,7 +40,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num-outer-steps", type=int, default=40)
     p.add_argument("--step-size", type=float, default=0.3)
     p.add_argument("--theta", type=float, default=0.5)
-    p.add_argument("--leaf-size", type=int, default=16)
+    p.add_argument("--leaf-size", type=int, default=64)
+    p.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Tree backend: 'auto' -> radix for d<=3 else leaf_kdtree.",
+    )
     p.add_argument("--learning-rate", type=float, default=0.15)
     p.add_argument("--eval-steps", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
@@ -83,6 +89,9 @@ def main() -> None:
     cov_diag = jnp.asarray(args.cov_diag)
     dim = int(cov_diag.shape[0])
     tgt = T.gaussian(jnp.zeros(dim), cov_diag)
+    backend = args.backend
+    if backend == "auto":
+        backend = "radix" if dim <= 3 else "leaf_kdtree"
 
     key = jax.random.PRNGKey(args.seed)
     p0 = jax.random.normal(key, (args.n, dim)) * 0.5
@@ -100,6 +109,7 @@ def main() -> None:
         num_svgd_steps=args.num_svgd_steps,
         theta=args.theta,
         leaf_size=args.leaf_size,
+        backend=backend,
         learning_rate=args.learning_rate,
         num_outer_steps=args.num_outer_steps,
         traversal_config=cfg,
@@ -114,6 +124,7 @@ def main() -> None:
             args.eval_steps,
             theta=args.theta,
             leaf_size=args.leaf_size,
+            backend=backend,
             traversal_config=cfg,
         )
         return [float(v) for v in pf.std(0)]
@@ -137,6 +148,7 @@ def main() -> None:
             "step_size": args.step_size,
             "theta": args.theta,
             "leaf_size": args.leaf_size,
+            "backend": backend,
             "learning_rate": args.learning_rate,
             "eval_steps": args.eval_steps,
             "seed": args.seed,
