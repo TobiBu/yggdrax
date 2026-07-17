@@ -148,3 +148,26 @@ def dump_json(payload: dict[str, Any], output: str | Path) -> Path:
         json.dump(payload, fh, indent=2)
     print(f"[bench] wrote {path}")
     return path
+
+
+def dump_npz(arrays: dict[str, Any], output: str | Path) -> Path:
+    """Write named arrays to a compressed ``.npz`` at ``output``.
+
+    Used for bulk numeric payloads (trajectories, per-step histories) that are
+    too large or too array-shaped for the summary JSON. Values are coerced to
+    NumPy via :func:`numpy.asarray`, so JAX arrays are accepted directly.
+
+    Args:
+        arrays: Mapping of array name to array-like value.
+        output: Destination ``.npz`` path (parents are created).
+
+    Returns:
+        The path written to.
+    """
+    import numpy as np
+
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **{k: np.asarray(v) for k, v in arrays.items()})
+    print(f"[bench] wrote {path}")
+    return path
