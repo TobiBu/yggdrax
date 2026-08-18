@@ -6399,12 +6399,8 @@ def dual_tree_walk_mutual(
     index_neg1 = as_index(-1)
     theta_sq = jnp.asarray(theta, dtype=centers.dtype) ** 2
 
-    wf_a = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(
-        as_index(root)
-    )
-    wf_b = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(
-        as_index(root)
-    )
+    wf_a = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
+    wf_b = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
 
     init = (
         wf_a,

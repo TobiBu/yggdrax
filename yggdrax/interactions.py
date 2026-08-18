@@ -9,13 +9,13 @@ from jaxtyping import Array
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
-    MutualWalkResult,
     CompactTaggedFarPairs,
     CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
     MACType,
+    MutualWalkResult,
     NodeInteractionList,
     NodeNeighborList,
     OctreeNativeNeighborList,
