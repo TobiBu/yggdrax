@@ -9,6 +9,7 @@ from jaxtyping import Array
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
+    MutualWalkResult,
     CompactTaggedFarPairs,
     CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
@@ -22,6 +23,7 @@ from ._interactions_impl import (
     _compute_effective_extents,
     _compute_leaf_effective_extents,
     _interaction_capacity_candidates,
+    dual_tree_walk_mutual,
     interactions_for_node,
     neighbors_for_leaf,
 )
@@ -763,6 +765,7 @@ __all__ = [
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
+    "MutualWalkResult",
     "CompactTaggedFarPairs",
     "CompactTaggedOctreeFarPairs",
     "OctreeNativeNeighborList",
@@ -771,6 +774,7 @@ __all__ = [
     "build_interactions_and_neighbors",
     "build_interactions_and_neighbors_split",
     "build_compact_far_pairs",
+    "dual_tree_walk_mutual",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_octree_native_far_pairs",
     "build_octree_native_neighbor_lists",
