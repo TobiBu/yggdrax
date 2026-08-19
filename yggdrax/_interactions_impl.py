@@ -6373,18 +6373,23 @@ def dual_tree_walk_mutual(
 
     Parameters
     ----------
-    left_child_full, right_child_full:
-        ``(total_nodes,)`` child indices, **-1 for leaves**. A caller with
+    left_child_full:
+        ``(total_nodes,)`` left-child indices, **-1 for leaves**. A caller with
         ``(num_internal,)`` arrays pads them; the -1 is what marks a leaf here,
         so no separate leaf mask is needed.
-    centers, radii:
-        ``(total_nodes, 3)`` and ``(total_nodes,)`` MAC geometry, supplied by the
-        caller rather than derived from a ``TreeGeometry``. That is deliberate:
-        the mutual FMM's MAC is defined on **centres of mass** and
-        max-COM-distance radii, which are recomputed from the live positions on
-        every evaluation, and are not the bounding-sphere proxies
+    right_child_full:
+        ``(total_nodes,)`` right-child indices, likewise -1 for leaves.
+    centers:
+        ``(total_nodes, 3)`` node centres used by the MAC, supplied by the caller
+        rather than derived from a ``TreeGeometry``. That is deliberate: the
+        mutual FMM's MAC is defined on **centres of mass**, recomputed from the
+        live positions on every evaluation, not on the bounding-sphere proxies
         ``_build_mac_extents`` selects. Letting the caller pass them keeps this
         walk agnostic and reproduces jaccpot's host traversal pair-for-pair.
+    radii:
+        ``(total_nodes,)`` node radii used by the MAC -- for the mutual FMM the
+        exact max centre-of-mass-to-particle distance, again caller-supplied for
+        the reason above.
     theta:
         Accepts a pair when ``theta * |c_b - c_a| > r_a + r_b`` -- strict, and
         symmetric in the two nodes by construction, which is what lets one
@@ -6393,18 +6398,23 @@ def dual_tree_walk_mutual(
         Index of the root node.
     max_pair_queue:
         Wavefront capacity, in node pairs.
-    far_cap, near_cap:
-        Output capacities for the canonical far and near lists.
+    far_cap:
+        Output capacity for the canonical far list.
+    near_cap:
+        Output capacity for the canonical near list.
+
+    Returns
+    -------
+    MutualWalkResult
+        The canonical far and near pair lists, ``-1``-padded to ``far_cap`` and
+        ``near_cap``, with their live counts and the three overflow flags. The
+        flags must be read -- see :class:`MutualWalkResult`.
     """
     index_neg1 = as_index(-1)
     theta_sq = jnp.asarray(theta, dtype=centers.dtype) ** 2
 
-    wf_a = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(
-        as_index(root)
-    )
-    wf_b = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(
-        as_index(root)
-    )
+    wf_a = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
+    wf_b = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
 
     init = (
         wf_a,
@@ -6443,12 +6453,17 @@ def dual_tree_walk_mutual(
         ) = state
 
         live = (jnp.arange(max_pair_queue, dtype=INDEX_DTYPE) < size) & (cur_a >= 0)
-        sa = jnp.where(live, cur_a, as_index(0))
-        sb = jnp.where(live, cur_b, as_index(0))
+        # `jnp.asarray` here is for the type checker, not the runtime: a
+        # `lax.while_loop` carry is a heterogeneous tuple, so unpacking it widens
+        # every element to the union of the tuple's member types, and that union
+        # then propagates through `jnp.where` into the refiner's `Array`
+        # parameters. Narrowing once here keeps the rest of the body clean.
+        sa = jnp.asarray(jnp.where(live, cur_a, as_index(0)))
+        sb = jnp.asarray(jnp.where(live, cur_b, as_index(0)))
 
         a_leaf = left_child_full[sa] < 0
         b_leaf = left_child_full[sb] < 0
-        same = sa == sb
+        same = jnp.asarray(sa == sb)
 
         delta = centers[sb] - centers[sa]
         dist_sq = jnp.sum(delta * delta, axis=-1)
