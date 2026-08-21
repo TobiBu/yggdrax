@@ -44,14 +44,14 @@ class ReverseHaloResult(NamedTuple):
     """What came back from other devices, and whether anything was dropped.
 
     ``target_index`` and ``values`` are the contributions this device must apply to
-    its OWN particles or nodes; ``count`` is how many are live. ``overflow`` is true
+    its OWN particles or nodes; ``n_received`` is how many are live. ``overflow`` is true
     if the receive capacity was too small, which is reported rather than silently
     truncated because a dropped ``-f`` is invisible in a per-device momentum check.
     """
 
     target_index: Array
     values: Array
-    count: Array
+    n_received: Array
     overflow: Array
 
 
@@ -140,7 +140,7 @@ def export_reverse_halo(
     return ReverseHaloResult(
         target_index=recv[:, 0].astype(INDEX_DTYPE),
         values=recv[:, 1:],
-        count=total,
+        n_received=total,
         overflow=total > as_index(int(recv_capacity)),
     )
 
@@ -150,7 +150,7 @@ def apply_reverse_halo(into: Array, result: ReverseHaloResult) -> Array:
 
     Additive, not assignment: several remote devices can send a contribution for the
     same local index, and a mutual force requires all of them to sum. Rows past
-    ``count`` are dropped rather than added, so a partially filled receive buffer
+    ``n_received`` are dropped rather than added, so a partially filled receive buffer
     does not inject zeros-with-an-index.
 
     Parameters
@@ -166,7 +166,7 @@ def apply_reverse_halo(into: Array, result: ReverseHaloResult) -> Array:
         ``into`` with the contributions added.
     """
     rows = jnp.arange(result.target_index.shape[0], dtype=INDEX_DTYPE)
-    live = rows < result.count
+    live = rows < result.n_received
     idx = jnp.where(live, result.target_index, as_index(into.shape[0]))
     return into.at[idx].add(
         jnp.where(live[:, None], result.values, jnp.zeros_like(result.values)),

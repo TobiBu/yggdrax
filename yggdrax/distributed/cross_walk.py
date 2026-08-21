@@ -649,7 +649,10 @@ def single_owner_domain(
     unknown = as_index(-2)
     owner = jnp.where(is_leaf, tag_domain.astype(INDEX_DTYPE), unknown)
 
-    def round_fn(_, own):
+    def round_fn(_: Array, own: Array) -> Array:
+        # Narrowed for the type checker: `fori_loop` widens the carry to
+        # `Array | tuple[Array, ...]` inside the body, and this carry is one array.
+        own = jnp.asarray(own)
         lo = own[jnp.maximum(left_child_full, 0)]
         ro = own[jnp.maximum(right_child_full, 0)]
         resolved = (lo != unknown) & (ro != unknown)
@@ -657,7 +660,10 @@ def single_owner_domain(
         internal = jnp.where(resolved, jnp.where(agree, lo, as_index(-1)), unknown)
         return jnp.where(is_leaf, own, internal)
 
-    owner = lax.fori_loop(0, int(max_depth), round_fn, owner)
+    # `jnp.asarray`: `fori_loop` is typed as returning the carry's union type,
+    # `Array | tuple[Array, ...]`, so the narrowing is for the type checker rather
+    # than the runtime -- the carry here is a single array.
+    owner = jnp.asarray(lax.fori_loop(0, int(max_depth), round_fn, owner))
     # Anything still unresolved is treated as straddling: refuse to accept it and
     # refine instead, which is the safe direction.
     return jnp.where(owner == unknown, as_index(-1), owner)
@@ -896,8 +902,8 @@ def dual_tree_walk_cross_mutual(
             _cand(split_r & (~both), sl, rl),
             _cand(split_r & (~both), sl, rr),
         ]
-        cand_l = jnp.concatenate([c[0] for c in cands])
-        cand_r = jnp.concatenate([c[1] for c in cands])
+        cand_l = jnp.concatenate([jnp.asarray(c[0]) for c in cands])
+        cand_r = jnp.concatenate([jnp.asarray(c[1]) for c in cands])
         push = (cand_l >= 0) & (cand_r >= 0)
         pos = jnp.cumsum(push.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - push.astype(
             INDEX_DTYPE

@@ -61,14 +61,14 @@ def test_apply_reverse_halo_accumulates_rather_than_assigns():
     res = ReverseHaloResult(
         target_index=jnp.asarray([1, 1, 2, 0], dtype=jnp.int32),
         values=jnp.asarray([[1.0, 0, 0], [2.0, 0, 0], [5.0, 0, 0], [7.0, 0, 0]]),
-        count=jnp.asarray(3, dtype=jnp.int32),
+        n_received=jnp.asarray(3, dtype=jnp.int32),
         overflow=jnp.asarray(False),
     )
     out = apply_reverse_halo(jnp.zeros((3, 3)), res)
     got = np.asarray(out)[:, 0]
     assert got[1] == pytest.approx(3.0), "two contributions to index 1 did not sum"
     assert got[2] == pytest.approx(5.0)
-    assert got[0] == pytest.approx(0.0), "a row past `count` was applied anyway"
+    assert got[0] == pytest.approx(0.0), "a row past `n_received` was applied anyway"
 
 
 @pytest.mark.skipif(shard_map is None, reason="needs jax.experimental.shard_map")
