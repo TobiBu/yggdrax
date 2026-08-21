@@ -66,6 +66,7 @@ def _compute_leaf_bounds(
     leaf_counts: Array,
     *,
     max_leaf_size: int | None = None,
+    particle_radius: Array | None = None,
 ) -> tuple[Array, Array]:
     dtype = positions_sorted.dtype
     num_leaves = leaf_starts.shape[0]
@@ -101,10 +102,26 @@ def _compute_leaf_bounds(
     safe_indices = jnp.where(valid, indices, as_index(0))
     points = positions_sorted[safe_indices]  # (L, M, 3)
 
+    # A "particle" may stand for an aggregate -- an LET coarse particle is a whole
+    # remote leaf reduced to its centre of mass -- in which case the bound has to
+    # cover the ball it represents, not the point it was reduced to. Bounding the
+    # points alone is what makes a coarse tree's MAC extent understate the source
+    # region it is standing in for, so the MAC accepts pairs whose true separation
+    # is smaller than the source's own radius. Growing each point into a cube here
+    # (rather than padding ``radius`` afterwards) keeps the box centre, the
+    # half-extent, the sphere radius and the L-infinity extent mutually consistent
+    # and lets the upward pass carry the inflation to every ancestor for free.
+    lows = points
+    highs = points
+    if particle_radius is not None:
+        radius = jnp.asarray(particle_radius, dtype=dtype)[safe_indices][..., None]
+        lows = points - radius
+        highs = points + radius
+
     # Masked min / max reduction along axis=1.
     big = jnp.finfo(dtype).max
-    mins = jnp.where(valid[:, :, None], points, big)
-    maxs = jnp.where(valid[:, :, None], points, -big)
+    mins = jnp.where(valid[:, :, None], lows, big)
+    maxs = jnp.where(valid[:, :, None], highs, -big)
     mins = jnp.min(mins, axis=1)  # (L, 3)
     maxs = jnp.max(maxs, axis=1)  # (L, 3)
     return mins, maxs
@@ -161,6 +178,7 @@ def compute_tree_geometry(
     positions_sorted: Array,
     *,
     max_leaf_size: int | None = None,
+    particle_radius: Array | None = None,
 ) -> TreeGeometry:
     """Compute per-node bounding boxes and helper radii.
 
@@ -175,6 +193,13 @@ def compute_tree_geometry(
         Optional explicit upper bound for particles per leaf. Passing the known
         tree leaf cap keeps JIT-staged leaf gathers bounded by leaf occupancy
         instead of the full particle count.
+    particle_radius
+        Optional per-particle radius ``(n_particles,)``. Each particle is then
+        bounded as a ball of that radius rather than as a point, so every node's
+        box covers the aggregates its particles stand for. Required for trees
+        built over *proxies* -- an LET coarse tree's particles are whole remote
+        leaves reduced to their centres of mass, and without their radii the
+        resulting MAC extent understates the source region it represents.
 
     Returns
     -------
@@ -207,9 +232,14 @@ def compute_tree_geometry(
             leaf_starts,
             leaf_counts,
             max_leaf_size=max_leaf_size,
+            particle_radius=particle_radius,
         )
 
-    if has_morton_fields:
+    # The Morton shortcut derives leaf bounds from the cell geometry rather than
+    # from the particles, so it cannot honour a per-particle radius -- taking it
+    # would silently drop the inflation and hand back the understated extents this
+    # argument exists to prevent. Use the positional path whenever radii are given.
+    if has_morton_fields and particle_radius is None:
         leaf_min, leaf_max = lax.cond(
             use_morton_bounds,
             lambda _: _compute_leaf_bounds_from_morton(tree),
