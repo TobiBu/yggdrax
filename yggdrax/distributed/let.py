@@ -104,9 +104,12 @@ def _leaf_radii_about(
     offsets = jnp.arange(width, dtype=INDEX_DTYPE)[None, :]
     valid = (offsets < counts[:, None]) & nonempty[:, None]
     indices = jnp.clip(starts[:, None] + offsets, 0, num_particles - 1)
-    distances = jnp.linalg.norm(
-        positions_sorted[indices] - centres[:, None, :], axis=-1
-    )
+    deltas = positions_sorted[indices] - centres[:, None, :]
+    # sqrt(sum(d^2)) rather than jnp.linalg.norm: for a real array reduced along one
+    # axis the two are the same computation, but norm is typed as returning
+    # ``Array | tuple[Array, ...]`` (its multi-axis overloads), which does not satisfy
+    # the ``ArrayLike`` that jnp.max takes.
+    distances = jnp.sqrt(jnp.sum(deltas * deltas, axis=-1))
     return jnp.max(jnp.where(valid, distances, 0.0), axis=1)
 
 
