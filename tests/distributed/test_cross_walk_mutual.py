@@ -68,7 +68,16 @@ def _all_owned_by(tree, dev):
     return jnp.full((total,), dev, dtype=jnp.int32)
 
 
-def _walk(a, b, this_dev, src_dev, theta=0.35, remote_owner=None, **caps):
+def _walk(
+    a,
+    b,
+    this_dev,
+    src_dev,
+    theta=0.35,
+    remote_owner=None,
+    remote_index_in_owner=None,
+    **caps,
+):
     return dual_tree_walk_cross_mutual(
         a[0],
         a[1],
@@ -85,6 +94,7 @@ def _walk(a, b, this_dev, src_dev, theta=0.35, remote_owner=None, **caps):
         remote_owner=(
             _all_owned_by(b, src_dev) if remote_owner is None else remote_owner
         ),
+        remote_index_in_owner=remote_index_in_owner,
         **(caps or CAPS),
     )
 
@@ -232,3 +242,107 @@ def test_near_pairs_are_always_single_owner():
     m = int(res.near_count)
     assert m > 0, "no near pairs -- test would be vacuous"
     assert np.all(np.asarray(res.near_owner)[:m] >= 0)
+
+
+def _relabel(tree, perm):
+    """The same tree with its nodes renumbered: ``perm[old] = new``.
+
+    What a merged LET coarse tree does to remote node ids. The geometry is
+    untouched, so the *geometric* pair set is identical -- only the names change,
+    which is exactly the variable under test.
+
+    Returns the relabelled tree and ``inv``, mapping a new index back to the
+    owner's own index, i.e. the ``remote_index_in_owner`` table.
+    """
+    left, right, centers, radii, _root = (np.asarray(t) for t in tree)
+    total = left.shape[0]
+    perm = np.asarray(perm)
+    inv = np.empty(total, dtype=np.int32)
+    inv[perm] = np.arange(total, dtype=np.int32)
+    nl = np.full(total, -1, dtype=np.int32)
+    nr = np.full(total, -1, dtype=np.int32)
+    nc = np.zeros_like(centers)
+    nrad = np.zeros_like(radii)
+    for old in range(total):
+        new = perm[old]
+        nl[new] = perm[left[old]] if left[old] >= 0 else -1
+        nr[new] = perm[right[old]] if right[old] >= 0 else -1
+        nc[new] = centers[old]
+        nrad[new] = radii[old]
+    relabelled = (
+        jnp.asarray(nl),
+        jnp.asarray(nr),
+        jnp.asarray(nc),
+        jnp.asarray(nrad),
+        jnp.asarray(int(perm[0])),
+    )
+    return relabelled, jnp.asarray(inv)
+
+
+def _pairs_in_owner_space(res, inv, swap):
+    """Owned pairs as ``(device-0 node, device-1 node)`` in each owner's numbering."""
+    n, m = int(res.far_count), int(res.near_count)
+    inv = None if inv is None else np.asarray(inv)
+    take = lambda a, k: np.asarray(a)[:k]  # noqa: E731
+    fa, fb = take(res.far_local, n), take(res.far_remote, n)
+    na, nb = take(res.near_local, m), take(res.near_remote, m)
+    if inv is not None:  # remote side is relabelled -- name it as its owner does
+        fb, nb = inv[fb], inv[nb]
+    if swap:
+        return set(zip(fb.tolist(), fa.tolist())), set(zip(nb.tolist(), na.tolist()))
+    return set(zip(fa.tolist(), fb.tolist())), set(zip(na.tolist(), nb.tolist()))
+
+
+def _partition_defect(a, b, remote_index_in_owner):
+    """``(duplicated, dropped)`` pair counts across the two sides of the boundary.
+
+    Device 0 sees device 1's tree renumbered (the LET case); device 1 sees device
+    0's tree in device 0's own numbering (nothing to relabel). A partition means
+    both counts are zero.
+    """
+    rng = np.random.default_rng(11)
+    perm = rng.permutation(np.asarray(b[0]).shape[0])
+    b_relabelled, inv = _relabel(b, perm)
+
+    r0 = _walk(a, b_relabelled, 0, 1, remote_index_in_owner=remote_index_in_owner(inv))
+    r1 = _walk(b, a, 1, 0)
+    ref_far, ref_near = _pairs_in_owner_space(_walk(a, b, 0, 0), None, swap=False)
+    far0, near0 = _pairs_in_owner_space(r0, inv, swap=False)
+    far1, near1 = _pairs_in_owner_space(r1, None, swap=True)
+
+    assert ref_far and ref_near, "no far or near pairs at all -- test would be vacuous"
+    both = (far0 & far1) | (near0 & near1)
+    union = (far0 | far1, near0 | near1)
+    dropped = (ref_far - union[0]) | (ref_near - union[1])
+    return len(both), len(dropped)
+
+
+def test_a_renumbered_remote_tree_still_partitions():
+    """The LET case: the remote tree's numbering is the importer's, not its owner's.
+
+    A merged coarse tree is built by whoever imports it, so two devices give the
+    same remote node different indices. The ownership rule is a function of those
+    indices, so without ``remote_index_in_owner`` the two sides disagree about who
+    owns a pair -- and every such disagreement is silent downstream, since a
+    dropped `-f` and a doubled one both leave per-device momentum exact.
+    """
+    a = _random_tree(8, 21, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 22, (0.85, 0.1, 0.0))
+    duplicated, dropped = _partition_defect(a, b, lambda inv: inv)
+    assert duplicated == 0, f"{duplicated} pairs emitted by BOTH devices"
+    assert dropped == 0, f"{dropped} pairs emitted by NEITHER device"
+
+
+def test_without_the_owner_numbering_the_partition_actually_breaks():
+    """Negative control, so the test above cannot pass for the wrong reason.
+
+    Same trees, same runs, ``remote_index_in_owner`` left at its default. If this
+    partitioned anyway the parameter would be untested decoration.
+    """
+    a = _random_tree(8, 21, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 22, (0.85, 0.1, 0.0))
+    duplicated, dropped = _partition_defect(a, b, lambda _inv: None)
+    assert duplicated or dropped, (
+        "the default numbering partitioned a relabelled remote tree, so the "
+        "renumbering hazard this parameter exists for is not reproduced here"
+    )

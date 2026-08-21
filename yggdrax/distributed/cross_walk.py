@@ -707,6 +707,7 @@ def dual_tree_walk_cross_mutual(
     *,
     this_device: Array,
     remote_owner: Array,
+    remote_index_in_owner: Optional[Array] = None,
     max_pair_queue: int,
     far_cap: int,
     near_cap: int,
@@ -727,6 +728,21 @@ def dual_tree_walk_cross_mutual(
     gives it. Without that filter every cross pair is evaluated twice, and the
     resulting force error is invisible to a per-device momentum check -- see the
     note above :func:`cross_pair_owner`.
+
+    That filter only partitions if both devices key the pair on the *same* two
+    numbers, which is what ``remote_index_in_owner`` exists for. The rule is a
+    function of ``(device, node index)`` per endpoint, and a node index is only
+    canonical in the tree its owner built. When the remote tree IS the source
+    device's own tree -- an ``all_gather`` of its node arrays -- the remote node
+    index already is that, and the default is right. When the remote tree is a
+    merged LET coarse tree
+    (:func:`~yggdrax.distributed.let.build_remote_coarse_tree`), it is NOT: that
+    tree is built by the importer over every *other* domain's frontier, so its
+    numbering is local to the importer and two devices assign different indices to
+    the same remote node. Left at the default the two sides then disagree about who
+    owns a pair, which drops some pairs and duplicates others -- and both
+    failure modes leave every per-device momentum sum exact, so only a global force
+    comparison notices.
 
     **Centres and radii are caller-supplied**, not derived by
     ``_build_mac_extents``, for the same reason the single-device
@@ -773,6 +789,13 @@ def dual_tree_walk_cross_mutual(
         NODE, not a single scalar, because the imported remote tree is a MERGE of
         every other domain's frontier, so different nodes belong to different
         devices.
+    remote_index_in_owner:
+        ``(remote_total_nodes,)`` each remote node's index **in its owning domain's
+        own tree**, which is the only numbering both sides of a boundary agree on.
+        ``None`` means "the remote index already is that", which holds exactly when
+        the remote tree is the source device's own tree. For a merged coarse tree
+        pass ``tag_node_id`` (via each leaf's ``node_ranges`` start), and see the
+        paragraph on ownership above for what going without costs.
     max_pair_queue:
         Wavefront capacity in node pairs.
     far_cap:
@@ -792,6 +815,13 @@ def dual_tree_walk_cross_mutual(
     cap = int(max_pair_queue)
     theta_sq = jnp.asarray(theta, dtype=local_centers.dtype) ** 2
     wf_indices = jnp.arange(cap, dtype=INDEX_DTYPE)
+    # `None` stays None rather than becoming an identity table: the check below is a
+    # trace-time Python branch, so the default path emits no gather at all.
+    r_key = (
+        None
+        if remote_index_in_owner is None
+        else jnp.asarray(remote_index_in_owner).astype(INDEX_DTYPE)
+    )
 
     init = (
         jnp.full((cap,), -1, dtype=INDEX_DTYPE).at[0].set(local_root),
@@ -854,7 +884,12 @@ def dual_tree_walk_cross_mutual(
         accept_geom = mac_ok & single_owner
         near_geom = live & (~mac_ok) & both_leaf
 
-        owned = cross_pair_is_owned(this_device, sl, r_dom, sr)
+        # The ownership rule is only a partition if both devices key the pair
+        # identically, and a merged coarse tree renumbers remote nodes -- hence the
+        # translation to the owner's own numbering when one was given.
+        owned = cross_pair_is_owned(
+            this_device, sl, r_dom, sr if r_key is None else r_key[sr]
+        )
         emit_far = accept_geom & owned
         emit_near = near_geom & owned
         # The remote index and its owning domain are appended together, so the
