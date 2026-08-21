@@ -37,6 +37,7 @@ __all__ = [
     "apply_reverse_halo",
     "export_reverse_halo",
     "group_by_destination",
+    "halo_return_addresses",
 ]
 
 
@@ -86,6 +87,55 @@ def group_by_destination(owner: Array, ndev: int) -> tuple[Array, Array]:
         length=ndev + 1,
     )[:ndev].astype(INDEX_DTYPE)
     return order, send_sizes
+
+
+def halo_return_addresses(
+    coarse_pos: Array,
+    within_leaf: Array,
+    tag_domain: Array,
+    tag_range: Array,
+    valid: Array,
+) -> tuple[Array, Array]:
+    """Turn coarse-tree positions into ``(owner device, owner-local index)`` rows.
+
+    The glue between the LET and the reverse exchange, and the reason
+    :class:`~yggdrax.distributed.let.GlobalCoarseTree` carries ``tag_range`` at all.
+
+    A cross-domain near pair names its remote side by a position in the *remote coarse
+    tree*, which is a merged structure with its own numbering. The ``-f`` half has to
+    be applied to a particle in the *owning domain's own* array, and nothing on the
+    receiving side can reconstruct which particle that was -- so the address is
+    computed here, where the tags are in scope, and travels with the payload.
+
+    ``tag_range[p, 0]`` is where that coarse leaf's particles start in its origin
+    domain's local ordering, so origin-local index is ``tag_range[p, 0] +
+    within_leaf``. Padding is returned as owner ``-1``, which
+    :func:`export_reverse_halo` drops.
+
+    Parameters
+    ----------
+    coarse_pos:
+        ``(k,)`` sorted position in the remote coarse tree for each contribution.
+    within_leaf:
+        ``(k,)`` offset of the particle inside that coarse leaf.
+    tag_domain:
+        ``(n_remote,)`` origin domain per coarse position.
+    tag_range:
+        ``(n_remote, 2)`` origin particle range per coarse position.
+    valid:
+        ``(k,)`` whether the row is a real contribution.
+
+    Returns
+    -------
+    tuple[Array, Array]
+        ``(owner, index)``, owner ``-1`` where invalid.
+    """
+    safe = jnp.where(valid, coarse_pos, as_index(0))
+    owner = jnp.where(valid, tag_domain[safe].astype(INDEX_DTYPE), as_index(-1))
+    index = jnp.where(
+        valid, tag_range[safe, 0].astype(INDEX_DTYPE) + within_leaf, as_index(0)
+    )
+    return owner, index
 
 
 def export_reverse_halo(

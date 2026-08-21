@@ -153,3 +153,62 @@ def test_momentum_cancels_globally_but_not_per_device():
     assert not np.allclose(
         per_device, 0.0, atol=1e-6
     ), "per-device sums are all zero -- the test would pass without any exchange"
+
+
+def test_halo_return_addresses_maps_coarse_positions_to_owner_local_indices():
+    """The glue between the LET and the reverse exchange.
+
+    A cross pair names its remote side by a position in the MERGED remote coarse
+    tree, which has its own numbering. The `-f` has to land on a particle in the
+    owning domain's own array, and the receiver cannot reconstruct which one -- so the
+    address is derived where the tags are in scope. Getting this wrong would apply a
+    correct force to the wrong particle: momentum would still conserve globally, and
+    only a force comparison would notice.
+    """
+    from yggdrax.distributed.reverse_halo import halo_return_addresses
+
+    # coarse position -> (origin domain, origin particle range)
+    tag_domain = jnp.asarray([2, 2, 5, 7], dtype=jnp.int32)
+    tag_range = jnp.asarray([[0, 4], [4, 8], [16, 20], [8, 12]], dtype=jnp.int32)
+
+    coarse_pos = jnp.asarray([0, 1, 2, 3, 0], dtype=jnp.int32)
+    within = jnp.asarray([0, 3, 1, 2, 9], dtype=jnp.int32)
+    valid = jnp.asarray([True, True, True, True, False])
+
+    owner, index = halo_return_addresses(
+        coarse_pos, within, tag_domain, tag_range, valid
+    )
+    assert list(np.asarray(owner)) == [2, 2, 5, 7, -1]
+    # index = tag_range[p, 0] + within_leaf, in the OWNER's local numbering
+    assert list(np.asarray(index))[:4] == [0, 7, 17, 10]
+    assert int(np.asarray(owner)[4]) == -1, "padding must be droppable"
+
+
+def test_halo_return_addresses_round_trips_through_the_exchange():
+    """An address derived from the tags must survive the exchange unchanged."""
+    from yggdrax.distributed.reverse_halo import (
+        ReverseHaloResult,
+        apply_reverse_halo,
+        halo_return_addresses,
+    )
+
+    tag_domain = jnp.asarray([0, 0], dtype=jnp.int32)
+    tag_range = jnp.asarray([[2, 4], [6, 8]], dtype=jnp.int32)
+    owner, index = halo_return_addresses(
+        jnp.asarray([0, 1], dtype=jnp.int32),
+        jnp.asarray([1, 0], dtype=jnp.int32),
+        tag_domain,
+        tag_range,
+        jnp.asarray([True, True]),
+    )
+    # feed the derived addresses straight into the accumulate step
+    res = ReverseHaloResult(
+        target_index=index,
+        values=jnp.asarray([[1.0, 0, 0], [2.0, 0, 0]]),
+        n_received=jnp.asarray(2, dtype=jnp.int32),
+        overflow=jnp.asarray(False),
+    )
+    out = np.asarray(apply_reverse_halo(jnp.zeros((8, 3)), res))[:, 0]
+    assert out[3] == pytest.approx(1.0), "range start 2 + offset 1 -> index 3"
+    assert out[6] == pytest.approx(2.0), "range start 6 + offset 0 -> index 6"
+    assert out.sum() == pytest.approx(3.0), "a contribution landed somewhere else"
