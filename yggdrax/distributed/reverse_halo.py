@@ -167,7 +167,11 @@ def apply_reverse_halo(into: Array, result: ReverseHaloResult) -> Array:
     """
     rows = jnp.arange(result.target_index.shape[0], dtype=INDEX_DTYPE)
     live = rows < result.n_received
-    idx = jnp.where(live, result.target_index, as_index(into.shape[0]))
+    # `.astype(INDEX_DTYPE)`: a scatter whose index dtype is wider than the buffer's
+    # is a FutureWarning now and an error in later JAX.
+    idx = jnp.where(live, result.target_index, as_index(into.shape[0])).astype(
+        INDEX_DTYPE
+    )
     return into.at[idx].add(
         jnp.where(live[:, None], result.values, jnp.zeros_like(result.values)),
         mode="drop",
