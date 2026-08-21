@@ -605,6 +605,64 @@ def cross_pair_is_owned(
     )
 
 
+def single_owner_domain(
+    left_child_full: Array,
+    right_child_full: Array,
+    tag_domain: Array,
+    *,
+    max_depth: int,
+) -> Array:
+    """Per-node owning domain, or ``-1`` where a node straddles several.
+
+    A merged remote coarse tree (:func:`~yggdrax.distributed.let.build_remote_coarse_tree`)
+    holds *other* domains' frontiers in ONE tree, so its leaves each carry a single
+    origin domain but its internal nodes generally aggregate several. That matters
+    for a mutual force: the ``-f`` half of an accepted far pair has to be sent
+    somewhere, and an internal node spanning three domains has no single somewhere.
+
+    Propagates bottom-up: a leaf owns its own tag; an internal node owns a domain
+    only if both children resolve to the *same* one. Runs a fixed number of rounds
+    rather than a convergence test so it stays a fixed-shape traceable program;
+    ``max_depth`` rounds suffice, since information travels one level per round.
+
+    Leaves are never straddling by construction, which is what makes refinement a
+    terminating strategy: a walk that refuses to accept a straddling node and
+    descends instead always reaches single-owner nodes.
+
+    Parameters
+    ----------
+    left_child_full:
+        ``(total_nodes,)`` left children, -1 for leaves.
+    right_child_full:
+        ``(total_nodes,)`` right children, -1 for leaves.
+    tag_domain:
+        ``(total_nodes,)`` origin domain per node; only leaf entries are read.
+    max_depth:
+        Rounds to propagate, at least the tree depth. Static.
+
+    Returns
+    -------
+    Array
+        ``(total_nodes,)`` owning domain, ``-1`` where the node spans more than one.
+    """
+    is_leaf = left_child_full < 0
+    unknown = as_index(-2)
+    owner = jnp.where(is_leaf, tag_domain.astype(INDEX_DTYPE), unknown)
+
+    def round_fn(_, own):
+        lo = own[jnp.maximum(left_child_full, 0)]
+        ro = own[jnp.maximum(right_child_full, 0)]
+        resolved = (lo != unknown) & (ro != unknown)
+        agree = resolved & (lo == ro) & (lo >= as_index(0))
+        internal = jnp.where(resolved, jnp.where(agree, lo, as_index(-1)), unknown)
+        return jnp.where(is_leaf, own, internal)
+
+    owner = lax.fori_loop(0, int(max_depth), round_fn, owner)
+    # Anything still unresolved is treated as straddling: refuse to accept it and
+    # refine instead, which is the safe direction.
+    return jnp.where(owner == unknown, as_index(-1), owner)
+
+
 class CrossMutualWalkResult(NamedTuple):
     """Flat canonical cross-domain pair lists, one entry per owned pair.
 
@@ -617,9 +675,11 @@ class CrossMutualWalkResult(NamedTuple):
 
     far_local: Array
     far_remote: Array
+    far_owner: Array
     far_count: Array
     near_local: Array
     near_remote: Array
+    near_owner: Array
     near_count: Array
     far_overflow: Array
     near_overflow: Array
@@ -640,7 +700,7 @@ def dual_tree_walk_cross_mutual(
     theta: float,
     *,
     this_device: Array,
-    source_device: Array,
+    remote_owner: Array,
     max_pair_queue: int,
     far_cap: int,
     near_cap: int,
@@ -701,8 +761,12 @@ def dual_tree_walk_cross_mutual(
         Opening angle; acceptance is strict.
     this_device:
         Device id running this walk.
-    source_device:
-        Device the source tree was imported from.
+    remote_owner:
+        ``(remote_total_nodes,)`` owning domain per remote node, ``-1`` where the
+        node straddles several -- as produced by :func:`single_owner_domain`. Per
+        NODE, not a single scalar, because the imported remote tree is a MERGE of
+        every other domain's frontier, so different nodes belong to different
+        devices.
     max_pair_queue:
         Wavefront capacity in node pairs.
     far_cap:
@@ -729,7 +793,9 @@ def dual_tree_walk_cross_mutual(
         as_index(1),
         jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
         jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
+        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
         as_index(0),
+        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
         jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
         jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
         as_index(0),
@@ -748,9 +814,11 @@ def dual_tree_walk_cross_mutual(
             wf_size,
             far_l,
             far_r,
+            far_o,
             far_n,
             near_l,
             near_r,
+            near_o,
             near_n,
             of_far,
             of_near,
@@ -763,25 +831,49 @@ def dual_tree_walk_cross_mutual(
         delta = remote_centers[sr] - local_centers[sl]
         dist_sq = jnp.sum(delta * delta, axis=1)
         radius_sum = local_radii[sl] + remote_radii[sr]
-        accept_geom = live & (theta_sq * dist_sq > radius_sum * radius_sum)
+        mac_ok = live & (theta_sq * dist_sq > radius_sum * radius_sum)
 
         l_leaf = local_left_child_full[sl] < 0
         r_leaf = remote_left_child_full[sr] < 0
         both_leaf = l_leaf & r_leaf
-        near_geom = live & (~accept_geom) & both_leaf
 
-        owned = cross_pair_is_owned(this_device, sl, source_device, sr)
-        far_l, far_r, far_n, ofl = _flat_append(
-            far_l, far_r, far_n, accept_geom & owned, sl, sr, far_cap
+        # A far pair may only be ACCEPTED against a single-owner remote node. An
+        # internal node of the merged remote tree can aggregate several domains, and
+        # the `-f` half of an accepted pair has to be sent somewhere -- a node
+        # spanning three domains has no single somewhere. So a straddling node is
+        # refined instead, which terminates because coarse leaves each carry exactly
+        # one origin domain.
+        r_dom = remote_owner[sr]
+        single_owner = r_dom >= as_index(0)
+        accept_geom = mac_ok & single_owner
+        near_geom = live & (~mac_ok) & both_leaf
+
+        owned = cross_pair_is_owned(this_device, sl, r_dom, sr)
+        emit_far = accept_geom & owned
+        emit_near = near_geom & owned
+        # The remote index and its owning domain are appended together, so the
+        # reverse exchange never has to re-derive a destination from an index.
+        far_l, far_r, far_n_next, ofl = _flat_append(
+            far_l, far_r, far_n, emit_far, sl, sr, far_cap
         )
-        near_l, near_r, near_n, ofn = _flat_append(
-            near_l, near_r, near_n, near_geom & owned, sl, sr, near_cap
+        far_o, _unused_a, _unused_n, _unused_o = _flat_append(
+            far_o, far_o, far_n, emit_far, r_dom, r_dom, far_cap
         )
+        far_n = far_n_next
+        near_l, near_r, near_n_next, ofn = _flat_append(
+            near_l, near_r, near_n, emit_near, sl, sr, near_cap
+        )
+        near_o, _unused_b, _unused_m, _unused_p = _flat_append(
+            near_o, near_o, near_n, emit_near, r_dom, r_dom, near_cap
+        )
+        near_n = near_n_next
 
         # Refinement is deliberately NOT filtered by ownership: a pair this device
         # does not own may still need splitting to reach descendants it does.
         # Filtering here would prune away owned pairs deeper in the tree.
-        refine = live & (~accept_geom) & (~both_leaf)
+        # Refine anything not emitted that still has structure left: the MAC
+        # rejected it, or the MAC accepted it but the remote node straddles domains.
+        refine = live & (~accept_geom) & (~near_geom) & (~both_leaf)
         split_l = refine & (~l_leaf) & (r_leaf | (local_radii[sl] >= remote_radii[sr]))
         split_r = refine & (~r_leaf) & (l_leaf | (remote_radii[sr] > local_radii[sl]))
         both = split_l & split_r
@@ -829,9 +921,11 @@ def dual_tree_walk_cross_mutual(
             jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE),
             far_l,
             far_r,
+            far_o,
             far_n,
             near_l,
             near_r,
+            near_o,
             near_n,
             of_far | ofl,
             of_near | ofn,
@@ -844,9 +938,11 @@ def dual_tree_walk_cross_mutual(
         _sz,
         far_l,
         far_r,
+        far_o,
         far_n,
         near_l,
         near_r,
+        near_o,
         near_n,
         of_far,
         of_near,
@@ -855,9 +951,11 @@ def dual_tree_walk_cross_mutual(
     return CrossMutualWalkResult(
         far_local=far_l,
         far_remote=far_r,
+        far_owner=far_o,
         far_count=far_n,
         near_local=near_l,
         near_remote=near_r,
+        near_owner=near_o,
         near_count=near_n,
         far_overflow=of_far,
         near_overflow=of_near,
@@ -867,6 +965,7 @@ def dual_tree_walk_cross_mutual(
 
 __all__ = [
     "CrossMutualWalkResult",
+    "single_owner_domain",
     "cross_pair_is_owned",
     "cross_pair_owner",
     "dual_tree_walk_cross",

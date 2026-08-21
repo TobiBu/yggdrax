@@ -57,7 +57,18 @@ def _random_tree(n_leaves: int, seed: int, offset):
 CAPS = dict(max_pair_queue=8192, far_cap=16384, near_cap=16384)
 
 
-def _walk(a, b, this_dev, src_dev, theta=0.35, **caps):
+def _all_owned_by(tree, dev):
+    """Tag every node of ``tree`` with one owning domain.
+
+    The simple boundary case. A real remote tree merges several domains and its
+    internal nodes straddle; that is covered by
+    `test_straddling_nodes_are_never_accepted`.
+    """
+    total = tree[0].shape[0]
+    return jnp.full((total,), dev, dtype=jnp.int32)
+
+
+def _walk(a, b, this_dev, src_dev, theta=0.35, remote_owner=None, **caps):
     return dual_tree_walk_cross_mutual(
         a[0],
         a[1],
@@ -71,7 +82,9 @@ def _walk(a, b, this_dev, src_dev, theta=0.35, **caps):
         b[4],
         theta,
         this_device=jnp.asarray(this_dev),
-        source_device=jnp.asarray(src_dev),
+        remote_owner=(
+            _all_owned_by(b, src_dev) if remote_owner is None else remote_owner
+        ),
         **(caps or CAPS),
     )
 
@@ -149,3 +162,73 @@ def test_overflow_is_reported_not_truncated():
     assert bool(
         res.far_overflow or res.near_overflow
     ), "undersized caps did not raise an overflow flag"
+
+
+def test_single_owner_domain_marks_straddling_internal_nodes():
+    """A merged remote tree's internal nodes generally span several domains."""
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    # 4 leaves (nodes 3..6) under internals 0..2; leaves belong to domains 7,7,9,9
+    left = jnp.asarray([1, 3, 5, -1, -1, -1, -1], dtype=jnp.int32)
+    right = jnp.asarray([2, 4, 6, -1, -1, -1, -1], dtype=jnp.int32)
+    tag = jnp.asarray([0, 0, 0, 7, 7, 9, 9], dtype=jnp.int32)
+    own = np.asarray(single_owner_domain(left, right, tag, max_depth=8))
+
+    assert own[3] == own[4] == 7, "leaves keep their own tag"
+    assert own[5] == own[6] == 9
+    assert own[1] == 7, "both children in domain 7 -> single owner"
+    assert own[2] == 9
+    assert own[0] == -1, "root spans domains 7 and 9 -> must be marked straddling"
+
+
+def test_straddling_nodes_are_never_accepted_as_far_pairs():
+    """Option 1 of the design: refine a straddling node instead of accepting it.
+
+    An accepted far pair owes a `-f` to the remote endpoint's domain. An internal
+    node aggregating three domains has no single destination, so accepting it would
+    leave the reverse exchange undefined. Refining instead terminates, because coarse
+    leaves each carry exactly one origin domain.
+    """
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (0.9, 0.0, 0.0))
+    total_b = b[0].shape[0]
+    # give b's 8 leaves two different domains, so every internal node straddles
+    tag = np.zeros(total_b, dtype=np.int32)
+    leaves = np.where(np.asarray(b[0]) < 0)[0]
+    tag[leaves[: len(leaves) // 2]] = 3
+    tag[leaves[len(leaves) // 2 :]] = 5
+    owner = single_owner_domain(b[0], b[1], jnp.asarray(tag), max_depth=16)
+    own_np = np.asarray(owner)
+
+    res = _walk(a, b, 0, 0, remote_owner=owner)
+    n = int(res.far_count)
+    accepted_remote = np.asarray(res.far_remote)[:n]
+    assert n > 0, "no far pairs accepted -- test would be vacuous"
+    assert np.all(
+        own_np[accepted_remote] >= 0
+    ), "a straddling remote node was accepted as a far pair"
+    # and the recorded owner matches the node's actual domain, so a reverse
+    # exchange can trust it
+    assert np.array_equal(
+        np.asarray(res.far_owner)[:n], own_np[accepted_remote]
+    ), "far_owner disagrees with the remote node's domain"
+
+
+def test_near_pairs_are_always_single_owner():
+    """Near pairs are leaf-leaf, and a coarse leaf carries exactly one domain."""
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    a = _random_tree(8, 41, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 42, (0.9, 0.0, 0.0))
+    total_b = b[0].shape[0]
+    tag = np.zeros(total_b, dtype=np.int32)
+    leaves = np.where(np.asarray(b[0]) < 0)[0]
+    tag[leaves[::2]] = 2
+    tag[leaves[1::2]] = 6
+    owner = single_owner_domain(b[0], b[1], jnp.asarray(tag), max_depth=16)
+    res = _walk(a, b, 0, 0, remote_owner=owner)
+    m = int(res.near_count)
+    assert m > 0, "no near pairs -- test would be vacuous"
+    assert np.all(np.asarray(res.near_owner)[:m] >= 0)
