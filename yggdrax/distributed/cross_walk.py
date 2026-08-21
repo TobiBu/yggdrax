@@ -26,7 +26,7 @@ interaction/neighbour consumers work unchanged -- with the understanding that
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -501,4 +501,480 @@ dual_tree_walk_cross = partial(
 )(dual_tree_walk_cross_impl)
 
 
-__all__ = ["dual_tree_walk_cross", "dual_tree_walk_cross_impl"]
+# ---------------------------------------------------------------------------
+# Cross-domain canonical ownership
+# ---------------------------------------------------------------------------
+#
+# A mutual (momentum-conserving) FMM evaluates each unordered pair ONCE and
+# applies +f/-f. Within one device the self-walk gets that for free by emitting a
+# canonical `a < b` from a single tree (see `dual_tree_walk_mutual`). Across
+# devices it does not: the cross walk runs on BOTH sides of a boundary -- device p
+# walks its tree against q's imported nodes, and q walks its tree against p's --
+# so both discover the *same* geometric pair. Exactly one of them must emit it.
+#
+# Get this wrong in either direction and the failure is quiet. Emit on both and the
+# pair is double-counted; emit on neither and it is dropped. In BOTH cases every
+# device's local momentum sum still looks perfect, because +f/-f cancel within
+# whatever each device did do -- the error shows up only in the force, at the
+# percent level, and only in a global sum. That is why this predicate is a named,
+# tested function rather than an inline comparison.
+
+
+def cross_pair_owner(
+    device_a: Array,
+    index_a: Array,
+    device_b: Array,
+    index_b: Array,
+) -> Array:
+    """Which device owns the cross-domain pair ``(a, b)``.
+
+    Both endpoints are identified globally by ``(device, local node index)``, which
+    is the ordering the single-device walk did not need: local indices alone are
+    ambiguous across devices, since every device numbers its own nodes from zero.
+
+    The rule is symmetric under swapping ``a`` and ``b`` -- it has to be, because
+    the two devices see the pair in opposite orders and must still agree. It orders
+    the two endpoints by their global key and then picks by the parity of the index
+    sum:
+
+    * ``(index_a + index_b)`` even -> the lower key's device owns it;
+    * odd -> the higher key's device owns it.
+
+    Ordering alone (always "lower key wins") would also be consistent, but it gives
+    every cross pair between two domains to the same device, so with an SFC
+    partition device 0 accumulates a boundary with each of its neighbours while the
+    last device gets almost none. The parity term splits each domain-pair's work
+    roughly 50/50 while staying a pure function of data both sides already have --
+    so it needs no agreement round.
+
+    Parameters
+    ----------
+    device_a:
+        Owning device of the ``a`` endpoint.
+    index_a:
+        Node index of ``a`` within its own device's tree.
+    device_b:
+        Owning device of the ``b`` endpoint.
+    index_b:
+        Node index of ``b`` within its own device's tree.
+
+    Returns
+    -------
+    Array
+        The owning device id, broadcast over the inputs.
+    """
+    a_first = (device_a < device_b) | ((device_a == device_b) & (index_a <= index_b))
+    lo_dev = jnp.where(a_first, device_a, device_b)
+    hi_dev = jnp.where(a_first, device_b, device_a)
+    even = ((index_a + index_b) % 2) == 0
+    return jnp.where(even, lo_dev, hi_dev)
+
+
+def cross_pair_is_owned(
+    this_device: Array,
+    index_local: Array,
+    source_device: Array,
+    index_remote: Array,
+) -> Array:
+    """Whether *this* device should emit the pair, from its own point of view.
+
+    Thin wrapper over :func:`cross_pair_owner` in the argument order a walk
+    actually has them: its own device and local node, and the source device and the
+    remote node. Both sides of a boundary calling this on the same geometric pair
+    get exactly one ``True`` between them.
+
+    Parameters
+    ----------
+    this_device:
+        The device running the walk.
+    index_local:
+        Node index on this device.
+    source_device:
+        Device the remote node came from.
+    index_remote:
+        Node index on the source device.
+
+    Returns
+    -------
+    Array
+        True where this device owns the pair.
+    """
+    return (
+        cross_pair_owner(this_device, index_local, source_device, index_remote)
+        == this_device
+    )
+
+
+def single_owner_domain(
+    left_child_full: Array,
+    right_child_full: Array,
+    tag_domain: Array,
+    *,
+    max_depth: int,
+) -> Array:
+    """Per-node owning domain, or ``-1`` where a node straddles several.
+
+    A merged remote coarse tree (:func:`~yggdrax.distributed.let.build_remote_coarse_tree`)
+    holds *other* domains' frontiers in ONE tree, so its leaves each carry a single
+    origin domain but its internal nodes generally aggregate several. That matters
+    for a mutual force: the ``-f`` half of an accepted far pair has to be sent
+    somewhere, and an internal node spanning three domains has no single somewhere.
+
+    Propagates bottom-up: a leaf owns its own tag; an internal node owns a domain
+    only if both children resolve to the *same* one. Runs a fixed number of rounds
+    rather than a convergence test so it stays a fixed-shape traceable program;
+    ``max_depth`` rounds suffice, since information travels one level per round.
+
+    Leaves are never straddling by construction, which is what makes refinement a
+    terminating strategy: a walk that refuses to accept a straddling node and
+    descends instead always reaches single-owner nodes.
+
+    Parameters
+    ----------
+    left_child_full:
+        ``(total_nodes,)`` left children, -1 for leaves.
+    right_child_full:
+        ``(total_nodes,)`` right children, -1 for leaves.
+    tag_domain:
+        ``(total_nodes,)`` origin domain per node; only leaf entries are read.
+    max_depth:
+        Rounds to propagate, at least the tree depth. Static.
+
+    Returns
+    -------
+    Array
+        ``(total_nodes,)`` owning domain, ``-1`` where the node spans more than one.
+    """
+    is_leaf = left_child_full < 0
+    unknown = as_index(-2)
+    owner = jnp.where(is_leaf, tag_domain.astype(INDEX_DTYPE), unknown)
+
+    def round_fn(_: Array, own: Array) -> Array:
+        # Narrowed for the type checker: `fori_loop` widens the carry to
+        # `Array | tuple[Array, ...]` inside the body, and this carry is one array.
+        own = jnp.asarray(own)
+        lo = own[jnp.maximum(left_child_full, 0)]
+        ro = own[jnp.maximum(right_child_full, 0)]
+        resolved = (lo != unknown) & (ro != unknown)
+        agree = resolved & (lo == ro) & (lo >= as_index(0))
+        internal = jnp.where(resolved, jnp.where(agree, lo, as_index(-1)), unknown)
+        return jnp.where(is_leaf, own, internal)
+
+    # `jnp.asarray`: `fori_loop` is typed as returning the carry's union type,
+    # `Array | tuple[Array, ...]`, so the narrowing is for the type checker rather
+    # than the runtime -- the carry here is a single array.
+    owner = jnp.asarray(lax.fori_loop(0, int(max_depth), round_fn, owner))
+    # Anything still unresolved is treated as straddling: refuse to accept it and
+    # refine instead, which is the safe direction.
+    return jnp.where(owner == unknown, as_index(-1), owner)
+
+
+class CrossMutualWalkResult(NamedTuple):
+    """Flat canonical cross-domain pair lists, one entry per owned pair.
+
+    Mirrors ``MutualWalkResult`` from the single-device walk: flat COO rather than
+    per-target CSR, because a mutual pair belongs to neither endpoint in
+    particular. ``*_local`` indexes this device's tree and ``*_remote`` the source
+    device's, so a consumer knows which side to apply ``+f`` to locally and which
+    side owes a ``-f`` back to ``source_device``.
+    """
+
+    far_local: Array
+    far_remote: Array
+    far_owner: Array
+    far_count: Array
+    near_local: Array
+    near_remote: Array
+    near_owner: Array
+    near_count: Array
+    far_overflow: Array
+    near_overflow: Array
+    queue_overflow: Array
+
+
+def dual_tree_walk_cross_mutual(
+    local_left_child_full: Array,
+    local_right_child_full: Array,
+    local_centers: Array,
+    local_radii: Array,
+    local_root: Array,
+    remote_left_child_full: Array,
+    remote_right_child_full: Array,
+    remote_centers: Array,
+    remote_radii: Array,
+    remote_root: Array,
+    theta: float,
+    *,
+    this_device: Array,
+    remote_owner: Array,
+    max_pair_queue: int,
+    far_cap: int,
+    near_cap: int,
+) -> CrossMutualWalkResult:
+    """Cross-domain dual walk emitting each owned pair ONCE, flat.
+
+    The mutual analogue of :func:`dual_tree_walk_cross_impl`, and a separate
+    function rather than a flag on it: the production cross walk is target-centric
+    and its per-target CSR layout is what the target-centric FMM consumes, so it
+    stays untouched. This differs in three ways that cannot be bolted on.
+
+    **Flat, not CSR.** A mutual pair is not owned by its target -- both endpoints
+    receive force -- so the output is a flat pair list, which is the shape the
+    mutual near and far kernels already take.
+
+    **Filtered by ownership.** Both sides of a boundary run this walk and discover
+    the same geometric pairs, so each emits only what :func:`cross_pair_is_owned`
+    gives it. Without that filter every cross pair is evaluated twice, and the
+    resulting force error is invisible to a per-device momentum check -- see the
+    note above :func:`cross_pair_owner`.
+
+    **Centres and radii are caller-supplied**, not derived by
+    ``_build_mac_extents``, for the same reason the single-device
+    ``dual_tree_walk_mutual`` takes them: the mutual MAC is defined on centres of
+    MASS and exact max centre-of-mass-to-particle radii, recomputed from the live
+    positions on every evaluation, not on the bounding-sphere proxies the
+    target-centric walk selects. Different extents accept a different pair set, so
+    this stays agnostic rather than silently re-baselining accuracy.
+
+    The MAC is ``theta * |c_b - c_a| > r_a + r_b``, strict, and symmetric in the
+    two nodes by construction -- which is what lets one decision serve both
+    directions of the pair.
+
+    Parameters
+    ----------
+    local_left_child_full:
+        ``(total_nodes,)`` left-child indices for this device's tree, **-1 for
+        leaves** (the -1 is what marks a leaf, so no separate mask is needed).
+    local_right_child_full:
+        ``(total_nodes,)`` right children, likewise -1 for leaves.
+    local_centers:
+        ``(total_nodes, 3)`` centres of mass for this device's nodes.
+    local_radii:
+        ``(total_nodes,)`` max centre-of-mass-to-particle radii.
+    local_root:
+        Root index in this device's tree.
+    remote_left_child_full:
+        As above, for the imported source tree.
+    remote_right_child_full:
+        As above, for the imported source tree.
+    remote_centers:
+        As above, for the imported source tree.
+    remote_radii:
+        As above, for the imported source tree.
+    remote_root:
+        Root index in the source tree.
+    theta:
+        Opening angle; acceptance is strict.
+    this_device:
+        Device id running this walk.
+    remote_owner:
+        ``(remote_total_nodes,)`` owning domain per remote node, ``-1`` where the
+        node straddles several -- as produced by :func:`single_owner_domain`. Per
+        NODE, not a single scalar, because the imported remote tree is a MERGE of
+        every other domain's frontier, so different nodes belong to different
+        devices.
+    max_pair_queue:
+        Wavefront capacity in node pairs.
+    far_cap:
+        Output capacity for the far list.
+    near_cap:
+        Output capacity for the near list.
+
+    Returns
+    -------
+    CrossMutualWalkResult
+        Flat owned pair lists plus overflow flags. Overflow is reported, never
+        silently truncated: a dropped cross pair loses both halves, so momentum
+        stays exact and only the force is wrong.
+    """
+    from yggdrax._interactions_impl import _flat_append
+
+    cap = int(max_pair_queue)
+    theta_sq = jnp.asarray(theta, dtype=local_centers.dtype) ** 2
+    wf_indices = jnp.arange(cap, dtype=INDEX_DTYPE)
+
+    init = (
+        jnp.full((cap,), -1, dtype=INDEX_DTYPE).at[0].set(local_root),
+        jnp.full((cap,), -1, dtype=INDEX_DTYPE).at[0].set(remote_root),
+        as_index(1),
+        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
+        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
+        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
+        as_index(0),
+        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
+        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
+        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
+        as_index(0),
+        jnp.asarray(False),
+        jnp.asarray(False),
+        jnp.asarray(False),
+    )
+
+    def cond_fun(state):
+        return state[2] > as_index(0)
+
+    def body_fun(state):
+        (
+            wf_l,
+            wf_r,
+            wf_size,
+            far_l,
+            far_r,
+            far_o,
+            far_n,
+            near_l,
+            near_r,
+            near_o,
+            near_n,
+            of_far,
+            of_near,
+            of_wf,
+        ) = state
+        live = (wf_indices < wf_size) & (wf_l >= 0) & (wf_r >= 0)
+        sl = jnp.asarray(jnp.where(live, wf_l, as_index(0)))
+        sr = jnp.asarray(jnp.where(live, wf_r, as_index(0)))
+
+        delta = remote_centers[sr] - local_centers[sl]
+        dist_sq = jnp.sum(delta * delta, axis=1)
+        radius_sum = local_radii[sl] + remote_radii[sr]
+        mac_ok = live & (theta_sq * dist_sq > radius_sum * radius_sum)
+
+        l_leaf = local_left_child_full[sl] < 0
+        r_leaf = remote_left_child_full[sr] < 0
+        both_leaf = l_leaf & r_leaf
+
+        # A far pair may only be ACCEPTED against a single-owner remote node. An
+        # internal node of the merged remote tree can aggregate several domains, and
+        # the `-f` half of an accepted pair has to be sent somewhere -- a node
+        # spanning three domains has no single somewhere. So a straddling node is
+        # refined instead, which terminates because coarse leaves each carry exactly
+        # one origin domain.
+        r_dom = remote_owner[sr]
+        single_owner = r_dom >= as_index(0)
+        accept_geom = mac_ok & single_owner
+        near_geom = live & (~mac_ok) & both_leaf
+
+        owned = cross_pair_is_owned(this_device, sl, r_dom, sr)
+        emit_far = accept_geom & owned
+        emit_near = near_geom & owned
+        # The remote index and its owning domain are appended together, so the
+        # reverse exchange never has to re-derive a destination from an index.
+        far_l, far_r, far_n_next, ofl = _flat_append(
+            far_l, far_r, far_n, emit_far, sl, sr, far_cap
+        )
+        far_o, _unused_a, _unused_n, _unused_o = _flat_append(
+            far_o, far_o, far_n, emit_far, r_dom, r_dom, far_cap
+        )
+        far_n = far_n_next
+        near_l, near_r, near_n_next, ofn = _flat_append(
+            near_l, near_r, near_n, emit_near, sl, sr, near_cap
+        )
+        near_o, _unused_b, _unused_m, _unused_p = _flat_append(
+            near_o, near_o, near_n, emit_near, r_dom, r_dom, near_cap
+        )
+        near_n = near_n_next
+
+        # Refinement is deliberately NOT filtered by ownership: a pair this device
+        # does not own may still need splitting to reach descendants it does.
+        # Filtering here would prune away owned pairs deeper in the tree.
+        # Refine anything not emitted that still has structure left: the MAC
+        # rejected it, or the MAC accepted it but the remote node straddles domains.
+        refine = live & (~accept_geom) & (~near_geom) & (~both_leaf)
+        split_l = refine & (~l_leaf) & (r_leaf | (local_radii[sl] >= remote_radii[sr]))
+        split_r = refine & (~r_leaf) & (l_leaf | (remote_radii[sr] > local_radii[sl]))
+        both = split_l & split_r
+
+        ll = local_left_child_full[sl]
+        lr = local_right_child_full[sl]
+        rl = remote_left_child_full[sr]
+        rr = remote_right_child_full[sr]
+
+        def _cand(sel, a, b):
+            return jnp.where(sel, a, as_index(-1)), jnp.where(sel, b, as_index(-1))
+
+        cands = [
+            _cand(both, ll, rl),
+            _cand(both, ll, rr),
+            _cand(both, lr, rl),
+            _cand(both, lr, rr),
+            _cand(split_l & (~both), ll, sr),
+            _cand(split_l & (~both), lr, sr),
+            _cand(split_r & (~both), sl, rl),
+            _cand(split_r & (~both), sl, rr),
+        ]
+        cand_l = jnp.concatenate([jnp.asarray(c[0]) for c in cands])
+        cand_r = jnp.concatenate([jnp.asarray(c[1]) for c in cands])
+        push = (cand_l >= 0) & (cand_r >= 0)
+        pos = jnp.cumsum(push.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - push.astype(
+            INDEX_DTYPE
+        )
+        push_ok = push & (pos < as_index(cap))
+        of_wf = of_wf | jnp.any(push & (pos >= as_index(cap)))
+        slot = jnp.where(push_ok, pos, as_index(cap))
+        new_l = (
+            jnp.full((cap,), -1, dtype=INDEX_DTYPE)
+            .at[slot]
+            .set(jnp.where(push_ok, cand_l, as_index(-1)), mode="drop")
+        )
+        new_r = (
+            jnp.full((cap,), -1, dtype=INDEX_DTYPE)
+            .at[slot]
+            .set(jnp.where(push_ok, cand_r, as_index(-1)), mode="drop")
+        )
+        return (
+            new_l,
+            new_r,
+            jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE),
+            far_l,
+            far_r,
+            far_o,
+            far_n,
+            near_l,
+            near_r,
+            near_o,
+            near_n,
+            of_far | ofl,
+            of_near | ofn,
+            of_wf,
+        )
+
+    (
+        _l,
+        _r,
+        _sz,
+        far_l,
+        far_r,
+        far_o,
+        far_n,
+        near_l,
+        near_r,
+        near_o,
+        near_n,
+        of_far,
+        of_near,
+        of_wf,
+    ) = lax.while_loop(cond_fun, body_fun, init)
+    return CrossMutualWalkResult(
+        far_local=far_l,
+        far_remote=far_r,
+        far_owner=far_o,
+        far_count=far_n,
+        near_local=near_l,
+        near_remote=near_r,
+        near_owner=near_o,
+        near_count=near_n,
+        far_overflow=of_far,
+        near_overflow=of_near,
+        queue_overflow=of_wf,
+    )
+
+
+__all__ = [
+    "CrossMutualWalkResult",
+    "single_owner_domain",
+    "cross_pair_is_owned",
+    "cross_pair_owner",
+    "dual_tree_walk_cross",
+    "dual_tree_walk_cross_impl",
+    "dual_tree_walk_cross_mutual",
+]
