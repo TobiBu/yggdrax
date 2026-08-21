@@ -20,6 +20,7 @@ def compute_tree_geometry(
     positions_sorted: Array,
     *,
     max_leaf_size: int | None = None,
+    particle_radius: Array | None = None,
 ) -> TreeGeometry:
     """Compute per-node geometric bounds and helper radii.
 
@@ -40,6 +41,15 @@ def compute_tree_geometry(
         bounds the staging shape used during construction and avoids falling
         back to a ``num_particles``-sized buffer under tracing. Defaults to the
         tree's ``leaf_size`` when available.
+    particle_radius
+        Optional per-particle radius ``(n_particles,)``. Each particle is bounded
+        as a ball of that radius instead of as a point, so every node's box covers
+        what its particles stand for. Pass it whenever the "particles" are proxies
+        for extended objects -- an LET coarse tree's particles are whole remote
+        leaves reduced to their centres of mass, and bounding those points alone
+        understates the source region, which makes the MAC accept pairs that are
+        not actually well separated. Ignored by the Morton bounds shortcut, which
+        is therefore bypassed when this is given.
 
     Returns
     -------
@@ -61,6 +71,7 @@ def compute_tree_geometry(
         topology,
         positions_sorted,
         max_leaf_size=resolved_leaf_cap,
+        particle_radius=particle_radius,
     )
 
 
