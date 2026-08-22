@@ -708,7 +708,7 @@ def dual_tree_walk_cross_mutual(
     this_device: Array,
     remote_owner: Array,
     remote_index_in_owner: Optional[Array] = None,
-    accept_only_remote_leaves: bool = False,
+    accept_only_leaf_pairs: bool = False,
     max_pair_queue: int,
     far_cap: int,
     near_cap: int,
@@ -790,20 +790,22 @@ def dual_tree_walk_cross_mutual(
         NODE, not a single scalar, because the imported remote tree is a MERGE of
         every other domain's frontier, so different nodes belong to different
         devices.
-    accept_only_remote_leaves:
-        Refuse to accept a far pair against an INTERNAL remote node, refining it
-        instead. Set this when the remote tree is a merged LET coarse tree: an
-        accepted pair's ``-f`` half is a local expansion that has to be addressed to a
-        node in its owner's own tree, and only a coarse LEAF corresponds to one such
-        node (it is exactly one frontier leaf). Leave it off when the remote tree IS
-        the source device's own tree, where every node is addressable by its own index
-        and accepting high up prunes more.
+    accept_only_leaf_pairs:
+        Accept a far pair only when BOTH endpoints are leaves, refining anything else.
+        Required whenever the remote tree is a merged LET coarse tree, for two
+        independent reasons -- the remote side needs an address, and the local side
+        needs the ownership filter to be a partition. See the comment at the
+        acceptance site; the local half is the subtle one and it is a correctness
+        requirement, not a tuning choice.
 
-        The pruning this costs is bounded and recoverable: the remote side ends up
-        represented at frontier-leaf granularity, which is the resolution the frontier
-        publishes anyway, and a sender that later wants to accept higher can push its
-        coarse local expansions down to the leaves itself without changing what
-        crosses the wire.
+        Leave it off when the remote tree IS the source device's own tree. There every
+        node is addressable by its own index, both devices see the same node set, and
+        accepting high up prunes more.
+
+        What it costs is pruning, not accuracy: the far list stays
+        ``O(local leaves x remote leaves)`` rather than collapsing to accepted
+        subtrees. The volume win of ``theta > 0`` survives regardless, because a far
+        pair is an M2L against a multipole instead of a particle import.
     remote_index_in_owner:
         ``(remote_total_nodes,)`` each remote node's index **in its owning domain's
         own tree**, which is the only numbering both sides of a boundary agree on.
@@ -897,14 +899,27 @@ def dual_tree_walk_cross_mutual(
         r_dom = remote_owner[sr]
         single_owner = r_dom >= as_index(0)
         accept_geom = mac_ok & single_owner
-        if accept_only_remote_leaves:
-            # Same argument one step further: a single OWNER is not yet a single
-            # ADDRESS. An internal coarse node spans several of its owner's frontier
-            # leaves, so there is no one node in the owner's own tree to send an
-            # accepted pair's local expansion to -- and picking the first would be a
-            # valid-looking wrong answer. Refining instead terminates for exactly the
-            # reason straddling does: coarse leaves are addressable by construction.
-            accept_geom = accept_geom & r_leaf
+        if accept_only_leaf_pairs:
+            # BOTH endpoints, and the two halves of that are different arguments.
+            #
+            # The REMOTE side must be a leaf to have an address: a single OWNER is not
+            # yet a single ADDRESS, because an internal coarse node spans several of
+            # its owner's frontier leaves and an accepted pair's local expansion has
+            # no one node to be sent to.
+            #
+            # The LOCAL side must be a leaf for the ownership filter to mean anything.
+            # Both sides of a boundary run this walk, and each sees the other's tree
+            # only as a frontier of LEAVES -- so a pair naming an internal LOCAL node
+            # is a pair the other device cannot even express, let alone agree about.
+            # The two then decompose the same interaction differently: device A emits
+            # (A_subtree, B_leaf) while device B emits (B_subtree, A_leaf), and the
+            # union of those double-counts part of the interaction and MISSES part of
+            # it. Measured on two well-separated clumps of 32: exactly one quarter
+            # doubled and one quarter absent, which is order-independent (it is a
+            # coverage error, not an approximation error), leaves global momentum
+            # exact (each emitted pair still applies +f/-f), and came out WORSE than
+            # treating each clump as a single point mass.
+            accept_geom = accept_geom & l_leaf & r_leaf
         near_geom = live & (~mac_ok) & both_leaf
 
         # The ownership rule is only a partition if both devices key the pair
