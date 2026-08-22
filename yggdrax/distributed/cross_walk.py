@@ -708,6 +708,7 @@ def dual_tree_walk_cross_mutual(
     this_device: Array,
     remote_owner: Array,
     remote_index_in_owner: Optional[Array] = None,
+    accept_only_remote_leaves: bool = False,
     max_pair_queue: int,
     far_cap: int,
     near_cap: int,
@@ -789,6 +790,20 @@ def dual_tree_walk_cross_mutual(
         NODE, not a single scalar, because the imported remote tree is a MERGE of
         every other domain's frontier, so different nodes belong to different
         devices.
+    accept_only_remote_leaves:
+        Refuse to accept a far pair against an INTERNAL remote node, refining it
+        instead. Set this when the remote tree is a merged LET coarse tree: an
+        accepted pair's ``-f`` half is a local expansion that has to be addressed to a
+        node in its owner's own tree, and only a coarse LEAF corresponds to one such
+        node (it is exactly one frontier leaf). Leave it off when the remote tree IS
+        the source device's own tree, where every node is addressable by its own index
+        and accepting high up prunes more.
+
+        The pruning this costs is bounded and recoverable: the remote side ends up
+        represented at frontier-leaf granularity, which is the resolution the frontier
+        publishes anyway, and a sender that later wants to accept higher can push its
+        coarse local expansions down to the leaves itself without changing what
+        crosses the wire.
     remote_index_in_owner:
         ``(remote_total_nodes,)`` each remote node's index **in its owning domain's
         own tree**, which is the only numbering both sides of a boundary agree on.
@@ -882,6 +897,14 @@ def dual_tree_walk_cross_mutual(
         r_dom = remote_owner[sr]
         single_owner = r_dom >= as_index(0)
         accept_geom = mac_ok & single_owner
+        if accept_only_remote_leaves:
+            # Same argument one step further: a single OWNER is not yet a single
+            # ADDRESS. An internal coarse node spans several of its owner's frontier
+            # leaves, so there is no one node in the owner's own tree to send an
+            # accepted pair's local expansion to -- and picking the first would be a
+            # valid-looking wrong answer. Refining instead terminates for exactly the
+            # reason straddling does: coarse leaves are addressable by construction.
+            accept_geom = accept_geom & r_leaf
         near_geom = live & (~mac_ok) & both_leaf
 
         # The ownership rule is only a partition if both devices key the pair

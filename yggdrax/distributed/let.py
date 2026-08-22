@@ -52,6 +52,21 @@ class CoarseFrontier:
     Morton-code clusters (which breaks a level-truncation antichain). Leaf
     granularity is the natural coarse resolution; it can be coarsened later by a
     leaf-up level cut without changing the force path.
+
+    ``payload`` is an OPAQUE per-leaf row block that rides along unread. It exists
+    because a cross-domain far field needs the remote leaf's MULTIPOLE, not just its
+    mass and centre of mass -- and a multipole is expressed in the caller's basis
+    (jaccpot's real spherical harmonics, ``(num_nodes, sh_size(order))``), which is
+    not something a tree library should know. So the caller computes whatever it
+    needs per node and this carries it across the boundary, permuted into the coarse
+    tree's order alongside the origin tags, which is the part a caller cannot do for
+    itself: only :func:`build_remote_coarse_tree` knows that permutation.
+
+    Deliberately untyped beyond "some rows per leaf": monopole-only callers pass
+    nothing, and a caller wanting expansions to order p pays ``(p+1)**2`` floats per
+    leaf on the frontier ``all_gather`` -- still ``O(N / leaf_size)`` and negligible
+    against the particles, but the caller's choice to make rather than this
+    module's.
     """
 
     mass: Array  # [num_leaves]
@@ -59,6 +74,7 @@ class CoarseFrontier:
     node_range: Array  # [num_leaves, 2] particle range in the local tree
     node_id: Array  # [num_leaves] local node id (-1 = empty/padding leaf)
     radius: Array  # [num_leaves] max |x - com| over the leaf's own particles
+    payload: Optional[Array] = None  # [num_leaves, k] caller's own per-leaf data
 
 
 def _leaf_radii_about(
@@ -120,6 +136,7 @@ def build_coarse_frontier(
     *,
     positions_sorted: Optional[Array] = None,
     max_leaf_size: Optional[int] = None,
+    node_payload: Optional[Array] = None,
 ) -> CoarseFrontier:
     """Frontier = all leaf nodes of ``tree`` (a guaranteed mass-conserving cut).
 
@@ -143,6 +160,10 @@ def build_coarse_frontier(
         Particle positions in the tree's own order. Defaults to
         ``tree.positions_sorted``; one of the two must be available, because the
         radius cannot be recovered from the mass moments.
+    node_payload
+        ``(num_nodes, k)`` opaque per-node rows; the leaf rows are carried on the
+        frontier as ``payload``. ``None`` carries nothing. Never read here -- see
+        :class:`CoarseFrontier`.
     max_leaf_size
         Cap on the per-leaf gather, as for ``compute_tree_geometry``. Defaults to the
         tree's ``leaf_size`` when it exposes a concrete one.
@@ -195,12 +216,14 @@ def build_coarse_frontier(
         max_leaf_size=max_leaf_size,
     )
 
+    f_payload = None if node_payload is None else jnp.asarray(node_payload)[leaf_ids]
     return CoarseFrontier(
         mass=f_mass,
         com=f_com,
         node_range=f_range,
         node_id=f_nodeid,
         radius=f_radius,
+        payload=f_payload,
     )
 
 
@@ -216,6 +239,10 @@ class GlobalCoarseTree:
     tag_range: Array  # [ncoarse, 2] origin particle range
     positions_sorted: Array
     masses_sorted: Array
+    # [ncoarse, k] the frontier's opaque per-leaf rows, in THIS tree's order --
+    # which is the only reason they travel through here rather than the caller
+    # doing its own all_gather. None when the frontier carried none.
+    payload: Optional[Array] = None
 
 
 def gather_global_coarse_tree(
@@ -412,6 +439,11 @@ def build_remote_coarse_tree(
     )
     node_id = jax.lax.all_gather(frontier.node_id, axis_name, tiled=True)
     node_range = jax.lax.all_gather(frontier.node_range, axis_name, tiled=True)
+    payload = (
+        None
+        if frontier.payload is None
+        else jax.lax.all_gather(frontier.payload, axis_name, tiled=True)
+    )
 
     # Compact to the (ndev-1)*n_top remote coarse particles (static size).
     keep = domain != me
@@ -423,6 +455,7 @@ def build_remote_coarse_tree(
     r_domain = domain[idx]
     r_node_id = node_id[idx]
     r_range = node_range[idx]
+    r_payload = None if payload is None else payload[idx]
 
     # Build a Tree wrapper (identical adaptive-radix topology) rather than the
     # raw RadixTree, so jaccpot's Tree-typed stages (e.g. compute_node_multipoles
@@ -454,6 +487,10 @@ def build_remote_coarse_tree(
         tag_range=r_range[pidx],
         positions_sorted=pos_sorted,
         masses_sorted=mass_sorted,
+        # Same `pidx` as the tags, for the same reason: a row has to stay
+        # attached to the coarse particle it describes once the build reorders
+        # them.
+        payload=None if r_payload is None else r_payload[pidx],
     )
 
 
