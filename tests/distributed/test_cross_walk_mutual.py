@@ -76,7 +76,7 @@ def _walk(
     theta=0.35,
     remote_owner=None,
     remote_index_in_owner=None,
-    accept_only_remote_leaves=False,
+    accept_only_leaf_pairs=False,
     **caps,
 ):
     return dual_tree_walk_cross_mutual(
@@ -96,7 +96,7 @@ def _walk(
             _all_owned_by(b, src_dev) if remote_owner is None else remote_owner
         ),
         remote_index_in_owner=remote_index_in_owner,
-        accept_only_remote_leaves=accept_only_remote_leaves,
+        accept_only_leaf_pairs=accept_only_leaf_pairs,
         **(caps or CAPS),
     )
 
@@ -350,46 +350,98 @@ def test_without_the_owner_numbering_the_partition_actually_breaks():
     )
 
 
-def _accepted_remote_nodes(res, tree):
-    """``(accepted remote node indices, which of them are internal)``."""
+def _accepted(res, a_tree, b_tree):
+    """Accepted far pairs, and whether each endpoint is an internal node."""
     n = int(res.far_count)
+    local = np.asarray(res.far_local)[:n]
     remote = np.asarray(res.far_remote)[:n]
-    internal = np.asarray(tree[0])[remote] >= 0  # left_child >= 0 => internal
-    return remote, internal
-
-
-def test_accept_only_remote_leaves_refuses_internal_remote_nodes():
-    """A merged coarse tree's internal nodes have no address in their owner's tree.
-
-    A single OWNER is not yet a single ADDRESS: an internal coarse node spans several
-    of its owner's frontier leaves, so an accepted pair's local expansion has nowhere
-    to be sent. Refining instead terminates for the same reason straddling does.
-    """
-    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
-    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
-    res = _walk(a, b, 0, 1, theta=0.9, accept_only_remote_leaves=True)
-    assert not bool(res.queue_overflow or res.far_overflow or res.near_overflow)
-    remote, internal = _accepted_remote_nodes(res, b)
-    assert remote.size, "no far pairs accepted at all -- test would be vacuous"
-    assert not internal.any(), (
-        f"{int(internal.sum())} of {remote.size} accepted far pairs name an INTERNAL "
-        "remote node, which has no owner-local address"
+    return (
+        local,
+        remote,
+        np.asarray(a_tree[0])[local] >= 0,  # left_child >= 0 => internal
+        np.asarray(b_tree[0])[remote] >= 0,
     )
 
 
-def test_without_the_flag_internal_remote_nodes_are_still_accepted():
+def test_accept_only_leaf_pairs_refuses_internal_nodes_on_both_sides():
+    """Both endpoints, for two independent reasons.
+
+    The REMOTE side needs an address: an internal coarse node spans several of its
+    owner's frontier leaves, so an accepted pair's local expansion has no one node to
+    be sent to.
+
+    The LOCAL side is the subtle half. Each device sees the other's tree only as a
+    frontier of LEAVES, so a pair naming an internal LOCAL node is one the other
+    device cannot express -- and the two then decompose the same interaction
+    differently, double-counting part and missing part. That is a correctness
+    requirement, not a tuning choice, which is why this asserts both sides.
+    """
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, theta=0.9, accept_only_leaf_pairs=True)
+    assert not bool(res.queue_overflow or res.far_overflow or res.near_overflow)
+    local, remote, li, ri = _accepted(res, a, b)
+    assert local.size, "no far pairs accepted at all -- test would be vacuous"
+    assert not ri.any(), (
+        f"{int(ri.sum())} of {remote.size} accepted pairs name an INTERNAL remote "
+        "node, which has no owner-local address"
+    )
+    assert not li.any(), (
+        f"{int(li.sum())} of {local.size} accepted pairs name an INTERNAL local node, "
+        "which the other device cannot express -- so the two disagree about coverage"
+    )
+
+
+def test_without_the_flag_internal_nodes_are_still_accepted():
     """Negative control: the flag must actually change the accepted set.
 
-    If the default already refused internal remote nodes, the test above would pass
-    for free and the parameter would be decoration. It also pins the pruning the flag
-    gives up, which is the reason it is opt-in rather than always on.
+    If the default already refused internal nodes, the test above would pass for free
+    and the parameter would be decoration.
     """
     a = _random_tree(8, 31, (0.0, 0.0, 0.0))
     b = _random_tree(8, 32, (1.6, 0.0, 0.0))
     res = _walk(a, b, 0, 1, theta=0.9)
-    remote, internal = _accepted_remote_nodes(res, b)
-    assert remote.size, "no far pairs accepted at all -- test would be vacuous"
-    assert internal.any(), (
-        "the default accepted only leaf remote nodes, so accept_only_remote_leaves "
-        "cannot be shown to restrict anything"
+    local, remote, li, ri = _accepted(res, a, b)
+    assert local.size, "no far pairs accepted at all -- test would be vacuous"
+    assert li.any() or ri.any(), (
+        "the default accepted only leaf-leaf pairs, so accept_only_leaf_pairs cannot "
+        "be shown to restrict anything"
+    )
+
+
+def test_leaf_pair_acceptance_is_a_partition_across_the_boundary():
+    """The property the local-leaf half exists for: agreed coverage.
+
+    Both devices run the walk and must between them claim every accepted interaction
+    exactly once. With internal LOCAL nodes allowed, device A emits (A_subtree,
+    B_leaf) while device B emits (B_subtree, A_leaf) -- different decompositions of
+    the same interaction, so part is claimed twice and part not at all. Restricted to
+    leaf pairs, the two see identical pairs and the ownership filter partitions them.
+    """
+    a = _random_tree(8, 41, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 42, (1.7, 0.1, 0.0))
+    r0 = _walk(a, b, 0, 1, theta=0.9, accept_only_leaf_pairs=True)
+    r1 = _walk(b, a, 1, 0, theta=0.9, accept_only_leaf_pairs=True)
+    n0, n1 = int(r0.far_count), int(r1.far_count)
+    s0 = set(
+        zip(
+            np.asarray(r0.far_local)[:n0].tolist(),
+            np.asarray(r0.far_remote)[:n0].tolist(),
+        )
+    )
+    # device 1 names the same pair (a-node, b-node) with the roles swapped
+    s1 = set(
+        zip(
+            np.asarray(r1.far_remote)[:n1].tolist(),
+            np.asarray(r1.far_local)[:n1].tolist(),
+        )
+    )
+    ref_far, _ref_near = _sets(
+        _walk(a, b, 0, 0, theta=0.9, accept_only_leaf_pairs=True), swap=False
+    )
+    assert ref_far, "no far pairs at all -- test would be vacuous"
+    assert not (s0 & s1), f"{len(s0 & s1)} far pairs claimed by BOTH devices"
+    assert s0 | s1 == ref_far, (
+        f"coverage gap: missing {len(ref_far - (s0 | s1))}, "
+        f"extra {len((s0 | s1) - ref_far)}"
     )
