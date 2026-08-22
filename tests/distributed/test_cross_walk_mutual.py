@@ -76,6 +76,7 @@ def _walk(
     theta=0.35,
     remote_owner=None,
     remote_index_in_owner=None,
+    accept_only_remote_leaves=False,
     **caps,
 ):
     return dual_tree_walk_cross_mutual(
@@ -95,6 +96,7 @@ def _walk(
             _all_owned_by(b, src_dev) if remote_owner is None else remote_owner
         ),
         remote_index_in_owner=remote_index_in_owner,
+        accept_only_remote_leaves=accept_only_remote_leaves,
         **(caps or CAPS),
     )
 
@@ -345,4 +347,49 @@ def test_without_the_owner_numbering_the_partition_actually_breaks():
     assert duplicated or dropped, (
         "the default numbering partitioned a relabelled remote tree, so the "
         "renumbering hazard this parameter exists for is not reproduced here"
+    )
+
+
+def _accepted_remote_nodes(res, tree):
+    """``(accepted remote node indices, which of them are internal)``."""
+    n = int(res.far_count)
+    remote = np.asarray(res.far_remote)[:n]
+    internal = np.asarray(tree[0])[remote] >= 0  # left_child >= 0 => internal
+    return remote, internal
+
+
+def test_accept_only_remote_leaves_refuses_internal_remote_nodes():
+    """A merged coarse tree's internal nodes have no address in their owner's tree.
+
+    A single OWNER is not yet a single ADDRESS: an internal coarse node spans several
+    of its owner's frontier leaves, so an accepted pair's local expansion has nowhere
+    to be sent. Refining instead terminates for the same reason straddling does.
+    """
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, theta=0.9, accept_only_remote_leaves=True)
+    assert not bool(res.queue_overflow or res.far_overflow or res.near_overflow)
+    remote, internal = _accepted_remote_nodes(res, b)
+    assert remote.size, "no far pairs accepted at all -- test would be vacuous"
+    assert not internal.any(), (
+        f"{int(internal.sum())} of {remote.size} accepted far pairs name an INTERNAL "
+        "remote node, which has no owner-local address"
+    )
+
+
+def test_without_the_flag_internal_remote_nodes_are_still_accepted():
+    """Negative control: the flag must actually change the accepted set.
+
+    If the default already refused internal remote nodes, the test above would pass
+    for free and the parameter would be decoration. It also pins the pruning the flag
+    gives up, which is the reason it is opt-in rather than always on.
+    """
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, theta=0.9)
+    remote, internal = _accepted_remote_nodes(res, b)
+    assert remote.size, "no far pairs accepted at all -- test would be vacuous"
+    assert internal.any(), (
+        "the default accepted only leaf remote nodes, so accept_only_remote_leaves "
+        "cannot be shown to restrict anything"
     )
