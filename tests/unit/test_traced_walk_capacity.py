@@ -35,7 +35,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from yggdrax._interactions_impl import _DUAL_TREE_QUEUE_CACHE
+from yggdrax._interactions_impl import (
+    _DUAL_TREE_QUEUE_CACHE,
+    _traced_wavefront_capacity,
+)
 from yggdrax.geometry import compute_tree_geometry
 from yggdrax.interactions import (
     DualTreeTraversalConfig,
@@ -226,3 +229,57 @@ def test_the_traced_capacity_ignores_the_ladder_cache(disc_tree, monkeypatch):
     assert (
         warm == cold
     ), f"a warm ladder cache changed the traced result: {warm} against {cold}"
+
+
+def test_the_tree_bound_is_the_number_of_distinct_pairs_it_can_hold():
+    """The wavefront can never hold more pairs than the tree has, so cap it there.
+
+    Honouring ``max_pair_queue`` is correct but not free: the wavefront loop
+    evaluates the full capacity-length array every round and its round count is
+    O(tree depth), so per-round work is linear in the capacity whether or not the
+    pairs are live. A caller that asks for 32768 on a 15-node tree pays 28.8x for
+    an identical answer.
+
+    It cannot need it. Refinement canonicalises every child through
+    ``_sorted_pair``, so pairs are unordered, and the branch that produces them is
+    a priority ``where`` chain -- exactly one of split-both / split-target /
+    split-source applies per pair. A child ``(a, b)`` therefore has at most one
+    parent route (the three candidate parents differ, and all three descend from
+    ``(parent(a), parent(b))``, which takes exactly one of the exclusive
+    branches), so no pair is ever enqueued twice and the whole walk visits at most
+    ``n * (n + 1) / 2`` distinct pairs.
+    """
+    assert _traced_wavefront_capacity(1 << 15, 15) == 120  # 15 * 16 / 2
+    assert _traced_wavefront_capacity(1 << 15, 31) == 496
+
+    # Above the bound the caller's number is what stands -- the cap only ever
+    # removes capacity the tree provably cannot use.
+    assert _traced_wavefront_capacity(1 << 15, 4095) == 1 << 15
+    assert _traced_wavefront_capacity(1 << 19, 4095) == 1 << 19
+
+    # Never below the four slots the walk's own stack initialisation needs.
+    assert _traced_wavefront_capacity(1 << 15, 1) >= 4
+
+
+def test_the_tree_bound_does_not_truncate_any_tree(disc_tree):
+    """The empirical guard on the argument above.
+
+    If the distinctness reasoning is wrong anywhere, it shows up here as a set
+    overflow flag or a changed pair count rather than as a silent capacity
+    shortfall in production.
+    """
+    topology, geometry, num_leaves = disc_tree
+    total_nodes = int(topology.parent.shape[0])
+    bound = _traced_wavefront_capacity(1 << 22, total_nodes)
+
+    generous = _walk(topology, geometry, jit=True, max_pair_queue=1 << 22)
+    bounded = _walk(topology, geometry, jit=True, max_pair_queue=bound)
+
+    assert num_leaves >= 256, "vacuous on a tree this small"
+    assert not bounded["queue_overflow"], (
+        f"the tree bound ({bound}) overflowed on a {total_nodes}-node tree, so "
+        "the distinctness argument behind it does not hold"
+    )
+    assert (
+        bounded == generous
+    ), f"the tree bound changed the answer: {bounded} against {generous}"

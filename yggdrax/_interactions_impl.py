@@ -323,6 +323,47 @@ def _walk_inputs_are_traced(node_parent: object, node_center: object) -> bool:
     )
 
 
+def _traced_wavefront_capacity(authorised: int, total_nodes: int) -> int:
+    """Clamp a traced wavefront capacity to what the tree can actually hold.
+
+    Honouring the caller's ``max_pair_queue`` on the traced path is correct, but it
+    is not free: :func:`_dual_tree_walk_impl` is a *wavefront* traversal, so each
+    round evaluates the full capacity-length array (masked by
+    ``wf_indices < wf_size``) and the round count is O(tree depth). Per-round work
+    is therefore linear in the capacity whether or not the pairs are live, and a
+    caller asking for 32768 on a 15-node tree pays ~29x for an identical answer.
+
+    It cannot need it. Refinement canonicalises every child through
+    ``_sorted_pair``, so pairs are unordered, and the branch that produces them is a
+    priority ``where`` chain: exactly one of split-both / split-target /
+    split-source applies to a given pair. A child ``(a, b)`` therefore has at most
+    one parent route -- its three candidate parents all descend from
+    ``(parent(a), parent(b))``, which takes exactly one of those exclusive branches
+    -- so no pair is ever enqueued twice and the entire walk visits at most
+    ``n * (n + 1) / 2`` distinct pairs. The wavefront is a subset of those.
+
+    This only ever removes capacity the tree provably cannot use; above the bound
+    the caller's number stands unchanged.
+
+    Parameters
+    ----------
+    authorised
+        Capacity the caller asked for.
+    total_nodes
+        Number of nodes in the tree being traversed.
+
+    Returns
+    -------
+    int
+        ``min(authorised, n * (n + 1) / 2)``, floored at the four slots the walk's
+        stack initialisation needs.
+    """
+
+    nodes = max(1, int(total_nodes))
+    distinct_pairs = nodes * (nodes + 1) // 2
+    return max(4, min(int(authorised), distinct_pairs))
+
+
 def _queue_candidates_bounded(
     *,
     max_capacity: int,
@@ -4040,11 +4081,15 @@ def _run_dual_tree_walk_raw(
         # ``bench/distributed_ceiling_sweep.py`` in the jaccpot repo, whose
         # distributed driver is the traced caller this matters to.
         #
+        # Clamped to what the tree can hold, which is free of any guess: see
+        # _traced_wavefront_capacity. Honouring a capacity is correct; allocating
+        # and iterating one the tree provably cannot fill is not.
+        #
         # The overflow flags still travel out in the returned result, so a caller
         # that *can* retry keeps its retry -- and now grows a knob that has an
         # effect. Eager execution is untouched: there the flags are concrete and
         # the ladder does its job.
-        queue_candidates = [int(authorised_queue)]
+        queue_candidates = [_traced_wavefront_capacity(authorised_queue, total_nodes)]
 
     # If the user did not supply capacities (and no traversal_config override),
     # run a jitted count-only traversal to determine per-node and per-leaf
