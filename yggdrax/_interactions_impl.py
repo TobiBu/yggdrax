@@ -293,6 +293,36 @@ def _store_cached_queue_capacity(cache_key: tuple, queue_capacity: int) -> None:
         _DUAL_TREE_QUEUE_CACHE.popitem(last=False)
 
 
+def _walk_inputs_are_traced(node_parent: object, node_center: object) -> bool:
+    """Whether the dual-tree walk is running inside an outer trace.
+
+    Under ``jax.jit`` or ``shard_map`` the walk's overflow flags come back as
+    tracers, so nothing on the host can read them: the capacity-retry ladder has
+    exactly one attempt and no way to check whether it sufficed. The topology and
+    the geometry are the walk's only array inputs, so if either is traced the flags
+    will be too.
+
+    Takes the two arrays rather than their containers so that it adds no attribute
+    access of its own -- the caller has already resolved both.
+
+    Parameters
+    ----------
+    node_parent
+        The topology's per-node parent array.
+    node_center
+        The geometry's per-node centre array.
+
+    Returns
+    -------
+    bool
+        ``True`` when the walk's outputs will be tracers.
+    """
+
+    return isinstance(node_parent, jax_core.Tracer) or isinstance(
+        node_center, jax_core.Tracer
+    )
+
+
 def _queue_candidates_bounded(
     *,
     max_capacity: int,
@@ -3882,6 +3912,10 @@ def _run_dual_tree_walk_raw(
     nodes_by_level = get_nodes_by_level(tree)
 
     config = _resolve_dual_tree_config(traversal_config)
+    # ``getattr`` rather than plain attribute access: this function already inspects
+    # the topology dynamically (the ``hasattr`` probes above) because it accepts
+    # radix, kd and octree containers with no common static type.
+    traced_walk = _walk_inputs_are_traced(getattr(tree, "parent"), geometry.center)
 
     # Route all public entry calls through explicit dispatch helpers. Octree
     # gets its own seam now; radix and kd continue through the legacy binary
@@ -3936,7 +3970,11 @@ def _run_dual_tree_walk_raw(
             bool(collect_near),
             str(mac_type),
         )
-        cached_q = _get_cached_queue_capacity(queue_cache_key)
+        # Not on the traced path: see the ladder collapse below. A capacity the
+        # walk cannot verify must not also depend on what ran eagerly earlier in
+        # the process, or the same jitted callable compiles to different
+        # wavefront shapes from one run to the next.
+        cached_q = None if traced_walk else _get_cached_queue_capacity(queue_cache_key)
         if cached_q is not None:
             queue_candidates = [int(cached_q)]
         else:
@@ -3956,6 +3994,10 @@ def _run_dual_tree_walk_raw(
             for cap in queue_candidates
             if not (int(cap) in seen_queue_caps or seen_queue_caps.add(int(cap)))
         ]
+        # What the caller authorised, for the traced path below: the config field
+        # itself, not the ladder's tail (which the auto candidates can push past
+        # it).
+        authorised_queue = queue_max
     else:
         queue_cache_key = None
         user_supplied_queue = max_pair_queue is not None
@@ -3980,6 +4022,29 @@ def _run_dual_tree_walk_raw(
             num_leaves=(total_nodes - num_internal),
         )
         process_override = None
+        # An explicit ``max_pair_queue`` is a single-element ladder already; with
+        # neither that nor a config the caller authorised the documented default,
+        # which is the conservative tail of the auto ladder.
+        authorised_queue = queue_candidates[-1]
+
+    if traced_walk:
+        # One attempt, so spend it on the largest capacity the caller authorised
+        # rather than the smallest the ladder would have started from.
+        #
+        # The ladder's first rung is ``max(1024, process_block * 16)``, so before
+        # this the traced wavefront was sized from ``process_block`` -- a
+        # vectorisation width -- and ``max_pair_queue`` was never reached at all.
+        # On a 256-leaf disc that returned 204 near pairs against the eager
+        # ladder's 43 854, unchanged across four decades of ``max_pair_queue``;
+        # at 2048 leaves, 36 against 1 117 432. See
+        # ``bench/distributed_ceiling_sweep.py`` in the jaccpot repo, whose
+        # distributed driver is the traced caller this matters to.
+        #
+        # The overflow flags still travel out in the returned result, so a caller
+        # that *can* retry keeps its retry -- and now grows a knob that has an
+        # effect. Eager execution is untouched: there the flags are concrete and
+        # the ladder does its job.
+        queue_candidates = [int(authorised_queue)]
 
     # If the user did not supply capacities (and no traversal_config override),
     # run a jitted count-only traversal to determine per-node and per-leaf
@@ -3996,10 +4061,7 @@ def _run_dual_tree_walk_raw(
         # ints for host-side buffer sizing. Under an outer jit those counts are
         # traced, so fall back to the existing static candidate capacities
         # instead of forcing concretization.
-        traced_count_pass = isinstance(tree.parent, jax_core.Tracer) or isinstance(
-            geometry.center, jax_core.Tracer
-        )
-        if traced_count_pass:
+        if traced_walk:
             use_count_pass = False
 
     _traversal_diag(
@@ -4336,6 +4398,14 @@ def _run_dual_tree_walk_raw(
                 if isinstance(overflow_queue, jax_core.Tracer) or isinstance(
                     overflow_far, jax_core.Tracer
                 ):
+                    # Traced: these flags cannot be read here, so there is no
+                    # retry to make and ``queue_candidates`` was collapsed to the
+                    # caller's capacity above. ``success`` means "stop iterating",
+                    # not "the walk fitted" -- what fitted is only knowable from
+                    # the flags, which travel out untouched in ``result`` for the
+                    # caller to reduce. It gates the eager-only ``_raise_if_true``
+                    # calls below, which on a traced flag would install a
+                    # ``jax.debug.callback`` on every traversal.
                     success = True
                     break
 
