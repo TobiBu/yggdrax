@@ -623,6 +623,14 @@ class HaloImport:
     source names one via its node range) to its halo block index ``h`` (or -1) --
     the link the combined near-field P2P uses to point a local target leaf at its
     imported halo particles.
+
+    ``payload`` is the caller's own per-PARTICLE data for the same rows, or ``None``
+    when none was passed. It is the per-particle counterpart of
+    :attr:`CoarseFrontier.payload` and rides the same round-B exchange as the
+    positions, so it is sized by the halo rather than by the system -- which is why
+    it is here and not on the frontier. The frontier is ``all_gather``-ed, so
+    publishing ``leaf_size`` columns there would ship every remote particle's value
+    to every device, i.e. ``O(N_total)``, defeating the demand-driven import.
     """
 
     positions: Array  # [max_req_leaves * leaf_size, 3]
@@ -633,6 +641,7 @@ class HaloImport:
     needed_mass: Array  # scalar: total mass of the requested remote leaves
     imported_mass: Array  # scalar: total mass actually received (== needed_mass)
     request_overflow: Array  # scalar bool
+    payload: Optional[Array] = None  # [max_req_leaves * leaf_size, k] caller's own
 
 
 def import_near_halo(
@@ -645,6 +654,7 @@ def import_near_halo(
     leaf_size: int,
     max_req_leaves: int,
     max_recv_leaves: int,
+    payload_sorted: Optional[Array] = None,
     axis_name: str = AXIS_NAME,
 ) -> HaloImport:
     """Two-round ragged import of the remote near-field particles.
@@ -654,6 +664,17 @@ def import_near_halo(
     leaves' actual particles. The importer never over-imports (each leaf sends
     exactly its ``count`` particles), so a halo particle is never also covered
     by a far M2L node -- no double counting.
+
+    ``payload_sorted`` is an optional ``(n_local, k)`` block of the caller's own
+    per-particle data, in the same tree order as ``positions_sorted``. It rides
+    round B in the same buffer as the positions and masses -- no extra collective --
+    and comes back on :attr:`HaloImport.payload`, row for row with
+    ``positions``/``gid``. ``None`` carries nothing and costs nothing.
+
+    A per-particle quantity has to travel this way rather than on the frontier: the
+    frontier is ``all_gather``-ed, so ``leaf_size`` columns published there would
+    ship every remote particle's value to every device. Anything defined per
+    *leaf* -- a multipole, an extent -- belongs on the frontier instead.
     """
 
     me = jax.lax.axis_index(axis_name)
@@ -718,8 +739,23 @@ def import_near_halo(
     resp_mass = jnp.where(in_leaf, masses_sorted[safe_idx], 0.0)
     resp_gid = jnp.where(in_leaf, me * as_index(_GID_STRIDE) + safe_idx, as_index(-1))
     R = max_recv_leaves
-    resp_posm = jnp.concatenate([resp_pos, resp_mass[..., None]], axis=-1).reshape(
-        (R * leaf_size, 4)
+    # The payload joins the position/mass buffer rather than getting an exchange of
+    # its own: same rows, same sizes, same ordering, so it cannot drift out of step
+    # with the particles it describes -- and one fewer collective.
+    resp_cols = [resp_pos, resp_mass[..., None]]
+    n_payload = 0
+    if payload_sorted is not None:
+        pay = jnp.asarray(payload_sorted, dtype=resp_pos.dtype)
+        if pay.ndim != 2 or pay.shape[0] != positions_sorted.shape[0]:
+            raise ValueError(
+                "payload_sorted must be (n_local, k) in the same order as "
+                f"positions_sorted ({positions_sorted.shape[0]} rows); got "
+                f"{tuple(pay.shape)}"
+            )
+        n_payload = int(pay.shape[1])
+        resp_cols.append(jnp.where(in_leaf[..., None], pay[safe_idx], 0.0))
+    resp_posm = jnp.concatenate(resp_cols, axis=-1).reshape(
+        (R * leaf_size, 4 + n_payload)
     )
     resp_gid = resp_gid.reshape((R * leaf_size, 1))
     send_sizes_b = (recv_sizes_a * as_index(leaf_size)).astype(_COUNT_DTYPE)
@@ -738,6 +774,7 @@ def import_near_halo(
     )
     halo_pos = halo_posm[:, :3]
     halo_mass = halo_posm[:, 3]
+    halo_payload = None if payload_sorted is None else halo_posm[:, 4:]
     halo_gid = halo_gid[:, 0]
     halo_valid = halo_gid >= 0
 
@@ -752,6 +789,7 @@ def import_near_halo(
         needed_mass=needed_mass,
         imported_mass=imported_mass,
         request_overflow=request_overflow,
+        payload=halo_payload,
     )
 
 
