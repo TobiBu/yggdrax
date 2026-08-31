@@ -26,7 +26,7 @@ interaction/neighbour consumers work unchanged -- with the understanding that
 from __future__ import annotations
 
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -325,8 +325,16 @@ def dual_tree_walk_cross_impl(
 
         valid = (wf_indices < wf_size) & (wf_t >= 0) & (wf_s >= 0)
         vb = valid.astype(jnp.bool_)
-        st_t = jnp.where(valid, wf_t, as_index(0))
-        st_s = jnp.where(valid, wf_s, as_index(0))
+        # `cast`, not a runtime conversion: jax's type stubs declare `jnp.where` as
+        # returning `Array | tuple[Array, ...]` -- the tuple is the one-argument
+        # (nonzero) form -- so the three-argument call here is an `Array` at runtime but
+        # a union to the checker. These two are handed to helpers annotated `Array`, so
+        # the union has to be narrowed somewhere; doing it at the source keeps every
+        # consumer's signature honest instead of widening them to a type they cannot
+        # actually accept. `typing.cast` is the codebase's existing idiom for this (see
+        # `tree.py` and `octree_uvwx.py`).
+        st_t = cast(Array, jnp.where(valid, wf_t, as_index(0)))
+        st_s = cast(Array, jnp.where(valid, wf_s, as_index(0)))
 
         ct = t_centers[st_t]
         cs = s_centers[st_s]
