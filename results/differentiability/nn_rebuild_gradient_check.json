@@ -1,0 +1,1682 @@
+{
+  "benchmark": "nn_rebuild_gradient_check",
+  "series": "density-matched-target/gradient-check",
+  "switch_metric": "morton_ordering",
+  "target_mode": "density-matched",
+  "target_reference_n": 256,
+  "what_this_measures": "Gradient correctness at a single configuration per N, not convergence. (1) autodiff through the rebuild vs autodiff at a frozen ordering -- should be identical, since the ordering is integer-valued and takes zero cotangent. (2) autodiff vs central differences at a PINNED topology -- the correctness gate. (3) the same central difference UNPINNED, which straddles a rebuild boundary and is expected to disagree; that disagreement is the boundary effect and not a gradient bug. A fourth variant freezes the objective's argmin as well as the ordering -- the objective takes a min over 2k candidates, so it carries a second discrete choice whose switching boundaries are dense at large N and which pinning the tree does not pin.",
+  "limitations": {
+    "objective": "Geometric: mean nearest-neighbour spacing driven to a target r*. This is not an inference or likelihood objective, and scaling N does not make it one. Whatever N is reached, the supported claim stays 'gradient descent through a per-step-rebuilt tree converges', not 'high-dimensional inference through rebuilds converges'.",
+    "optimizer": "Plain gradient descent by design -- the experiment is an existence proof, so no adaptive optimizer is substituted to improve the curves. An Adam run would be a separate series, not a point on this one.",
+    "switch_metric": "morton_ordering: the fraction of steps on which the Morton *ordering* changed. That is a permutation-switch rate, one component of a topology. A reordering can occur with no change in which pairs interact, so this rate is >= the rate of interaction-list change. It is an upper-bound-shaped signal and must not be drawn beside an interaction-switch curve (e.g. jaccpot's fig19) as the same quantity; jaccpot/mutual/identity.py separates permutation / tree_shape / leaf_partition / node_ranges / far_pairs / near_pairs precisely because they differ. That facility is deliberately not used here: the dependency edge runs jaccpot -> yggdrax, and yggdrax has no MutualTopology to fingerprint.",
+    "extensive_vs_intensive": "topology_change_fraction counts steps on which the permutation changed AT ALL. That is an extensive indicator: if each particle changes slot with probability p, P(no change) ~ (1-p)^N, so the statistic is driven to 1 by N alone and carries no information about tree stability at scale. Its saturation is a property of the estimator, not of the system. Read slot_change_fraction, leaf_change_fraction and mean_abs_rank_shift_normalized instead -- per-particle rates with a well-defined large-N limit. The extensive field is retained only because the committed N = 256 point and the figure notebook use it.",
+    "budget_scaling": "The objective is a *mean* over particles, so the per-particle gradient measured on this problem scales as N^(-4/3) (1/N from the mean, N^(-1/3) from r*), while the distance each particle must travel scales as N^(-1/3). Progress per step under a fixed learning rate therefore scales as 1/N: a fixed (lr, steps) budget is comparable in *cost* across N but not in *optimizer progress*. A fixed-lr switch-rate curve thus mixes the switch rate with how far along the path each run got, and is not an intrinsic N-dependence of rebuild switching. The n-scaled lr mode (lr proportional to N) holds the descent dynamics N-invariant; it is a separate series, still plain gradient descent.",
+    "not_a_measure_estimate": "These runs measure the frequency of switch events along an optimization path. They do not estimate the measure of the switching set and must not be described as having measured it. The measure-zero statement in docs/differentiability_model.md is a reasoned argument and stays one."
+  },
+  "metadata": {
+    "jax_version": "0.10.2",
+    "backend": "gpu",
+    "device_kind": "NVIDIA A100-PCIE-40GB",
+    "device_platform": "gpu",
+    "compute_capability": "8.0",
+    "x64_enabled": true,
+    "git_commit": "5b8c318",
+    "timestamp_utc": "2026-09-02T18:16:53Z",
+    "hostname": "compgpu10",
+    "cuda_visible_devices": "7",
+    "gpu_contention_at_start": {
+      "gpu_index": "7",
+      "memory_used_mib": 0,
+      "memory_total_mib": 40960,
+      "utilization_pct": 0,
+      "compute_process_count": 0
+    },
+    "gpu_contention_at_end": {
+      "gpu_index": "7",
+      "memory_used_mib": 34817,
+      "memory_total_mib": 40960,
+      "utilization_pct": 0,
+      "compute_process_count": 1
+    },
+    "xla_memory_env": {
+      "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
+      "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.85",
+      "XLA_PYTHON_CLIENT_ALLOCATOR": null
+    },
+    "wall_clock_s": 279.2796425530687
+  },
+  "records": [
+    {
+      "num_particles": 256,
+      "free_parameters": 768,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.12,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.004284401424229145,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.034422073513269424,
+        "autodiff_rebuilt": 0.034422073513269424
+      },
+      "best_pinned": {
+        "eps": 0.0001,
+        "rel_err_pinned": 1.1363507232872354e-05,
+        "rel_err_rebuilt": 1.1363507232872354e-05,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.0078125
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 1.1363507232872354e-05,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 0.025203265249729156,
+          "fd_pinned_full": 0.0336742028594017,
+          "fd_rebuilt": 0.1014697402715683,
+          "rel_err_pinned": 0.26781676182251174,
+          "rel_err_pinned_full": 0.021726484709859897,
+          "rel_err_rebuilt": 1.9478102251002558,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.890625
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 0.03384612128138542,
+          "fd_pinned_full": 0.034405846148729324,
+          "fd_rebuilt": 0.06004050001502037,
+          "rel_err_pinned": 0.016732060945194888,
+          "rel_err_pinned_full": 0.00047142321434659023,
+          "rel_err_rebuilt": 0.7442441400828237,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.57421875
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.034421682357788086,
+          "fd_pinned_full": 0.034421682357788086,
+          "fd_rebuilt": 0.034421682357788086,
+          "rel_err_pinned": 1.1363507232872354e-05,
+          "rel_err_pinned_full": 1.1363507232872354e-05,
+          "rel_err_rebuilt": 1.1363507232872354e-05,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.0078125
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.03455206751823425,
+          "fd_pinned_full": 0.03455206751823425,
+          "fd_rebuilt": 0.03455206751823425,
+          "rel_err_pinned": 0.0037764722370579123,
+          "rel_err_pinned_full": 0.0037764722370579123,
+          "rel_err_rebuilt": 0.0037764722370579123,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        }
+      ],
+      "wall_clock_s": 7.631630855612457,
+      "memory": {
+        "device_bytes_in_use": 31488,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2109865984,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 256,
+      "free_parameters": 768,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.12,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.004284401590275645,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.020432329257142532,
+        "autodiff_rebuilt": 0.020432329257142532
+      },
+      "best_pinned": {
+        "eps": 1e-06,
+        "rel_err_pinned": 1.5992225256480963e-10,
+        "rel_err_rebuilt": 1.5992225256480963e-10,
+        "stencil_crossed_a_rebuild": false,
+        "stencil_slot_change_fraction": 0.0
+      },
+      "best_pinned_full": {
+        "eps": 1e-06,
+        "rel_err_pinned_full": 7.502133626960068e-11,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.02043231751659713,
+          "fd_pinned_full": 0.02043231751661448,
+          "fd_rebuilt": 0.02043231751659713,
+          "rel_err_pinned": 5.746063139792523e-07,
+          "rel_err_pinned_full": 5.746054649700893e-07,
+          "rel_err_rebuilt": 5.746063139792523e-07,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.0078125
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.020432329139730143,
+          "fd_pinned_full": 0.020432329139730143,
+          "fd_rebuilt": 0.020432329139730143,
+          "rel_err_pinned": 5.746402544789559e-09,
+          "rel_err_pinned_full": 5.746402544789559e-09,
+          "rel_err_rebuilt": 5.746402544789559e-09,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 0.020432329253874948,
+          "fd_pinned_full": 0.02043232925560967,
+          "fd_rebuilt": 0.020432329253874948,
+          "rel_err_pinned": 1.5992225256480963e-10,
+          "rel_err_pinned_full": 7.502133626960068e-11,
+          "rel_err_rebuilt": 1.5992225256480963e-10,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 0.020432329248670777,
+          "fd_pinned_full": 0.020432329248670777,
+          "fd_rebuilt": 0.020432329248670777,
+          "rel_err_pinned": 4.146250014504365e-10,
+          "rel_err_pinned_full": 4.146250014504365e-10,
+          "rel_err_rebuilt": 4.146250014504365e-10,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        }
+      ],
+      "wall_clock_s": 6.693716094829142,
+      "memory": {
+        "device_bytes_in_use": 46592,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2194800640,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 1024,
+      "free_parameters": 3072,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.07559526299369239,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.0005517646786756814,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.004260409157723188,
+        "autodiff_rebuilt": 0.004260409157723188
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.005373062157953534,
+        "rel_err_rebuilt": 0.005373062157953534,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.001953125
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 0.0006384193344983949,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 0.004164082929491997,
+          "fd_pinned_full": 0.004472630098462105,
+          "fd_rebuilt": -0.011897645890712738,
+          "rel_err_pinned": 0.022609619091765704,
+          "rel_err_pinned_full": 0.04981233794275518,
+          "rel_err_rebuilt": 3.792606402402669,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8876953125
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 0.0036442650016397238,
+          "fd_pinned_full": 0.004272907506674528,
+          "fd_rebuilt": 0.10097189247608185,
+          "rel_err_pinned": 0.14462088810567178,
+          "rel_err_pinned_full": 0.0029336029683165415,
+          "rel_err_rebuilt": 22.70004587306877,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8271484375
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.004158355295658112,
+          "fd_pinned_full": 0.004263129085302353,
+          "fd_rebuilt": 0.0023888424038887024,
+          "rel_err_pinned": 0.02395400495280495,
+          "rel_err_pinned_full": 0.0006384193344983949,
+          "rel_err_rebuilt": 0.4392927262494837,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.0048828125
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.004237517714500427,
+          "fd_pinned_full": 0.004237517714500427,
+          "fd_rebuilt": 0.004237517714500427,
+          "rel_err_pinned": 0.005373062157953534,
+          "rel_err_pinned_full": 0.005373062157953534,
+          "rel_err_rebuilt": 0.005373062157953534,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.001953125
+        }
+      ],
+      "wall_clock_s": 7.059996745549142,
+      "memory": {
+        "device_bytes_in_use": 114432,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2253520896,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 1024,
+      "free_parameters": 3072,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.07559526299369239,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.0005517647030947073,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.0006159258848394862,
+        "autodiff_rebuilt": 0.0006159258848394862
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 4.04926983378575e-09,
+        "rel_err_rebuilt": 4.04926983378575e-09,
+        "stencil_crossed_a_rebuild": false,
+        "stencil_slot_change_fraction": 0.0
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 4.04926983378575e-09,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.0006100673642910753,
+          "fd_pinned_full": 0.0006158757786048352,
+          "fd_rebuilt": -0.2162677101586385,
+          "rel_err_pinned": 0.009511729726925898,
+          "rel_err_pinned_full": 8.135107792075545e-05,
+          "rel_err_rebuilt": 352.12619144915317,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.2333984375
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.0006159253843063262,
+          "fd_pinned_full": 0.0006159253843063262,
+          "fd_rebuilt": 0.017763556749584436,
+          "rel_err_pinned": 8.126516069197375e-07,
+          "rel_err_pinned_full": 8.126516069197375e-07,
+          "rel_err_rebuilt": 27.84041276202204,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.001953125
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 0.0006159258797433509,
+          "fd_pinned_full": 0.0006159258797433509,
+          "fd_rebuilt": 0.0006159258797433509,
+          "rel_err_pinned": 8.273942441340356e-09,
+          "rel_err_pinned_full": 8.273942441340356e-09,
+          "rel_err_rebuilt": 8.273942441340356e-09,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 0.0006159258823454361,
+          "fd_pinned_full": 0.0006159258823454361,
+          "fd_rebuilt": 0.0006159258823454361,
+          "rel_err_pinned": 4.04926983378575e-09,
+          "rel_err_pinned_full": 4.04926983378575e-09,
+          "rel_err_rebuilt": 4.04926983378575e-09,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        }
+      ],
+      "wall_clock_s": 7.170261380262673,
+      "memory": {
+        "device_bytes_in_use": 172544,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2300706816,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 4096,
+      "free_parameters": 12288,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.047622031559045985,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.00011988583719357848,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.0038474993780255318,
+        "autodiff_rebuilt": 0.0038474993780255318
+      },
+      "best_pinned": {
+        "eps": 0.0001,
+        "rel_err_pinned": 0.00726879535130171,
+        "rel_err_rebuilt": 10.753774973548982,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.135009765625
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 7.019716447026194e-06,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 0.0025933142751455307,
+          "fd_pinned_full": 0.003482494503259659,
+          "fd_rebuilt": -0.004046212416142225,
+          "rel_err_pinned": 0.3259740885321797,
+          "rel_err_pinned_full": 0.09486807895292941,
+          "rel_err_rebuilt": 2.0516473216998072,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.930908203125
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 0.00374542991630733,
+          "fd_pinned_full": 0.003822496859356761,
+          "fd_rebuilt": 0.00594090623781085,
+          "rel_err_pinned": 0.026528779264048088,
+          "rel_err_pinned_full": 0.006498381471240585,
+          "rel_err_rebuilt": 0.5440954381283403,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.64599609375
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.00387546606361866,
+          "fd_pinned_full": 0.0038475263863801956,
+          "fd_rebuilt": -0.03752764314413071,
+          "rel_err_pinned": 0.00726879535130171,
+          "rel_err_pinned_full": 7.019716447026194e-06,
+          "rel_err_rebuilt": 10.753774973548982,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.135009765625
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.0037834979593753815,
+          "fd_pinned_full": 0.003841705620288849,
+          "fd_rebuilt": 0.14659017324447632,
+          "rel_err_pinned": 0.016634549446761623,
+          "rel_err_pinned_full": 0.0015058502074810328,
+          "rel_err_rebuilt": 37.10011616420424,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.01904296875
+        }
+      ],
+      "wall_clock_s": 7.514042383059859,
+      "memory": {
+        "device_bytes_in_use": 446208,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2352087040,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 4096,
+      "free_parameters": 12288,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.047622031559045985,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 0.00011988584885913998,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -0.0013499585421418788,
+        "autodiff_rebuilt": -0.0013499585421418788
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 9.23235014974586e-10,
+        "rel_err_rebuilt": 9.23235014974586e-10,
+        "stencil_crossed_a_rebuild": false,
+        "stencil_slot_change_fraction": 0.0
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 9.23235014974586e-10,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": -0.0014312577279536505,
+          "fd_pinned_full": -0.00135040186768692,
+          "fd_rebuilt": 0.011557440231131644,
+          "rel_err_pinned": 0.06022346855391601,
+          "rel_err_pinned_full": 0.0003283993776118223,
+          "rel_err_rebuilt": 9.561329752241363,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.17578125
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -0.0013499629630082594,
+          "fd_pinned_full": -0.0013499629630082594,
+          "fd_rebuilt": -0.025085207671173868,
+          "rel_err_pinned": 3.274816405576596e-06,
+          "rel_err_pinned_full": 3.274816405576596e-06,
+          "rel_err_rebuilt": 17.582205962690555,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.013671875
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": -0.0013499585863226138,
+          "fd_pinned_full": -0.0013499585863226138,
+          "fd_rebuilt": -0.0013499585863226138,
+          "rel_err_pinned": 3.27274754343175e-08,
+          "rel_err_pinned_full": 3.27274754343175e-08,
+          "rel_err_rebuilt": 3.27274754343175e-08,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": -0.0013499585433882078,
+          "fd_pinned_full": -0.0013499585433882078,
+          "fd_rebuilt": -0.0013499585433882078,
+          "rel_err_pinned": 9.23235014974586e-10,
+          "rel_err_pinned_full": 9.23235014974586e-10,
+          "rel_err_rebuilt": 9.23235014974586e-10,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        }
+      ],
+      "wall_clock_s": 7.103640521876514,
+      "memory": {
+        "device_bytes_in_use": 676352,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2394554368,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 16384,
+      "free_parameters": 49152,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.03,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 2.6753079509944655e-05,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -0.0010518197668716311,
+        "autodiff_rebuilt": -0.0010518197668716311
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.0016532258823209092,
+        "rel_err_rebuilt": 69.1212615783642,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.095458984375
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 6.972834611114499e-06,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": -0.0012290081940591335,
+          "fd_pinned_full": -0.0008425849955528975,
+          "fd_rebuilt": -0.00015350524336099625,
+          "rel_err_pinned": 0.16845892496820442,
+          "rel_err_pinned_full": 0.19892644910168308,
+          "rel_err_rebuilt": 0.8540574647902289,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.986572265625
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": -0.001063861302100122,
+          "fd_pinned_full": -0.0010496004251763225,
+          "fd_rebuilt": 0.00037503193016164005,
+          "rel_err_pinned": 0.011448287632305387,
+          "rel_err_pinned_full": 0.00211000188930614,
+          "rel_err_rebuilt": 1.356555316769789,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.85064697265625
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": -0.0011076917871832848,
+          "fd_pinned_full": -0.001051812432706356,
+          "fd_rebuilt": 0.001080334186553955,
+          "rel_err_pinned": 0.05311938610721364,
+          "rel_err_pinned_full": 6.972834611114499e-06,
+          "rel_err_rebuilt": 2.027109606208612,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.54180908203125
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -0.00105355866253376,
+          "fd_pinned_full": -0.00105355866253376,
+          "fd_rebuilt": -0.0737549290060997,
+          "rel_err_pinned": 0.0016532258823209092,
+          "rel_err_pinned_full": 0.0016532258823209092,
+          "rel_err_rebuilt": 69.1212615783642,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.095458984375
+        }
+      ],
+      "wall_clock_s": 7.6915113190189,
+      "memory": {
+        "device_bytes_in_use": 1773312,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2444361728,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 16384,
+      "free_parameters": 49152,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.03,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 2.675307837408614e-05,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.0016366185250430404,
+        "autodiff_rebuilt": 0.0016366185250430404
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 7.416386240012874e-11,
+        "rel_err_rebuilt": 7.416386240012874e-11,
+        "stencil_crossed_a_rebuild": false,
+        "stencil_slot_change_fraction": 0.0
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 7.416386240012874e-11,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.0016328139819735132,
+          "fd_pinned_full": 0.001636481668659557,
+          "fd_rebuilt": 0.005801281854101196,
+          "rel_err_pinned": 0.0023246364447860927,
+          "rel_err_pinned_full": 8.362143125553067e-05,
+          "rel_err_rebuilt": 2.5446756622461133,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.4852294921875
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.0016277560684323925,
+          "fd_pinned_full": 0.0016366171565976998,
+          "fd_rebuilt": -0.0024808508529818377,
+          "rel_err_pinned": 0.005415102221462859,
+          "rel_err_pinned_full": 8.361419106598236e-07,
+          "rel_err_rebuilt": 2.5158394060806537,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.11029052734375
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 0.0016366185112866305,
+          "fd_pinned_full": 0.0016366185112866305,
+          "fd_rebuilt": 0.08869382492142884,
+          "rel_err_pinned": 8.405385644990112e-09,
+          "rel_err_pinned_full": 8.405385644990112e-09,
+          "rel_err_rebuilt": 53.19334045427375,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.0860595703125
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 0.0016366185251644183,
+          "fd_pinned_full": 0.0016366185251644183,
+          "fd_rebuilt": 0.0016366185251644183,
+          "rel_err_pinned": 7.416386240012874e-11,
+          "rel_err_pinned_full": 7.416386240012874e-11,
+          "rel_err_rebuilt": 7.416386240012874e-11,
+          "stencil_crossed_a_rebuild": false,
+          "stencil_slot_change_fraction": 0.0
+        }
+      ],
+      "wall_clock_s": 7.394551840610802,
+      "memory": {
+        "device_bytes_in_use": 2691584,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2495741952,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 65536,
+      "free_parameters": 196608,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.018898815748423097,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 4.051961695950013e-06,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.00022933528816793114,
+        "autodiff_rebuilt": 0.00022933528816793114
+      },
+      "best_pinned": {
+        "eps": 0.0001,
+        "rel_err_pinned": 0.0050888332917401686,
+        "rel_err_rebuilt": 7.323683909460532,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.8920745849609375
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 1.2627062994006078e-05,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 9.415816748514771e-05,
+          "fd_pinned_full": 0.00044325715862214565,
+          "fd_rebuilt": -0.00011697848094627261,
+          "rel_err_pinned": 0.5894300949612244,
+          "rel_err_pinned_full": 0.9327909026262451,
+          "rel_err_rebuilt": 1.510076237637772,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.997894287109375
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 0.00024575271527282894,
+          "fd_pinned_full": 0.00023416940530296415,
+          "fd_rebuilt": -0.00038978757220320404,
+          "rel_err_pinned": 0.07158700798315917,
+          "rel_err_pinned_full": 0.02107881945971272,
+          "rel_err_rebuilt": 2.699640623634778,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.984649658203125
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.00023050233721733093,
+          "fd_pinned_full": 0.00022933818399906158,
+          "fd_rebuilt": -0.0014502438716590405,
+          "rel_err_pinned": 0.0050888332917401686,
+          "rel_err_pinned_full": 1.2627062994006078e-05,
+          "rel_err_rebuilt": 7.323683909460532,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8920745849609375
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.00023865140974521637,
+          "fd_pinned_full": 0.00023137545213103294,
+          "fd_rebuilt": 0.0004030880518257618,
+          "rel_err_pinned": 0.040622276892963306,
+          "rel_err_pinned_full": 0.00889598796329979,
+          "rel_err_rebuilt": 0.7576364067033587,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.598480224609375
+        }
+      ],
+      "wall_clock_s": 7.492253364995122,
+      "memory": {
+        "device_bytes_in_use": 7081984,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2551312384,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 65536,
+      "free_parameters": 196608,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.018898815748423097,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 4.0519619429005296e-06,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.00028998379002599206,
+        "autodiff_rebuilt": 0.00028998379002599206
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 2.501356842640193e-11,
+        "rel_err_rebuilt": 2.501356842640193e-11,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 6.103515625e-05
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 2.501356842640193e-11,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.00027677344800844817,
+          "fd_pinned_full": 0.00028999251940151505,
+          "fd_rebuilt": 0.0011732821590508275,
+          "rel_err_pinned": 0.045555449897250494,
+          "rel_err_pinned_full": 3.010297755682457e-05,
+          "rel_err_rebuilt": 3.0460267070295997,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.883026123046875
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.00028364246870303186,
+          "fd_pinned_full": 0.0002899838732881759,
+          "fd_rebuilt": 0.002579266439136003,
+          "rel_err_pinned": 0.021867847586900652,
+          "rel_err_pinned_full": 2.871270280848477e-07,
+          "rel_err_rebuilt": 7.894519376082421,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.467376708984375
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 0.00028817854154958127,
+          "fd_pinned_full": 0.00028998379088610027,
+          "fd_rebuilt": 0.04140517507127779,
+          "rel_err_pinned": 0.0062253427208775495,
+          "rel_err_pinned_full": 2.9660561665772665e-09,
+          "rel_err_rebuilt": 141.78444690845143,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.44384765625
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 0.00028998379001873853,
+          "fd_pinned_full": 0.00028998379001873853,
+          "fd_rebuilt": 0.00028998379001873853,
+          "rel_err_pinned": 2.501356842640193e-11,
+          "rel_err_pinned_full": 2.501356842640193e-11,
+          "rel_err_rebuilt": 2.501356842640193e-11,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 6.103515625e-05
+        }
+      ],
+      "wall_clock_s": 7.388777697458863,
+      "memory": {
+        "device_bytes_in_use": 10752512,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2586963968,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 262144,
+      "free_parameters": 786432,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.011905507889761496,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 8.021348207876144e-07,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 0.00011295189324300736,
+        "autodiff_rebuilt": 0.00011295189324300736
+      },
+      "best_pinned": {
+        "eps": 0.001,
+        "rel_err_pinned": 0.004508570283799461,
+        "rel_err_rebuilt": 1.3072663342349486,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.9857864379882812
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 0.00103130702866982,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 2.571687218733132e-05,
+          "fd_pinned_full": 8.743954822421074e-05,
+          "fd_rebuilt": -3.8746657082811e-05,
+          "rel_err_pinned": 0.7723201316156478,
+          "rel_err_pinned_full": 0.22586912256449534,
+          "rel_err_rebuilt": 1.3430368094800371,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9995346069335938
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 0.00011244264169363305,
+          "fd_pinned_full": 0.00011478550004540011,
+          "fd_rebuilt": -3.4706314181676134e-05,
+          "rel_err_pinned": 0.004508570283799461,
+          "rel_err_pinned_full": 0.016233519861839643,
+          "rel_err_rebuilt": 1.3072663342349486,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9857864379882812
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 0.0001157604856416583,
+          "fd_pinned_full": 0.00011306838132441044,
+          "fd_rebuilt": -0.000677828211337328,
+          "rel_err_pinned": 0.02486538576744767,
+          "rel_err_pinned_full": 0.00103130702866982,
+          "rel_err_rebuilt": 7.001034527850121,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9536628723144531
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 0.00011423253454267979,
+          "fd_pinned_full": 0.0001127773430198431,
+          "fd_rebuilt": -0.003835884854197502,
+          "rel_err_pinned": 0.011337935672465648,
+          "rel_err_pinned_full": 0.001545350132279137,
+          "rel_err_rebuilt": 34.96034138130725,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.6995735168457031
+        }
+      ],
+      "wall_clock_s": 8.128791733644903,
+      "memory": {
+        "device_bytes_in_use": 28315392,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2661502976,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 262144,
+      "free_parameters": 786432,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.011905507889761496,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 8.021347741000111e-07,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 7.614333223243649e-05,
+        "autodiff_rebuilt": 7.614333223243649e-05
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 0.0013393579774237272,
+        "rel_err_rebuilt": 0.0013393579774237272,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 1.9073486328125e-05
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 1.7007052513065578e-09,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 6.87805274051463e-05,
+          "fd_pinned_full": 7.614320967551337e-05,
+          "fd_rebuilt": 6.345107211430103e-05,
+          "rel_err_pinned": 0.09669664580497152,
+          "rel_err_pinned_full": 1.6095555517002947e-06,
+          "rel_err_rebuilt": 0.16668905531203748,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8950462341308594
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 7.290352376150035e-05,
+          "fd_pinned_full": 7.614336229540058e-05,
+          "fd_rebuilt": 0.0013875082856276632,
+          "rel_err_pinned": 0.042548813874420985,
+          "rel_err_pinned_full": 3.9482070475741876e-07,
+          "rel_err_rebuilt": 17.22232157363603,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.5707130432128906
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 7.585205721990715e-05,
+          "fd_pinned_full": 7.61433325381167e-05,
+          "fd_rebuilt": 0.0014867204001239734,
+          "rel_err_pinned": 0.003825351530980903,
+          "rel_err_pinned_full": 4.014536914085323e-09,
+          "rel_err_rebuilt": 18.525286804963883,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.026763916015625
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 7.604134905298335e-05,
+          "fd_pinned_full": 7.614333236193385e-05,
+          "fd_rebuilt": 7.604134905298335e-05,
+          "rel_err_pinned": 0.0013393579774237272,
+          "rel_err_pinned_full": 1.7007052513065578e-09,
+          "rel_err_rebuilt": 0.0013393579774237272,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 1.9073486328125e-05
+        }
+      ],
+      "wall_clock_s": 8.511626838706434,
+      "memory": {
+        "device_bytes_in_use": 42996224,
+        "device_peak_bytes_in_use": 285311488,
+        "host_max_rss_bytes": 2706518016,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 1048576,
+      "free_parameters": 3145728,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.0075000000000000015,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 1.205409603244334e-07,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -1.948415956576355e-06,
+        "autodiff_rebuilt": -1.948415956576355e-06
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.15978389641815874,
+        "rel_err_rebuilt": 578.601922414445,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.9260149002075195
+      },
+      "best_pinned_full": {
+        "eps": 1e-05,
+        "rel_err_pinned_full": 0.026930793266694862,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": -1.9795697880908847e-05,
+          "fd_pinned_full": -1.487351255491376e-05,
+          "fd_rebuilt": 4.87270881421864e-06,
+          "rel_err_pinned": 9.159893124511624,
+          "rel_err_pinned_full": 6.633643373075555,
+          "rel_err_rebuilt": 3.500856553638929,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9992256164550781
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": -2.8303472845436772e-06,
+          "fd_pinned_full": -2.1173034383537015e-06,
+          "fd_rebuilt": 4.176399306743406e-05,
+          "rel_err_pinned": 0.45264016905148,
+          "rel_err_pinned_full": 0.08667937726916697,
+          "rel_err_rebuilt": 22.4348445086743,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9985761642456055
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": -3.2741809263825417e-07,
+          "fd_pinned_full": -1.8735590856522322e-06,
+          "fd_rebuilt": -3.601599019020796e-06,
+          "rel_err_pinned": 0.8319567792836318,
+          "rel_err_pinned_full": 0.038419348123003905,
+          "rel_err_rebuilt": 0.8484754278800507,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9662942886352539
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -1.6370904631912708e-06,
+          "fd_pinned_full": -2.000888343900442e-06,
+          "fd_rebuilt": 0.0011254088021814823,
+          "rel_err_pinned": 0.15978389641815874,
+          "rel_err_pinned_full": 0.026930793266694862,
+          "rel_err_rebuilt": 578.601922414445,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9260149002075195
+        }
+      ],
+      "wall_clock_s": 8.221106708049774,
+      "memory": {
+        "device_bytes_in_use": 113250304,
+        "device_peak_bytes_in_use": 452990720,
+        "host_max_rss_bytes": 2839146496,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 1048576,
+      "free_parameters": 3145728,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.0075000000000000015,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 1.205409620258333e-07,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -2.7633654963373892e-05,
+        "autodiff_rebuilt": -2.7633654963373892e-05
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 0.0017347754339370474,
+        "rel_err_rebuilt": 31.280444497490453,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.0015020370483398438
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 4.277680754185134e-09,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": -2.4752350112261837e-05,
+          "fd_pinned_full": -2.7570799522887005e-05,
+          "fd_rebuilt": -0.00020524474095504346,
+          "rel_err_pinned": 0.1042679607504322,
+          "rel_err_pinned_full": 0.0022745974273108657,
+          "rel_err_rebuilt": 6.427346879270161,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9727745056152344
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -2.8560003190866904e-05,
+          "fd_pinned_full": -2.763249279998797e-05,
+          "fd_rebuilt": 0.00028616019323557916,
+          "rel_err_pinned": 0.03352246486108368,
+          "rel_err_pinned_full": 4.2056086589424235e-05,
+          "rel_err_rebuilt": 11.355495630775613,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8288784027099609
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": -2.7751409565393006e-05,
+          "fd_pinned_full": -2.7633643650778507e-05,
+          "fd_rebuilt": 0.0001633714665421693,
+          "rel_err_pinned": 0.004261274962547962,
+          "rel_err_pinned_full": 4.0937745658007793e-07,
+          "rel_err_rebuilt": 6.912046986137179,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.15503883361816406
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": -2.7681593149154245e-05,
+          "fd_pinned_full": -2.7633654845165938e-05,
+          "fd_rebuilt": 0.0008367593553812447,
+          "rel_err_pinned": 0.0017347754339370474,
+          "rel_err_pinned_full": 4.277680754185134e-09,
+          "rel_err_rebuilt": 31.280444497490453,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.0015020370483398438
+        }
+      ],
+      "wall_clock_s": 8.824250925332308,
+      "memory": {
+        "device_bytes_in_use": 171971072,
+        "device_peak_bytes_in_use": 661656832,
+        "host_max_rss_bytes": 2873094144,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 4194304,
+      "free_parameters": 12582912,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.004724703937105775,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 3.91719900960652e-08,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -1.5746933058835566e-05,
+        "autodiff_rebuilt": -1.5746933058835566e-05
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.006580594961191955,
+        "rel_err_rebuilt": 3.3333804629981305,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.989018440246582
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 0.000927807518752524,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": -9.990617400035262e-06,
+          "fd_pinned_full": -2.143642632290721e-05,
+          "fd_rebuilt": -8.063216228038073e-06,
+          "rel_err_pinned": 0.36555154183312216,
+          "rel_err_pinned_full": 0.36130802377922616,
+          "rel_err_rebuilt": 0.4879500536446479,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9998986721038818
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": -1.5088516192918178e-05,
+          "fd_pinned_full": -1.5715157132945023e-05,
+          "fd_rebuilt": -8.313690159411635e-06,
+          "rel_err_pinned": 0.04181238743171974,
+          "rel_err_pinned_full": 0.0020179120449561557,
+          "rel_err_rebuilt": 0.4720438495325384,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9975912570953369
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": -1.6698322724550962e-05,
+          "fd_pinned_full": -1.5761543181724846e-05,
+          "fd_rebuilt": -7.554262992925942e-05,
+          "rel_err_pinned": 0.060417457936774166,
+          "rel_err_pinned_full": 0.000927807518752524,
+          "rel_err_rebuilt": 3.797291615262988,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9939019680023193
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -1.5643308870494366e-05,
+          "fd_pinned_full": -1.5643308870494366e-05,
+          "fd_rebuilt": 3.67435859516263e-05,
+          "rel_err_pinned": 0.006580594961191955,
+          "rel_err_pinned_full": 0.006580594961191955,
+          "rel_err_rebuilt": 3.3333804629981305,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.989018440246582
+        }
+      ],
+      "wall_clock_s": 10.816487709060311,
+      "memory": {
+        "device_bytes_in_use": 452988672,
+        "device_peak_bytes_in_use": 2164266496,
+        "host_max_rss_bytes": 3370414080,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 4194304,
+      "free_parameters": 12582912,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.004724703937105775,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 3.917198925913079e-08,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -2.3275751253200406e-06,
+        "autodiff_rebuilt": -2.3275751253200406e-06
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 0.016243842788460156,
+        "rel_err_rebuilt": 315.49892386057974,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.20393061637878418
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 4.0196604983308305e-08,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 2.9440610829406847e-07,
+          "fd_pinned_full": -2.3227752324327144e-06,
+          "fd_rebuilt": -2.4589156236124615e-05,
+          "rel_err_pinned": 1.1264861894644915,
+          "rel_err_pinned_full": 0.002062186021457112,
+          "rel_err_rebuilt": 9.56428038289145,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9979910850524902
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -1.928736506037797e-06,
+          "fd_pinned_full": -2.3286993881333536e-06,
+          "fd_rebuilt": 0.00015617530252227106,
+          "rel_err_pinned": 0.1713537040946867,
+          "rel_err_pinned_full": 0.0004830189157303376,
+          "rel_err_rebuilt": 68.09785683106448,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9454061985015869
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": -2.4466744548336944e-06,
+          "fd_pinned_full": -2.327586436985012e-06,
+          "fd_rebuilt": 0.00016184552096337105,
+          "rel_err_pinned": 0.05116884444160643,
+          "rel_err_pinned_full": 4.859849569737118e-06,
+          "rel_err_rebuilt": 70.53396227806711,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.6952335834503174
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": -2.36538388973407e-06,
+          "fd_pinned_full": -2.3275752188806585e-06,
+          "fd_rebuilt": -0.0007366750223684469,
+          "rel_err_pinned": 0.016243842788460156,
+          "rel_err_pinned_full": 4.0196604983308305e-08,
+          "rel_err_rebuilt": 315.49892386057974,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.20393061637878418
+        }
+      ],
+      "wall_clock_s": 10.704253936186433,
+      "memory": {
+        "device_bytes_in_use": 687870464,
+        "device_peak_bytes_in_use": 4055897600,
+        "host_max_rss_bytes": 3398287360,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 16777216,
+      "free_parameters": 50331648,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.0029763769724403745,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 5.533701497029142e-09,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -1.3915006320530665e-06,
+        "autodiff_rebuilt": -1.3915006320530665e-06
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.01958934028902016,
+        "rel_err_rebuilt": 34.43200349614441,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.9679426550865173
+      },
+      "best_pinned_full": {
+        "eps": 0.0001,
+        "rel_err_pinned_full": 0.009822979502309235,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": -1.7440470401197672e-06,
+          "fd_pinned_full": -2.88418959826231e-06,
+          "fd_rebuilt": 8.406459528487176e-07,
+          "rel_err_pinned": 0.2533569873745166,
+          "rel_err_pinned_full": 1.0727188560503063,
+          "rel_err_rebuilt": 1.6041290485139057,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9999748468399048
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": -2.325577725059702e-06,
+          "fd_pinned_full": -1.702573968032084e-06,
+          "fd_rebuilt": -2.9906002964708023e-05,
+          "rel_err_pinned": 0.671273207852207,
+          "rel_err_pinned_full": 0.22355242161841454,
+          "rel_err_rebuilt": 20.491907567863414,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9997935891151428
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": -1.1550582712516189e-06,
+          "fd_pinned_full": -1.4051693142391741e-06,
+          "fd_rebuilt": 8.999450074043125e-06,
+          "rel_err_pinned": 0.16991897477803708,
+          "rel_err_pinned_full": 0.009822979502309235,
+          "rel_err_rebuilt": 7.467442318560097,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9998964667320251
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -1.3642420526593924e-06,
+          "fd_pinned_full": -1.4097167877480388e-06,
+          "fd_rebuilt": 4.652065399568528e-05,
+          "rel_err_pinned": 0.01958934028902016,
+          "rel_err_pinned_full": 0.013091015034679167,
+          "rel_err_rebuilt": 34.43200349614441,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9679426550865173
+        }
+      ],
+      "wall_clock_s": 20.07689365837723,
+      "memory": {
+        "device_bytes_in_use": 1811943168,
+        "device_peak_bytes_in_use": 8657049088,
+        "host_max_rss_bytes": 5159399424,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 16777216,
+      "free_parameters": 50331648,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.0029763769724403745,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 5.533701545220671e-09,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": 1.2000193704479078e-06,
+        "autodiff_rebuilt": 1.2000193704479078e-06
+      },
+      "best_pinned": {
+        "eps": 1e-07,
+        "rel_err_pinned": 0.01581715079786822,
+        "rel_err_rebuilt": 31.529894281682303,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.42523789405822754
+      },
+      "best_pinned_full": {
+        "eps": 1e-07,
+        "rel_err_pinned_full": 8.007817841374034e-08,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.0001,
+          "fd_pinned": 1.156666961231009e-06,
+          "fd_pinned_full": 1.197241998271244e-06,
+          "fd_rebuilt": 1.9826770738535354e-05,
+          "rel_err_pinned": 0.036126424526562013,
+          "rel_err_pinned_full": 0.0023144394541124605,
+          "rel_err_rebuilt": 15.522042249313861,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9934753179550171
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": 1.2610032020177664e-06,
+          "fd_pinned_full": 1.1991389506387689e-06,
+          "fd_rebuilt": 5.5737426893486955e-05,
+          "rel_err_pinned": 0.0508190393185873,
+          "rel_err_pinned_full": 0.0007336713313304904,
+          "rel_err_rebuilt": 45.4471059935332,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9770869016647339
+        },
+        {
+          "eps": 1e-06,
+          "fd_pinned": 1.2237241800192402e-06,
+          "fd_pinned_full": 1.2000091878842066e-06,
+          "fd_rebuilt": -0.00010850178322895397,
+          "rel_err_pinned": 0.019753689111272125,
+          "rel_err_pinned_full": 8.485332780378565e-06,
+          "rel_err_rebuilt": 91.41669318092393,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.8471711277961731
+        },
+        {
+          "eps": 1e-07,
+          "fd_pinned": 1.2190002577906452e-06,
+          "fd_pinned_full": 1.2000192743525425e-06,
+          "fd_rebuilt": -3.663646451574558e-05,
+          "rel_err_pinned": 0.01581715079786822,
+          "rel_err_pinned_full": 8.007817841374034e-08,
+          "rel_err_rebuilt": 31.529894281682303,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.42523789405822754
+        }
+      ],
+      "wall_clock_s": 20.34959089104086,
+      "memory": {
+        "device_bytes_in_use": 2751468032,
+        "device_peak_bytes_in_use": 16575895040,
+        "host_max_rss_bytes": 5237444608,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 67108864,
+      "free_parameters": 201326592,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float32",
+      "target_distance": 0.0018750000000000004,
+      "direction_convention": "unit RMS per coordinate",
+      "rebuild_transparency": {
+        "max_abs_grad_difference": 0.0,
+        "max_abs_grad": 9.268730227773858e-10,
+        "relative": 0.0,
+        "identical": true,
+        "note": "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. build_tree returns an integer ordering, so the rebuild should take zero cotangent and these should agree exactly."
+      },
+      "directional_derivative": {
+        "autodiff_pinned": -1.2054977105435682e-07,
+        "autodiff_rebuilt": -1.2054977105435682e-07
+      },
+      "best_pinned": {
+        "eps": 1e-05,
+        "rel_err_pinned": 0.43415817353802977,
+        "rel_err_rebuilt": 65.69458215881859,
+        "stencil_crossed_a_rebuild": true,
+        "stencil_slot_change_fraction": 0.9896489381790161
+      },
+      "best_pinned_full": {
+        "eps": 1e-05,
+        "rel_err_pinned_full": 0.0569302892300496,
+        "note": "Ordering AND argmin frozen. This is the correctness gate: it isolates the autodiff gradient from both discrete choices. rel_err_pinned degrading at large N while this stays small means the residual came from argmin switching inside the objective's min(), not from the tree rebuild."
+      },
+      "eps_ladder": [
+        {
+          "eps": 0.01,
+          "fd_pinned": 1.8953869584947824e-07,
+          "fd_pinned_full": -1.7462298274040222e-08,
+          "fd_rebuilt": -1.7300862964475527e-07,
+          "rel_err_pinned": 2.5722858217956612,
+          "rel_err_pinned_full": 0.8551444924257356,
+          "rel_err_rebuilt": 0.43516348584971054,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.999983012676239
+        },
+        {
+          "eps": 0.001,
+          "fd_pinned": 3.5743138937505137e-07,
+          "fd_pinned_full": -3.2468958011122595e-07,
+          "fd_rebuilt": -8.126334591906925e-07,
+          "rel_err_pinned": 3.9650109348932965,
+          "rel_err_pinned_full": 1.6934068581915507,
+          "rel_err_rebuilt": 5.74106182104875,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9998530149459839
+        },
+        {
+          "eps": 0.0001,
+          "fd_pinned": 1.8417267710901797e-07,
+          "fd_pinned_full": -1.3642420526593924e-07,
+          "fd_rebuilt": 5.127276381244883e-06,
+          "rel_err_pinned": 2.52777293144732,
+          "rel_err_pinned_full": 0.1316836529239405,
+          "rel_err_rebuilt": 43.532443955724766,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9999172687530518
+        },
+        {
+          "eps": 1e-05,
+          "fd_pinned": -6.821210263296962e-08,
+          "fd_pinned_full": -1.1368683772161603e-07,
+          "fd_rebuilt": 7.79891706770286e-06,
+          "rel_err_pinned": 0.43415817353802977,
+          "rel_err_pinned_full": 0.0569302892300496,
+          "rel_err_rebuilt": 65.69458215881859,
+          "stencil_crossed_a_rebuild": true,
+          "stencil_slot_change_fraction": 0.9896489381790161
+        }
+      ],
+      "wall_clock_s": 59.74554720334709,
+      "memory": {
+        "device_bytes_in_use": 6442455296,
+        "device_peak_bytes_in_use": 34359744000,
+        "host_max_rss_bytes": 12324429824,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    },
+    {
+      "num_particles": 67108864,
+      "free_parameters": 201326592,
+      "dim": 3,
+      "seed": 0,
+      "dtype": "float64",
+      "target_distance": 0.0018750000000000004,
+      "error_type": "JaxRuntimeError",
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 47.00GiB. [executable_name='jit__reduce_sum'] [tf-allocator-allocation-error='']",
+      "wall_clock_s": 46.78872902877629,
+      "memory": {
+        "device_bytes_in_use": 8053067264,
+        "device_peak_bytes_in_use": 34359744000,
+        "host_max_rss_bytes": 12324429824,
+        "note": "Peaks are process-cumulative high-water marks, not per-run; within an increasing-N sweep they are tight only for the largest N so far."
+      }
+    }
+  ]
+}
