@@ -13,7 +13,7 @@ import math
 
 import jax.numpy as jnp
 from beartype import beartype
-from jaxtyping import Array, jaxtyped
+from jaxtyping import Array, Inexact, jaxtyped
 
 from .dtypes import INDEX_DTYPE
 
@@ -41,8 +41,19 @@ def multi_index_factorial(combo: tuple[int, int, int]) -> int:
 
 
 @jaxtyped(typechecker=beartype)
-def multi_power(vec: Array, combo: tuple[int, int, int]) -> Array:
-    """Return ``vec[0]^i * vec[1]^j * vec[2]^k`` for ``combo = (i, j, k)``."""
+def multi_power(vec: Inexact[Array, "3"], combo: tuple[int, int, int]) -> Array:
+    """Return ``vec[0]^i * vec[1]^j * vec[2]^k`` for ``combo = (i, j, k)``.
+
+    The length is enforced because it cannot be checked any other way: the body indexes
+    ``vec[0..2]`` and JAX CLAMPS an out-of-bounds index, so a 2-vector silently produced a
+    monomial from ``vec[-1]`` -- ``multi_power([2, 3], (1, 1, 1))`` returned ``18.0`` where
+    ``[2, 3, 5]`` gives ``30.0``, and a ``(1, 3)`` vector returned each component cubed
+    instead of a scalar. Every violation is a valid gather after clamping, so no runtime
+    check inside the function can see one.
+
+    ``Inexact`` rather than ``Float``: ``translate_packed_moments`` casts its ``delta`` to
+    the coefficient dtype, so a complex packed expansion hands this a complex vector.
+    """
 
     value = jnp.array(1.0, dtype=vec.dtype)
     if combo[0]:
