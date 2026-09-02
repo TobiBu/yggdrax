@@ -22,9 +22,11 @@ shrink what "near" pulls in, trading communication for the coarse M2L radius.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
+from jax import core as jax_core
 from jaxtyping import Array
 
 from ..dtypes import INDEX_DTYPE, as_index
@@ -50,20 +52,134 @@ class CoarseFrontier:
     Morton-code clusters (which breaks a level-truncation antichain). Leaf
     granularity is the natural coarse resolution; it can be coarsened later by a
     leaf-up level cut without changing the force path.
+
+    ``payload`` is an OPAQUE per-leaf row block that rides along unread. It exists
+    because a cross-domain far field needs the remote leaf's MULTIPOLE, not just its
+    mass and centre of mass -- and a multipole is expressed in the caller's basis
+    (jaccpot's real spherical harmonics, ``(num_nodes, sh_size(order))``), which is
+    not something a tree library should know. So the caller computes whatever it
+    needs per node and this carries it across the boundary, permuted into the coarse
+    tree's order alongside the origin tags, which is the part a caller cannot do for
+    itself: only :func:`build_remote_coarse_tree` knows that permutation.
+
+    Deliberately untyped beyond "some rows per leaf": monopole-only callers pass
+    nothing, and a caller wanting expansions to order p pays ``(p+1)**2`` floats per
+    leaf on the frontier ``all_gather`` -- still ``O(N / leaf_size)`` and negligible
+    against the particles, but the caller's choice to make rather than this
+    module's.
     """
 
     mass: Array  # [num_leaves]
     com: Array  # [num_leaves, 3]
     node_range: Array  # [num_leaves, 2] particle range in the local tree
     node_id: Array  # [num_leaves] local node id (-1 = empty/padding leaf)
+    radius: Array  # [num_leaves] max |x - com| over the leaf's own particles
+    payload: Optional[Array] = None  # [num_leaves, k] caller's own per-leaf data
+
+
+def _leaf_radii_about(
+    positions_sorted: Array,
+    leaf_ranges: Array,
+    centres: Array,
+    nonempty: Array,
+    *,
+    max_leaf_size: Optional[int] = None,
+) -> Array:
+    """Distance from each leaf's ``centre`` to its farthest own particle.
+
+    Mirrors ``_geometry_impl._compute_leaf_bounds``'s padded gather -- a
+    ``(num_leaves, width)`` index block with a validity mask -- so the staging
+    buffer is bounded by leaf occupancy and not by the particle count.
+
+    Parameters
+    ----------
+    positions_sorted
+        Particle positions in the tree's own order.
+    leaf_ranges
+        ``(num_leaves, 2)`` inclusive particle range per leaf.
+    centres
+        ``(num_leaves, 3)`` point each leaf is reduced to (its centre of mass).
+    nonempty
+        ``(num_leaves,)`` mask. Empty leaves get radius 0 rather than a distance to
+        the root centre of mass their COM was substituted with.
+    max_leaf_size
+        Cap on the gather width. Falls back to the particle count, which is correct
+        but stages a whole-problem-sized buffer.
+
+    Returns
+    -------
+    Array
+        ``(num_leaves,)`` radius, zero on empty leaves.
+    """
+
+    num_particles = positions_sorted.shape[0]
+    starts = leaf_ranges[:, 0]
+    counts = leaf_ranges[:, 1] - starts + as_index(1)
+    width = max(int(max_leaf_size) if max_leaf_size is not None else num_particles, 1)
+
+    offsets = jnp.arange(width, dtype=INDEX_DTYPE)[None, :]
+    valid = (offsets < counts[:, None]) & nonempty[:, None]
+    indices = jnp.clip(starts[:, None] + offsets, 0, num_particles - 1)
+    deltas = positions_sorted[indices] - centres[:, None, :]
+    # sqrt(sum(d^2)) rather than jnp.linalg.norm: for a real array reduced along one
+    # axis the two are the same computation, but norm is typed as returning
+    # ``Array | tuple[Array, ...]`` (its multi-axis overloads), which does not satisfy
+    # the ``ArrayLike`` that jnp.max takes.
+    distances = jnp.sqrt(jnp.sum(deltas * deltas, axis=-1))
+    return jnp.max(jnp.where(valid, distances, 0.0), axis=1)
 
 
 def build_coarse_frontier(
     tree: object,
     node_mass: Array,
     node_com: Array,
+    *,
+    positions_sorted: Optional[Array] = None,
+    max_leaf_size: Optional[int] = None,
+    node_payload: Optional[Array] = None,
 ) -> CoarseFrontier:
-    """Frontier = all leaf nodes of ``tree`` (a guaranteed mass-conserving cut)."""
+    """Frontier = all leaf nodes of ``tree`` (a guaranteed mass-conserving cut).
+
+    Each entry also carries ``radius``: the distance from the leaf's centre of mass
+    to its farthest own particle. Reducing a leaf to a point discards that, and a
+    coarse tree built from the points alone reports a MAC extent bounding the
+    centres of mass rather than the particles -- so a cross-domain walk accepts
+    pairs whose true separation is smaller than the source's own radius, and the M2L
+    is evaluated inside the region it is expanding. One float per leaf is what lets
+    :func:`build_remote_coarse_tree` hand honest extents to that walk.
+
+    Parameters
+    ----------
+    tree
+        Local tree whose leaves form the frontier.
+    node_mass
+        Per-node mass, from ``compute_tree_mass_moments``.
+    node_com
+        Per-node centre of mass, from the same source.
+    positions_sorted
+        Particle positions in the tree's own order. Defaults to
+        ``tree.positions_sorted``; one of the two must be available, because the
+        radius cannot be recovered from the mass moments.
+    node_payload
+        ``(num_nodes, k)`` opaque per-node rows; the leaf rows are carried on the
+        frontier as ``payload``. ``None`` carries nothing. Never read here -- see
+        :class:`CoarseFrontier`.
+    max_leaf_size
+        Cap on the per-leaf gather, as for ``compute_tree_geometry``. Defaults to the
+        tree's ``leaf_size`` when it exposes a concrete one.
+
+    Returns
+    -------
+    CoarseFrontier
+        The leaf cut: mass, centre of mass, particle range, node id and radius.
+
+    Raises
+    ------
+    ValueError
+        If no particle positions are available from either source. Returning a zero
+        radius instead would silently reinstate the understated extents this field
+        exists to prevent.
+    """
 
     node_ranges = jnp.asarray(tree.node_ranges, dtype=INDEX_DTYPE)
     total = node_mass.shape[0]
@@ -78,7 +194,37 @@ def build_coarse_frontier(
     f_com = jnp.where(nonempty[:, None], node_com[leaf_ids], node_com[root])
     f_range = node_ranges[leaf_ids]
     f_nodeid = jnp.where(nonempty, leaf_ids, as_index(-1))
-    return CoarseFrontier(mass=f_mass, com=f_com, node_range=f_range, node_id=f_nodeid)
+
+    if positions_sorted is None:
+        positions_sorted = getattr(tree, "positions_sorted", None)
+    if positions_sorted is None:
+        raise ValueError(
+            "build_coarse_frontier needs particle positions to bound each leaf: "
+            "pass positions_sorted=, or build the tree with return_reordered=True. "
+            "The leaf radius cannot be derived from the mass moments, and "
+            "defaulting it to zero would understate every coarse MAC extent."
+        )
+    if max_leaf_size is None:
+        leaf_size = getattr(tree, "leaf_size", None)
+        if leaf_size is not None and not isinstance(leaf_size, jax_core.Tracer):
+            max_leaf_size = int(leaf_size)
+    f_radius = _leaf_radii_about(
+        jnp.asarray(positions_sorted),
+        f_range,
+        f_com,
+        nonempty,
+        max_leaf_size=max_leaf_size,
+    )
+
+    f_payload = None if node_payload is None else jnp.asarray(node_payload)[leaf_ids]
+    return CoarseFrontier(
+        mass=f_mass,
+        com=f_com,
+        node_range=f_range,
+        node_id=f_nodeid,
+        radius=f_radius,
+        payload=f_payload,
+    )
 
 
 @dataclass
@@ -93,6 +239,10 @@ class GlobalCoarseTree:
     tag_range: Array  # [ncoarse, 2] origin particle range
     positions_sorted: Array
     masses_sorted: Array
+    # [ncoarse, k] the frontier's opaque per-leaf rows, in THIS tree's order --
+    # which is the only reason they travel through here rather than the caller
+    # doing its own all_gather. None when the frontier carried none.
+    payload: Optional[Array] = None
 
 
 def gather_global_coarse_tree(
@@ -116,6 +266,7 @@ def gather_global_coarse_tree(
 
     coms = jax.lax.all_gather(frontier.com, axis_name, tiled=True)  # [ncoarse,3]
     masses = jax.lax.all_gather(frontier.mass, axis_name, tiled=True)  # [ncoarse]
+    radii = jax.lax.all_gather(frontier.radius, axis_name, tiled=True)  # [ncoarse]
     domain = jax.lax.all_gather(
         jnp.broadcast_to(me, (n_top,)).astype(INDEX_DTYPE), axis_name, tiled=True
     )
@@ -127,13 +278,19 @@ def gather_global_coarse_tree(
     tree, pos_sorted, mass_sorted = _build_local_tree(
         coms, masses, bounds, tree_type="radix", leaf_size=int(coarse_leaf_size)
     )
+    # Origin tags and the per-particle radii both live in the gathered order, so
+    # reorder them into the coarse tree's Morton-sorted particle order.
+    pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
+    # Bound each coarse particle as the ball it stands for, not as the point it was
+    # reduced to; see build_coarse_frontier on why the point bound is not safe.
     geometry = compute_tree_geometry(
-        tree, pos_sorted, max_leaf_size=int(coarse_leaf_size)
+        tree,
+        pos_sorted,
+        max_leaf_size=int(coarse_leaf_size),
+        particle_radius=radii[pidx],
     )
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
 
-    # Reorder origin tags into the coarse tree's Morton-sorted particle order.
-    pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
     return GlobalCoarseTree(
         tree=tree,
         geometry=geometry,
@@ -215,7 +372,13 @@ def build_distributed_coarse_tree(
         node_com = moments.center_of_mass
         root = as_index(jnp.argmin(jnp.asarray(tree.parent)))
 
-        fr = build_coarse_frontier(tree, node_mass, node_com)
+        fr = build_coarse_frontier(
+            tree,
+            node_mass,
+            node_com,
+            positions_sorted=pos_sorted,
+            max_leaf_size=leaf_size,
+        )
         # Coarse tree is always radix: it is an internal representation over
         # remote frontier COMs (backend-immaterial), and radix is robust at the
         # coarse leaf_size=1 that KD/octree bucket builds cannot honour exactly.
@@ -255,6 +418,14 @@ def build_remote_coarse_tree(
     pairs at full resolution, so excluding own domain here prevents any
     double-counting. Own-domain frontier nodes are dropped structurally (not
     just mass-zeroed), so they never clog the near list.
+
+    The geometry handed back bounds each coarse particle as the **ball** its remote
+    leaf occupies, using ``frontier.radius``, not as the centre of mass the leaf was
+    reduced to. That is what makes the returned ``geometry`` safe to use as a MAC
+    extent: bounding the centres of mass understates the source region, so the walk
+    accepts pairs whose true separation is smaller than the source's own radius and
+    the M2L is then evaluated inside the region it is expanding -- an error that
+    exceeds the term it is approximating.
     """
 
     n_top = frontier.mass.shape[0]
@@ -262,11 +433,17 @@ def build_remote_coarse_tree(
 
     coms = jax.lax.all_gather(frontier.com, axis_name, tiled=True)
     masses = jax.lax.all_gather(frontier.mass, axis_name, tiled=True)
+    radii = jax.lax.all_gather(frontier.radius, axis_name, tiled=True)
     domain = jax.lax.all_gather(
         jnp.broadcast_to(me, (n_top,)).astype(INDEX_DTYPE), axis_name, tiled=True
     )
     node_id = jax.lax.all_gather(frontier.node_id, axis_name, tiled=True)
     node_range = jax.lax.all_gather(frontier.node_range, axis_name, tiled=True)
+    payload = (
+        None
+        if frontier.payload is None
+        else jax.lax.all_gather(frontier.payload, axis_name, tiled=True)
+    )
 
     # Compact to the (ndev-1)*n_top remote coarse particles (static size).
     keep = domain != me
@@ -274,9 +451,11 @@ def build_remote_coarse_tree(
     idx = jnp.nonzero(keep, size=n_remote, fill_value=0)[0]
     r_coms = coms[idx]
     r_mass = masses[idx]
+    r_radius = radii[idx]
     r_domain = domain[idx]
     r_node_id = node_id[idx]
     r_range = node_range[idx]
+    r_payload = None if payload is None else payload[idx]
 
     # Build a Tree wrapper (identical adaptive-radix topology) rather than the
     # raw RadixTree, so jaccpot's Tree-typed stages (e.g. compute_node_multipoles
@@ -291,12 +470,14 @@ def build_remote_coarse_tree(
     )
     pos_sorted = tree.positions_sorted
     mass_sorted = tree.masses_sorted
+    pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
     geometry = compute_tree_geometry(
-        tree, pos_sorted, max_leaf_size=int(coarse_leaf_size)
+        tree,
+        pos_sorted,
+        max_leaf_size=int(coarse_leaf_size),
+        particle_radius=r_radius[pidx],
     )
     moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
-
-    pidx = jnp.asarray(tree.particle_indices, dtype=INDEX_DTYPE)
     return GlobalCoarseTree(
         tree=tree,
         geometry=geometry,
@@ -306,6 +487,10 @@ def build_remote_coarse_tree(
         tag_range=r_range[pidx],
         positions_sorted=pos_sorted,
         masses_sorted=mass_sorted,
+        # Same `pidx` as the tags, for the same reason: a row has to stay
+        # attached to the coarse particle it describes once the build reorders
+        # them.
+        payload=None if r_payload is None else r_payload[pidx],
     )
 
 
@@ -385,7 +570,13 @@ def classify_against_remote(
         root = as_index(jnp.argmin(jnp.asarray(tree.parent)))
         own_mass = moments.mass[root]
 
-        fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
+        fr = build_coarse_frontier(
+            tree,
+            moments.mass,
+            moments.center_of_mass,
+            positions_sorted=pos_sorted,
+            max_leaf_size=leaf_size,
+        )
         # Coarse tree is always radix (internal remote-COM representation).
         rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
         rroot = as_index(jnp.argmin(jnp.asarray(rct.tree.parent)))
@@ -432,6 +623,14 @@ class HaloImport:
     source names one via its node range) to its halo block index ``h`` (or -1) --
     the link the combined near-field P2P uses to point a local target leaf at its
     imported halo particles.
+
+    ``payload`` is the caller's own per-PARTICLE data for the same rows, or ``None``
+    when none was passed. It is the per-particle counterpart of
+    :attr:`CoarseFrontier.payload` and rides the same round-B exchange as the
+    positions, so it is sized by the halo rather than by the system -- which is why
+    it is here and not on the frontier. The frontier is ``all_gather``-ed, so
+    publishing ``leaf_size`` columns there would ship every remote particle's value
+    to every device, i.e. ``O(N_total)``, defeating the demand-driven import.
     """
 
     positions: Array  # [max_req_leaves * leaf_size, 3]
@@ -442,6 +641,7 @@ class HaloImport:
     needed_mass: Array  # scalar: total mass of the requested remote leaves
     imported_mass: Array  # scalar: total mass actually received (== needed_mass)
     request_overflow: Array  # scalar bool
+    payload: Optional[Array] = None  # [max_req_leaves * leaf_size, k] caller's own
 
 
 def import_near_halo(
@@ -454,6 +654,7 @@ def import_near_halo(
     leaf_size: int,
     max_req_leaves: int,
     max_recv_leaves: int,
+    payload_sorted: Optional[Array] = None,
     axis_name: str = AXIS_NAME,
 ) -> HaloImport:
     """Two-round ragged import of the remote near-field particles.
@@ -463,6 +664,17 @@ def import_near_halo(
     leaves' actual particles. The importer never over-imports (each leaf sends
     exactly its ``count`` particles), so a halo particle is never also covered
     by a far M2L node -- no double counting.
+
+    ``payload_sorted`` is an optional ``(n_local, k)`` block of the caller's own
+    per-particle data, in the same tree order as ``positions_sorted``. It rides
+    round B in the same buffer as the positions and masses -- no extra collective --
+    and comes back on :attr:`HaloImport.payload`, row for row with
+    ``positions``/``gid``. ``None`` carries nothing and costs nothing.
+
+    A per-particle quantity has to travel this way rather than on the frontier: the
+    frontier is ``all_gather``-ed, so ``leaf_size`` columns published there would
+    ship every remote particle's value to every device. Anything defined per
+    *leaf* -- a multipole, an extent -- belongs on the frontier instead.
     """
 
     me = jax.lax.axis_index(axis_name)
@@ -527,8 +739,23 @@ def import_near_halo(
     resp_mass = jnp.where(in_leaf, masses_sorted[safe_idx], 0.0)
     resp_gid = jnp.where(in_leaf, me * as_index(_GID_STRIDE) + safe_idx, as_index(-1))
     R = max_recv_leaves
-    resp_posm = jnp.concatenate([resp_pos, resp_mass[..., None]], axis=-1).reshape(
-        (R * leaf_size, 4)
+    # The payload joins the position/mass buffer rather than getting an exchange of
+    # its own: same rows, same sizes, same ordering, so it cannot drift out of step
+    # with the particles it describes -- and one fewer collective.
+    resp_cols = [resp_pos, resp_mass[..., None]]
+    n_payload = 0
+    if payload_sorted is not None:
+        pay = jnp.asarray(payload_sorted, dtype=resp_pos.dtype)
+        if pay.ndim != 2 or pay.shape[0] != positions_sorted.shape[0]:
+            raise ValueError(
+                "payload_sorted must be (n_local, k) in the same order as "
+                f"positions_sorted ({positions_sorted.shape[0]} rows); got "
+                f"{tuple(pay.shape)}"
+            )
+        n_payload = int(pay.shape[1])
+        resp_cols.append(jnp.where(in_leaf[..., None], pay[safe_idx], 0.0))
+    resp_posm = jnp.concatenate(resp_cols, axis=-1).reshape(
+        (R * leaf_size, 4 + n_payload)
     )
     resp_gid = resp_gid.reshape((R * leaf_size, 1))
     send_sizes_b = (recv_sizes_a * as_index(leaf_size)).astype(_COUNT_DTYPE)
@@ -547,6 +774,7 @@ def import_near_halo(
     )
     halo_pos = halo_posm[:, :3]
     halo_mass = halo_posm[:, 3]
+    halo_payload = None if payload_sorted is None else halo_posm[:, 4:]
     halo_gid = halo_gid[:, 0]
     halo_valid = halo_gid >= 0
 
@@ -561,6 +789,7 @@ def import_near_halo(
         needed_mass=needed_mass,
         imported_mass=imported_mass,
         request_overflow=request_overflow,
+        payload=halo_payload,
     )
 
 
@@ -637,7 +866,13 @@ def distributed_let_import(
         )
         geom = compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
         moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
-        fr = build_coarse_frontier(tree, moments.mass, moments.center_of_mass)
+        fr = build_coarse_frontier(
+            tree,
+            moments.mass,
+            moments.center_of_mass,
+            positions_sorted=pos_sorted,
+            max_leaf_size=leaf_size,
+        )
         # Coarse tree is always radix (internal remote-COM representation).
         rct = build_remote_coarse_tree(fr, ndev, bounds=bounds, axis_name=axis_name)
         res = dual_tree_walk_cross_impl(

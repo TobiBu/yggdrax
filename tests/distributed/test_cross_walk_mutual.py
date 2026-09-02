@@ -1,0 +1,447 @@
+"""The two sides of a boundary must partition the cross pairs between them.
+
+`dual_tree_walk_cross_mutual` runs on both devices of a boundary and each emits
+only what it owns. The property to pin is a PARTITION: every geometric cross pair
+appears exactly once across the two runs -- never twice, never zero times.
+
+Both failure modes are silent downstream. Double-counting and dropping each leave
+per-device momentum exact, because +f/-f still cancel within whatever each device
+did do; only a global force comparison would notice. So the combinatorics are
+checked here directly rather than trusted to a downstream assertion.
+
+Trees are synthetic: a small random binary tree given explicitly as child/centre/
+radius arrays, which is what the walk takes. That keeps the test about the walk's
+partitioning rather than about any tree builder.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+jnp = pytest.importorskip("jax.numpy")
+
+from yggdrax.distributed.cross_walk import dual_tree_walk_cross_mutual
+
+
+def _random_tree(n_leaves: int, seed: int, offset):
+    """A complete binary tree over ``n_leaves`` leaves, as explicit arrays.
+
+    Layout: internal nodes ``0 .. n_leaves-2``, leaves ``n_leaves-1 .. 2*n_leaves-2``,
+    root at 0, children -1 for leaves.
+    """
+    assert n_leaves & (n_leaves - 1) == 0, "use a power of two"
+    total = 2 * n_leaves - 1
+    left = np.full(total, -1, dtype=np.int32)
+    right = np.full(total, -1, dtype=np.int32)
+    for i in range(n_leaves - 1):
+        left[i] = 2 * i + 1
+        right[i] = 2 * i + 2
+    rng = np.random.default_rng(seed)
+    centers = rng.normal(scale=0.4, size=(total, 3)) + np.asarray(offset)
+    radii = np.abs(rng.normal(scale=0.15, size=(total,))) + 0.02
+    # internal radii must cover their children, or the MAC is inconsistent
+    for i in range(n_leaves - 2, -1, -1):
+        for c in (left[i], right[i]):
+            d = np.linalg.norm(centers[i] - centers[c])
+            radii[i] = max(radii[i], d + radii[c])
+    return (
+        jnp.asarray(left),
+        jnp.asarray(right),
+        jnp.asarray(centers),
+        jnp.asarray(radii),
+        jnp.asarray(0),
+    )
+
+
+CAPS = dict(max_pair_queue=8192, far_cap=16384, near_cap=16384)
+
+
+def _all_owned_by(tree, dev):
+    """Tag every node of ``tree`` with one owning domain.
+
+    The simple boundary case. A real remote tree merges several domains and its
+    internal nodes straddle; that is covered by
+    `test_straddling_nodes_are_never_accepted`.
+    """
+    total = tree[0].shape[0]
+    return jnp.full((total,), dev, dtype=jnp.int32)
+
+
+def _walk(
+    a,
+    b,
+    this_dev,
+    src_dev,
+    theta=0.35,
+    remote_owner=None,
+    remote_index_in_owner=None,
+    accept_only_leaf_pairs=False,
+    **caps,
+):
+    return dual_tree_walk_cross_mutual(
+        a[0],
+        a[1],
+        a[2],
+        a[3],
+        a[4],
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        theta,
+        this_device=jnp.asarray(this_dev),
+        remote_owner=(
+            _all_owned_by(b, src_dev) if remote_owner is None else remote_owner
+        ),
+        remote_index_in_owner=remote_index_in_owner,
+        accept_only_leaf_pairs=accept_only_leaf_pairs,
+        **(caps or CAPS),
+    )
+
+
+def _sets(res, swap):
+    n, m = int(res.far_count), int(res.near_count)
+    fa = np.asarray(res.far_local)[:n].tolist()
+    fb = np.asarray(res.far_remote)[:n].tolist()
+    na = np.asarray(res.near_local)[:m].tolist()
+    nb = np.asarray(res.near_remote)[:m].tolist()
+    if swap:  # put both runs in the same (device-0 node, device-1 node) frame
+        return set(zip(fb, fa)), set(zip(nb, na))
+    return set(zip(fa, fb)), set(zip(na, nb))
+
+
+def test_the_two_devices_partition_the_cross_pairs():
+    a = _random_tree(8, 0, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 1, (0.9, 0.0, 0.0))
+    r0 = _walk(a, b, 0, 1)
+    r1 = _walk(b, a, 1, 0)
+    for r in (r0, r1):
+        assert not bool(r.queue_overflow), "wavefront overflowed"
+        assert not bool(r.far_overflow or r.near_overflow), "output overflowed"
+
+    far0, near0 = _sets(r0, swap=False)
+    far1, near1 = _sets(r1, swap=True)
+    assert not (far0 & far1), f"{len(far0 & far1)} far pairs emitted by BOTH devices"
+    assert not (near0 & near1), f"{len(near0 & near1)} near pairs emitted by BOTH"
+    # a vacuous pass is the trap: both lists empty would satisfy the above
+    assert far0 or far1, "no far pairs at all -- test would be vacuous"
+    assert near0 or near1, "no near pairs at all -- test would be vacuous"
+
+
+def test_union_equals_the_unfiltered_pair_set():
+    """Nothing is DROPPED: the partition covers the whole set.
+
+    The reference is the same walk with both device ids equal, which makes
+    `cross_pair_is_owned` true for every pair.
+    """
+    a = _random_tree(8, 5, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 6, (0.8, 0.2, 0.0))
+    ref_far, ref_near = _sets(_walk(a, b, 0, 0), swap=False)
+    far0, near0 = _sets(_walk(a, b, 0, 1), swap=False)
+    far1, near1 = _sets(_walk(b, a, 1, 0), swap=True)
+
+    assert far0 | far1 == ref_far, (
+        f"far: missing {len(ref_far - (far0 | far1))}, "
+        f"extra {len((far0 | far1) - ref_far)}"
+    )
+    assert near0 | near1 == ref_near, (
+        f"near: missing {len(ref_near - (near0 | near1))}, "
+        f"extra {len((near0 | near1) - ref_near)}"
+    )
+    assert ref_far and ref_near, "reference empty -- test would be vacuous"
+
+
+def test_both_devices_get_a_share_of_the_work():
+    """Ownership must balance, not hand a whole boundary to one device."""
+    a = _random_tree(16, 21, (0.0, 0.0, 0.0))
+    b = _random_tree(16, 22, (0.9, 0.0, 0.0))
+    n0 = int(_walk(a, b, 0, 1).near_count) + int(_walk(a, b, 0, 1).far_count)
+    n1 = int(_walk(b, a, 1, 0).near_count) + int(_walk(b, a, 1, 0).far_count)
+    total = n0 + n1
+    assert total > 0
+    share = n0 / total
+    assert 0.3 < share < 0.7, f"lopsided split {share:.2f}/{1 - share:.2f}"
+
+
+def test_overflow_is_reported_not_truncated():
+    """A dropped cross pair loses BOTH halves, so momentum stays exact and only the
+    force is wrong -- which is precisely why this must be a loud flag."""
+    a = _random_tree(8, 11, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 12, (0.9, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, max_pair_queue=8192, far_cap=2, near_cap=2)
+    assert bool(
+        res.far_overflow or res.near_overflow
+    ), "undersized caps did not raise an overflow flag"
+
+
+def test_single_owner_domain_marks_straddling_internal_nodes():
+    """A merged remote tree's internal nodes generally span several domains."""
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    # 4 leaves (nodes 3..6) under internals 0..2; leaves belong to domains 7,7,9,9
+    left = jnp.asarray([1, 3, 5, -1, -1, -1, -1], dtype=jnp.int32)
+    right = jnp.asarray([2, 4, 6, -1, -1, -1, -1], dtype=jnp.int32)
+    tag = jnp.asarray([0, 0, 0, 7, 7, 9, 9], dtype=jnp.int32)
+    own = np.asarray(single_owner_domain(left, right, tag, max_depth=8))
+
+    assert own[3] == own[4] == 7, "leaves keep their own tag"
+    assert own[5] == own[6] == 9
+    assert own[1] == 7, "both children in domain 7 -> single owner"
+    assert own[2] == 9
+    assert own[0] == -1, "root spans domains 7 and 9 -> must be marked straddling"
+
+
+def test_straddling_nodes_are_never_accepted_as_far_pairs():
+    """Option 1 of the design: refine a straddling node instead of accepting it.
+
+    An accepted far pair owes a `-f` to the remote endpoint's domain. An internal
+    node aggregating three domains has no single destination, so accepting it would
+    leave the reverse exchange undefined. Refining instead terminates, because coarse
+    leaves each carry exactly one origin domain.
+    """
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (0.9, 0.0, 0.0))
+    total_b = b[0].shape[0]
+    # give b's 8 leaves two different domains, so every internal node straddles
+    tag = np.zeros(total_b, dtype=np.int32)
+    leaves = np.where(np.asarray(b[0]) < 0)[0]
+    tag[leaves[: len(leaves) // 2]] = 3
+    tag[leaves[len(leaves) // 2 :]] = 5
+    owner = single_owner_domain(b[0], b[1], jnp.asarray(tag), max_depth=16)
+    own_np = np.asarray(owner)
+
+    res = _walk(a, b, 0, 0, remote_owner=owner)
+    n = int(res.far_count)
+    accepted_remote = np.asarray(res.far_remote)[:n]
+    assert n > 0, "no far pairs accepted -- test would be vacuous"
+    assert np.all(
+        own_np[accepted_remote] >= 0
+    ), "a straddling remote node was accepted as a far pair"
+    # and the recorded owner matches the node's actual domain, so a reverse
+    # exchange can trust it
+    assert np.array_equal(
+        np.asarray(res.far_owner)[:n], own_np[accepted_remote]
+    ), "far_owner disagrees with the remote node's domain"
+
+
+def test_near_pairs_are_always_single_owner():
+    """Near pairs are leaf-leaf, and a coarse leaf carries exactly one domain."""
+    from yggdrax.distributed.cross_walk import single_owner_domain
+
+    a = _random_tree(8, 41, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 42, (0.9, 0.0, 0.0))
+    total_b = b[0].shape[0]
+    tag = np.zeros(total_b, dtype=np.int32)
+    leaves = np.where(np.asarray(b[0]) < 0)[0]
+    tag[leaves[::2]] = 2
+    tag[leaves[1::2]] = 6
+    owner = single_owner_domain(b[0], b[1], jnp.asarray(tag), max_depth=16)
+    res = _walk(a, b, 0, 0, remote_owner=owner)
+    m = int(res.near_count)
+    assert m > 0, "no near pairs -- test would be vacuous"
+    assert np.all(np.asarray(res.near_owner)[:m] >= 0)
+
+
+def _relabel(tree, perm):
+    """The same tree with its nodes renumbered: ``perm[old] = new``.
+
+    What a merged LET coarse tree does to remote node ids. The geometry is
+    untouched, so the *geometric* pair set is identical -- only the names change,
+    which is exactly the variable under test.
+
+    Returns the relabelled tree and ``inv``, mapping a new index back to the
+    owner's own index, i.e. the ``remote_index_in_owner`` table.
+    """
+    left, right, centers, radii, _root = (np.asarray(t) for t in tree)
+    total = left.shape[0]
+    perm = np.asarray(perm)
+    inv = np.empty(total, dtype=np.int32)
+    inv[perm] = np.arange(total, dtype=np.int32)
+    nl = np.full(total, -1, dtype=np.int32)
+    nr = np.full(total, -1, dtype=np.int32)
+    nc = np.zeros_like(centers)
+    nrad = np.zeros_like(radii)
+    for old in range(total):
+        new = perm[old]
+        nl[new] = perm[left[old]] if left[old] >= 0 else -1
+        nr[new] = perm[right[old]] if right[old] >= 0 else -1
+        nc[new] = centers[old]
+        nrad[new] = radii[old]
+    relabelled = (
+        jnp.asarray(nl),
+        jnp.asarray(nr),
+        jnp.asarray(nc),
+        jnp.asarray(nrad),
+        jnp.asarray(int(perm[0])),
+    )
+    return relabelled, jnp.asarray(inv)
+
+
+def _pairs_in_owner_space(res, inv, swap):
+    """Owned pairs as ``(device-0 node, device-1 node)`` in each owner's numbering."""
+    n, m = int(res.far_count), int(res.near_count)
+    inv = None if inv is None else np.asarray(inv)
+    take = lambda a, k: np.asarray(a)[:k]  # noqa: E731
+    fa, fb = take(res.far_local, n), take(res.far_remote, n)
+    na, nb = take(res.near_local, m), take(res.near_remote, m)
+    if inv is not None:  # remote side is relabelled -- name it as its owner does
+        fb, nb = inv[fb], inv[nb]
+    if swap:
+        return set(zip(fb.tolist(), fa.tolist())), set(zip(nb.tolist(), na.tolist()))
+    return set(zip(fa.tolist(), fb.tolist())), set(zip(na.tolist(), nb.tolist()))
+
+
+def _partition_defect(a, b, remote_index_in_owner):
+    """``(duplicated, dropped)`` pair counts across the two sides of the boundary.
+
+    Device 0 sees device 1's tree renumbered (the LET case); device 1 sees device
+    0's tree in device 0's own numbering (nothing to relabel). A partition means
+    both counts are zero.
+    """
+    rng = np.random.default_rng(11)
+    perm = rng.permutation(np.asarray(b[0]).shape[0])
+    b_relabelled, inv = _relabel(b, perm)
+
+    r0 = _walk(a, b_relabelled, 0, 1, remote_index_in_owner=remote_index_in_owner(inv))
+    r1 = _walk(b, a, 1, 0)
+    ref_far, ref_near = _pairs_in_owner_space(_walk(a, b, 0, 0), None, swap=False)
+    far0, near0 = _pairs_in_owner_space(r0, inv, swap=False)
+    far1, near1 = _pairs_in_owner_space(r1, None, swap=True)
+
+    assert ref_far and ref_near, "no far or near pairs at all -- test would be vacuous"
+    both = (far0 & far1) | (near0 & near1)
+    union = (far0 | far1, near0 | near1)
+    dropped = (ref_far - union[0]) | (ref_near - union[1])
+    return len(both), len(dropped)
+
+
+def test_a_renumbered_remote_tree_still_partitions():
+    """The LET case: the remote tree's numbering is the importer's, not its owner's.
+
+    A merged coarse tree is built by whoever imports it, so two devices give the
+    same remote node different indices. The ownership rule is a function of those
+    indices, so without ``remote_index_in_owner`` the two sides disagree about who
+    owns a pair -- and every such disagreement is silent downstream, since a
+    dropped `-f` and a doubled one both leave per-device momentum exact.
+    """
+    a = _random_tree(8, 21, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 22, (0.85, 0.1, 0.0))
+    duplicated, dropped = _partition_defect(a, b, lambda inv: inv)
+    assert duplicated == 0, f"{duplicated} pairs emitted by BOTH devices"
+    assert dropped == 0, f"{dropped} pairs emitted by NEITHER device"
+
+
+def test_without_the_owner_numbering_the_partition_actually_breaks():
+    """Negative control, so the test above cannot pass for the wrong reason.
+
+    Same trees, same runs, ``remote_index_in_owner`` left at its default. If this
+    partitioned anyway the parameter would be untested decoration.
+    """
+    a = _random_tree(8, 21, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 22, (0.85, 0.1, 0.0))
+    duplicated, dropped = _partition_defect(a, b, lambda _inv: None)
+    assert duplicated or dropped, (
+        "the default numbering partitioned a relabelled remote tree, so the "
+        "renumbering hazard this parameter exists for is not reproduced here"
+    )
+
+
+def _accepted(res, a_tree, b_tree):
+    """Accepted far pairs, and whether each endpoint is an internal node."""
+    n = int(res.far_count)
+    local = np.asarray(res.far_local)[:n]
+    remote = np.asarray(res.far_remote)[:n]
+    return (
+        local,
+        remote,
+        np.asarray(a_tree[0])[local] >= 0,  # left_child >= 0 => internal
+        np.asarray(b_tree[0])[remote] >= 0,
+    )
+
+
+def test_accept_only_leaf_pairs_refuses_internal_nodes_on_both_sides():
+    """Both endpoints, for two independent reasons.
+
+    The REMOTE side needs an address: an internal coarse node spans several of its
+    owner's frontier leaves, so an accepted pair's local expansion has no one node to
+    be sent to.
+
+    The LOCAL side is the subtle half. Each device sees the other's tree only as a
+    frontier of LEAVES, so a pair naming an internal LOCAL node is one the other
+    device cannot express -- and the two then decompose the same interaction
+    differently, double-counting part and missing part. That is a correctness
+    requirement, not a tuning choice, which is why this asserts both sides.
+    """
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, theta=0.9, accept_only_leaf_pairs=True)
+    assert not bool(res.queue_overflow or res.far_overflow or res.near_overflow)
+    local, remote, li, ri = _accepted(res, a, b)
+    assert local.size, "no far pairs accepted at all -- test would be vacuous"
+    assert not ri.any(), (
+        f"{int(ri.sum())} of {remote.size} accepted pairs name an INTERNAL remote "
+        "node, which has no owner-local address"
+    )
+    assert not li.any(), (
+        f"{int(li.sum())} of {local.size} accepted pairs name an INTERNAL local node, "
+        "which the other device cannot express -- so the two disagree about coverage"
+    )
+
+
+def test_without_the_flag_internal_nodes_are_still_accepted():
+    """Negative control: the flag must actually change the accepted set.
+
+    If the default already refused internal nodes, the test above would pass for free
+    and the parameter would be decoration.
+    """
+    a = _random_tree(8, 31, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 32, (1.6, 0.0, 0.0))
+    res = _walk(a, b, 0, 1, theta=0.9)
+    local, remote, li, ri = _accepted(res, a, b)
+    assert local.size, "no far pairs accepted at all -- test would be vacuous"
+    assert li.any() or ri.any(), (
+        "the default accepted only leaf-leaf pairs, so accept_only_leaf_pairs cannot "
+        "be shown to restrict anything"
+    )
+
+
+def test_leaf_pair_acceptance_is_a_partition_across_the_boundary():
+    """The property the local-leaf half exists for: agreed coverage.
+
+    Both devices run the walk and must between them claim every accepted interaction
+    exactly once. With internal LOCAL nodes allowed, device A emits (A_subtree,
+    B_leaf) while device B emits (B_subtree, A_leaf) -- different decompositions of
+    the same interaction, so part is claimed twice and part not at all. Restricted to
+    leaf pairs, the two see identical pairs and the ownership filter partitions them.
+    """
+    a = _random_tree(8, 41, (0.0, 0.0, 0.0))
+    b = _random_tree(8, 42, (1.7, 0.1, 0.0))
+    r0 = _walk(a, b, 0, 1, theta=0.9, accept_only_leaf_pairs=True)
+    r1 = _walk(b, a, 1, 0, theta=0.9, accept_only_leaf_pairs=True)
+    n0, n1 = int(r0.far_count), int(r1.far_count)
+    s0 = set(
+        zip(
+            np.asarray(r0.far_local)[:n0].tolist(),
+            np.asarray(r0.far_remote)[:n0].tolist(),
+        )
+    )
+    # device 1 names the same pair (a-node, b-node) with the roles swapped
+    s1 = set(
+        zip(
+            np.asarray(r1.far_remote)[:n1].tolist(),
+            np.asarray(r1.far_local)[:n1].tolist(),
+        )
+    )
+    ref_far, _ref_near = _sets(
+        _walk(a, b, 0, 0, theta=0.9, accept_only_leaf_pairs=True), swap=False
+    )
+    assert ref_far, "no far pairs at all -- test would be vacuous"
+    assert not (s0 & s1), f"{len(s0 & s1)} far pairs claimed by BOTH devices"
+    assert s0 | s1 == ref_far, (
+        f"coverage gap: missing {len(ref_far - (s0 | s1))}, "
+        f"extra {len((s0 | s1) - ref_far)}"
+    )

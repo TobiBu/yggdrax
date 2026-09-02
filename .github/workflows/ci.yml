@@ -79,3 +79,119 @@ jobs:
         with:
           name: coverage-xml-py${{ matrix.python-version }}
           path: coverage.xml
+
+  distributed-tier:
+    # The only job with more than one device, so the only one that runs the 42 tests in
+    # tests/distributed that need a mesh.
+    #
+    # WHAT WAS AND WAS NOT ALREADY COVERED. `lint-and-test` above runs bare `pytest` on
+    # a single default CPU device, and 24 of the tier's 66 tests pass there -- the ones
+    # built on synthetic trees rather than a mesh: `test_cross_pair_ownership`,
+    # `test_cross_walk`, `test_cross_walk_mutual` and three of
+    # `test_local_tree_backends`. That is worth stating precisely, because it includes
+    # the cross-pair ownership rule and the leaf-pair acceptance partition -- the two
+    # properties whose violations caused real force errors downstream in jaccpot. Those
+    # were never a device-coverage gap; the tests simply did not exist yet, and once
+    # written they run in ordinary CI.
+    #
+    # The 42 that skipped are everything with a mesh in it: `test_comm` (the ragged
+    # all-to-all), `test_partition`, `test_local_tree`, `test_classify`, `test_let`,
+    # `test_import` (the halo import), `test_reverse_halo`, `test_frontier_payload` and
+    # the octree/kdtree halves of `test_local_tree_backends`. So every collective and
+    # both exchanges went untested on every run, while CI stayed green -- and
+    # `pyproject.toml` omits `yggdrax/distributed/*` from the coverage gate, so that
+    # reported nothing either. pytest exits 0 on a run that skips 42 tests, which is
+    # why the guard below is a step and not a comment.
+    #
+    # `--xla_force_host_platform_device_count=4` fakes four CPU devices. NOT a
+    # substitute for real multi-GPU -- NCCL is not exercised on host-platform devices --
+    # but it is what makes the collectives run at all.
+    #
+    # SHARDED BY FILE, because the tier is ~2 h serially and xdist barely helps: `-n 4`
+    # measured 1:18:34 against a serial run that was still going at 71% when a 90 min
+    # cap killed it. It is compile-bound in a way that does not parallelise, with single
+    # items costing 700-1300 s -- `test_local_tree_backends[octree]` alone is 1292 s of
+    # call plus ~2400 s of fixture setup, and `test_let`'s module fixture is ~1240 s.
+    # The shards below split that cost. The alternative -- one job with a 2 h timeout
+    # -- is a timeout so wide it would stop detecting a hang, which is the same argument
+    # against absorbing new tests by widening a cap.
+    #
+    # Measured wall time per shard, all run CONCURRENTLY on one workstation so these are
+    # upper bounds rather than best cases (a CI runner gives each shard a machine, but a
+    # slower one):
+    #
+    #     exchanges   23 tests   25:22
+    #     let + import (as one)  13 tests   52:04   <- split, hence the two shards
+    #     backends     9 tests   44:19
+    #
+    # `backends` is the long pole and it is almost entirely the octree parametrisation
+    # (1292 s of call plus ~2400 s of fixture setup). If that path is not one the shipped
+    # distributed API actually uses, deselecting it would roughly halve this job's
+    # critical path -- worth deciding deliberately rather than by default.
+    #
+    # The three device-independent files are deliberately NOT repeated here -- they
+    # already run in `lint-and-test` on every Python version, and re-running them under
+    # a mesh exercises no different path.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: exchanges
+            paths: >-
+              tests/distributed/test_comm.py
+              tests/distributed/test_reverse_halo.py
+              tests/distributed/test_partition.py
+              tests/distributed/test_local_tree.py
+              tests/distributed/test_classify.py
+          - shard: let
+            paths: >-
+              tests/distributed/test_let.py
+              tests/distributed/test_coarse_tree_extents.py
+          - shard: import
+            paths: >-
+              tests/distributed/test_import.py
+              tests/distributed/test_frontier_payload.py
+          - shard: backends
+            paths: tests/distributed/test_local_tree_backends.py
+    name: distributed-tier (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      JAX_PLATFORMS: cpu
+      XLA_FLAGS: --xla_force_host_platform_device_count=4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install package + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Distributed tests (${{ matrix.shard }})
+        # `--no-cov`: `addopts` carries `--cov-fail-under=80`, and these paths only
+        # touch `yggdrax/distributed/*`, which the coverage config omits -- so the gate
+        # would measure a near-empty report against 80 and fail for a reason unrelated
+        # to the tests. `-rs` prints skip reasons for the next step to read.
+        run: |
+          set -o pipefail
+          pytest ${{ matrix.paths }} --no-cov -rs -v | tee pytest-shard.txt
+      - name: Fail if the shard was skipped rather than run
+        # A skipped suite PASSES, and green-but-vacuous is the state this job exists to
+        # end. Keyed on DEVICE-related skip reasons rather than on any skip, because the
+        # tier has legitimate ones (`test_reverse_halo` guards on `shard_map` being
+        # importable) and a blanket rule would fail for the wrong reason. The second
+        # check catches a collection error that skips everything without a reason line.
+        run: |
+          if grep -qiE "^SKIPPED.*device" pytest-shard.txt; then
+            echo "::error::${{ matrix.shard }} skipped for a DEVICE reason -- it ran on one device, so it tested nothing"
+            grep -iE "^SKIPPED.*device" pytest-shard.txt | head -5
+            exit 1
+          fi
+          if ! grep -qE "[0-9]+ passed" pytest-shard.txt; then
+            echo "::error::no test passed in ${{ matrix.shard }}; the shard did not run"
+            exit 1
+          fi
