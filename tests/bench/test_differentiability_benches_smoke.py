@@ -114,6 +114,7 @@ def test_nn_rebuild_sweep_smoke(tmp_path):
         "switch_metric",
         "not_a_measure_estimate",
         "budget_scaling",
+        "extensive_vs_intensive",
     }
 
     seeds = sorted({r["seed"] for r in payload["records"]})
@@ -126,6 +127,25 @@ def test_nn_rebuild_sweep_smoke(tmp_path):
         assert summary["topology_change_fraction"] == changes / rec["steps"]
         assert rec["timing"]["total_s"] > 0
 
+        # The intensive rates are the ones that survive large N; the extensive
+        # indicator saturates. Both must be present and mutually consistent.
+        for key in (
+            "slot_change_fraction_mean",
+            "leaf_change_fraction_mean",
+            "mean_abs_rank_shift_normalized",
+        ):
+            assert 0.0 <= summary[key] <= 1.0, key
+        # A particle cannot change leaf without changing slot.
+        assert summary["leaf_change_fraction_mean"] <= (
+            summary["slot_change_fraction_mean"] + 1e-6
+        )
+        # Any step counted as changed must have moved at least one particle.
+        traj = rec["trajectory"]
+        for changed, frac in zip(
+            traj["topology_changed"], traj["slot_change_fraction"]
+        ):
+            assert changed == (frac > 0.0)
+
     # One aggregate entry per N, carrying the spread over seeds.
     assert [a["num_particles"] for a in payload["aggregate"]] == sorted(
         {r["num_particles"] for r in payload["records"]}
@@ -133,3 +153,41 @@ def test_nn_rebuild_sweep_smoke(tmp_path):
     for agg in payload["aggregate"]:
         assert agg["seeds"] == seeds
         assert agg["topology_change_fraction"]["std"] >= 0.0
+
+
+def test_nn_rebuild_gradient_check_smoke(tmp_path):
+    """Autodiff through a rebuild is transparent, and matches FD when pinned."""
+    output = tmp_path / "nn_rebuild_gradient_check.json"
+    result = subprocess.run(
+        [sys.executable, "bench/differentiability/nn_rebuild.py"]
+        + ["--smoke-gradient-check", "--output", str(output)],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, (
+        f"nn_rebuild --smoke-gradient-check failed (exit {result.returncode})\n"
+        f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
+    )
+    payload = json.loads(output.read_text())
+    assert payload["benchmark"] == "nn_rebuild_gradient_check"
+    assert payload["records"]
+
+    checked = [r for r in payload["records"] if "error" not in r]
+    assert checked, "no gradient check completed"
+    for rec in checked:
+        # build_tree returns integers, so differentiating *through* the rebuild
+        # must equal differentiating at a frozen ordering -- exactly, not nearly.
+        assert rec["rebuild_transparency"]["identical"], rec["num_particles"]
+        assert rec["rebuild_transparency"]["max_abs_grad_difference"] == 0.0
+
+    # The correctness gate: at a pinned topology autodiff matches central
+    # differences. float64 has the precision to say so tightly.
+    f64 = [r for r in checked if r["dtype"] == "float64"]
+    assert f64, "float64 check did not run"
+    for rec in f64:
+        assert rec["best_pinned"]["rel_err_pinned"] < 1e-6, (
+            rec["num_particles"],
+            rec["best_pinned"],
+        )

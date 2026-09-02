@@ -91,6 +91,7 @@ from bench.differentiability._common import (
 
 _SINGLE_OUTPUT = "results/differentiability/nn_rebuild.json"
 _SWEEP_OUTPUT = "results/differentiability/nn_rebuild_scaling.json"
+_CHECK_OUTPUT = "results/differentiability/nn_rebuild_gradient_check.json"
 
 #: What the per-step switch counter actually compares. Carried into every
 #: payload so a number lifted out of the JSON keeps its label.
@@ -124,6 +125,17 @@ LIMITATIONS: dict[str, str] = {
         "edge runs jaccpot -> yggdrax, and yggdrax has no MutualTopology to "
         "fingerprint."
     ),
+    "extensive_vs_intensive": (
+        "topology_change_fraction counts steps on which the permutation changed "
+        "AT ALL. That is an extensive indicator: if each particle changes slot "
+        "with probability p, P(no change) ~ (1-p)^N, so the statistic is driven "
+        "to 1 by N alone and carries no information about tree stability at "
+        "scale. Its saturation is a property of the estimator, not of the "
+        "system. Read slot_change_fraction, leaf_change_fraction and "
+        "mean_abs_rank_shift_normalized instead -- per-particle rates with a "
+        "well-defined large-N limit. The extensive field is retained only "
+        "because the committed N = 256 point and the figure notebook use it."
+    ),
     "budget_scaling": (
         "The objective is a *mean* over particles, so the per-particle gradient "
         "measured on this problem scales as N^(-4/3) (1/N from the mean, "
@@ -143,6 +155,137 @@ LIMITATIONS: dict[str, str] = {
         "docs/differentiability_model.md is a reasoned argument and stays one."
     ),
 }
+
+
+def _nn_spacing_loss(positions, perm, *, target, k):
+    """Mean-squared deviation of the Morton-neighbour NN distance from ``target``.
+
+    Split out of the descent loop so the gradient check can evaluate the exact
+    same objective against a *supplied* permutation instead of a rebuilt one.
+
+    Parameters
+    ----------
+    positions
+        Unsorted particle positions, shape ``(n, dim)``.
+    perm
+        Morton ordering to read neighbours from (``tree.particle_indices``).
+    target
+        Target nearest-neighbour spacing ``r*``.
+    k
+        Neighbour candidates are the ordering offsets ``+/-1..k``.
+
+    Returns
+    -------
+    tuple
+        ``(loss, nn_dist)``.
+    """
+    import jax.numpy as jnp
+
+    pos_sorted = positions[perm]
+    n = pos_sorted.shape[0]
+    idx = jnp.arange(n)
+    big = jnp.asarray(1e6, dtype=pos_sorted.dtype)
+
+    def safe_norm(delta):
+        return jnp.sqrt(jnp.sum(delta * delta, axis=1) + 1e-12)
+
+    candidate_dists = []
+    for off in range(1, k + 1):
+        idx_plus = jnp.clip(idx + off, 0, n - 1)
+        idx_minus = jnp.clip(idx - off, 0, n - 1)
+        dist_plus = safe_norm(pos_sorted - pos_sorted[idx_plus])
+        dist_minus = safe_norm(pos_sorted - pos_sorted[idx_minus])
+        candidate_dists.append(jnp.where(idx + off < n, dist_plus, big))
+        candidate_dists.append(jnp.where(idx - off >= 0, dist_minus, big))
+
+    nn_dist = jnp.min(jnp.stack(candidate_dists, axis=1), axis=1)
+    loss = jnp.mean((nn_dist - target) ** 2)
+    return loss, nn_dist
+
+
+def _nn_partner_slots(positions, perm, *, k):
+    """Return, per Morton slot, the slot of its nearest candidate neighbour.
+
+    The objective takes a ``min`` over 2k candidates, so it carries a *second*
+    discrete choice on top of the tree ordering: which candidate is nearest.
+    Freezing the tree does not freeze that, and its switching boundaries are
+    dense at large N. Recovering the argmin lets the gradient check pin both.
+
+    Parameters
+    ----------
+    positions
+        Unsorted particle positions, shape ``(n, dim)``.
+    perm
+        Morton ordering to read neighbours from.
+    k
+        Neighbour candidates are the ordering offsets ``+/-1..k``.
+
+    Returns
+    -------
+    Array
+        Integer partner slot per slot, shape ``(n,)``.
+    """
+    import jax.numpy as jnp
+
+    pos_sorted = positions[perm]
+    n = pos_sorted.shape[0]
+    idx = jnp.arange(n)
+    big = jnp.asarray(1e6, dtype=pos_sorted.dtype)
+
+    def safe_norm(delta):
+        return jnp.sqrt(jnp.sum(delta * delta, axis=1) + 1e-12)
+
+    dists = []
+    slots = []
+    for off in range(1, k + 1):
+        idx_plus = jnp.clip(idx + off, 0, n - 1)
+        idx_minus = jnp.clip(idx - off, 0, n - 1)
+        dists.append(
+            jnp.where(idx + off < n, safe_norm(pos_sorted - pos_sorted[idx_plus]), big)
+        )
+        slots.append(idx_plus)
+        dists.append(
+            jnp.where(
+                idx - off >= 0, safe_norm(pos_sorted - pos_sorted[idx_minus]), big
+            )
+        )
+        slots.append(idx_minus)
+
+    stacked = jnp.stack(dists, axis=1)
+    partner = jnp.stack(slots, axis=1)
+    choice = jnp.argmin(stacked, axis=1)
+    return jnp.take_along_axis(partner, choice[:, None], axis=1)[:, 0]
+
+
+def _nn_spacing_loss_selected(positions, perm, partner, *, target):
+    """The objective with BOTH discrete choices frozen: ordering and argmin.
+
+    Equal in value to :func:`_nn_spacing_loss` at the point where ``partner``
+    was computed, but smooth in ``positions`` -- no ``min``, no rebuild -- so
+    central differences converge at the textbook rate at any N.
+
+    Parameters
+    ----------
+    positions
+        Unsorted particle positions, shape ``(n, dim)``.
+    perm
+        Frozen Morton ordering.
+    partner
+        Frozen partner slot per slot, from :func:`_nn_partner_slots`.
+    target
+        Target nearest-neighbour spacing ``r*``.
+
+    Returns
+    -------
+    Array
+        Scalar loss.
+    """
+    import jax.numpy as jnp
+
+    pos_sorted = positions[perm]
+    delta = pos_sorted - pos_sorted[partner]
+    nn_dist = jnp.sqrt(jnp.sum(delta * delta, axis=1) + 1e-12)
+    return jnp.mean((nn_dist - target) ** 2)
 
 
 @dataclass(frozen=True)
@@ -206,8 +349,8 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            f"Results JSON. Defaults to {_SINGLE_OUTPUT} for a single run and "
-            f"{_SWEEP_OUTPUT} for a sweep."
+            f"Results JSON. Defaults to {_SINGLE_OUTPUT} for a single run, "
+            f"{_SWEEP_OUTPUT} for a sweep, {_CHECK_OUTPUT} for a gradient check."
         ),
     )
     p.add_argument("--smoke", action="store_true")
@@ -288,6 +431,27 @@ def _parse_args() -> argparse.Namespace:
         help="Companion series files, recorded in the payload so no curve is read alone.",
     )
     sweep.add_argument("--smoke-sweep", action="store_true")
+
+    check = p.add_argument_group("gradient check")
+    check.add_argument(
+        "--gradient-check-n",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Particle counts at which to certify the gradient (autodiff vs "
+            "central differences at a pinned topology). Enables check mode."
+        ),
+    )
+    check.add_argument(
+        "--gradient-check-dtypes",
+        type=str,
+        nargs="+",
+        default=("float32", "float64"),
+        choices=("float32", "float64"),
+        help="Dtypes to check. float32 matches the descent; float64 is the gate.",
+    )
+    check.add_argument("--smoke-gradient-check", action="store_true")
     return p.parse_args()
 
 
@@ -426,26 +590,9 @@ def _descend(
     def morton_nn_stats(positions_unsorted):
         """Return (loss, nn_dist) using the rebuilt tree's Morton neighbours."""
         tree = build_tree(positions_unsorted, masses, leaf_size=leaf_size)
-        pos_sorted = positions_unsorted[tree.particle_indices]
-        n = pos_sorted.shape[0]
-        idx = jnp.arange(n)
-        big = jnp.asarray(1e6, dtype=pos_sorted.dtype)
-
-        def safe_norm(delta):
-            return jnp.sqrt(jnp.sum(delta * delta, axis=1) + 1e-12)
-
-        candidate_dists = []
-        for off in range(1, k + 1):
-            idx_plus = jnp.clip(idx + off, 0, n - 1)
-            idx_minus = jnp.clip(idx - off, 0, n - 1)
-            dist_plus = safe_norm(pos_sorted - pos_sorted[idx_plus])
-            dist_minus = safe_norm(pos_sorted - pos_sorted[idx_minus])
-            candidate_dists.append(jnp.where(idx + off < n, dist_plus, big))
-            candidate_dists.append(jnp.where(idx - off >= 0, dist_minus, big))
-
-        nn_dist = jnp.min(jnp.stack(candidate_dists, axis=1), axis=1)
-        loss = jnp.mean((nn_dist - target) ** 2)
-        return loss, nn_dist
+        return _nn_spacing_loss(
+            positions_unsorted, tree.particle_indices, target=target, k=k
+        )
 
     def loss_only(positions_unsorted):
         return morton_nn_stats(positions_unsorted)[0]
@@ -460,13 +607,53 @@ def _descend(
 
     ordering_jit = jax.jit(ordering)
 
+    def churn(order, prev_rank):
+        """Per-particle ordering churn between two consecutive rebuilds.
+
+        ``topology_changed`` -- "did the permutation change at all?" -- is an
+        *extensive* indicator: if each particle moves slot with probability p,
+        P(no change) ~ (1-p)^n, so it is forced to 1 at large n no matter how
+        stable the tree is. These rates are intensive and keep their resolution.
+        """
+        n = order.shape[0]
+        rank = (
+            jnp.zeros(n, dtype=jnp.int32).at[order].set(jnp.arange(n, dtype=jnp.int32))
+        )
+        moved = rank != prev_rank
+        shift = jnp.abs(rank - prev_rank)
+        leaf_moved = (rank // leaf_size) != (prev_rank // leaf_size)
+        return (
+            rank,
+            jnp.mean(moved.astype(jnp.float32)),
+            jnp.mean(leaf_moved.astype(jnp.float32)),
+            jnp.mean(shift.astype(jnp.float32)),
+            jnp.max(shift),
+            jnp.any(moved),
+        )
+
+    churn_jit = jax.jit(churn)
+
+    def ranks(order):
+        n = order.shape[0]
+        return (
+            jnp.zeros(n, dtype=jnp.int32).at[order].set(jnp.arange(n, dtype=jnp.int32))
+        )
+
+    ranks_jit = jax.jit(ranks)
+
     positions = positions0
     positions_history = [positions0] if collect_history else None
     loss_history: list[float] = []
     mean_nn_history: list[float] = []
     topology_changed: list[bool] = []  # per-step: did the ordering change?
+    slot_change_history: list[float] = []  # per-step: fraction that moved slot
+    leaf_change_history: list[float] = []  # per-step: fraction that changed leaf
+    rank_shift_history: list[float] = []  # per-step: mean |delta rank|
+    max_rank_shift_history: list[int] = []
+    instrument_times: list[float] = []
 
     prev_order = ordering_jit(positions)
+    prev_rank = ranks_jit(prev_order)
     _, nn0 = stats(positions)
     initial_mean_nn = float(jnp.mean(nn0))
     setup_s = time.perf_counter() - t_setup
@@ -487,10 +674,22 @@ def _descend(
         mean_nn_history.append(float(jnp.mean(nn_dist)))
 
         order = ordering_jit(positions)
-        changed = not bool(jnp.array_equal(order, prev_order))
-        topology_changed.append(changed)
-        prev_order = order
         step_times.append(time.perf_counter() - t_step)
+
+        # Instrumentation is timed separately so `median_step_s` stays a
+        # descent cost rather than a measurement cost.
+        t_instr = time.perf_counter()
+        rank, slot_frac, leaf_frac, mean_shift, max_shift, any_moved = churn_jit(
+            order, prev_rank
+        )
+        changed = bool(any_moved)
+        topology_changed.append(changed)
+        slot_change_history.append(float(slot_frac))
+        leaf_change_history.append(float(leaf_frac))
+        rank_shift_history.append(float(mean_shift))
+        max_rank_shift_history.append(int(max_shift))
+        prev_rank = rank
+        instrument_times.append(time.perf_counter() - t_instr)
 
         if verbose and (step % max(1, cfg.steps // 6) == 0 or step == cfg.steps - 1):
             print(
@@ -532,6 +731,22 @@ def _descend(
                 sum(topology_changed[half:]) / (cfg.steps - half) if half else None
             ),
             "last_switch_step": switched_steps[-1] if switched_steps else None,
+            "slot_change_fraction_mean": statistics.mean(slot_change_history),
+            "slot_change_fraction_max": max(slot_change_history),
+            "leaf_change_fraction_mean": statistics.mean(leaf_change_history),
+            "leaf_change_fraction_max": max(leaf_change_history),
+            "mean_abs_rank_shift": statistics.mean(rank_shift_history),
+            "mean_abs_rank_shift_normalized": (
+                statistics.mean(rank_shift_history) / cfg.num_particles
+            ),
+            "max_abs_rank_shift": max(max_rank_shift_history),
+            "intensive_metric_note": (
+                "topology_change_fraction is an EXTENSIVE indicator (did anything "
+                "change?) and saturates at 1 for large N by construction. The "
+                "slot/leaf change fractions and the rank shift are per-particle "
+                "rates and keep their resolution at any N -- read those for a "
+                "scaling trend."
+            ),
         },
         "timing": {
             "setup_s": setup_s,
@@ -539,9 +754,12 @@ def _descend(
             "total_s": setup_s + loop_s,
             "first_step_s": step_times[0],
             "median_step_s": statistics.median(step_times),
+            "median_instrument_s": statistics.median(instrument_times),
             "note": (
                 "setup_s and first_step_s include XLA compilation for this "
-                "problem shape; median_step_s is the steady-state per-step cost."
+                "problem shape; median_step_s is the steady-state per-step cost "
+                "and excludes the churn instrumentation, which is timed "
+                "separately as median_instrument_s."
             ),
         },
         "geometry": {
@@ -566,9 +784,299 @@ def _descend(
             "loss": loss_history,
             "mean_nn": mean_nn_history,
             "topology_changed": [bool(c) for c in topology_changed],
+            "slot_change_fraction": slot_change_history,
+            "leaf_change_fraction": leaf_change_history,
+            "mean_abs_rank_shift": rank_shift_history,
         },
     }
     return record, positions_history
+
+
+#: Central-difference step ladder per dtype. Reported in full so the rounding
+#: floor is visible rather than hidden behind a single lucky epsilon.
+_EPS_LADDER: dict[str, tuple[float, ...]] = {
+    "float64": (1e-4, 1e-5, 1e-6, 1e-7),
+    "float32": (1e-2, 1e-3, 1e-4, 1e-5),
+}
+
+
+def _gradient_check(
+    cfg: DescentConfig, *, dtype_name: str, direction_seed: int = 12345
+) -> dict[str, Any]:
+    """Certify the gradient of the rebuild objective at one N.
+
+    Three separate questions, which the convergence sweep cannot answer because
+    a converging loss is not evidence of a correct gradient:
+
+    1. Is autodiff *through the rebuild* the same as autodiff at a frozen
+       ordering? ``build_tree`` returns integers, so the rebuild should
+       contribute zero cotangent and the two gradients should agree exactly.
+    2. Does that gradient match central differences at a **pinned** topology?
+       This is the correctness gate, and pinning is what makes it meaningful.
+    3. What does an **unpinned** central difference do? It straddles a rebuild
+       boundary and is *expected* to disagree. The size of the disagreement is
+       the boundary effect, not a bug.
+
+    The probe direction is normalised to unit RMS per coordinate rather than
+    unit L2 norm, so a step of ``eps`` moves every particle by ~``eps``
+    independently of N; a unit-L2 direction would shrink the perturbation as
+    N^(-1/2) and drown the difference in rounding at large N.
+
+    Parameters
+    ----------
+    cfg
+        Configuration supplying N, dim, seed, r*, k and leaf size.
+    dtype_name
+        ``"float32"`` (the dtype the descent actually runs in) or
+        ``"float64"`` (enough precision for a clean correctness number).
+    direction_seed
+        PRNG seed for the probe direction, held fixed across N.
+
+    Returns
+    -------
+    dict
+        Gradient-agreement record, or one carrying ``error`` if the problem did
+        not fit in memory at this N and dtype.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from yggdrax import build_tree
+
+    dtype = jnp.float64 if dtype_name == "float64" else jnp.float32
+    target, k, leaf_size = cfg.target_distance, cfg.k_neighbors, cfg.leaf_size
+    t0 = time.perf_counter()
+
+    try:
+        key_pos, _ = jax.random.split(jax.random.PRNGKey(cfg.seed))
+        positions = jax.random.uniform(
+            key_pos,
+            (cfg.num_particles, cfg.dim),
+            minval=-1.0,
+            maxval=1.0,
+            dtype=jnp.float32,
+        ).astype(dtype)
+        masses = jnp.ones((cfg.num_particles,), dtype=dtype)
+
+        direction = jax.random.normal(
+            jax.random.PRNGKey(direction_seed),
+            (cfg.num_particles, cfg.dim),
+            dtype=dtype,
+        )
+        direction = direction / jnp.sqrt(jnp.mean(direction * direction))
+
+        def perm_at(x):
+            return build_tree(x, masses, leaf_size=leaf_size).particle_indices
+
+        perm_jit = jax.jit(perm_at)
+        perm0 = perm_jit(positions)
+
+        partner0 = jax.jit(lambda x: _nn_partner_slots(x, perm0, k=k))(positions)
+
+        def pinned(x):
+            return _nn_spacing_loss(x, perm0, target=target, k=k)[0]
+
+        def pinned_full(x):
+            """Both discrete choices frozen: ordering and nearest-candidate."""
+            return _nn_spacing_loss_selected(x, perm0, partner0, target=target)
+
+        def rebuilt(x):
+            return _nn_spacing_loss(x, perm_at(x), target=target, k=k)[0]
+
+        pinned_jit = jax.jit(pinned)
+        pinned_full_jit = jax.jit(pinned_full)
+        rebuilt_jit = jax.jit(rebuilt)
+        grad_pinned = jax.jit(jax.grad(pinned))(positions)
+        grad_rebuilt = jax.jit(jax.grad(rebuilt))(positions)
+
+        # (1) rebuild transparency: the two gradients should be identical.
+        gap = jnp.max(jnp.abs(grad_pinned - grad_rebuilt))
+        scale = jnp.max(jnp.abs(grad_pinned))
+        directional_pinned = float(jnp.sum(grad_pinned * direction))
+        directional_rebuilt = float(jnp.sum(grad_rebuilt * direction))
+
+        # (2) and (3): central differences along the probe direction.
+        eps_rows: list[dict[str, Any]] = []
+        for eps in _EPS_LADDER[dtype_name]:
+            step = jnp.asarray(eps, dtype=dtype) * direction
+            fd_pinned = float(
+                (pinned_jit(positions + step) - pinned_jit(positions - step))
+                / (2.0 * eps)
+            )
+            fd_full = float(
+                (pinned_full_jit(positions + step) - pinned_full_jit(positions - step))
+                / (2.0 * eps)
+            )
+            fd_rebuilt = float(
+                (rebuilt_jit(positions + step) - rebuilt_jit(positions - step))
+                / (2.0 * eps)
+            )
+            perm_plus = perm_jit(positions + step)
+            perm_minus = perm_jit(positions - step)
+            moved = jnp.mean((perm_plus != perm_minus).astype(jnp.float32))
+            eps_rows.append(
+                {
+                    "eps": eps,
+                    "fd_pinned": fd_pinned,
+                    "fd_pinned_full": fd_full,
+                    "fd_rebuilt": fd_rebuilt,
+                    "rel_err_pinned": abs(fd_pinned - directional_pinned)
+                    / max(abs(directional_pinned), 1e-300),
+                    "rel_err_pinned_full": abs(fd_full - directional_pinned)
+                    / max(abs(directional_pinned), 1e-300),
+                    "rel_err_rebuilt": abs(fd_rebuilt - directional_rebuilt)
+                    / max(abs(directional_rebuilt), 1e-300),
+                    "stencil_crossed_a_rebuild": bool(
+                        not jnp.array_equal(perm_plus, perm_minus)
+                    ),
+                    "stencil_slot_change_fraction": float(moved),
+                }
+            )
+        best = min(eps_rows, key=lambda r: r["rel_err_pinned"])
+        best_full = min(eps_rows, key=lambda r: r["rel_err_pinned_full"])
+    except Exception as exc:  # pragma: no cover - resource-dependent
+        return {
+            "num_particles": cfg.num_particles,
+            "free_parameters": cfg.num_particles * cfg.dim,
+            "dim": cfg.dim,
+            "seed": cfg.seed,
+            "dtype": dtype_name,
+            "target_distance": target,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:2000],
+            "wall_clock_s": time.perf_counter() - t0,
+            "memory": _memory_snapshot(),
+        }
+
+    return {
+        "num_particles": cfg.num_particles,
+        "free_parameters": cfg.num_particles * cfg.dim,
+        "dim": cfg.dim,
+        "seed": cfg.seed,
+        "dtype": dtype_name,
+        "target_distance": target,
+        "direction_convention": "unit RMS per coordinate",
+        "rebuild_transparency": {
+            "max_abs_grad_difference": float(gap),
+            "max_abs_grad": float(scale),
+            "relative": float(gap) / max(float(scale), 1e-300),
+            "identical": bool(gap == 0),
+            "note": (
+                "grad(rebuild-inside) vs grad(frozen-ordering) at the same point. "
+                "build_tree returns an integer ordering, so the rebuild should "
+                "take zero cotangent and these should agree exactly."
+            ),
+        },
+        "directional_derivative": {
+            "autodiff_pinned": directional_pinned,
+            "autodiff_rebuilt": directional_rebuilt,
+        },
+        "best_pinned": {
+            "eps": best["eps"],
+            "rel_err_pinned": best["rel_err_pinned"],
+            "rel_err_rebuilt": best["rel_err_rebuilt"],
+            "stencil_crossed_a_rebuild": best["stencil_crossed_a_rebuild"],
+            "stencil_slot_change_fraction": best["stencil_slot_change_fraction"],
+        },
+        "best_pinned_full": {
+            "eps": best_full["eps"],
+            "rel_err_pinned_full": best_full["rel_err_pinned_full"],
+            "note": (
+                "Ordering AND argmin frozen. This is the correctness gate: it "
+                "isolates the autodiff gradient from both discrete choices. "
+                "rel_err_pinned degrading at large N while this stays small "
+                "means the residual came from argmin switching inside the "
+                "objective's min(), not from the tree rebuild."
+            ),
+        },
+        "eps_ladder": eps_rows,
+        "wall_clock_s": time.perf_counter() - t0,
+        "memory": _memory_snapshot(),
+    }
+
+
+def _run_gradient_check(args: argparse.Namespace) -> None:
+    """Run the gradient check across N and dtypes and write its own JSON.
+
+    Parameters
+    ----------
+    args
+        Parsed command-line arguments with ``gradient_check_n`` set.
+    """
+    records: list[dict[str, Any]] = []
+    t0 = time.perf_counter()
+    contention_start = _gpu_contention()
+    for num_particles in args.gradient_check_n:
+        target = _target_for(args, num_particles)
+        for dtype_name in args.gradient_check_dtypes:
+            cfg = DescentConfig(
+                num_particles=num_particles,
+                dim=args.dim,
+                target_distance=target,
+                k_neighbors=args.k_neighbors,
+                leaf_size=args.leaf_size,
+                steps=args.steps,
+                learning_rate=args.learning_rate,
+                clip=args.clip,
+                seed=args.seed,
+            )
+            rec = _gradient_check(cfg, dtype_name=dtype_name)
+            records.append(rec)
+            if "error" in rec:
+                print(
+                    f"[gradcheck] N={num_particles} {dtype_name} FAILED: "
+                    f"{rec['error_type']}"
+                )
+                continue
+            print(
+                f"[gradcheck] N={num_particles} {dtype_name} "
+                f"| rebuild-vs-pinned grad rel {rec['rebuild_transparency']['relative']:.2e} "
+                f"| FD pinned rel {rec['best_pinned']['rel_err_pinned']:.2e} "
+                f"| FD pinned+argmin rel "
+                f"{rec['best_pinned_full']['rel_err_pinned_full']:.2e} "
+                f"| FD rebuilt rel {rec['best_pinned']['rel_err_rebuilt']:.2e} "
+                f"| stencil moved {rec['best_pinned']['stencil_slot_change_fraction']:.2%}"
+            )
+    payload = {
+        "benchmark": "nn_rebuild_gradient_check",
+        "series": f"{args.target_mode}-target/gradient-check",
+        "switch_metric": SWITCH_METRIC,
+        "target_mode": args.target_mode,
+        "target_reference_n": args.target_reference_n,
+        "what_this_measures": (
+            "Gradient correctness at a single configuration per N, not "
+            "convergence. (1) autodiff through the rebuild vs autodiff at a "
+            "frozen ordering -- should be identical, since the ordering is "
+            "integer-valued and takes zero cotangent. (2) autodiff vs central "
+            "differences at a PINNED topology -- the correctness gate. (3) the "
+            "same central difference UNPINNED, which straddles a rebuild "
+            "boundary and is expected to disagree; that disagreement is the "
+            "boundary effect and not a gradient bug. A fourth variant freezes "
+            "the objective's argmin as well as the ordering -- the objective "
+            "takes a min over 2k candidates, so it carries a second discrete "
+            "choice whose switching boundaries are dense at large N and which "
+            "pinning the tree does not pin."
+        ),
+        "limitations": LIMITATIONS,
+        "metadata": run_metadata(
+            extra={
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "gpu_contention_at_start": contention_start,
+                "gpu_contention_at_end": _gpu_contention(),
+                "xla_memory_env": {
+                    key: os.environ.get(key)
+                    for key in (
+                        "XLA_PYTHON_CLIENT_PREALLOCATE",
+                        "XLA_PYTHON_CLIENT_MEM_FRACTION",
+                        "XLA_PYTHON_CLIENT_ALLOCATOR",
+                    )
+                },
+                "wall_clock_s": time.perf_counter() - t0,
+            }
+        ),
+        "records": records,
+    }
+    dump_json(payload, args.output)
 
 
 def _legacy_payload(cfg: DescentConfig, record: dict[str, Any]) -> dict[str, Any]:
@@ -612,7 +1120,12 @@ def _legacy_payload(cfg: DescentConfig, record: dict[str, Any]) -> dict[str, Any
             "final_loss": summary["final_loss"],
             "topology_changes": summary["topology_changes"],
         },
-        "trajectory": record["trajectory"],
+        "trajectory": {
+            "step": record["trajectory"]["step"],
+            "loss": record["trajectory"]["loss"],
+            "mean_nn": record["trajectory"]["mean_nn"],
+            "topology_changed": record["trajectory"]["topology_changed"],
+        },
     }
 
 
@@ -730,6 +1243,15 @@ def _aggregate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "switch_metric": SWITCH_METRIC,
                 "topology_change_fraction": spread(
                     [r["summary"]["topology_change_fraction"] for r in group]
+                ),
+                "slot_change_fraction": spread(
+                    [r["summary"]["slot_change_fraction_mean"] for r in group]
+                ),
+                "leaf_change_fraction": spread(
+                    [r["summary"]["leaf_change_fraction_mean"] for r in group]
+                ),
+                "mean_abs_rank_shift_normalized": spread(
+                    [r["summary"]["mean_abs_rank_shift_normalized"] for r in group]
                 ),
                 "final_loss": spread([r["summary"]["final_loss"] for r in group]),
                 "loss_ratio": spread([r["summary"]["loss_ratio"] for r in group]),
@@ -909,12 +1431,22 @@ def main() -> None:
         args.sweep_seeds = [0, 1]
         args.steps = 5
         args.gpu_select = "none"
+    if args.smoke_gradient_check:
+        args.gradient_check_n = [64, 128]
+        args.gpu_select = "none"
     sweep_mode = args.sweep_n is not None
+    check_mode = args.gradient_check_n is not None
     if args.output is None:
-        args.output = _SWEEP_OUTPUT if sweep_mode else _SINGLE_OUTPUT
+        if check_mode:
+            args.output = _CHECK_OUTPUT
+        else:
+            args.output = _SWEEP_OUTPUT if sweep_mode else _SINGLE_OUTPUT
 
     select_free_gpu(args.gpu_select, tag="nn_rebuild")
 
+    if check_mode:
+        _run_gradient_check(args)
+        return
     if sweep_mode:
         _run_sweep(args)
         return
