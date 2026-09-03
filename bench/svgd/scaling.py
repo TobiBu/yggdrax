@@ -73,6 +73,17 @@ def _parse_args() -> argparse.Namespace:
             "historical default); 'float32' leaves it off."
         ),
     )
+    p.add_argument(
+        "--cutoff-bandwidths",
+        type=float,
+        default=None,
+        help=(
+            "Kernel-aware far-field cutoff c, in bandwidths: node pairs whose "
+            "closest possible separation exceeds c * h contribute nothing and "
+            "are dropped by the pair policy. Omit for the monopole-everything "
+            "far field."
+        ),
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -132,13 +143,16 @@ def main() -> None:
         # The build is timed in its two halves. The first call pays the
         # traversal's capacity-retry compile ladder, so both halves are warmed
         # first; a cold ``build_s`` measures compilation, not the partition.
-        def walk_fn(pp=p):
+        cutoff = None if args.cutoff_bandwidths is None else args.cutoff_bandwidths * h
+
+        def walk_fn(pp=p, rc=cutoff):
             return build_svgd_traversal(
                 pp,
                 theta=args.theta,
                 leaf_size=args.leaf_size,
                 backend=backend,
                 traversal_config=cfg,
+                kernel_cutoff=rc,
             )
 
         # Fewer repeats than the JAX kernels: the host half does numpy work that
@@ -182,7 +196,10 @@ def main() -> None:
             "value_and_grad": vg_t.as_dict(),
             "grad_ratio": vg_t.min_s / phi_t.min_s,
             "num_far_pairs": int(walk.far_src.shape[0]),
-            "num_near_leaf_pairs": int(topo.near_target_row.shape[0]),
+            # Directed count, so it stays comparable across work packages: WP2
+            # stores one row per *unordered* pair and reports the doubled count.
+            "num_near_leaf_pairs": int(topo.num_near_leaf_pairs),
+            "num_near_pair_rows": int(topo.near_target_row.shape[0]),
             "num_far_contribs": int(topo.far_tgt_slot.shape[0]),
             "max_leaf": int(topo.leaf_slots.shape[1]),
             "device_memory": device_memory_stats(),
@@ -222,6 +239,7 @@ def main() -> None:
             "leaf_size": args.leaf_size,
             "backend": backend,
             "dtype": args.dtype,
+            "cutoff_bandwidths": args.cutoff_bandwidths,
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,
