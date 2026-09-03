@@ -152,14 +152,25 @@ def main() -> None:
         topo = assemble_svgd_topology(walk)
         build_s = walk_t.min_s + assemble_t.min_s
 
-        phi = jax.jit(lambda pp, t=topo: svgd_phi_from_topology(pp, scores, h, t))
+        # The partition and the scores are jit *arguments*, not closure
+        # constants. Closed over, XLA constant-folds the whole
+        # sco[leaf_slots] / pos[leaf_slots] gather tree into a literal (it says
+        # so, at N=1e4: "%gather.7 = f32[250704,1,32,3] gather(%constant.56,
+        # %constant.58)") and the timing then omits work every real per-step
+        # rebuild has to do -- flattering the tree update against a baseline
+        # that has no gathers to fold.
+        phi = jax.jit(svgd_phi_from_topology)
         vg = jax.jit(
-            lambda pp, t=topo: jax.value_and_grad(
-                lambda q: jnp.sum(svgd_phi_from_topology(q, scores, h, t) ** 2)
+            lambda pp, sc, hh, t: jax.value_and_grad(
+                lambda q: jnp.sum(svgd_phi_from_topology(q, sc, hh, t) ** 2)
             )(pp)
         )
-        phi_t = time_callable(lambda: phi(p), warmup=args.warmup, runs=args.runs)
-        vg_t = time_callable(lambda: vg(p), warmup=args.warmup, runs=args.runs)
+        phi_t = time_callable(
+            lambda: phi(p, scores, h, topo), warmup=args.warmup, runs=args.runs
+        )
+        vg_t = time_callable(
+            lambda: vg(p, scores, h, topo), warmup=args.warmup, runs=args.runs
+        )
 
         entry = {
             "n": n,
@@ -177,14 +188,14 @@ def main() -> None:
             "device_memory": device_memory_stats(),
         }
         if n <= args.exact_max_n:
-            exact = jax.jit(lambda pp: exact_phi(pp, scores, h))
-            ref = exact(p)
-            tree = phi(p)
+            exact = jax.jit(exact_phi)
+            ref = exact(p, scores, h)
+            tree = phi(p, scores, h, topo)
             entry["rel_error_vs_exact"] = float(
                 jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref)
             )
             exact_t = time_callable(
-                lambda: exact(p), warmup=args.warmup, runs=args.runs
+                lambda: exact(p, scores, h), warmup=args.warmup, runs=args.runs
             )
             entry["exact"] = exact_t.as_dict()
             entry["exact_s"] = exact_t.min_s
