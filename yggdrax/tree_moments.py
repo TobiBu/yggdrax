@@ -683,6 +683,24 @@ def _validate_inputs(
         raise ValueError("positions must have shape (N, 3)")
 
 
+def _validate_inputs_mod(
+    tree: object,
+    positions_sorted: Array,
+    masses_sorted: Array,
+) -> None:
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+
+    total_nodes = topology.parent.shape[0]
+    if topology.node_ranges.shape[0] != total_nodes:
+        raise ValueError("tree.node_ranges must align with tree.parent shape")
+
+    if masses_sorted.shape[0] != positions_sorted.shape[0]:
+        raise ValueError("masses_sorted must match tree.num_particles")
+    if positions_sorted.shape[1] != 3:
+        raise ValueError("positions must have shape (N, 3)")
+
+
 def compute_tree_mass_moments(
     tree: object,
     positions_sorted: Array,
@@ -711,6 +729,69 @@ def compute_tree_mass_moments(
     topology = resolve_tree_topology(tree)
     require_fmm_core_topology(topology)
     _validate_inputs(topology, positions_sorted, masses_sorted)
+
+    ranges = topology.node_ranges.astype(INDEX_DTYPE)
+    starts = ranges[:, 0]
+    ends = ranges[:, 1] + as_index(1)  # make end exclusive for prefix sums
+
+    # Prefix sums over masses and mass-weighted positions enable O(1)
+    # range queries per node.
+    pad = jnp.zeros((1,), dtype=masses_sorted.dtype)
+    mass_prefix = jnp.concatenate([pad, jnp.cumsum(masses_sorted)])
+
+    weighted = masses_sorted[:, None] * positions_sorted
+    weighted_pad = jnp.zeros(
+        (1, positions_sorted.shape[1]), dtype=positions_sorted.dtype
+    )
+    weighted_prefix = jnp.concatenate(
+        [weighted_pad, jnp.cumsum(weighted, axis=0)],
+        axis=0,
+    )
+
+    total_mass = mass_prefix[ends] - mass_prefix[starts]
+    moment_sum = weighted_prefix[ends] - weighted_prefix[starts]
+
+    safe_mass = jnp.where(
+        total_mass == 0,
+        jnp.ones_like(total_mass),
+        total_mass,
+    )
+    center = moment_sum / safe_mass[:, None]
+    center = jnp.where(total_mass[:, None] == 0, 0.0, center)
+
+    return TreeMassMoments(mass=total_mass, center_of_mass=center)
+
+
+@jax.jit
+@jaxtyped(typechecker=beartype)
+def compute_tree_mass_moments_jit(
+    tree: object,
+    positions_sorted: Array,
+    masses_sorted: Array,
+) -> TreeMassMoments:
+    """Compute total mass and center of mass for every tree node.
+
+    Uses prefix sums over the Morton-sorted masses and mass-weighted positions
+    for O(1)-per-node range queries.
+
+    Parameters
+    ----------
+    tree
+        Tree container or topology exposing the FMM-core contract.
+    positions_sorted
+        Particle positions in Morton order, shape ``(n_particles, 3)``.
+    masses_sorted
+        Particle masses reordered identically to ``positions_sorted``.
+
+    Returns
+    -------
+    TreeMassMoments
+        Per-node total mass and center of mass.
+    """
+
+    topology = resolve_tree_topology(tree)
+    require_fmm_core_topology(topology)
+    _validate_inputs_mod(topology, positions_sorted, masses_sorted)
 
     ranges = topology.node_ranges.astype(INDEX_DTYPE)
     starts = ranges[:, 0]
