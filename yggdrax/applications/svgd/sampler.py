@@ -437,7 +437,23 @@ def build_svgd_topology(
 #: Target byte size of one chunk's ``(chunk, ml, ml, d)`` near-field tensor.
 #: Reverse mode rematerialises the chunk rather than storing it, so this caps
 #: peak device memory of the near field independently of the pair count.
-_NEAR_CHUNK_BYTES = 64 << 20
+#:
+#: 256 MiB, measured, not guessed. At N = 1e4 (41778 unordered pairs, ml = 32,
+#: float64) on an A100:
+#:
+#: ===========  =======  ==========  =====
+#: chunk bytes  chunks   fwd (ms)    fwd+grad (ms)
+#: ===========  =======  ==========  =====
+#:      64 MiB       16       10.12  17.46
+#:     256 MiB        4        2.19   9.97
+#:     979 MiB        1        2.29   8.62
+#: ===========  =======  ==========  =====
+#:
+#: 64 MiB gives the best forward-to-gradient *ratio* (1.72) purely by making the
+#: forward 4.6x slower, which is not a speed-up of anything. 256 MiB gives the
+#: best forward and near-best total while still bounding memory; one chunk is
+#: marginally faster and bounds nothing (5 GiB by N = 3e4).
+_NEAR_CHUNK_BYTES = 256 << 20
 
 
 def _near_chunk_bothways(
