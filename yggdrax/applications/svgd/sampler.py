@@ -172,12 +172,13 @@ class SvgdTopology(NamedTuple):
     order: Array  # (n,) sorted-slot -> original particle id
     leaf_slots: Array  # (L, max_leaf) padded sorted-slot indices per leaf
     leaf_mask: Array  # (L, max_leaf) 1.0 valid / 0.0 pad
-    near_target_row: Array  # (P,) target-leaf row (directional, complete)
-    near_source_row: Array  # (P,) source-leaf row
+    near_target_row: Array  # (Q,) one row of each UNORDERED near leaf pair
+    near_source_row: Array  # (Q,) the other row; row_a < row_b throughout
     far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
     far_src_start: Array  # (M,) inclusive start slot of the far source node
     far_src_end: Array  # (M,) inclusive end slot of the far source node
     num_far_pairs: int  # far node pairs kept (M is their expansion, >= this)
+    num_near_leaf_pairs: int  # DIRECTED near pairs, i.e. 2 * len(near_target_row)
     num_particles: int
 
 
@@ -337,6 +338,25 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     row_counts = (n_off[1:] - n_off[:-1]).astype(np.int64)
     near_target_row = np.repeat(np.arange(num_leaves, dtype=np.int64), row_counts)
     near_source_row = node_to_row[n_nb[: int(n_off[-1])]].astype(np.int64)
+    num_directed = int(near_target_row.shape[0])
+
+    # Halve the list. The walk emits (A -> B) and (B -> A) for every near leaf
+    # pair, and the kernel value is shared between them: the contribution to i
+    # from j is k*s_j + k*(x_i - x_j)/h^2 and the contribution to j from i is
+    # k*s_i - k*(x_i - x_j)/h^2, one exp for both. Keeping one entry per
+    # unordered pair halves the exp count and the tensor reverse mode has to
+    # deal with.
+    upper = near_target_row < near_source_row
+    kept = int(upper.sum())
+    if 2 * kept != num_directed:
+        raise ValueError(
+            "the near leaf-pair list is not symmetric: "
+            f"{num_directed} directed entries, {kept} with row_a < row_b. The "
+            "Stein partition is only complete when every near pair appears in "
+            "both directions."
+        )
+    near_target_row = near_target_row[upper]
+    near_source_row = near_source_row[upper]
 
     # Far field: expand each far pair's TARGET node to its particles; each such
     # particle receives the monopole of the paired SOURCE node.
@@ -351,11 +371,14 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     tgt_start = node_ranges[far_tgt, 0]
     tgt_end = node_ranges[far_tgt, 1]
     tgt_len = (tgt_end - tgt_start + 1).astype(np.int64)
-    far_tgt_slot = (
-        np.concatenate([np.arange(s, e + 1) for s, e in zip(tgt_start, tgt_end)])
-        if far_src.shape[0] > 0
-        else np.zeros(0, dtype=np.int64)
-    )
+    # Expand each far pair's target node into its particle slots without a
+    # Python loop. The list-comprehension form (one np.arange per far pair) was
+    # 132 ms of a 245 ms build at N = 2e4 -- more than the whole device half --
+    # and grew superlinearly because it is one interpreter iteration per pair.
+    total = int(tgt_len.sum())
+    starts = np.cumsum(tgt_len) - tgt_len
+    within = np.arange(total, dtype=np.int64) - np.repeat(starts, tgt_len)
+    far_tgt_slot = np.repeat(tgt_start.astype(np.int64), tgt_len) + within
     far_src_start = np.repeat(node_ranges[far_src, 0], tgt_len)
     far_src_end = np.repeat(node_ranges[far_src, 1], tgt_len)
 
@@ -369,6 +392,7 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         far_src_start=jnp.asarray(far_src_start.astype(np.int64)),
         far_src_end=jnp.asarray(far_src_end.astype(np.int64)),
         num_far_pairs=int(far_src.shape[0]),
+        num_near_leaf_pairs=num_directed,
         num_particles=n,
     )
 
@@ -410,11 +434,66 @@ def build_svgd_topology(
     )
 
 
+#: Target byte size of one chunk's ``(chunk, ml, ml, d)`` near-field tensor.
+#: Reverse mode rematerialises the chunk rather than storing it, so this caps
+#: peak device memory of the near field independently of the pair count.
+_NEAR_CHUNK_BYTES = 64 << 20
+
+
+def _near_chunk_bothways(
+    phi: Array,
+    pos: Array,
+    sco: Array,
+    leaf_slots: Array,
+    leaf_mask: Array,
+    rows_a: Array,
+    rows_b: Array,
+    live: Array,
+    h: float | Float[Array, ""],
+) -> Array:
+    """Scatter both directions of one chunk of unordered near leaf pairs.
+
+    Args:
+        phi: Accumulator in sorted-slot order, shape ``(n, d)``.
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        leaf_slots: Padded per-leaf slot blocks, shape ``(L, ml)``.
+        leaf_mask: Validity of ``leaf_slots``, shape ``(L, ml)``.
+        rows_a: Leaf rows on one side of each pair, shape ``(chunk,)``.
+        rows_b: Leaf rows on the other side, shape ``(chunk,)``.
+        live: 1.0 for real pairs, 0.0 for the chunk's padding, ``(chunk,)``.
+        h: Kernel bandwidth.
+
+    Returns:
+        ``phi`` with this chunk's contribution added.
+    """
+    slots_a = leaf_slots[rows_a]  # (chunk, ml)
+    slots_b = leaf_slots[rows_b]
+    mask_a = leaf_mask[rows_a] * live[:, None]
+    mask_b = leaf_mask[rows_b] * live[:, None]
+    x_a, x_b = pos[slots_a], pos[slots_b]  # (chunk, ml, d)
+    s_a, s_b = sco[slots_a], sco[slots_b]
+
+    diff = x_a[:, :, None, :] - x_b[:, None, :, :]  # (chunk, ml, ml, d)
+    k = jnp.exp(-jnp.sum(diff * diff, axis=-1) / (2.0 * h**2))[..., None]
+    repulsive = k * diff / (h**2)
+
+    to_a = jnp.sum(
+        (k * s_b[:, None, :, :] + repulsive) * mask_b[:, None, :, None], axis=2
+    )
+    to_b = jnp.sum(
+        (k * s_a[:, :, None, :] - repulsive) * mask_a[:, :, None, None], axis=1
+    )
+    phi = phi.at[slots_a].add(to_a * mask_a[..., None])
+    return phi.at[slots_b].add(to_b * mask_b[..., None])
+
+
 def svgd_phi_from_topology(
     particles: Float[Array, "n d"],
     scores: Float[Array, "n d"],
     h: float | Float[Array, ""],
     topo: SvgdTopology,
+    chunk_pairs: int | None = None,
 ) -> Float[Array, "n d"]:
     """Tree-accelerated Stein update given a fixed partition (differentiable).
 
@@ -423,6 +502,9 @@ def svgd_phi_from_topology(
         scores: Target score at each particle, shape ``(n, d)``.
         h: Kernel bandwidth.
         topo: Partition from :func:`build_svgd_topology`.
+        chunk_pairs: Near leaf pairs per rematerialised chunk. ``None``
+            (default) picks the largest chunk whose ``(chunk, ml, ml, d)``
+            tensor stays under 64 MB.
 
     Returns:
         Update directions, shape ``(n, d)``.
@@ -444,18 +526,52 @@ def svgd_phi_from_topology(
     within = jnp.sum(terms * mask[:, None, :, None], axis=2)  # (L, ml, d)
     phi = phi.at[topo.leaf_slots].add(within * mask[..., None])
 
-    # cross-leaf near pairs (directional).
-    tgt_x = blocks_x[topo.near_target_row]  # (P, ml, d)
-    src_x = blocks_x[topo.near_source_row]
-    src_s = blocks_s[topo.near_source_row]
-    src_m = mask[topo.near_source_row]
-    tgt_m = mask[topo.near_target_row]
-    cterms = stein_pair_terms(
-        tgt_x[:, :, None, :], src_x[:, None, :, :], src_s[:, None, :, :], h
-    )  # (P, ml, ml, d)
-    cross = jnp.sum(cterms * src_m[:, None, :, None], axis=2)  # (P, ml, d)
-    tgt_slots = topo.leaf_slots[topo.near_target_row]  # (P, ml)
-    phi = phi.at[tgt_slots].add(cross * tgt_m[..., None])
+    # cross-leaf near pairs: one entry per unordered pair, both directions
+    # scattered from one kernel evaluation, in rematerialised chunks.
+    num_pairs = int(topo.near_target_row.shape[0])
+    if num_pairs > 0:
+        max_leaf = int(topo.leaf_slots.shape[1])
+        if chunk_pairs is None:
+            per_pair = max(1, max_leaf * max_leaf * d * particles.dtype.itemsize)
+            chunk_pairs = max(1, _NEAR_CHUNK_BYTES // per_pair)
+        chunk = min(int(chunk_pairs), num_pairs)
+        num_chunks = -(-num_pairs // chunk)
+        pad = num_chunks * chunk - num_pairs
+        rows_a = topo.near_target_row
+        rows_b = topo.near_source_row
+        live = jnp.ones((num_pairs,), dtype=pos.dtype)
+        if pad:
+            zeros_i = jnp.zeros((pad,), dtype=rows_a.dtype)
+            rows_a = jnp.concatenate([rows_a, zeros_i])
+            rows_b = jnp.concatenate([rows_b, zeros_i])
+            live = jnp.concatenate([live, jnp.zeros((pad,), dtype=pos.dtype)])
+
+        @jax.checkpoint
+        def _step(carry, xs):
+            return (
+                _near_chunk_bothways(
+                    carry,
+                    pos,
+                    sco,
+                    topo.leaf_slots,
+                    mask,
+                    xs[0],
+                    xs[1],
+                    xs[2],
+                    h,
+                ),
+                None,
+            )
+
+        phi, _ = jax.lax.scan(
+            _step,
+            phi,
+            (
+                rows_a.reshape(num_chunks, chunk),
+                rows_b.reshape(num_chunks, chunk),
+                live.reshape(num_chunks, chunk),
+            ),
+        )
 
     # --- far field: monopole (M2P) ---
     if topo.far_tgt_slot.shape[0] > 0:
@@ -482,7 +598,9 @@ def svgd_phi_from_topology(
 # Fused, compiled accumulation. Given a (fixed) partition the Stein update is a
 # pure array computation; jitting it collapses the eager per-op dispatch into one
 # kernel (~1.5x faster per step even when the partition shapes vary a little).
-_jit_svgd_phi_from_topology = jax.jit(svgd_phi_from_topology)
+_jit_svgd_phi_from_topology = jax.jit(
+    svgd_phi_from_topology, static_argnames=("chunk_pairs",)
+)
 
 
 def _cutoff_radius(
