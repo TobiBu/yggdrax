@@ -360,35 +360,54 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     near_source_row = near_source_row[upper]
 
     # Far field: expand each far pair's TARGET node to its particles; each such
-    # particle receives the monopole of the paired SOURCE node. This runs on
-    # device. M is the largest array anywhere in the partition -- 89.5 million
-    # entries at N = 1e5 -- and building it on the host cost 1074 ms of a 1438 ms
-    # build, nearly all of it allocating ~2 GB of numpy and copying it back. Only
-    # two scalars cross to the host here: the kept pair count and M itself, both
-    # needed to give the device arrays a shape.
-    far_src_dev, far_tgt_dev = walk.far_src, walk.far_tgt
-    if walk.far_tags.shape[0] == far_src_dev.shape[0]:
-        keep = walk.far_tags != FAR_TAG_IGNORE
-        num_kept = int(jnp.count_nonzero(keep))
-        if num_kept != far_src_dev.shape[0]:
-            (kept_idx,) = jnp.nonzero(keep, size=num_kept)
-            far_src_dev = far_src_dev[kept_idx]
-            far_tgt_dev = far_tgt_dev[kept_idx]
-    num_far_pairs = int(far_src_dev.shape[0])
+    # particle receives the monopole of the paired SOURCE node.
+    far_src = np.asarray(walk.far_src)
+    far_tgt = np.asarray(walk.far_tgt)
+    far_tags = np.asarray(walk.far_tags)
+    if far_tags.shape[0] == far_src.shape[0]:
+        keep = far_tags != FAR_TAG_IGNORE
+        if not keep.all():
+            far_src = far_src[keep]
+            far_tgt = far_tgt[keep]
+    tgt_start = node_ranges[far_tgt, 0]
+    tgt_len = (node_ranges[far_tgt, 1] - tgt_start + 1).astype(np.int64)
+    total = int(tgt_len.sum())
 
-    ranges = jnp.asarray(walk.node_ranges)
-    tgt_start = ranges[far_tgt_dev, 0]
-    tgt_len = ranges[far_tgt_dev, 1] - tgt_start + 1
-    total = int(jnp.sum(tgt_len))
-    seg_start = jnp.cumsum(tgt_len) - tgt_len
-    within = jnp.arange(total, dtype=tgt_len.dtype) - jnp.repeat(
-        seg_start, tgt_len, total_repeat_length=total
-    )
-    far_tgt_slot = jnp.repeat(tgt_start, tgt_len, total_repeat_length=total) + within
-    far_src_start = jnp.repeat(
-        ranges[far_src_dev, 0], tgt_len, total_repeat_length=total
-    )
-    far_src_end = jnp.repeat(ranges[far_src_dev, 1], tgt_len, total_repeat_length=total)
+    if total >= _DEVICE_FAR_EXPANSION_MIN_ENTRIES:
+        # M is by far the largest array in the partition -- 89,555,008 entries at
+        # N = 1e5 -- and expanding it on the host means allocating ~2 GB of numpy
+        # and copying it back: 1091 ms of a 1456 ms build. On device that is
+        # 48 ms of 409 ms. Only ``total`` crosses to the host, to give the
+        # device arrays a shape.
+        ranges = jnp.asarray(node_ranges)
+        tgt_start_d = jnp.asarray(tgt_start)
+        tgt_len_d = jnp.asarray(tgt_len)
+        seg_start = jnp.cumsum(tgt_len_d) - tgt_len_d
+        within = jnp.arange(total, dtype=tgt_len_d.dtype) - jnp.repeat(
+            seg_start, tgt_len_d, total_repeat_length=total
+        )
+        far_tgt_slot = (
+            jnp.repeat(tgt_start_d, tgt_len_d, total_repeat_length=total) + within
+        )
+        src_nodes = jnp.asarray(far_src)
+        far_src_start = jnp.repeat(
+            ranges[src_nodes, 0], tgt_len_d, total_repeat_length=total
+        )
+        far_src_end = jnp.repeat(
+            ranges[src_nodes, 1], tgt_len_d, total_repeat_length=total
+        )
+    else:
+        # Below the threshold the device path's per-call dispatch costs more
+        # than the copy it avoids (host assembly 8.3 ms against 22.9 ms at
+        # N = 1e4), so expand in numpy -- vectorised, not the np.arange-per-pair
+        # loop this replaced, which was 132 ms of a 245 ms build at N = 2e4.
+        seg_start_h = np.cumsum(tgt_len) - tgt_len
+        within_h = np.arange(total, dtype=np.int64) - np.repeat(seg_start_h, tgt_len)
+        far_tgt_slot = jnp.asarray(
+            np.repeat(tgt_start.astype(np.int64), tgt_len) + within_h
+        )
+        far_src_start = jnp.asarray(np.repeat(node_ranges[far_src, 0], tgt_len))
+        far_src_end = jnp.asarray(np.repeat(node_ranges[far_src, 1], tgt_len))
 
     return SvgdTopology(
         order=jnp.asarray(order),
@@ -399,7 +418,7 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         far_tgt_slot=far_tgt_slot,
         far_src_start=far_src_start,
         far_src_end=far_src_end,
-        num_far_pairs=num_far_pairs,
+        num_far_pairs=int(far_src.shape[0]),
         num_near_leaf_pairs=num_directed,
         num_particles=n,
     )
@@ -462,6 +481,15 @@ def build_svgd_topology(
 #: best forward and near-best total while still bounding memory; one chunk is
 #: marginally faster and bounds nothing (5 GiB by N = 3e4).
 _NEAR_CHUNK_BYTES = 256 << 20
+
+#: Far entries (*M*) above which the far-field expansion is assembled on device
+#: rather than in numpy. Measured on an A100: at N = 1e4 (M = 388,912) the host
+#: half of the build is 8.3 ms host-side against 22.9 ms device-side, because
+#: the device path pays ~10 eager dispatches and two synchronisations whatever
+#: the size; at N = 1e5 (M = 89,555,008) it is 1091 ms against 48 ms, because
+#: the host path has to allocate ~2 GB of numpy and copy it back. The crossover
+#: is around a million entries.
+_DEVICE_FAR_EXPANSION_MIN_ENTRIES = 1 << 21
 
 
 def _near_chunk_bothways(
