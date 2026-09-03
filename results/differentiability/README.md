@@ -6,7 +6,7 @@ Jaccpot I §7). Produced by `bench/differentiability/*.py`; every payload carrie
 
 | File | Bench | What it holds |
 |---|---|---|
-| `nn_rebuild.json` / `.npz` | `nn_rebuild.py` | The original single-run existence proof: N = 256, 768 free coordinates, CPU. Read by `examples/differentiable_paper/fig_nn_rebuild.ipynb`. |
+| `nn_rebuild.json` / `.npz` | `nn_rebuild.py` | The original single-run existence proof: N = 256, 768 free coordinates, CPU. Read by `examples/differentiable_paper/fig_nn_rebuild.ipynb`. **Untouched by the scale-up**, so that figure is unchanged and still current. |
 | `nn_rebuild_gradient_check.json` | `nn_rebuild.py --gradient-check-n` | **Gradient correctness vs N.** The certificate, not a convergence run. |
 | `nn_rebuild_scaling.json` | `nn_rebuild.py --sweep-n` | **Series A** — fixed r\*, fixed lr. |
 | `nn_rebuild_scaling_density_matched.json` | `nn_rebuild.py --sweep-n` | **Series B** — density-matched r\*, fixed lr. |
@@ -188,7 +188,27 @@ an N effect only. The committed point rides along in each payload as
    B mix churn rates with how far each run got. Only C compares at matched progress.
 5. **Plain gradient descent throughout**, by design.
 
-### 8. Reproducing
+### 8. The figure
+
+`examples/differentiable_paper/fig_nn_rebuild_scaling.ipynb` →
+`examples/differentiable_paper/figures/fig_nn_rebuild_scaling.{pdf,png}`. Two panels, built
+from the committed JSON only — it never recomputes, so it needs no GPU:
+
+- **(a)** the extensive indicator flat at 1.000 against the intensive rates resolving a trend
+  over the same range, with seed error bars, plus mean rank shift on a right log axis.
+- **(b)** the gradient certificate: unpinned / tree-pinned / tree-and-argmin-pinned FD error
+  vs N, with the exactly-zero rebuild gap annotated. The notebook **asserts** that gap is
+  `0.0` across every run rather than only claiming it in the caption, so the figure fails
+  loudly if a future re-run breaks the exactness result.
+
+`fig_nn_rebuild.{pdf,png}` (the N = 256 existence proof) is deliberately **not** regenerated —
+its inputs were preserved byte-for-byte.
+
+Note that sweep mode does not write a position history (at N = 3.4e7 over 121 steps it would be
+~49 GB), so a positions-style panel like `fig_nn_rebuild`'s (a)/(b) is not available at scale
+and would need a purpose-built run.
+
+### 9. Reproducing
 
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
