@@ -47,6 +47,7 @@ from yggdrax import (
     compute_tree_geometry,
 )
 from yggdrax.applications.svgd.kernel import stein_pair_terms
+from yggdrax.dtypes import INDEX_DTYPE, as_index
 from yggdrax.kdtree import build_leaf_kdtree
 
 # Tree geometry is a pure device computation whose output shape is fixed by the
@@ -58,6 +59,92 @@ from yggdrax.kdtree import build_leaf_kdtree
 _jit_compute_tree_geometry = jax.jit(
     compute_tree_geometry, static_argnames=("max_leaf_size",)
 )
+
+
+# Traversal action codes, mirroring ``yggdrax._interactions_impl``.
+_ACTION_ACCEPT = 0
+_ACTION_NEAR = 1
+_ACTION_REFINE = 2
+
+#: Tag on an accepted far pair that is summarised by its monopole.
+FAR_TAG_MONOPOLE = 0
+#: Tag on an accepted far pair whose kernel contribution is negligible. Such a
+#: pair is accepted purely to stop the walk descending into it; the partition
+#: then drops it, so it costs nothing in the update.
+FAR_TAG_IGNORE = 1
+
+
+def _kernel_cutoff_pair_policy(
+    policy_state,
+    *,
+    valid_pairs,
+    mac_ok,
+    different_nodes,
+    target_leaf,
+    source_leaf,
+    same_node,
+    target_nodes,
+    source_nodes,
+    center_target,
+    center_source,
+    dist_sq,
+    extent_target,
+    extent_source,
+):
+    """Traversal policy that drops node pairs the RBF kernel cannot reach.
+
+    The Stein kernel ``exp(-r^2 / 2h^2)`` has compact effective support, so a
+    node pair whose *closest possible* particle separation
+    ``d - r_A - r_B`` already exceeds the cutoff contributes nothing -- at any
+    opening angle. Gravity has no such pairs, which is why the built-in MAC has
+    no notion of them: it summarises every well-separated pair as a monopole and
+    evaluates it at every target particle, and for this kernel the great majority
+    of those evaluations return zero to floating-point precision.
+
+    Three outcomes per pair:
+
+    * **drop** -- beyond the cutoff: accept (so the walk stops descending) and
+      tag :data:`FAR_TAG_IGNORE` so the partition never expands it;
+    * **monopole** -- the MAC accepts and the pair is within the cutoff: accept
+      and tag :data:`FAR_TAG_MONOPOLE`, the usual far field;
+    * otherwise the built-in near/refine decision stands.
+
+    The decision is symmetric under swapping target and source, so the two
+    directed evaluations the traversal performs always agree.
+
+    Args:
+        policy_state: The cutoff radius ``r_cut`` (a scalar), in the same length
+            units as the particle positions.
+        valid_pairs: Mask of live pairs in the wavefront.
+        mac_ok: Built-in multipole acceptance decision per pair.
+        different_nodes: Mask of pairs whose two nodes differ.
+        target_leaf: Whether the target node is a leaf.
+        source_leaf: Whether the source node is a leaf.
+        same_node: Unused.
+        target_nodes: Unused.
+        source_nodes: Unused.
+        center_target: Unused.
+        center_source: Unused.
+        dist_sq: Squared distance between the two node centres.
+        extent_target: Conservative radius of the target node.
+        extent_source: Conservative radius of the source node.
+
+    Returns:
+        ``(actions, tags)`` as integer arrays over the pair batch.
+    """
+    del same_node, target_nodes, source_nodes, center_target, center_source
+
+    r_cut = jnp.asarray(policy_state, dtype=dist_sq.dtype)
+    gap = jnp.sqrt(dist_sq) - extent_target - extent_source
+    negligible = valid_pairs & different_nodes & (gap > r_cut)
+
+    near = valid_pairs & (~mac_ok) & target_leaf & source_leaf & different_nodes
+    actions = jnp.full(valid_pairs.shape, _ACTION_REFINE, dtype=INDEX_DTYPE)
+    actions = jnp.where(mac_ok, as_index(_ACTION_ACCEPT), actions)
+    actions = jnp.where(near, as_index(_ACTION_NEAR), actions)
+    actions = jnp.where(negligible, as_index(_ACTION_ACCEPT), actions)
+    tags = jnp.where(negligible, as_index(FAR_TAG_IGNORE), as_index(FAR_TAG_MONOPOLE))
+    return actions, tags
 
 
 class SvgdTraversal(NamedTuple):
@@ -75,6 +162,7 @@ class SvgdTraversal(NamedTuple):
     near_neighbors: Array  # (>= near_offsets[-1],) source *node* ids
     far_src: Array  # (F,) source node of each accepted far pair
     far_tgt: Array  # (F,) target node of each accepted far pair
+    far_tags: Array  # (F,) FAR_TAG_MONOPOLE / FAR_TAG_IGNORE per far pair
     num_particles: int
 
 
@@ -89,6 +177,7 @@ class SvgdTopology(NamedTuple):
     far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
     far_src_start: Array  # (M,) inclusive start slot of the far source node
     far_src_end: Array  # (M,) inclusive end slot of the far source node
+    num_far_pairs: int  # far node pairs kept (M is their expansion, >= this)
     num_particles: int
 
 
@@ -112,6 +201,7 @@ def build_svgd_traversal(
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
+    kernel_cutoff: float | None = None,
 ) -> SvgdTraversal:
     """Run the dual-tree walk for the Stein update and return its device output.
 
@@ -128,14 +218,21 @@ def build_svgd_traversal(
         backend: ``"leaf_kdtree"`` (default, dimension-general, exact coverage),
             ``"radix"``, or ``"octree"`` (both 3-D only).
         traversal_config: Optional explicit traversal capacities.
+        kernel_cutoff: Optional kernel cutoff radius ``r_cut``. When given, node
+            pairs whose closest possible separation exceeds it are dropped by
+            :func:`_kernel_cutoff_pair_policy` instead of being refined or
+            summarised; see :func:`svgd_phi` for the ``c * h`` convention.
+            ``None`` (default) reproduces the plain MAC traversal exactly.
 
     Returns:
         An :class:`SvgdTraversal`.
 
     Raises:
-        ValueError: If a 3-D-only backend is requested for ``d != 3``, or the
-            backend name is unknown.
+        ValueError: If a 3-D-only backend is requested for ``d != 3``, the
+            backend name is unknown, or ``kernel_cutoff`` is not positive.
     """
+    if kernel_cutoff is not None and not kernel_cutoff > 0.0:
+        raise ValueError(f"kernel_cutoff must be positive; got {kernel_cutoff!r}")
     if backend == "leaf_kdtree":
         tree = build_leaf_kdtree(particles, leaf_size=leaf_size)
         pos_sorted = particles[tree.particle_indices]
@@ -161,21 +258,43 @@ def build_svgd_traversal(
             f"unknown backend {backend!r}; use 'leaf_kdtree', 'radix', or " "'octree'."
         )
     geometry = _jit_compute_tree_geometry(tree, pos_sorted, max_leaf_size=leaf_size)
-    interactions, neighbors = build_interactions_and_neighbors(
-        tree,
-        geometry,
-        theta=theta,
-        mac_type="dehnen",
-        traversal_config=traversal_config,
-    )
+    if kernel_cutoff is None:
+        interactions, neighbors = build_interactions_and_neighbors(
+            tree,
+            geometry,
+            theta=theta,
+            mac_type="dehnen",
+            traversal_config=traversal_config,
+        )
+        far_src = interactions.sources
+        far_tgt = interactions.targets
+        far_tags = jnp.full(far_src.shape, FAR_TAG_MONOPOLE, dtype=INDEX_DTYPE)
+    else:
+        # The tags only exist when a policy is installed, and they are carried on
+        # the compact far-pair payload rather than on the sparse per-node list.
+        interactions, neighbors, far_pairs = build_interactions_and_neighbors(
+            tree,
+            geometry,
+            theta=theta,
+            mac_type="dehnen",
+            traversal_config=traversal_config,
+            pair_policy=_kernel_cutoff_pair_policy,
+            policy_state=float(kernel_cutoff),
+            return_compact_far_pairs=True,
+        )
+        del interactions
+        far_src = far_pairs.sources
+        far_tgt = far_pairs.targets
+        far_tags = far_pairs.tags
     return SvgdTraversal(
         order=tree.particle_indices,
         node_ranges=tree.node_ranges,
         leaf_ids=neighbors.leaf_indices,
         near_offsets=neighbors.offsets,
         near_neighbors=neighbors.neighbors,
-        far_src=interactions.sources,
-        far_tgt=interactions.targets,
+        far_src=far_src,
+        far_tgt=far_tgt,
+        far_tags=far_tags,
         num_particles=int(tree.num_particles),
     )
 
@@ -223,6 +342,12 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     # particle receives the monopole of the paired SOURCE node.
     far_src = np.asarray(walk.far_src)
     far_tgt = np.asarray(walk.far_tgt)
+    far_tags = np.asarray(walk.far_tags)
+    if far_tags.shape[0] == far_src.shape[0]:
+        keep = far_tags != FAR_TAG_IGNORE
+        if not keep.all():
+            far_src = far_src[keep]
+            far_tgt = far_tgt[keep]
     tgt_start = node_ranges[far_tgt, 0]
     tgt_end = node_ranges[far_tgt, 1]
     tgt_len = (tgt_end - tgt_start + 1).astype(np.int64)
@@ -243,6 +368,7 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         far_tgt_slot=jnp.asarray(far_tgt_slot.astype(np.int64)),
         far_src_start=jnp.asarray(far_src_start.astype(np.int64)),
         far_src_end=jnp.asarray(far_src_end.astype(np.int64)),
+        num_far_pairs=int(far_src.shape[0]),
         num_particles=n,
     )
 
@@ -254,6 +380,7 @@ def build_svgd_topology(
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
+    kernel_cutoff: float | None = None,
 ) -> SvgdTopology:
     """Build the near/far Stein-update partition for ``particles``.
 
@@ -265,6 +392,8 @@ def build_svgd_topology(
         backend: ``"leaf_kdtree"`` (default, dimension-general, exact coverage),
             ``"radix"``, or ``"octree"`` (both 3-D only).
         traversal_config: Optional explicit traversal capacities.
+        kernel_cutoff: Optional kernel cutoff radius; see
+            :func:`build_svgd_traversal`.
 
     Returns:
         An :class:`SvgdTopology`.
@@ -276,6 +405,7 @@ def build_svgd_topology(
             leaf_size=leaf_size,
             backend=backend,
             traversal_config=traversal_config,
+            kernel_cutoff=kernel_cutoff,
         )
     )
 
@@ -355,6 +485,23 @@ def svgd_phi_from_topology(
 _jit_svgd_phi_from_topology = jax.jit(svgd_phi_from_topology)
 
 
+def _cutoff_radius(
+    cutoff_bandwidths: float | None, h: float | Float[Array, ""]
+) -> float | None:
+    """Return the absolute cutoff radius for ``c`` bandwidths, or ``None``.
+
+    Args:
+        cutoff_bandwidths: Cutoff ``c`` in bandwidths, or ``None``.
+        h: Kernel bandwidth.
+
+    Returns:
+        ``c * h`` as a Python float, or ``None`` when no cutoff is requested.
+    """
+    if cutoff_bandwidths is None:
+        return None
+    return float(cutoff_bandwidths) * float(h)
+
+
 def svgd_phi(
     particles: Float[Array, "n d"],
     scores: Float[Array, "n d"],
@@ -364,6 +511,7 @@ def svgd_phi(
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
+    cutoff_bandwidths: float | None = None,
 ) -> Float[Array, "n d"]:
     """Tree-accelerated Stein update (build partition + accumulate).
 
@@ -375,6 +523,10 @@ def svgd_phi(
         leaf_size: Target leaf occupancy.
         backend: ``"radix"`` or ``"octree"``.
         traversal_config: Optional explicit traversal capacities.
+        cutoff_bandwidths: Kernel cutoff ``c``, in bandwidths: node pairs whose
+            closest possible separation exceeds ``c * h`` are dropped, at a
+            relative cost bounded by ``exp(-c^2 / 2)`` (1.5e-8 at ``c = 6``).
+            ``None`` (default) keeps the monopole-everything far field.
 
     Returns:
         Update directions, shape ``(n, d)``.
@@ -385,6 +537,7 @@ def svgd_phi(
         leaf_size=leaf_size,
         backend=backend,
         traversal_config=traversal_config,
+        kernel_cutoff=_cutoff_radius(cutoff_bandwidths, h),
     )
     return _jit_svgd_phi_from_topology(particles, scores, h, topo)
 
@@ -399,6 +552,7 @@ def tree_svgd_step(
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
+    cutoff_bandwidths: float | None = None,
 ) -> Float[Array, "n d"]:
     """One tree-accelerated SVGD step.
 
@@ -411,6 +565,7 @@ def tree_svgd_step(
         leaf_size: Target leaf occupancy.
         backend: ``"radix"`` or ``"octree"``.
         traversal_config: Optional explicit traversal capacities.
+        cutoff_bandwidths: Kernel cutoff in bandwidths; see :func:`svgd_phi`.
 
     Returns:
         Updated particles, shape ``(n, d)``.
@@ -424,6 +579,7 @@ def tree_svgd_step(
         leaf_size=leaf_size,
         backend=backend,
         traversal_config=traversal_config,
+        cutoff_bandwidths=cutoff_bandwidths,
     )
     return particles + step_size * phi
 
@@ -439,6 +595,7 @@ def run_tree_svgd(
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
+    cutoff_bandwidths: float | None = None,
 ) -> Float[Array, "n d"]:
     """Run tree-accelerated SVGD for ``num_steps`` steps.
 
@@ -452,6 +609,7 @@ def run_tree_svgd(
         leaf_size: Target leaf occupancy.
         backend: ``"radix"`` or ``"octree"``.
         traversal_config: Optional explicit traversal capacities.
+        cutoff_bandwidths: Kernel cutoff in bandwidths; see :func:`svgd_phi`.
 
     Returns:
         Final particles, shape ``(n, d)``.
@@ -467,5 +625,6 @@ def run_tree_svgd(
             leaf_size=leaf_size,
             backend=backend,
             traversal_config=traversal_config,
+            cutoff_bandwidths=cutoff_bandwidths,
         )
     return p
