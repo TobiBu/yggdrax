@@ -20,88 +20,104 @@
   },
   "u_total_exact": 188366064.03254038,
   "metadata": {
-    "jax_version": "0.9.0",
-    "backend": "gpu",
-    "device_kind": "NVIDIA A100-PCIE-40GB",
-    "device_platform": "gpu",
-    "compute_capability": "8.0",
+    "jax_version": "0.10.2",
+    "backend": "cpu",
+    "device_kind": "cpu",
+    "device_platform": "cpu",
+    "compute_capability": null,
     "x64_enabled": true,
-    "git_commit": "da773a2",
-    "timestamp_utc": "2026-07-16T09:03:50Z",
-    "hostname": "compgpu8"
+    "git_commit": "02e9258",
+    "timestamp_utc": "2026-09-03T17:43:25Z",
+    "hostname": "mac-buck-3.local"
   },
   "records": [
     {
       "theta": 0.2,
       "num_far_pairs": 103180,
-      "covered_particle_pairs": 33439232,
-      "u_far_exact": 16606537.837951027,
-      "u_far_monopole": 16611244.006361762,
-      "far_energy_fraction": 0.0881609854898398,
-      "rel_error_vs_total": 2.4984162805048634e-05
+      "covered_particle_pairs": 16719616,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.08360226011300564,
+      "u_far_exact": 8303268.918975517,
+      "u_far_monopole": 8305622.003180884,
+      "far_energy_fraction": 0.044080492744919916,
+      "rel_error_vs_total": 1.2492081402519374e-05
     },
     {
       "theta": 0.3,
       "num_far_pairs": 292440,
-      "covered_particle_pairs": 158125056,
-      "u_far_exact": 94735695.07694472,
-      "u_far_monopole": 94769698.24384823,
-      "far_energy_fraction": 0.5029339842264744,
-      "rel_error_vs_total": 0.0001805164166812798
+      "covered_particle_pairs": 79062528,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.39533240662033103,
+      "u_far_exact": 47367847.53847234,
+      "u_far_monopole": 47384849.12192414,
+      "far_energy_fraction": 0.2514669921132371,
+      "rel_error_vs_total": 9.025820834087721e-05
     },
     {
       "theta": 0.4,
       "num_far_pairs": 276146,
-      "covered_particle_pairs": 250098176,
-      "u_far_exact": 168312475.88364762,
-      "u_far_monopole": 168394050.03133273,
-      "far_energy_fraction": 0.893539272841479,
-      "rel_error_vs_total": 0.00043306180497044614
+      "covered_particle_pairs": 125049088,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.6252767038351917,
+      "u_far_exact": 84156237.94182381,
+      "u_far_monopole": 84197025.01566634,
+      "far_energy_fraction": 0.4467696364207395,
+      "rel_error_vs_total": 0.00021653090248506486
     },
     {
       "theta": 0.5,
       "num_far_pairs": 219278,
-      "covered_particle_pairs": 303962624,
-      "u_far_exact": 221181992.61465874,
-      "u_far_monopole": 221332497.50152028,
-      "far_energy_fraction": 1.174213591766983,
-      "rel_error_vs_total": 0.000799002132547257
+      "covered_particle_pairs": 151981312,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.7599445572278614,
+      "u_far_exact": 110590996.30732933,
+      "u_far_monopole": 110666248.75076014,
+      "far_energy_fraction": 0.5871067958834912,
+      "rel_error_vs_total": 0.0003995010662738658
     },
     {
       "theta": 0.6,
       "num_far_pairs": 164592,
-      "covered_particle_pairs": 334942720,
-      "u_far_exact": 256929815.44586805,
-      "u_far_monopole": 257141940.51398137,
-      "far_energy_fraction": 1.363992058577405,
-      "rel_error_vs_total": 0.0011261320833071198
+      "covered_particle_pairs": 167471360,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.8373986699334967,
+      "u_far_exact": 128464907.72293404,
+      "u_far_monopole": 128570970.2569907,
+      "far_energy_fraction": 0.6819960292887026,
+      "rel_error_vs_total": 0.0005630660416535599
     },
     {
       "theta": 0.7,
       "num_far_pairs": 125844,
-      "covered_particle_pairs": 354750464,
-      "u_far_exact": 283622572.72340846,
-      "u_far_monopole": 283915178.85129577,
-      "far_energy_fraction": 1.5056988857314153,
-      "rel_error_vs_total": 0.0015533908901805193
+      "covered_particle_pairs": 177375232,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.8869205060253013,
+      "u_far_exact": 141811286.3617042,
+      "u_far_monopole": 141957589.4256479,
+      "far_energy_fraction": 0.7528494428657074,
+      "rel_error_vs_total": 0.000776695445090576
     },
     {
       "theta": 0.8,
       "num_far_pairs": 95836,
-      "covered_particle_pairs": 366556160,
-      "u_far_exact": 301140674.3023927,
-      "u_far_monopole": 301491526.28368115,
-      "far_energy_fraction": 1.5986991916461686,
-      "rel_error_vs_total": 0.001862607169133306
+      "covered_particle_pairs": 183278080,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.9164362218110905,
+      "u_far_exact": 150570337.15119636,
+      "u_far_monopole": 150745763.14184058,
+      "far_energy_fraction": 0.7993495958230843,
+      "rel_error_vs_total": 0.000931303584566653
     },
     {
       "theta": 1.0,
       "num_far_pairs": 59660,
-      "covered_particle_pairs": 380315136,
-      "u_far_exact": 325564329.69814247,
-      "u_far_monopole": 325996801.337025,
-      "far_energy_fraction": 1.7283597837554274,
-      "rel_error_vs_total": 0.0022959105776495284
+      "covered_particle_pairs": 190157568,
+      "far_list_symmetric_halved": true,
+      "covered_fraction_of_unordered_pairs": 0.9508353817690884,
+      "u_far_exact": 162782164.8490712,
+      "u_far_monopole": 162998400.66851252,
+      "far_energy_fraction": 0.8641798918777135,
+      "rel_error_vs_total": 0.0011479552888250806
     }
   ]
 }

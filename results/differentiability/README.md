@@ -1,6 +1,6 @@
 # `results/differentiability/` — what each file is
 
-Results for the differentiability sections (Yggdrax paper Sect. 2; cited as a precedent by
+Results for the differentiability sections (Yggdrax I §3, the differentiability model; cited as a precedent by
 Jaccpot I §7). Produced by `bench/differentiability/*.py`; every payload carries a
 `metadata` block with the jax version, backend, device, x64 flag and git SHA.
 

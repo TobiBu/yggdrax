@@ -171,6 +171,18 @@ def main() -> None:
             u_far_mono += float(node_mass[a] * node_mass[b] / rc)
             covered_pairs += int(pa.shape[0] * pb.shape[0])
 
+        # The dual-tree walk emits a symmetric far list -- every (A, B) also
+        # appears as (B, A) -- while ``u_total`` counts each unordered pair
+        # once. Detect the symmetry from the data and halve, so the far
+        # sums and ``u_total`` are on the same footing. Without this the
+        # "far-field energy fraction" exceeds 1 and the error is 2x too small.
+        pair_set = set(zip(src.tolist(), tgt.tolist()))
+        far_list_symmetric = all((b, a) in pair_set for (a, b) in pair_set)
+        if far_list_symmetric and pair_set:
+            u_far_exact *= 0.5
+            u_far_mono *= 0.5
+            covered_pairs //= 2
+        n_unordered = args.n * (args.n - 1) // 2
         rel_err = abs(u_far_mono - u_far_exact) / u_total if u_total else 0.0
         far_fraction = u_far_exact / u_total if u_total else 0.0
         records.append(
@@ -178,6 +190,8 @@ def main() -> None:
                 "theta": theta,
                 "num_far_pairs": int(src.shape[0]),
                 "covered_particle_pairs": covered_pairs,
+                "far_list_symmetric_halved": far_list_symmetric,
+                "covered_fraction_of_unordered_pairs": covered_pairs / n_unordered,
                 "u_far_exact": u_far_exact,
                 "u_far_monopole": u_far_mono,
                 "far_energy_fraction": far_fraction,
