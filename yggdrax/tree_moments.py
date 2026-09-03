@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from beartype import beartype
 from beartype.typing import Tuple
-from jaxtyping import Array, jaxtyped
+from jaxtyping import Array, Inexact, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index
 from .multipole_utils import (
@@ -615,7 +615,7 @@ def multipole_from_packed(
 @jaxtyped(typechecker=beartype)
 def translate_packed_moments(
     packed_child: Array,
-    delta: Array,
+    delta: Inexact[Array, "3"],
     max_order: int,
 ) -> Array:
     """Translate a packed multipole expansion to a shifted center (M2M).
@@ -628,7 +628,10 @@ def translate_packed_moments(
     packed_child
         Packed child coefficients of length ``>= total_coefficients(max_order)``.
     delta
-        Translation vector ``parent_center - child_center`` of shape ``(3,)``.
+        Translation vector ``parent_center - child_center`` of shape ``(3,)``. The shape
+        is enforced: a ``(2,)`` delta used to return a well-formed expansion identical to
+        the one for ``(x, y, y)``, because ``multi_power`` indexes ``delta[2]`` and JAX
+        clamps it, and a ``(4,)`` delta silently ignored the surplus component.
     max_order
         Highest multipole order to translate (``0`` ≤ ``max_order`` ≤ ``4``).
 

@@ -86,3 +86,69 @@ def test_pack_tensor_raises_for_shape_mismatch():
 def test_unpack_tensor_raises_for_invalid_length():
     with pytest.raises(ValueError):
         unpack_tensor(2, jnp.zeros((5,), dtype=jnp.float32))
+
+
+# `multi_power` and the public M2M above it both document a length-3 vector and neither
+# enforced it. JAX CLAMPS an out-of-bounds index, so `vec[2]` on a 2-vector silently
+# returns `vec[-1]` and every violation is a valid gather afterwards -- no body-level
+# check can fire. Measured before the annotations:
+#
+#     multi_power([2, 3], (1, 1, 1))                  -> 18.0, where [2, 3, 5] gives 30.0
+#     multi_power([[2, 3, 5]], (1, 1, 1))             -> [8, 27, 125], a VECTOR
+#     translate_packed_moments(packed, [.5, .25], 2)  -> a valid-looking (10,) result that
+#                                                        is EXACTLY the answer for
+#                                                        (x, y, y), i.e. the clamp
+
+
+def test_multi_power_requires_a_length_three_vector():
+    """A 2- or 4-vector has no correct monomial, and clamping returned one anyway."""
+    from jaxtyping import TypeCheckError
+
+    vec = jnp.array([2.0, 3.0, 5.0], dtype=jnp.float64)
+    assert jnp.isclose(multi_power(vec, (1, 1, 1)), 30.0)
+
+    for bad in (vec[:2], jnp.array([2.0, 3.0, 5.0, 7.0], dtype=jnp.float64)):
+        with pytest.raises(TypeCheckError):
+            multi_power(bad, (1, 1, 1))
+
+
+def test_multi_power_requires_rank_one():
+    """``[[2, 3, 5]]`` returned each component cubed -- an array where a scalar belongs."""
+    from jaxtyping import TypeCheckError
+
+    vec = jnp.array([2.0, 3.0, 5.0], dtype=jnp.float64)
+    for bad in (vec[None, :], vec[:, None]):
+        with pytest.raises(TypeCheckError):
+            multi_power(bad, (1, 1, 1))
+
+
+def test_multi_power_still_accepts_a_complex_vector():
+    """``Inexact`` and not ``Float``: ``jnp.array(1.0, dtype=vec.dtype)`` allows complex.
+
+    ``translate_packed_moments`` casts ``delta`` to the coefficient dtype, so a complex
+    packed expansion hands ``multi_power`` a complex vector. Narrowing to ``Float`` would
+    break that path; every corruption measured above is a shape, not a dtype.
+    """
+    vec = jnp.array([2.0 + 1.0j, 3.0, 5.0])
+    assert jnp.isclose(multi_power(vec, (1, 0, 0)), 2.0 + 1.0j)
+
+
+def test_translate_packed_moments_requires_a_length_three_delta():
+    """The public M2M, where the clamp produced a plausible wrong translation.
+
+    A ``(2,)`` delta came back as a well-shaped ``(10,)`` expansion identical to the one
+    for ``(x, y, y)``. A ``(4,)`` delta silently ignored the surplus component. Both are
+    now rejected; the rank cases already raised a ``TypeError`` from a concatenate.
+    """
+    from jaxtyping import TypeCheckError
+
+    from yggdrax.tree_moments import translate_packed_moments
+
+    packed = jnp.arange(1, total_coefficients(2) + 1, dtype=jnp.float64)
+    good = jnp.array([0.5, 0.25, 0.125], dtype=jnp.float64)
+    # Non-vacuity: the documented call must still work.
+    assert translate_packed_moments(packed, good, 2).shape == (10,)
+
+    for bad in (good[:2], jnp.array([0.5, 0.25, 0.125, 0.0625], dtype=jnp.float64)):
+        with pytest.raises(TypeCheckError):
+            translate_packed_moments(packed, bad, 2)
