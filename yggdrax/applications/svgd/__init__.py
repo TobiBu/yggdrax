@@ -1,6 +1,6 @@
 """Tree-accelerated, differentiable Stein Variational Gradient Descent (SVGD).
 
-Modules (see the paper plan, Phase 3):
+Modules:
 
 * ``kernel``            -- RBF kernel, median heuristic, and Stein pair terms.
 * ``targets``           -- toy target distributions with analytic scores.

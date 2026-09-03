@@ -11,7 +11,7 @@ using the yggdrax dual-tree traversal to avoid the :math:`O(N^2)` sum:
   ``d_AB`` is the distance between the node centres of mass -- a monopole
   approximation whose error is controlled by the opening angle ``theta``.
 
-Design (matching the differentiability model, paper section 2): the tree
+Design (matching the differentiability model in `docs/`): the tree
 topology and near/far partition are built once as an integer
 :class:`PairTopology` (non-differentiable), and the soft counts are a smooth,
 reverse-mode-differentiable function of the particle positions *given* that
