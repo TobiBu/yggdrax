@@ -32,6 +32,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from bench.differentiability._common import (
+    device_memory_stats,
     dump_json,
     run_metadata,
     select_free_gpu,
@@ -49,6 +50,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sharpness", type=float, default=150.0)
     p.add_argument("--leaf-size", type=int, default=64)
     p.add_argument("--backend", type=str, default="radix")
+    p.add_argument(
+        "--dtype",
+        choices=("float32", "float64"),
+        default="float64",
+        help=(
+            "Working precision. 'float64' enables jax_enable_x64 (this bench's "
+            "historical default); 'float32' leaves it off."
+        ),
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -76,7 +86,8 @@ def main() -> None:
     import jax
     import jax.numpy as jnp
 
-    jax.config.update("jax_enable_x64", True)
+    use_x64 = args.dtype == "float64"
+    jax.config.update("jax_enable_x64", use_x64)
 
     from yggdrax import DualTreeTraversalConfig
     from yggdrax.applications.corrfunc.baselines import brute_force_soft_pair_counts
@@ -100,13 +111,14 @@ def main() -> None:
         max_interactions_per_node=1 << 13,
         max_neighbors_per_leaf=1 << 13,
     )
-    edges = make_log_edges(args.r_min, args.r_max, args.num_bins)
+    dtype = jnp.float64 if use_x64 else jnp.float32
+    edges = make_log_edges(args.r_min, args.r_max, args.num_bins).astype(dtype)
     sharp = args.sharpness
 
     records = []
     for n in args.sizes:
         key = jax.random.PRNGKey(args.seed)
-        pos = jax.random.uniform(key, (n, 3), dtype=jnp.float64)
+        pos = jax.random.uniform(key, (n, 3), dtype=dtype)
 
         # Topology build. The first call pays the capacity-retry compile ladder,
         # so time it warmed (like accumulate/value_and_grad) rather than as a
@@ -144,8 +156,11 @@ def main() -> None:
             "build": build_t.as_dict(),
             "accumulate": acc_t.as_dict(),
             "value_and_grad": vg_t.as_dict(),
+            "grad_ratio": vg_t.min_s / acc_t.min_s,
             "num_far_pairs": int(topo.far_src_start.shape[0]),
             "num_near_leaf_pairs": int(topo.near_target_row.shape[0]),
+            "max_leaf": int(topo.leaf_slots.shape[1]),
+            "device_memory": device_memory_stats(),
         }
         if n <= args.brute_force_max_n:
             t0 = time.perf_counter()
@@ -166,6 +181,7 @@ def main() -> None:
             "sharpness": sharp,
             "leaf_size": args.leaf_size,
             "backend": args.backend,
+            "dtype": args.dtype,
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,

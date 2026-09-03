@@ -1,13 +1,21 @@
 """Scaling of the tree-accelerated Stein update vs N at fixed dimension.
 
-Times the two stages of one SVGD update over a sweep of particle count:
+Times the stages of one SVGD update over a sweep of particle count:
 
-* ``build`` -- construct the (non-differentiable) near/far partition;
+* ``build`` -- construct the (non-differentiable) near/far partition, split into
+  its device half (tree build, geometry, dual-tree walk) and its host half (the
+  numpy assembly of the partition);
 * ``phi`` -- the differentiable Stein-update accumulation over that partition;
 * ``value_and_grad`` -- forward + reverse of the accumulation w.r.t. positions.
 
-The exact O(N^2) Stein update is timed for the small sizes as context. For the
-small sizes the accuracy of the tree update vs. exact is also recorded.
+The exact O(N^2) Stein update is timed for the small sizes as the baseline the
+tree update has to beat. It is **jitted and warmed** like everything else here:
+timing an eager op-dispatch loop against a compiled one measures the dispatch
+overhead, not the algorithm.
+
+Per-record counters (``num_far_pairs``, ``num_near_leaf_pairs``,
+``num_far_contribs``, peak device memory) make the effect of a far-field or
+near-field change visible in the JSON rather than only in the wall clock.
 
 Results -> ``results/svgd/scaling.json``.
 
@@ -32,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from bench.differentiability._common import (
+    device_memory_stats,
     dump_json,
     run_metadata,
     select_free_gpu,
@@ -55,6 +64,15 @@ def _parse_args() -> argparse.Namespace:
         default="auto",
         help="Tree backend: 'auto' -> radix for d<=3 else leaf_kdtree.",
     )
+    p.add_argument(
+        "--dtype",
+        choices=("float32", "float64"),
+        default="float64",
+        help=(
+            "Working precision. 'float64' enables jax_enable_x64 (this bench's "
+            "historical default); 'float32' leaves it off."
+        ),
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -77,19 +95,21 @@ def main() -> None:
 
     select_free_gpu(args.gpu_select, tag="svgd-scaling")
 
-    import time
-
     import jax
     import jax.numpy as jnp
 
-    jax.config.update("jax_enable_x64", True)
+    use_x64 = args.dtype == "float64"
+    jax.config.update("jax_enable_x64", use_x64)
 
     from yggdrax import DualTreeTraversalConfig
     from yggdrax.applications.svgd.exact import exact_phi
     from yggdrax.applications.svgd.sampler import (
-        build_svgd_topology,
+        assemble_svgd_topology,
+        build_svgd_traversal,
         svgd_phi_from_topology,
     )
+
+    dtype = jnp.float64 if use_x64 else jnp.float32
 
     cfg = DualTreeTraversalConfig(
         max_pair_queue=1 << 22,
@@ -105,20 +125,32 @@ def main() -> None:
     records = []
     for n in args.sizes:
         key = jax.random.PRNGKey(args.seed)
-        kp, ks = jax.random.split(key)
-        p = jax.random.normal(kp, (n, dim)) * 1.2
+        p = (jax.random.normal(key, (n, dim), dtype=dtype) * 1.2).astype(dtype)
         scores = -p  # standard-normal-like score for timing purposes
         h = 0.5
 
-        t0 = time.perf_counter()
-        topo = build_svgd_topology(
-            p,
-            theta=args.theta,
-            leaf_size=args.leaf_size,
-            backend=backend,
-            traversal_config=cfg,
+        # The build is timed in its two halves. The first call pays the
+        # traversal's capacity-retry compile ladder, so both halves are warmed
+        # first; a cold ``build_s`` measures compilation, not the partition.
+        def walk_fn(pp=p):
+            return build_svgd_traversal(
+                pp,
+                theta=args.theta,
+                leaf_size=args.leaf_size,
+                backend=backend,
+                traversal_config=cfg,
+            )
+
+        # Fewer repeats than the JAX kernels: the host half does numpy work that
+        # scales with N, so keep the warmed count bounded.
+        build_runs = min(args.runs, 3)
+        walk_t = time_callable(walk_fn, warmup=1, runs=build_runs)
+        walk = walk_fn()
+        assemble_t = time_callable(
+            lambda w=walk: assemble_svgd_topology(w), warmup=1, runs=build_runs
         )
-        build_s = time.perf_counter() - t0
+        topo = assemble_svgd_topology(walk)
+        build_s = walk_t.min_s + assemble_t.min_s
 
         phi = jax.jit(lambda pp, t=topo: svgd_phi_from_topology(pp, scores, h, t))
         vg = jax.jit(
@@ -133,24 +165,42 @@ def main() -> None:
             "n": n,
             "dim": dim,
             "build_s": build_s,
+            "build_device": walk_t.as_dict(),
+            "build_host": assemble_t.as_dict(),
             "phi": phi_t.as_dict(),
             "value_and_grad": vg_t.as_dict(),
+            "grad_ratio": vg_t.min_s / phi_t.min_s,
+            "num_far_pairs": int(walk.far_src.shape[0]),
+            "num_near_leaf_pairs": int(topo.near_target_row.shape[0]),
             "num_far_contribs": int(topo.far_tgt_slot.shape[0]),
+            "max_leaf": int(topo.leaf_slots.shape[1]),
+            "device_memory": device_memory_stats(),
         }
         if n <= args.exact_max_n:
-            ref = exact_phi(p, scores, h)
+            exact = jax.jit(lambda pp: exact_phi(pp, scores, h))
+            ref = exact(p)
             tree = phi(p)
             entry["rel_error_vs_exact"] = float(
                 jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref)
             )
-            t0 = time.perf_counter()
-            jax.block_until_ready(exact_phi(p, scores, h))
-            entry["exact_s"] = time.perf_counter() - t0
+            exact_t = time_callable(
+                lambda: exact(p), warmup=args.warmup, runs=args.runs
+            )
+            entry["exact"] = exact_t.as_dict()
+            entry["exact_s"] = exact_t.min_s
+            entry["speedup_vs_exact"] = exact_t.min_s / phi_t.min_s
         records.append(entry)
-        print(
+        msg = (
             f"n={n:>8d} build={build_s * 1e3:8.1f} ms "
-            f"phi={phi_t.min_s * 1e3:8.2f} ms vgrad={vg_t.min_s * 1e3:8.2f} ms"
+            f"(dev={walk_t.min_s * 1e3:7.1f} host={assemble_t.min_s * 1e3:7.1f}) "
+            f"phi={phi_t.min_s * 1e3:8.2f} ms vgrad={vg_t.min_s * 1e3:8.2f} ms "
+            f"ratio={entry['grad_ratio']:4.2f} "
+            f"far_pairs={entry['num_far_pairs']:>8d} "
+            f"M={entry['num_far_contribs']:>9d}"
         )
+        if "exact_s" in entry:
+            msg += f" exact={entry['exact_s'] * 1e3:8.2f} ms"
+        print(msg)
 
     payload = {
         "benchmark": "svgd_scaling",
@@ -160,6 +210,7 @@ def main() -> None:
             "theta": args.theta,
             "leaf_size": args.leaf_size,
             "backend": backend,
+            "dtype": args.dtype,
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,

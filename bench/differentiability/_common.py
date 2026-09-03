@@ -38,6 +38,40 @@ def select_free_gpu(mode: str = "free", *, tag: str = "bench") -> None:
     autocvd(num_gpus=1, least_used=(mode == "least-used"))
 
 
+def device_memory_stats(device_index: int = 0) -> dict[str, int] | None:
+    """Return the backend's memory counters for one device, or ``None``.
+
+    ``peak_bytes_in_use`` is a high-water mark since process start, so across a
+    size sweep the interesting quantity is its *increment* from record to record,
+    not its absolute value. Returns ``None`` on backends that report nothing
+    (CPU) or when the device index does not exist.
+
+    Args:
+        device_index: Index into ``jax.local_devices()``.
+
+    Returns:
+        A dict of byte counters, or ``None`` if unavailable.
+    """
+    import jax
+
+    try:
+        devices = jax.local_devices()
+        if device_index >= len(devices):
+            return None
+        stats = devices[device_index].memory_stats()
+    except Exception:  # pragma: no cover - backend-dependent
+        return None
+    if not stats:
+        return None
+    keys = (
+        "bytes_in_use",
+        "peak_bytes_in_use",
+        "bytes_limit",
+        "largest_alloc_size",
+    )
+    return {k: int(stats[k]) for k in keys if k in stats}
+
+
 def _git_commit(repo_root: Path) -> str | None:
     """Return the short git commit of ``repo_root`` or None if unavailable."""
     try:
