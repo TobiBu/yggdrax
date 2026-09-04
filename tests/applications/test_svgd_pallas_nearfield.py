@@ -438,3 +438,176 @@ def test_the_auto_lane_needs_enough_leaves_to_be_worth_launching():
     # Above the threshold it defers to the capability probe, which is False on a
     # CPU runner -- so the only machine-independent assertion is agreement.
     assert prefer_fused_nearfield(1 << 20) == pallas_stein_nearfield_supported()
+
+
+# --------------------------------------------------------------------------
+# WP2: the far field. Same construction one level up -- the sources are node
+# monopoles instead of leaf blocks, and the reverse's source side has to leave
+# the kernel, because a far source node is seen by many target leaves.
+# --------------------------------------------------------------------------
+
+
+def _far_case(num_leaves=6, width=8, dim=2, num_nodes=5, seed=0):
+    """A synthetic far partition: a CSR of source nodes per target leaf."""
+    rng = np.random.default_rng(seed)
+    leaf_x = jnp.asarray(rng.normal(size=(num_leaves, width, dim)))
+    mask = jnp.asarray(rng.random((num_leaves, width)) > 0.2)
+    count = jnp.asarray(rng.integers(1, 20, size=(num_nodes,)).astype(float))
+    com = jnp.asarray(rng.normal(size=(num_nodes, dim)))
+    sums = jnp.asarray(rng.normal(size=(num_nodes, dim)))
+    per_leaf = rng.integers(0, 4, size=(num_leaves,))
+    node = (
+        np.concatenate([rng.integers(0, num_nodes, size=(int(c),)) for c in per_leaf])
+        if per_leaf.sum()
+        else np.zeros((0,), np.int64)
+    ).astype(np.int32)
+    offsets = jnp.asarray(np.concatenate([[0], np.cumsum(per_leaf)]).astype(np.int32))
+    node_offsets = jnp.asarray(
+        np.concatenate([[0], np.cumsum(np.bincount(node, minlength=num_nodes))]).astype(
+            np.int32
+        )
+    )
+    perm = jnp.asarray(np.argsort(node, kind="stable").astype(np.int32))
+    return (
+        leaf_x,
+        mask,
+        count,
+        com,
+        sums,
+        offsets,
+        jnp.asarray(node),
+        node_offsets,
+        perm,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_leaves,width,dim,num_nodes",
+    [(6, 8, 2, 5), (5, 5, 3, 7), (4, 16, 1, 3), (7, 12, 4, 9), (3, 1, 2, 2)],
+)
+def test_the_far_kernel_and_its_vjp_match_the_twin(num_leaves, width, dim, num_nodes):
+    """Value and all four cotangents, against autodiff through the twin."""
+    from yggdrax.applications.svgd.pallas_farfield import (
+        farfield_stein,
+        farfield_stein_jax,
+    )
+
+    case = _far_case(num_leaves, width, dim, num_nodes, seed=dim + num_nodes)
+    leaf_x, mask, count, com, sums, offsets, node, node_offsets, perm = case
+    band = jnp.asarray(0.63)
+    cotangent = jnp.asarray(np.random.default_rng(99).normal(size=leaf_x.shape))
+
+    def twin(x_, com_, sums_, h_):
+        return farfield_stein_jax(x_, mask, count, com_, sums_, offsets, node, h_)
+
+    def fused(x_, com_, sums_, h_):
+        return farfield_stein(
+            x_,
+            mask,
+            count,
+            com_,
+            sums_,
+            offsets,
+            node,
+            node_offsets,
+            perm,
+            h_,
+            interpret=True,
+        )
+
+    want, vjp_want = jax.vjp(twin, leaf_x, com, sums, band)
+    got, vjp_got = jax.vjp(fused, leaf_x, com, sums, band)
+    np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-11)
+    for name, a, b in zip(
+        ("d/dx", "d/dcom", "d/dsums", "d/dh"), vjp_got(cotangent), vjp_want(cotangent)
+    ):
+        np.testing.assert_allclose(a, b, rtol=1e-11, atol=1e-11, err_msg=name)
+
+
+def test_the_far_partition_is_leaf_major_and_never_materialises_m():
+    """The CSR must cover every accepted pair's particles exactly once.
+
+    ``num_far_contribs`` is *M*, the per-particle expansion the partition used
+    to build. It is still reported -- the paper's scaling figure reads it -- but
+    the arrays are now ``ml`` times smaller, and this pins both halves of that:
+    the count is right, and the entry list is the size it should be.
+    """
+    key = jax.random.PRNGKey(4)
+    particles = jax.random.normal(key, (600, 2), dtype=jnp.float64)
+    topo = build_svgd_topology(
+        particles, theta=0.5, leaf_size=8, backend="leaf_kdtree", traversal_config=_CFG
+    )
+    entries = int(topo.far_leaf_source.shape[0])
+    assert int(topo.num_far_contribs) > entries > 0
+    # Every entry names a real source node, and the CSR is sorted by target leaf.
+    offsets = np.asarray(topo.far_leaf_offsets)
+    assert offsets[0] == 0 and offsets[-1] == entries
+    assert np.all(np.diff(offsets) >= 0)
+    assert int(np.asarray(topo.far_leaf_source).max()) < int(
+        topo.far_node_start.shape[0]
+    )
+    # The transpose CSR is a permutation of the same entries, sorted by source.
+    perm = np.asarray(topo.far_entry_perm)[:entries]
+    assert sorted(perm.tolist()) == list(range(entries))
+    by_source = np.asarray(topo.far_leaf_source)[perm]
+    assert np.all(np.diff(by_source) >= 0)
+    assert int(np.asarray(topo.far_node_offsets)[-1]) == entries
+
+
+def test_the_fused_far_field_matches_the_pure_jax_one_end_to_end():
+    """Value and gradient through the whole update, near and far both fused."""
+    key = jax.random.PRNGKey(5)
+    particles = jax.random.normal(key, (192, 2), dtype=jnp.float64)
+    scores = -particles
+    topo = build_svgd_topology(
+        particles, theta=0.5, leaf_size=8, backend="leaf_kdtree", traversal_config=_CFG
+    )
+    assert int(topo.num_far_pairs) > 0
+
+    def loss(x, band, how):
+        return jnp.sum(
+            svgd_phi_from_topology(x, scores, band, topo, accumulate=how) ** 2
+        )
+
+    band = jnp.asarray(0.5)
+    np.testing.assert_allclose(
+        svgd_phi_from_topology(particles, scores, band, topo, accumulate="interpret"),
+        svgd_phi_from_topology(particles, scores, band, topo, accumulate="scatter"),
+        rtol=1e-11,
+        atol=1e-13,
+    )
+    want = jax.grad(loss, (0, 1))(particles, band, "scatter")
+    got = jax.grad(loss, (0, 1))(particles, band, "interpret")
+    np.testing.assert_allclose(got[0], want[0], rtol=1e-10, atol=1e-13)
+    np.testing.assert_allclose(got[1], want[1], rtol=1e-10, atol=1e-13)
+
+
+@pytest.mark.parametrize("capacity", ["exact", "pow2", "bucket"])
+def test_no_far_pairs_with_capacity_padding(capacity):
+    """A partition that accepted nothing as far must still run, padded or not.
+
+    ``capacity="pow2"`` -- the default for :func:`run_tree_svgd` -- rounds the
+    far entry list up to one entry even when there are none, and that entry
+    names a source node in a table that is empty. The guard is therefore on the
+    node table and not on the entry list.
+    """
+    key = jax.random.PRNGKey(6)
+    particles = jax.random.normal(key, (128, 2), dtype=jnp.float64)
+    topo = build_svgd_topology(
+        particles,
+        theta=0.0,
+        leaf_size=8,
+        backend="leaf_kdtree",
+        traversal_config=_CFG,
+        capacity=capacity,
+    )
+    assert int(topo.num_far_pairs) == 0
+    assert int(topo.far_node_start.shape[0]) == 0
+    np.testing.assert_allclose(
+        svgd_phi_from_topology(
+            particles, -particles, 0.5, topo, accumulate="interpret"
+        ),
+        svgd_phi_from_topology(particles, -particles, 0.5, topo, accumulate="scatter"),
+        rtol=1e-12,
+        atol=1e-14,
+    )
