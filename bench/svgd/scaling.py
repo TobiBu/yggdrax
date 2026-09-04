@@ -84,10 +84,36 @@ def _parse_args() -> argparse.Namespace:
             "far field."
         ),
     )
+    p.add_argument(
+        "--density",
+        choices=("fixed-cloud", "fixed-density"),
+        default="fixed-cloud",
+        help=(
+            "How the particle cloud grows with N. 'fixed-cloud' holds sigma at "
+            "1.2 and lets density grow, which is the paper's historical sweep "
+            "and the regime in which a compactly supported kernel cannot pay: "
+            "every particle's neighbour count inside the cutoff grows with N. "
+            "'fixed-density' scales sigma as N^(1/3), which is the regime the "
+            "far-field cutoff is designed for."
+        ),
+    )
+    p.add_argument(
+        "--sigma",
+        type=float,
+        default=1.2,
+        help="Cloud scale at the smallest size in --sizes.",
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exact-max-n", type=int, default=5000)
+    p.add_argument(
+        "--exact-block",
+        type=int,
+        default=2048,
+        help="Targets per block in the exact baseline; caps its (block, n) "
+        "kernel matrix.",
+    )
     p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
     )
@@ -133,10 +159,16 @@ def main() -> None:
     if backend == "auto":
         backend = "radix" if dim <= 3 else "leaf_kdtree"
 
+    n_ref = min(args.sizes)
     records = []
     for n in args.sizes:
         key = jax.random.PRNGKey(args.seed)
-        p = (jax.random.normal(key, (n, dim), dtype=dtype) * 1.2).astype(dtype)
+        # Fixed density means the cloud's volume grows with N, so its scale goes
+        # like N^(1/dim); fixed cloud holds it and lets the density grow.
+        sigma = args.sigma
+        if args.density == "fixed-density":
+            sigma *= (n / n_ref) ** (1.0 / dim)
+        p = (jax.random.normal(key, (n, dim), dtype=dtype) * sigma).astype(dtype)
         scores = -p  # standard-normal-like score for timing purposes
         h = 0.5
 
@@ -202,10 +234,16 @@ def main() -> None:
             "num_near_pair_rows": int(topo.near_target_row.shape[0]),
             "num_far_contribs": int(topo.far_tgt_slot.shape[0]),
             "max_leaf": int(topo.leaf_slots.shape[1]),
+            "sigma": sigma,
             "device_memory": device_memory_stats(),
         }
         if n <= args.exact_max_n:
-            exact = jax.jit(exact_phi)
+            # exact_phi contracts to two matmuls; block_size caps its kernel
+            # matrix at (block, n) so the baseline reaches the same N the tree
+            # does instead of stopping at 2e4.
+            exact = jax.jit(
+                lambda pp, sc, hh: exact_phi(pp, sc, hh, block_size=args.exact_block)
+            )
             ref = exact(p, scores, h)
             tree = phi(p, scores, h, topo)
             entry["rel_error_vs_exact"] = float(
@@ -240,6 +278,8 @@ def main() -> None:
             "backend": backend,
             "dtype": args.dtype,
             "cutoff_bandwidths": args.cutoff_bandwidths,
+            "density": args.density,
+            "sigma": args.sigma,
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,
