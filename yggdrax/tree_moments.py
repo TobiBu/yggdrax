@@ -686,7 +686,7 @@ def _validate_inputs(
         raise ValueError("positions must have shape (N, 3)")
 
 
-def _validate_inputs_mod(
+def _validate_inputs_jit(
     tree: object,
     positions_sorted: Array,
     masses_sorted: Array,
@@ -794,7 +794,7 @@ def compute_tree_mass_moments_jit(
 
     topology = resolve_tree_topology(tree)
     require_fmm_core_topology(topology)
-    _validate_inputs_mod(topology, positions_sorted, masses_sorted)
+    _validate_inputs_jit(topology, positions_sorted, masses_sorted)
 
     ranges = topology.node_ranges.astype(INDEX_DTYPE)
     starts = ranges[:, 0]
