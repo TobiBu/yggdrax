@@ -26,12 +26,15 @@ jobs:
           cache: pip
 
       - name: Install package + dev tools
-        # Include the `paper` extra (optax/scipy/matplotlib/nbformat): the
-        # differentiable-applications code (yggdrax/applications) and its
-        # bench smoke tests import it, and basedpyright type-checks it.
+        # Both extras. `paper` carries the bench dependencies (scipy, matplotlib,
+        # nbformat) that the bench smoke tests import; `applications` carries
+        # optax, which yggdrax/applications/{svgd/bandwidth_learning,
+        # corrfunc/inference_demo} import and basedpyright type-checks. `paper`
+        # happens to pull optax in too, but naming the extra that actually
+        # declares it is what keeps this correct if the two ever diverge.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,paper]"
+          pip install -e ".[dev,paper,applications]"
 
       - name: Black
         run: black --check .
@@ -168,9 +171,13 @@ jobs:
           python-version: "3.13"
           cache: pip
       - name: Install package + dev tools
+        # The `applications` extra carries optax, which
+        # yggdrax/applications/{svgd/bandwidth_learning,corrfunc/inference_demo}
+        # import. Without it basedpyright cannot resolve the import and the
+        # type-check step fails before the tests ever run.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,applications]"
       - name: Distributed tests (${{ matrix.shard }})
         # `--no-cov`: `addopts` carries `--cov-fail-under=80`, and these paths only
         # touch `yggdrax/distributed/*`, which the coverage config omits -- so the gate
