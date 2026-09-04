@@ -301,3 +301,77 @@ def test_directed_pair_list_is_sorted_and_twice_the_halved_one():
     assert directed.shape[0] == 2 * int(topo.near_target_row.shape[0])
     assert directed.shape[0] == int(topo.num_near_leaf_pairs)
     assert np.all(np.diff(directed) >= 0), "target rows must be non-decreasing"
+
+
+# --- static capacities -----------------------------------------------------
+#
+# The partition's lengths are data dependent, so a per-step-rebuild sampler
+# retraces every step: six rebuilds give six (near pairs, M) signatures, and 8
+# steps at N=1e4 cost 35.5 s against 2.2 s padded. Padding must be inert.
+
+
+@pytest.mark.parametrize("capacity", ["exact", "bucket", "pow2", 1 << 18])
+@pytest.mark.parametrize("accumulate", ["scatter", "segment"])
+def test_capacity_padding_is_inert(capacity, accumulate):
+    p = jax.random.normal(jax.random.PRNGKey(11), (1500, 3)) * 1.2
+    sc, h = p * 0.5, 0.6
+    kw = dict(theta=0.5, leaf_size=16, backend="radix", traversal_config=_CFG)
+    base = svgd_phi_from_topology(
+        p, sc, h, build_svgd_topology(p, capacity="exact", **kw), accumulate="scatter"
+    )
+    topo = build_svgd_topology(p, capacity=capacity, **kw)
+    got = svgd_phi_from_topology(p, sc, h, topo, accumulate=accumulate)
+    assert float(jnp.max(jnp.abs(got - base))) < 1e-12
+
+
+def test_padding_reduces_shape_churn_and_an_explicit_capacity_removes_it():
+    """The property the padding exists for -- and the limit of the cheap policies.
+
+    ``"pow2"`` and ``"bucket"`` pin a shape only while the count stays inside one
+    bucket; a count sitting on a boundary still flips between rebuilds, as *M*
+    does here (2048 vs 4096 at N = 4000). Only an explicit capacity is a
+    guarantee, which is what a long run should pin after one probe build.
+    """
+    p0 = jax.random.normal(jax.random.PRNGKey(12), (4000, 3)) * 1.2
+    kw = dict(theta=0.5, leaf_size=32, backend="radix", traversal_config=_CFG)
+
+    def shapes_for(cap):
+        seen = set()
+        for step in range(4):
+            p = p0 + 0.03 * step * jax.random.normal(
+                jax.random.PRNGKey(200 + step), p0.shape
+            )
+            t = build_svgd_topology(p, capacity=cap, **kw)
+            seen.add((int(t.near_target_row.shape[0]), int(t.far_tgt_slot.shape[0])))
+        return seen
+
+    exact = shapes_for("exact")
+    assert len(exact) > 1, "the test problem must actually vary"
+    assert len(shapes_for("pow2")) < len(exact)
+    assert len(shapes_for(1 << 16)) == 1, "an explicit capacity is the guarantee"
+
+
+def test_capacity_smaller_than_the_partition_is_rejected():
+    p = jax.random.normal(jax.random.PRNGKey(13), (1500, 3)) * 1.2
+    with pytest.raises(ValueError, match="smaller than"):
+        build_svgd_topology(
+            p,
+            theta=0.5,
+            leaf_size=16,
+            backend="radix",
+            traversal_config=_CFG,
+            capacity=4,
+        )
+
+
+def test_unknown_capacity_is_rejected():
+    p = jax.random.normal(jax.random.PRNGKey(14), (400, 3))
+    with pytest.raises(ValueError, match="capacity must be"):
+        build_svgd_topology(
+            p,
+            theta=0.5,
+            leaf_size=16,
+            backend="radix",
+            traversal_config=_CFG,
+            capacity="enormous",
+        )
