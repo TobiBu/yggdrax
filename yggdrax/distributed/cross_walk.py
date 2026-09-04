@@ -26,7 +26,7 @@ interaction/neighbour consumers work unchanged -- with the understanding that
 from __future__ import annotations
 
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +40,7 @@ from .._interactions_impl import (
     _DEFAULT_PAIR_BATCH,
     DualTreeWalkResult,
     MACType,
+    PairPolicy,
     _build_mac_extents,
     _compute_mac_ok,
     _default_pair_actions_only,
@@ -62,6 +63,111 @@ def _children_full(tree, total_nodes, num_internal):
     return left, right
 
 
+def _resolve_cross_pair_actions(
+    *,
+    pair_policy: Optional[PairPolicy],
+    policy_state: object,
+    valid_pairs: Array,
+    mac_ok: Array,
+    target_leaf: Array,
+    source_leaf: Array,
+    target_nodes: Array,
+    source_nodes: Array,
+    center_target: Array,
+    center_source: Array,
+    dist_sq: Array,
+    extent_target: Array,
+    extent_source: Array,
+) -> Array:
+    """Per-pair traversal actions for the cross walk, forward orientation only.
+
+    The self walk's :func:`_resolve_pair_actions` evaluates the policy TWICE --
+    once as given and once with target and source swapped -- and accepts only when
+    both orientations agree. That is right there: the self traversal emits both
+    directions of a pair, so a criterion that is asymmetric in ``A <-> B`` would
+    otherwise accept a pair in one direction and refine it in the other.
+
+    Here it is neither right nor possible. This walk is directed -- ordered
+    ``(target, source)``, never swapped, as the module docstring says -- so only
+    the forward orientation is ever emitted, and the two trees are disjoint index
+    spaces, so feeding a target-tree node id to a policy array sized over the
+    source tree would silently read the wrong node rather than fail. So the policy
+    is called once, and its verdict is used as given.
+
+    Order tags are not resolved: the cross far list is a plain
+    ``target_node <- source_node`` buffer with no tag column, so a tag would have
+    nowhere to go. A policy that assigns gears still returns them; they are
+    dropped here rather than half-plumbed.
+
+    Parameters
+    ----------
+    pair_policy : Optional[PairPolicy]
+        Solver-owned acceptance policy, or ``None`` for the geometric MAC.
+    policy_state : object
+        State the policy is evaluated against. Its ``source_*`` entries must be
+        indexed over the SOURCE tree and its ``target_*`` entries over the TARGET
+        tree; see the note above on why nothing checks that for you.
+    valid_pairs : Array
+        Which wavefront slots hold a live pair.
+    mac_ok : Array
+        The geometric MAC's verdict, passed through for policies that consult it.
+    target_leaf : Array
+        Whether the target node is a leaf.
+    source_leaf : Array
+        Whether the source node is a leaf.
+    target_nodes : Array
+        Target node index, in the target tree's index space.
+    source_nodes : Array
+        Source node index, in the source tree's index space.
+    center_target : Array
+        Target node centres.
+    center_source : Array
+        Source node centres.
+    dist_sq : Array
+        Squared centre distance per pair.
+    extent_target : Array
+        Target MAC extent.
+    extent_source : Array
+        Source MAC extent.
+
+    Returns
+    -------
+    Array
+        One action per pair: accept, near or refine.
+    """
+
+    if pair_policy is None:
+        return _default_pair_actions_only(
+            mac_ok=mac_ok,
+            valid_pairs=valid_pairs,
+            different_nodes=valid_pairs,
+            target_leaf=target_leaf,
+            source_leaf=source_leaf,
+        )
+
+    actions, _tags = pair_policy(
+        policy_state,
+        valid_pairs=valid_pairs,
+        mac_ok=mac_ok,
+        # Disjoint trees: a target node and a source node are never the same node,
+        # so "different" is simply "live" and "same_node" is never true.
+        different_nodes=valid_pairs,
+        same_node=jnp.zeros_like(valid_pairs),
+        target_leaf=target_leaf,
+        source_leaf=source_leaf,
+        target_nodes=target_nodes,
+        source_nodes=source_nodes,
+        center_target=center_target,
+        center_source=center_source,
+        dist_sq=dist_sq,
+        extent_target=extent_target,
+        extent_source=extent_source,
+    )
+    actions = jnp.asarray(actions, dtype=INDEX_DTYPE)
+    # A dead slot must never be emitted, whatever the policy said about it.
+    return jnp.where(valid_pairs, actions, as_index(_ACTION_REFINE))
+
+
 def dual_tree_walk_cross_impl(
     target_tree: object,
     target_geometry: TreeGeometry,
@@ -76,6 +182,8 @@ def dual_tree_walk_cross_impl(
     max_pair_queue: int,
     collect_far: bool = True,
     collect_near: bool = True,
+    pair_policy: Optional[PairPolicy] = None,
+    policy_state: object = None,
 ) -> DualTreeWalkResult:
     """Dual walk of target-tree nodes against source-tree nodes (un-jitted impl).
 
@@ -86,6 +194,15 @@ def dual_tree_walk_cross_impl(
     is keyed by target leaf (``target_leaf <- source_leaf``). Fixed-capacity,
     static output shapes, overflow flags returned -- safe to call under
     ``shard_map`` with capacities chosen as static args.
+
+    ``pair_policy`` lets a caller replace the geometric verdict with its own, the
+    way the self walk already allows. It is evaluated ONCE per pair, in the
+    forward orientation only -- see :func:`_resolve_cross_pair_actions` for why the
+    self walk's two-orientation agreement rule neither applies nor could work
+    across two index spaces. ``policy_state``'s ``source_*`` entries must be
+    indexed over ``source_tree`` and its ``target_*`` entries over
+    ``target_tree``; nothing checks that, and getting it wrong reads the wrong
+    node rather than raising.
     """
 
     t_parent = target_tree.parent
@@ -208,8 +325,16 @@ def dual_tree_walk_cross_impl(
 
         valid = (wf_indices < wf_size) & (wf_t >= 0) & (wf_s >= 0)
         vb = valid.astype(jnp.bool_)
-        st_t = jnp.where(valid, wf_t, as_index(0))
-        st_s = jnp.where(valid, wf_s, as_index(0))
+        # `cast`, not a runtime conversion: jax's type stubs declare `jnp.where` as
+        # returning `Array | tuple[Array, ...]` -- the tuple is the one-argument
+        # (nonzero) form -- so the three-argument call here is an `Array` at runtime but
+        # a union to the checker. These two are handed to helpers annotated `Array`, so
+        # the union has to be narrowed somewhere; doing it at the source keeps every
+        # consumer's signature honest instead of widening them to a type they cannot
+        # actually accept. `typing.cast` is the codebase's existing idiom for this (see
+        # `tree.py` and `octree_uvwx.py`).
+        st_t = cast(Array, jnp.where(valid, wf_t, as_index(0)))
+        st_s = cast(Array, jnp.where(valid, wf_s, as_index(0)))
 
         ct = t_centers[st_t]
         cs = s_centers[st_s]
@@ -233,12 +358,20 @@ def dual_tree_walk_cross_impl(
         t_leaf = vb & (~t_int)
         s_leaf = vb & (~s_int)
 
-        actions = _default_pair_actions_only(
-            mac_ok=mac_ok,
+        actions = _resolve_cross_pair_actions(
+            pair_policy=pair_policy,
+            policy_state=policy_state,
             valid_pairs=vb,
-            different_nodes=vb,
+            mac_ok=mac_ok,
             target_leaf=t_leaf,
             source_leaf=s_leaf,
+            target_nodes=st_t,
+            source_nodes=st_s,
+            center_target=ct,
+            center_source=cs,
+            dist_sq=dist_sq,
+            extent_target=et,
+            extent_source=es,
         )
         accept = vb & (actions == as_index(_ACTION_ACCEPT))
         near = vb & (actions == as_index(_ACTION_NEAR))
@@ -497,6 +630,10 @@ dual_tree_walk_cross = partial(
         "mac_type",
         "collect_far",
         "collect_near",
+        # A Python callable, so it must be static: traced, it would be flattened to
+        # nothing and the walk would silently fall back to the geometric MAC.
+        # ``policy_state`` stays traced -- it is arrays.
+        "pair_policy",
     ),
 )(dual_tree_walk_cross_impl)
 
