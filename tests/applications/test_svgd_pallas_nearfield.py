@@ -419,3 +419,22 @@ def test_the_csr_offsets_bound_the_live_directed_pairs():
         rtol=1e-12,
         atol=1e-14,
     )
+
+
+def test_the_auto_lane_needs_enough_leaves_to_be_worth_launching():
+    """One program per leaf, so a small partition cannot fill the device.
+
+    The threshold is measured (see ``_MIN_LEAVES_FOR_KERNEL``); what this pins is
+    that it is *applied*, and applied in one place -- an earlier revision had the
+    sampler's ``accumulate="auto"`` bypass it by forcing the kernel, which made
+    the whole threshold dead code.
+    """
+    from yggdrax.applications.svgd.pallas_nearfield import (
+        _MIN_LEAVES_FOR_KERNEL,
+        prefer_fused_nearfield,
+    )
+
+    assert not prefer_fused_nearfield(_MIN_LEAVES_FOR_KERNEL - 1)
+    # Above the threshold it defers to the capability probe, which is False on a
+    # CPU runner -- so the only machine-independent assertion is agreement.
+    assert prefer_fused_nearfield(1 << 20) == pallas_stein_nearfield_supported()

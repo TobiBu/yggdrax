@@ -49,7 +49,7 @@ from yggdrax import (
 from yggdrax.applications.svgd.kernel import stein_pair_terms
 from yggdrax.applications.svgd.pallas_nearfield import (
     nearfield_stein,
-    pallas_stein_nearfield_supported,
+    prefer_fused_nearfield,
 )
 from yggdrax.dtypes import INDEX_DTYPE, as_index
 from yggdrax.kdtree import build_leaf_kdtree
@@ -861,8 +861,10 @@ def svgd_phi_from_topology(
             :mod:`~yggdrax.applications.svgd.pallas_nearfield`, whose reverse is
             a hand-written rule so neither pass scatters; ``"interpret"`` is the
             same kernel under Pallas interpret mode, for testing without a GPU;
-            ``"auto"`` picks ``"pallas"`` where the kernel can run and float32
-            otherwise falls to ``"segment"``, with ``"scatter"`` for float64.
+            ``"auto"`` picks ``"pallas"`` where
+            :func:`~yggdrax.applications.svgd.pallas_nearfield.prefer_fused_nearfield`
+            says it is worth launching, and otherwise ``"segment"`` for float32
+            and ``"scatter"`` for float64.
             **The default is deliberately the one that is never worse under
             differentiation** -- see the note below.
 
@@ -890,7 +892,7 @@ def svgd_phi_from_topology(
             "accumulate must be 'scatter', 'segment', 'pallas', 'interpret' or "
             f"'auto'; got {accumulate!r}"
         )
-    if accumulate == "auto" and pallas_stein_nearfield_supported():
+    if accumulate == "auto" and prefer_fused_nearfield(topo.leaf_slots.shape[0]):
         accumulate = "pallas"
     if accumulate in ("pallas", "interpret"):
         return _finish(

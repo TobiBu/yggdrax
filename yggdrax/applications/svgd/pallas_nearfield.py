@@ -69,6 +69,30 @@ else:
 #: shapes. 32 x 32 is the measured optimum at ``leaf_size = 32``.
 _DEFAULT_TILE = 32
 
+#: Fewest leaves at which the fused kernel is worth launching, for
+#: ``backend="auto"``. One program owns one target leaf, so below a few hundred
+#: leaves there is not enough work to fill the device and the launch is
+#: overhead. Measured on an A100 (d = 3, leaf 32, theta = 0.5), speed-up of the
+#: fused path over ``accumulate="scatter"`` on the *full* update:
+#:
+#: ======  =====  ==========  ==========  ==========
+#:      N      L  f64 fwd     f64 fwd+dx  f32 fwd+dx
+#: ======  =====  ==========  ==========  ==========
+#:    500     16        0.63        0.74        1.09
+#:   1000     32        0.66        0.74        0.94
+#:   2000     63        1.02        1.10        1.74
+#:   4000    125        0.98        0.90        1.66
+#:   8000    250        1.73        1.24        2.05
+#:  16000    500        2.85        1.23        1.50
+#:  32000   1000        2.93        1.88        1.48
+#: ======  =====  ==========  ==========  ==========
+#:
+#: The only clear losses are the two rows with fewer leaves than the device has
+#: SMs (108); from L = 63 on it is a wash at worst and 2-3x at the sizes that
+#: matter. 64 is where that boundary sits, so that is the threshold -- not a
+#: round number chosen for looking like one.
+_MIN_LEAVES_FOR_KERNEL = 64
+
 
 def _pow2_floor(value: int) -> int:
     """Return the largest power of two not exceeding ``value`` (at least 1).
@@ -135,6 +159,25 @@ def pallas_stein_nearfield_supported() -> bool:
         return float(capability) >= 8.0
     except (TypeError, ValueError):  # pragma: no cover - vendor-specific strings
         return False
+
+
+def prefer_fused_nearfield(num_leaves: int) -> bool:
+    """Whether the fused kernel is the right lane for a partition this size.
+
+    Combines the two conditions: the machine can run it at all, and there is
+    enough of it to run. Both the ``backend="auto"`` selector here and
+    ``accumulate="auto"`` in :mod:`~yggdrax.applications.svgd.sampler` go
+    through this, so they cannot disagree.
+
+    Args:
+        num_leaves: Leaves in the partition, i.e. programs the kernel launches.
+
+    Returns:
+        ``True`` when the kernel should be preferred over the pure-JAX paths.
+    """
+    return (
+        int(num_leaves) >= _MIN_LEAVES_FOR_KERNEL and pallas_stein_nearfield_supported()
+    )
 
 
 def _target_rows_from_offsets(src_offsets: Array, num_entries: int) -> Array:
@@ -1119,10 +1162,11 @@ def nearfield_stein(
         h: Kernel bandwidth.
         include_self: Whether each leaf is also its own source.
         backend: ``"auto"`` (default) uses the kernel where
-            :func:`pallas_stein_nearfield_supported` says it can run and the
-            twin otherwise; ``"pallas"`` forces the kernel; ``"jax"`` forces the
-            twin. Forcing the kernel on an unsupported machine raises rather
-            than silently falling back.
+            :func:`pallas_stein_nearfield_supported` says it can run *and* there
+            are at least :data:`_MIN_LEAVES_FOR_KERNEL` leaves to keep the
+            device busy, and the twin otherwise; ``"pallas"`` forces the kernel;
+            ``"jax"`` forces the twin. Forcing the kernel on an unsupported
+            machine raises rather than silently falling back.
         target_subtile: Target lanes per program (kernel only).
         source_tile: Source lanes per inner iteration (kernel only).
         num_warps: Triton warps per program (kernel only).
@@ -1142,7 +1186,7 @@ def nearfield_stein(
     use_kernel = (
         interpret
         or backend == "pallas"
-        or (backend == "auto" and pallas_stein_nearfield_supported())
+        or (backend == "auto" and prefer_fused_nearfield(jnp.shape(leaf_x)[0]))
     )
     if not use_kernel:
         return nearfield_stein_jax(
