@@ -249,7 +249,8 @@ def main() -> None:
             # stores one row per *unordered* pair and reports the doubled count.
             "num_near_leaf_pairs": int(topo.num_near_leaf_pairs),
             "num_near_pair_rows": int(topo.near_target_row.shape[0]),
-            "num_far_contribs": int(topo.far_tgt_slot.shape[0]),
+            "num_far_contribs": int(topo.num_far_contribs),
+            "num_far_entries": int(topo.far_leaf_source.shape[0]),
             "max_leaf": int(topo.leaf_slots.shape[1]),
             "sigma": sigma,
             "device_memory": device_memory_stats(),
