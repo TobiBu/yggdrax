@@ -103,6 +103,17 @@ def _parse_args() -> argparse.Namespace:
         default=1.2,
         help="Cloud scale at the smallest size in --sizes.",
     )
+    p.add_argument(
+        "--accumulate",
+        choices=("scatter", "segment", "pallas", "auto"),
+        default="scatter",
+        help=(
+            "How the near field is summed. 'scatter' is the differentiation-safe "
+            "default; 'segment' replaces the contended atomicAdd with a segmented "
+            "reduction (fast forward in float32, slower reverse); 'pallas' is the "
+            "fused kernel with its hand-written VJP, so neither pass scatters."
+        ),
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -205,10 +216,15 @@ def main() -> None:
         # %constant.58)") and the timing then omits work every real per-step
         # rebuild has to do -- flattering the tree update against a baseline
         # that has no gathers to fold.
-        phi = jax.jit(svgd_phi_from_topology)
+        how = args.accumulate
+        phi = jax.jit(
+            lambda pp, sc, hh, t: svgd_phi_from_topology(pp, sc, hh, t, accumulate=how)
+        )
         vg = jax.jit(
             lambda pp, sc, hh, t: jax.value_and_grad(
-                lambda q: jnp.sum(svgd_phi_from_topology(q, sc, hh, t) ** 2)
+                lambda q: jnp.sum(
+                    svgd_phi_from_topology(q, sc, hh, t, accumulate=how) ** 2
+                )
             )(pp)
         )
         phi_t = time_callable(
@@ -221,6 +237,7 @@ def main() -> None:
         entry = {
             "n": n,
             "dim": dim,
+            "accumulate": args.accumulate,
             "build_s": build_s,
             "build_device": walk_t.as_dict(),
             "build_host": assemble_t.as_dict(),
