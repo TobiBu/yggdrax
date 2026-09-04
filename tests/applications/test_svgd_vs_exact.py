@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from yggdrax import DualTreeTraversalConfig
@@ -241,3 +242,62 @@ def test_svgd_phi_cutoff_bandwidths_is_the_c_times_h_convention():
     topo = build_svgd_topology(p, kernel_cutoff=6.0 * h, **kw)
     via_topo = svgd_phi_from_topology(p, sc, h, topo)
     assert float(jnp.max(jnp.abs(via_helper - via_topo))) < 1e-12
+
+
+# --- the two near-field accumulations --------------------------------------
+#
+# The near field can be summed by scattering each unordered pair's two
+# directions, or by a segmented reduction over the directed list. Which is
+# faster is a property of the dtype (float32's `.at[].add()` is 43x float64's
+# under index contention), so both exist. They must agree.
+
+
+@pytest.mark.parametrize("backend", ["radix", "leaf_kdtree"])
+def test_accumulations_agree(backend):
+    p = jax.random.normal(jax.random.PRNGKey(5), (1200, 3)) * 1.2
+    sc = p * 0.5
+    h = 0.6
+    topo = build_svgd_topology(
+        p, theta=0.4, leaf_size=16, backend=backend, traversal_config=_CFG
+    )
+    by_scatter = svgd_phi_from_topology(p, sc, h, topo, accumulate="scatter")
+    by_segment = svgd_phi_from_topology(p, sc, h, topo, accumulate="segment")
+    assert float(jnp.max(jnp.abs(by_scatter - by_segment))) < 1e-12
+
+    # "auto" is one of the two, never a third thing.
+    by_auto = svgd_phi_from_topology(p, sc, h, topo, accumulate="auto")
+    assert float(jnp.max(jnp.abs(by_auto - by_scatter))) < 1e-12
+
+
+def test_segment_accumulation_is_exact_at_theta_zero():
+    """The segmented path is a different summation order, not a different sum."""
+    p = jax.random.normal(jax.random.PRNGKey(6), (900, 3)) * 1.2
+    sc = p * 0.5
+    h = float(median_heuristic(p))
+    topo = build_svgd_topology(
+        p, theta=0.0, leaf_size=16, backend="radix", traversal_config=_CFG
+    )
+    ref = exact_phi(p, sc, h)
+    out = svgd_phi_from_topology(p, sc, h, topo, accumulate="segment")
+    assert float(jnp.linalg.norm(out - ref) / jnp.linalg.norm(ref)) < 1e-10
+
+
+def test_unknown_accumulation_is_rejected():
+    p = jax.random.normal(jax.random.PRNGKey(7), (200, 3))
+    topo = build_svgd_topology(
+        p, theta=0.4, leaf_size=16, backend="radix", traversal_config=_CFG
+    )
+    with pytest.raises(ValueError, match="accumulate must be"):
+        svgd_phi_from_topology(p, p * 0.5, 0.6, topo, accumulate="nonsense")
+
+
+def test_directed_pair_list_is_sorted_and_twice_the_halved_one():
+    """What makes the segmented reduction segmented."""
+    p = jax.random.normal(jax.random.PRNGKey(8), (1500, 3)) * 1.2
+    topo = build_svgd_topology(
+        p, theta=0.4, leaf_size=16, backend="radix", traversal_config=_CFG
+    )
+    directed = np.asarray(topo.near_dir_target)
+    assert directed.shape[0] == 2 * int(topo.near_target_row.shape[0])
+    assert directed.shape[0] == int(topo.num_near_leaf_pairs)
+    assert np.all(np.diff(directed) >= 0), "target rows must be non-decreasing"
