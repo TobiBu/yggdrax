@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .dtypes import INDEX_DTYPE
+from .dtypes import INDEX_DTYPE, is_traced
 from .morton import _compact3_u64
 
 _MORTON_BITS = 63
@@ -569,9 +570,39 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
         The topology extended with ``oct_*`` and ``radix_*_to_oct`` fields.
     """
 
+    if any(is_traced(leaf) for leaf in jax.tree_util.tree_leaves(topology)):
+        return _augment_radix_topology_with_octree_eager(topology)
+    # Eager dispatch is the whole cost here: profiled at N = 1e5 this function
+    # is 702 apply_primitive calls and ~190 ms, and its shapes depend only on
+    # the leaf count, so one compilation serves every rebuild of that size.
+    try:
+        return _jit_augment_radix_topology_with_octree(topology)
+    except Exception:  # pragma: no cover - fall back rather than fail a build
+        return _augment_radix_topology_with_octree_eager(topology)
+
+
+def _augment_radix_topology_with_octree_eager(topology: object) -> OctreeTopology:
+    """Return the octree-augmented topology without jitting.
+
+    Parameters
+    ----------
+    topology
+        Radix topology exposing the Morton leaf contract.
+
+    Returns
+    -------
+    OctreeTopology
+        The topology extended with ``oct_*`` and ``radix_*_to_oct`` fields.
+    """
+
     metadata = build_explicit_octree_metadata(topology)
     base_fields = tuple(getattr(topology, name) for name in topology._fields)
     return OctreeTopology(*base_fields, *metadata)
+
+
+_jit_augment_radix_topology_with_octree = jax.jit(
+    _augment_radix_topology_with_octree_eager
+)
 
 
 def build_explicit_octree_traversal_view(
