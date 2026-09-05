@@ -766,22 +766,49 @@ class OctreeTree(RadixTree):
         """Build an octree from particles using the octree-specific build path."""
 
         build_mode = _normalize_build_mode(build_mode)
-        result = _build_octree_result(
-            positions,
-            masses,
-            build_mode=build_mode,
-            bounds=bounds,
-            return_reordered=return_reordered,
-            workspace=workspace,
-            return_workspace=return_workspace,
-            leaf_size=leaf_size,
-            target_leaf_particles=target_leaf_particles,
-            max_depth=max_depth,
-            refine_local=refine_local,
-            max_refine_levels=max_refine_levels,
-            aspect_threshold=aspect_threshold,
-            min_refined_leaf_particles=min_refined_leaf_particles,
-        )
+        # The adaptive build is slow only because it is dispatched op by op.
+        # Profiled at N = 1e5 on an A100 it is 4213 apply_primitive calls and
+        # 1435 ms of wall clock, against 7.6 ms for the identical computation
+        # under jit -- and flat at ~1.3 s from N = 1e3 to 1e6, which is what a
+        # dispatch-bound build looks like. The partition's shapes are fixed by
+        # (n, leaf_size), so one compilation is reused across rebuilds. Same
+        # trick, and the same reason, as the SVGD sampler's jitted
+        # compute_tree_geometry.
+        #
+        # Only the adaptive mode: the fixed-depth build calls the host-side
+        # aspect refinement, which silently does nothing when positions are
+        # traced, so jitting it would quietly build a different tree. The
+        # adaptive branch touches none of the refinement arguments.
+        if (
+            build_mode == "adaptive"
+            and workspace is None
+            and not return_workspace
+            and not isinstance(positions, jax.core.Tracer)
+        ):
+            result = _build_octree_jit_result(
+                positions,
+                masses,
+                infer_bounds(positions) if bounds is None else bounds,
+                return_reordered=return_reordered,
+                leaf_size=leaf_size,
+            )
+        else:
+            result = _build_octree_result(
+                positions,
+                masses,
+                build_mode=build_mode,
+                bounds=bounds,
+                return_reordered=return_reordered,
+                workspace=workspace,
+                return_workspace=return_workspace,
+                leaf_size=leaf_size,
+                target_leaf_particles=target_leaf_particles,
+                max_depth=max_depth,
+                refine_local=refine_local,
+                max_refine_levels=max_refine_levels,
+                aspect_threshold=aspect_threshold,
+                min_refined_leaf_particles=min_refined_leaf_particles,
+            )
         return cls._from_build_result(
             result=result,
             build_mode=build_mode,
