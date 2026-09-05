@@ -234,3 +234,26 @@ This repository follows the same engineering principles used in the Rubix codeba
 - tested public APIs
 - explicit artifact contracts
 - examples that reflect real usage paths
+
+## Multi-GPU: the halo exchange needs jax >= 0.9.1
+
+`yggdrax.distributed` moves boundary particles between devices with
+`jax.lax.ragged_all_to_all`. **On jax < 0.9.1 that collective silently returns its
+fill value** once its buffers move: XLA:GPU caches the peer output addresses from the
+first execution, and input donation alone (any leapfrog loop) is enough to move them.
+Measured on jax 0.9.0 / 2×A100 with nothing but `jit(shard_map(ragged_all_to_all))`:
+36/40 calls corrupt under donation, 3/40 under allocator churn, 0/40 with identical
+buffers — so a run-it-twice reproducibility check cannot see it. In a locally
+essential tree the whole cross-domain near field disappears (~45 % force error on a
+17.8M-particle disc across 4 GPUs) while momentum, energy and every overflow flag stay
+healthy. Fixed in the 0.9.1 GPU plugin (XLA `4e0cc7e356`); verified clean on 0.9.1
+and 0.10.2.
+
+`ragged_all_to_all_exchange(method="auto")` therefore resolves to the `all_gather`
+fallback (`"buf"`, identical result, more bandwidth) below jax 0.9.1 and on CPU, and
+to the native collective otherwise — see `resolve_ragged_method` and
+`RAGGED_NATIVE_FIXED_JAX` in `yggdrax/distributed/comm.py`. Two cautions: a venv
+built with `--system-site-packages` can load an *older* `jax_plugins.xla_cuda12`
+than `pip list` reports (check `jax_plugins.xla_cuda12.__file__`); and any
+multi-device result taken on an affected JAX is unverified unless a step *after the
+first* was compared with a direct sum.

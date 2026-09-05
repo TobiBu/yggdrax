@@ -29,6 +29,58 @@ from .sharding import AXIS_NAME
 # is plenty for per-device row counts and matches XLA's expectations.
 _COUNT_DTYPE = jnp.int32
 
+#: First JAX release whose XLA:GPU ``ragged_all_to_all`` survives buffer movement.
+#:
+#: Below it, ``RaggedAllToAllStartThunk::Initialize`` caches the peer output-buffer
+#: device addresses from the FIRST execution. Once the allocator moves those
+#: buffers -- **input donation is enough; no gradient is required** -- the one-shot
+#: kernel writes to stale addresses and the real output keeps its ``fill_value``.
+#: Measured 2026-09-04 on jax 0.9.0 / 2xA100 with ``jit(shard_map(ragged_all_to_all))``
+#: and nothing else (jaccpot ``bench/repro_jax_ragged_all_to_all_forward.py``):
+#: 36/40 calls corrupt under donation, 3/40 under allocator churn alone, 0/40 with
+#: identical buffers -- so a repeat-the-same-input reproducibility check passes on a
+#: broken build. Clean on 0.9.1 and 0.10.2 (XLA ``4e0cc7e356``, shipped in the 0.9.1
+#: GPU plugin -- check ``jax_plugins.xla_cuda12.__file__`` is the one you think).
+#: In a LET this silently drops the entire cross-domain near field: a ~45 % force
+#: error on a 17.8M-particle disc across 4 GPUs while angular momentum, energy and
+#: every overflow flag stayed healthy.
+RAGGED_NATIVE_FIXED_JAX = (0, 9, 1)
+
+
+def _jax_version_tuple() -> tuple[int, ...]:
+    """``jax.__version__`` as comparable ints, tolerant of dev/rc suffixes."""
+    parts: list[int] = []
+    for piece in jax.__version__.split("."):
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def resolve_ragged_method(method: str = "auto") -> str:
+    """Decide which ragged exchange ``"auto"`` means on this JAX and backend.
+
+    ``"native"`` (:func:`jax.lax.ragged_all_to_all`) only when BOTH hold: the default
+    backend is GPU or TPU (XLA:CPU has no lowering -- ``UNIMPLEMENTED: HLO opcode
+    'ragged-all-to-all'``), and ``jax >= `` :data:`RAGGED_NATIVE_FIXED_JAX`. Otherwise
+    ``"buf"``, the all_gather-based exchange, which computes the identical result at
+    O(ndev^2 x capacity) bandwidth instead of O(actual halo). An explicit
+    ``"native"`` / ``"buf"`` is never overridden -- that is how the defect is
+    reproduced on purpose.
+    """
+    if method not in ("auto", "native", "buf"):
+        raise ValueError(f"method must be 'auto', 'native' or 'buf'; got {method!r}")
+    if method != "auto":
+        return method
+    if jax.default_backend() not in ("gpu", "tpu"):
+        return "buf"
+    return "native" if _jax_version_tuple() >= RAGGED_NATIVE_FIXED_JAX else "buf"
+
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -156,12 +208,17 @@ def ragged_all_to_all_exchange(
         Static leading dimension of the receive buffer. Must be large enough to
         hold this device's total received rows (over-allocate with slack, per
         the padding-based load-balancing strategy).
+    axis_name:
+        Mesh axis the exchange runs over; must match the enclosing ``shard_map``.
     fill_value:
         Value the unused (padding) tail of the output buffer is initialised to.
     method:
         ``"native"`` uses ``jax.lax.ragged_all_to_all`` (GPU/TPU); ``"buf"`` uses
         the all_gather fallback (works everywhere, incl. XLA:CPU); ``"auto"``
-        (default) picks native on gpu/tpu and buf otherwise.
+        (default) picks native on gpu/tpu **on jax >=** :data:`RAGGED_NATIVE_FIXED_JAX`
+        and buf otherwise. Below that version the native collective silently returns
+        ``fill_value`` once its buffers move (donation is enough) -- see the constant
+        for the measurement. Do not select ``"native"`` there except to reproduce it.
 
     Returns
     -------
@@ -176,8 +233,7 @@ def ragged_all_to_all_exchange(
     full = jax.lax.all_gather(send_sizes, axis_name, tiled=False)
     me = jax.lax.axis_index(axis_name)
 
-    if method == "auto":
-        method = "native" if jax.default_backend() in ("gpu", "tpu") else "buf"
+    method = resolve_ragged_method(method)
     impl = _ragged_native if method == "native" else _ragged_through_buf
     output = impl(operand, send_sizes, full, me, output_capacity, axis_name, fill_value)
 

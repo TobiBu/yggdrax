@@ -10,11 +10,13 @@ all-to-all as the central communication primitive.
 from __future__ import annotations
 
 from .comm import (
+    RAGGED_NATIVE_FIXED_JAX,
     ShardedArray,
     all_to_all_dense,
     exchange_pytree,
     exchange_sizes,
     ragged_all_to_all_exchange,
+    resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
 from .let import (
@@ -78,6 +80,8 @@ __all__ = [
     "global_bounds",
     "make_mesh",
     "ragged_all_to_all_exchange",
+    "resolve_ragged_method",
+    "RAGGED_NATIVE_FIXED_JAX",
     "sanitize_padding",
     "sfc_decompose",
     "sfc_partition",
