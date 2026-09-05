@@ -60,6 +60,24 @@ _jit_compute_tree_geometry = jax.jit(
 )
 
 
+class SvgdTraversal(NamedTuple):
+    """Device-side output of the SVGD dual-tree walk, before host assembly.
+
+    Everything here is still a device array: the tree's particle order and node
+    ranges, the near-neighbour CSR of the leaf walk, and the accepted far node
+    pairs. :func:`assemble_svgd_topology` is what pulls it to the host.
+    """
+
+    order: Array  # (n,) sorted-slot -> original particle id
+    node_ranges: Array  # (num_nodes, 2) inclusive [start, end] slot range
+    leaf_ids: Array  # (L,) node id of each leaf, in row order
+    near_offsets: Array  # (L + 1,) CSR offsets into ``near_neighbors``
+    near_neighbors: Array  # (>= near_offsets[-1],) source *node* ids
+    far_src: Array  # (F,) source node of each accepted far pair
+    far_tgt: Array  # (F,) target node of each accepted far pair
+    num_particles: int
+
+
 class SvgdTopology(NamedTuple):
     """Integer partition for one tree-accelerated Stein update (non-diff)."""
 
@@ -87,15 +105,20 @@ def _pad_to_3d(points: Array) -> Array:
     return jnp.concatenate([points, pad], axis=1)
 
 
-def build_svgd_topology(
+def build_svgd_traversal(
     particles: Float[Array, "n d"],
     *,
     theta: float = 0.4,
     leaf_size: int = 32,
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
-) -> SvgdTopology:
-    """Build the near/far Stein-update partition for ``particles``.
+) -> SvgdTraversal:
+    """Run the dual-tree walk for the Stein update and return its device output.
+
+    This is the whole device half of :func:`build_svgd_topology`: tree build,
+    geometry, traversal. Nothing is pulled to the host, so a caller can time it
+    on its own (``jax.block_until_ready`` on the returned tuple), reuse one walk
+    for several partitions, or replace the host assembly with its own.
 
     Args:
         particles: Particle positions, shape ``(n, d)``. Arbitrary ``d`` with
@@ -107,7 +130,7 @@ def build_svgd_topology(
         traversal_config: Optional explicit traversal capacities.
 
     Returns:
-        An :class:`SvgdTopology`.
+        An :class:`SvgdTraversal`.
 
     Raises:
         ValueError: If a 3-D-only backend is requested for ``d != 3``, or the
@@ -145,13 +168,37 @@ def build_svgd_topology(
         mac_type="dehnen",
         traversal_config=traversal_config,
     )
+    return SvgdTraversal(
+        order=tree.particle_indices,
+        node_ranges=tree.node_ranges,
+        leaf_ids=neighbors.leaf_indices,
+        near_offsets=neighbors.offsets,
+        near_neighbors=neighbors.neighbors,
+        far_src=interactions.sources,
+        far_tgt=interactions.targets,
+        num_particles=int(tree.num_particles),
+    )
 
-    node_ranges = np.asarray(tree.node_ranges)  # inclusive [start, end]
-    order = np.asarray(tree.particle_indices)
-    n = int(tree.num_particles)
+
+def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
+    """Turn a dual-tree walk into the near/far partition of the Stein update.
+
+    This is the host half of :func:`build_svgd_topology`: it pulls the walk's
+    integer arrays to the host and expands them into per-leaf slot blocks, the
+    directional near-pair rows, and the far target/source slot ranges.
+
+    Args:
+        walk: Device output of :func:`build_svgd_traversal`.
+
+    Returns:
+        An :class:`SvgdTopology`.
+    """
+    node_ranges = np.asarray(walk.node_ranges)  # inclusive [start, end]
+    order = np.asarray(walk.order)
+    n = int(walk.num_particles)
 
     # Leaves tile [0, n); build padded per-leaf slot blocks.
-    leaf_ids = np.asarray(neighbors.leaf_indices)
+    leaf_ids = np.asarray(walk.leaf_ids)
     leaf_start = node_ranges[leaf_ids, 0]
     leaf_end = node_ranges[leaf_ids, 1]
     leaf_len = leaf_end - leaf_start + 1
@@ -166,16 +213,16 @@ def build_svgd_topology(
 
     # Directional near leaf pairs (complete; NOT halved -- each target receives
     # from each source, and the symmetric entry handles the reverse).
-    n_off = np.asarray(neighbors.offsets)
-    n_nb = np.asarray(neighbors.neighbors)
+    n_off = np.asarray(walk.near_offsets)
+    n_nb = np.asarray(walk.near_neighbors)
     row_counts = (n_off[1:] - n_off[:-1]).astype(np.int64)
     near_target_row = np.repeat(np.arange(num_leaves, dtype=np.int64), row_counts)
     near_source_row = node_to_row[n_nb[: int(n_off[-1])]].astype(np.int64)
 
     # Far field: expand each far pair's TARGET node to its particles; each such
     # particle receives the monopole of the paired SOURCE node.
-    far_src = np.asarray(interactions.sources)
-    far_tgt = np.asarray(interactions.targets)
+    far_src = np.asarray(walk.far_src)
+    far_tgt = np.asarray(walk.far_tgt)
     tgt_start = node_ranges[far_tgt, 0]
     tgt_end = node_ranges[far_tgt, 1]
     tgt_len = (tgt_end - tgt_start + 1).astype(np.int64)
@@ -197,6 +244,39 @@ def build_svgd_topology(
         far_src_start=jnp.asarray(far_src_start.astype(np.int64)),
         far_src_end=jnp.asarray(far_src_end.astype(np.int64)),
         num_particles=n,
+    )
+
+
+def build_svgd_topology(
+    particles: Float[Array, "n d"],
+    *,
+    theta: float = 0.4,
+    leaf_size: int = 32,
+    backend: str = "leaf_kdtree",
+    traversal_config: DualTreeTraversalConfig | None = None,
+) -> SvgdTopology:
+    """Build the near/far Stein-update partition for ``particles``.
+
+    Args:
+        particles: Particle positions, shape ``(n, d)``. Arbitrary ``d`` with
+            the default ``leaf_kdtree`` backend; ``d <= 3`` for radix/octree.
+        theta: Opening angle for the multipole acceptance criterion.
+        leaf_size: Target leaf occupancy for the tree build.
+        backend: ``"leaf_kdtree"`` (default, dimension-general, exact coverage),
+            ``"radix"``, or ``"octree"`` (both 3-D only).
+        traversal_config: Optional explicit traversal capacities.
+
+    Returns:
+        An :class:`SvgdTopology`.
+    """
+    return assemble_svgd_topology(
+        build_svgd_traversal(
+            particles,
+            theta=theta,
+            leaf_size=leaf_size,
+            backend=backend,
+            traversal_config=traversal_config,
+        )
     )
 
 
