@@ -372,6 +372,209 @@ def build_svgd_traversal(
     )
 
 
+def _assemble_far_on_host(
+    node_ranges: np.ndarray,
+    walk: SvgdTraversal,
+    leaf_start: np.ndarray,
+    num_leaves: int,
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int
+]:
+    """Numpy counterpart of :func:`_assemble_far_on_device`, for small partitions.
+
+    Semantically identical, down to keying the monopole table by node id, so a
+    test can build both and compare. It exists because the device path pays a
+    fixed dispatch cost and a synchronisation whatever the size, which below a
+    few thousand far pairs is more than the numpy work it replaces.
+
+    Args:
+        node_ranges: Inclusive ``[start, end]`` slot range of every node.
+        walk: Device output of :func:`build_svgd_traversal`.
+        leaf_start: First sorted slot of each leaf, in leaf-row order.
+        num_leaves: Number of leaves ``L``.
+
+    Returns:
+        ``(leaf_offsets, leaf_source, node_offsets, entry_perm, node_start,
+        node_end, num_far_entries, num_far_contribs)``.
+    """
+    far_src = np.asarray(walk.far_src)
+    far_tgt = np.asarray(walk.far_tgt)
+    far_tags = np.asarray(walk.far_tags)
+    if far_tags.shape[0] == far_src.shape[0]:
+        keep = far_tags != FAR_TAG_IGNORE
+        if not keep.all():
+            far_src, far_tgt = far_src[keep], far_tgt[keep]
+
+    num_nodes = int(node_ranges.shape[0])
+    tgt_start = node_ranges[far_tgt, 0]
+    tgt_end = node_ranges[far_tgt, 1]
+    num_far_contribs = int((tgt_end - tgt_start + 1).sum())
+
+    by_start = np.argsort(leaf_start, kind="stable")
+    sorted_start = leaf_start[by_start]
+    first = np.searchsorted(sorted_start, tgt_start, side="right") - 1
+    last = np.searchsorted(sorted_start, tgt_end, side="right") - 1
+
+    pair_order = np.argsort(far_src, kind="stable")
+    counts = (last - first + 1).astype(np.int64)[pair_order]
+    total = int(counts.sum())
+    if total == 0:
+        empty = np.zeros((0,), dtype=np.int64)
+        return (
+            np.zeros((num_leaves + 1,), dtype=np.int64),
+            empty,
+            np.zeros((num_nodes + 1,), dtype=np.int64),
+            empty,
+            node_ranges[:, 0],
+            node_ranges[:, 1],
+            0,
+            num_far_contribs,
+        )
+
+    seg_start = np.cumsum(counts) - counts
+    within = np.arange(total, dtype=np.int64) - np.repeat(seg_start, counts)
+    entry_leaf = by_start[
+        np.repeat(first.astype(np.int64)[pair_order], counts) + within
+    ]
+    entry_source = np.repeat(far_src[pair_order].astype(np.int64), counts)
+    node_offsets = np.concatenate(
+        [[0], np.cumsum(np.bincount(entry_source, minlength=num_nodes))]
+    ).astype(np.int64)
+
+    by_leaf = np.argsort(entry_leaf, kind="stable")
+    leaf_offsets = np.concatenate(
+        [[0], np.cumsum(np.bincount(entry_leaf, minlength=num_leaves))]
+    ).astype(np.int64)
+    entry_perm = np.empty(total, dtype=np.int64)
+    entry_perm[by_leaf] = np.arange(total, dtype=np.int64)
+    return (
+        leaf_offsets,
+        entry_source[by_leaf],
+        node_offsets,
+        entry_perm,
+        node_ranges[:, 0],
+        node_ranges[:, 1],
+        total,
+        num_far_contribs,
+    )
+
+
+def _assemble_far_on_device(
+    walk: SvgdTraversal, leaf_start: np.ndarray, num_leaves: int
+) -> tuple[Array, Array, Array, Array, Array, int, int]:
+    """Build the leaf-major far CSR and its transpose without leaving the device.
+
+    The host version of this was 271 ms of a 633 ms build at N = 1e5: two
+    orderings of 2.8 million entries, two ``searchsorted`` over 1.1 million
+    pairs, and several ``np.repeat`` of the same size. Every input is already a
+    device array when :func:`assemble_svgd_topology` receives it, so none of
+    that needed to come to the host in the first place.
+
+    Two departures from the host path, both of which simplify it:
+
+    * **The monopole table is keyed by node id**, not by a compacted index over
+      the distinct far source nodes. That removes the dense remap, and it makes
+      the table's shape ``num_nodes`` -- fixed by ``(n, leaf_size)`` -- rather
+      than a data-dependent ``F``, so it does not churn between rebuilds. The
+      table is roughly twice as long and every row is a handful of scalars.
+    * **Pairs the policy dropped are given a leaf count of zero** rather than
+      being filtered out, because a boolean filter has a data-dependent length
+      and would need its own host synchronisation. They then expand to nothing.
+
+    Exactly one scalar crosses to the host: the total entry count, which is a
+    static shape everything downstream needs.
+
+    Args:
+        walk: Device output of :func:`build_svgd_traversal`.
+        leaf_start: First sorted slot of each leaf, in leaf-row order.
+        num_leaves: Number of leaves ``L``.
+
+    Returns:
+        ``(leaf_offsets, leaf_source, node_offsets, entry_perm, node_ranges,
+        num_far_entries, num_far_contribs)``.
+    """
+    ranges = walk.node_ranges
+    far_src, far_tgt = walk.far_src, walk.far_tgt
+    num_nodes = int(ranges.shape[0])
+
+    keep = jnp.ones(far_src.shape, dtype=bool)
+    if walk.far_tags.shape[0] == far_src.shape[0]:
+        keep = walk.far_tags != FAR_TAG_IGNORE
+
+    tgt_start = ranges[far_tgt, 0]
+    tgt_end = ranges[far_tgt, 1]
+    span = jnp.where(keep, tgt_end - tgt_start + 1, 0)
+    num_far_contribs = int(span.sum())
+
+    # Leaf rows are not assumed to be slot-ordered, so the node -> leaf-range
+    # lookup goes through a sort of the leaf starts rather than the row index.
+    starts = jnp.asarray(leaf_start)
+    by_start = jnp.argsort(starts)
+    sorted_start = starts[by_start]
+    first = jnp.searchsorted(sorted_start, tgt_start, side="right") - 1
+    last = jnp.searchsorted(sorted_start, tgt_end, side="right") - 1
+    counts = jnp.where(keep, last - first + 1, 0)
+
+    # Expand in SOURCE order, so the transpose CSR the reverse pass needs comes
+    # out grouped for free. Ordering 1.1 million pairs and then expanding is far
+    # cheaper than expanding first and ordering 2.8 million entries, whose key
+    # is no longer nearly sorted -- 20 ms against 180 ms when this was on the
+    # host, and the same asymmetry holds here.
+    pair_order = jnp.argsort(far_src)
+    counts_src = counts[pair_order]
+    total = int(counts_src.sum())
+    if total == 0:
+        empty = as_index(jnp.zeros((0,), dtype=INDEX_DTYPE))
+        zeros = as_index(jnp.zeros((num_leaves + 1,), dtype=INDEX_DTYPE))
+        node_zeros = as_index(jnp.zeros((num_nodes + 1,), dtype=INDEX_DTYPE))
+        return zeros, empty, node_zeros, empty, ranges, 0, num_far_contribs
+
+    seg_start = jnp.cumsum(counts_src) - counts_src
+    within = jnp.arange(total, dtype=counts_src.dtype) - jnp.repeat(
+        seg_start, counts_src, total_repeat_length=total
+    )
+    entry_leaf = by_start[
+        jnp.repeat(first[pair_order], counts_src, total_repeat_length=total) + within
+    ]
+    entry_source = jnp.repeat(
+        far_src[pair_order], counts_src, total_repeat_length=total
+    )
+    node_offsets = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=INDEX_DTYPE),
+            jnp.cumsum(jnp.bincount(entry_source, length=num_nodes)).astype(
+                INDEX_DTYPE
+            ),
+        ]
+    )
+
+    # Then the forward order: by target leaf. Only the grouping matters, since
+    # the entries within a leaf are summed, so the sort need not be stable.
+    by_leaf = jnp.argsort(entry_leaf)
+    leaf_offsets = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=INDEX_DTYPE),
+            jnp.cumsum(jnp.bincount(entry_leaf, length=num_leaves)).astype(INDEX_DTYPE),
+        ]
+    )
+    # The reverse needs the map the other way -- leaf-order index to its position
+    # in source order -- which is the inverse of ``by_leaf``, built by scatter.
+    entry_perm = (
+        jnp.zeros((total,), dtype=INDEX_DTYPE)
+        .at[by_leaf]
+        .set(jnp.arange(total, dtype=INDEX_DTYPE))
+    )
+    return (
+        as_index(leaf_offsets),
+        as_index(entry_source[by_leaf]),
+        as_index(node_offsets),
+        as_index(entry_perm),
+        ranges,
+        total,
+        num_far_contribs,
+    )
+
+
 def assemble_svgd_topology(
     walk: SvgdTraversal, capacity: str | int = "exact"
 ) -> SvgdTopology:
@@ -478,87 +681,49 @@ def assemble_svgd_topology(
     dir_target = _pad_int(dir_target, dir_cap, num_leaves - 1)
     dir_source = _pad_int(dir_source, dir_cap, num_leaves - 1)
 
-    # Far field: expand each far pair's TARGET node to its particles; each such
-    # particle receives the monopole of the paired SOURCE node.
-    far_src = np.asarray(walk.far_src)
-    far_tgt = np.asarray(walk.far_tgt)
-    far_tags = np.asarray(walk.far_tags)
-    if far_tags.shape[0] == far_src.shape[0]:
-        keep = far_tags != FAR_TAG_IGNORE
-        if not keep.all():
-            far_src = far_src[keep]
-            far_tgt = far_tgt[keep]
-    tgt_start = node_ranges[far_tgt, 0]
-    tgt_end = node_ranges[far_tgt, 1]
-    # M, the per-particle expansion, is *reported* but never built. At N = 1e5
-    # it is 89,555,008 entries: ~2 GB of index arrays whose host assembly was
-    # 1074 ms of a 1438 ms build, and whose accumulation is a scatter with 899
-    # repeats per target -- 272 ms of the 269 ms float32 far field.
-    num_far_contribs = int((tgt_end - tgt_start + 1).sum())
-
-    # Push each accepted pair down to the LEAVES under its target node instead.
-    # A node's slot range is a union of its descendant leaves' ranges, so this
-    # is exact, and it is ~ml times smaller: 2.8 million entries at N = 1e5.
-    # Leaf rows are not assumed to be slot-ordered, so the lookup goes through
-    # a sort of the leaf starts rather than through the row index.
-    by_start = np.argsort(leaf_start, kind="stable")
-    sorted_start = leaf_start[by_start]
-    first = np.searchsorted(sorted_start, tgt_start, side="right") - 1
-    last = np.searchsorted(sorted_start, tgt_end, side="right") - 1
-
-    # One monopole per DISTINCT far source node -- thousands, not millions --
-    # so the prefix-sum gather that summarises them is no longer O(M). A dense
-    # remap over the node ids beats np.unique's sort by 9x (5 vs 45 ms).
-    seen = np.zeros(int(node_ranges.shape[0]), dtype=bool)
-    seen[far_src] = True
-    uniq_src = np.flatnonzero(seen)
-    remap = np.zeros(int(node_ranges.shape[0]), dtype=np.int64)
-    remap[uniq_src] = np.arange(uniq_src.shape[0], dtype=np.int64)
-    pair_source = remap[far_src]
-
-    # Expand the pairs in SOURCE order, so the transpose CSR the reverse pass
-    # needs comes out sorted for free. Sorting 1.1 million pairs and then
-    # expanding costs 20 ms; expanding first and sorting the 2.8 million entries
-    # costs 180 ms, because the expanded key is no longer nearly ordered.
-    pair_order = np.argsort(pair_source, kind="stable")
-    counts_src = (last - first + 1).astype(np.int64)[pair_order]
-    num_far_entries = int(counts_src.sum())
-    seg_start = np.cumsum(counts_src) - counts_src
-    within = np.arange(num_far_entries, dtype=np.int64) - np.repeat(
-        seg_start, counts_src
+    # Far field, leaf-major. Every input is already a device array, and at
+    # N = 1e5 the host version of this was 271 ms of a 633 ms build, so it goes
+    # to the device once there is enough of it to pay the dispatch.
+    far_pairs_kept = (
+        int(np.asarray(walk.far_tags != FAR_TAG_IGNORE).sum())
+        if (walk.far_tags.shape[0] == walk.far_src.shape[0])
+        else int(walk.far_src.shape[0])
     )
-    entry_leaf = by_start[
-        np.repeat(first.astype(np.int64)[pair_order], counts_src) + within
-    ]
-    entry_source = np.repeat(pair_source[pair_order], counts_src)
-    far_node_offsets = np.concatenate(
-        [[0], np.cumsum(np.bincount(entry_source, minlength=uniq_src.shape[0]))]
-    ).astype(np.int64)
 
-    # Then the forward order: by target leaf. Only the grouping matters -- the
-    # entries within a leaf are summed -- so the sort need not be stable, and it
-    # goes to the device above a threshold: 11 ms against 239 ms in numpy for
-    # 2.8 million keys, which is most of what the host half of the build costs.
-    if num_far_entries >= _DEVICE_FAR_SORT_MIN_ENTRIES:
-        by_leaf = np.asarray(jnp.argsort(jnp.asarray(entry_leaf.astype(np.int32))))
+    if far_pairs_kept >= _DEVICE_FAR_ASSEMBLY_MIN_PAIRS:
+        (
+            far_leaf_offsets,
+            far_leaf_source,
+            far_node_offsets,
+            far_entry_perm,
+            far_ranges,
+            num_far_entries,
+            num_far_contribs,
+        ) = _assemble_far_on_device(walk, leaf_start, num_leaves)
+        far_node_start = as_index(far_ranges[:, 0])
+        far_node_end = as_index(far_ranges[:, 1])
     else:
-        by_leaf = np.argsort(entry_leaf, kind="stable")
-    far_leaf_offsets = np.concatenate(
-        [[0], np.cumsum(np.bincount(entry_leaf, minlength=num_leaves))]
-    ).astype(np.int64)
-    entry_source = entry_source[by_leaf]
-    # The reverse needs the map the other way: leaf-order index -> its position
-    # in source order, so its per-entry cotangents can be summed per node by a
-    # segmented reduction. That is the INVERSE of ``by_leaf``, built by scatter
-    # rather than by a second sort.
-    far_entry_perm = np.empty(num_far_entries, dtype=np.int64)
-    far_entry_perm[by_leaf] = np.arange(num_far_entries, dtype=np.int64)
+        (
+            far_leaf_offsets,
+            far_leaf_source,
+            far_node_offsets,
+            far_entry_perm,
+            far_node_start,
+            far_node_end,
+            num_far_entries,
+            num_far_contribs,
+        ) = _assemble_far_on_host(node_ranges, walk, leaf_start, num_leaves)
 
     far_cap = _round_up_capacity(num_far_entries, capacity)
     far_leaf_live = _live_mask(num_far_entries, far_cap)
     # Padding entries point at source node 0; the CSR bounds keep the kernel
     # away from them and ``far_leaf_live`` masks them for the pure-JAX path.
-    far_leaf_source = _pad_int(entry_source, far_cap, 0)
+    if far_cap != num_far_entries:
+        tail = jnp.zeros((far_cap - num_far_entries,), dtype=far_leaf_source.dtype)
+        far_leaf_source = jnp.concatenate([jnp.asarray(far_leaf_source), tail])
+        far_entry_perm = jnp.concatenate(
+            [jnp.asarray(far_entry_perm), jnp.zeros_like(tail)]
+        )
 
     return SvgdTopology(
         order=jnp.asarray(order),
@@ -574,11 +739,11 @@ def assemble_svgd_topology(
         far_leaf_offsets=as_index(jnp.asarray(far_leaf_offsets)),
         far_leaf_source=as_index(jnp.asarray(far_leaf_source)),
         far_leaf_live=jnp.asarray(far_leaf_live),
-        far_node_start=as_index(jnp.asarray(node_ranges[uniq_src, 0])),
-        far_node_end=as_index(jnp.asarray(node_ranges[uniq_src, 1])),
+        far_node_start=as_index(jnp.asarray(far_node_start)),
+        far_node_end=as_index(jnp.asarray(far_node_end)),
         far_node_offsets=as_index(jnp.asarray(far_node_offsets)),
-        far_entry_perm=as_index(jnp.asarray(_pad_int(far_entry_perm, far_cap, 0))),
-        num_far_pairs=int(far_src.shape[0]),
+        far_entry_perm=as_index(jnp.asarray(far_entry_perm)),
+        num_far_pairs=far_pairs_kept,
         num_far_contribs=num_far_contribs,
         num_near_leaf_pairs=num_directed,
         num_particles=n,
@@ -650,6 +815,11 @@ _NEAR_CHUNK_BYTES = 256 << 20
 #: Target byte size of one chunk's ``(chunk, ml, d)`` far-field tensor, matching
 #: :data:`_NEAR_CHUNK_BYTES`'s role for the near field.
 _FAR_CHUNK_BYTES = 256 << 20
+
+#: Accepted far pairs above which the whole far assembly runs on the device.
+#: Below it the per-call dispatch and the one scalar synchronisation cost more
+#: than the numpy work they replace, exactly as the old expansion threshold did.
+_DEVICE_FAR_ASSEMBLY_MIN_PAIRS = 1 << 14
 
 #: Far entries above which the leaf-order sort runs on the device. numpy's
 #: stable sort of 2.8 million small-range integer keys costs 239 ms (217 ms as
@@ -1229,10 +1399,11 @@ def _finish(
         Update directions in the caller's particle order, shape ``(n, d)``.
     """
     # --- far field: monopole (M2P), leaf-major ---
-    # Guard on the *node* table, not the entry list: a partition that accepted
-    # nothing as far still carries a one-entry padded list under
-    # ``capacity="pow2"``, and that entry names a monopole that does not exist.
-    if int(topo.far_node_start.shape[0]) > 0:
+    # The entry list is the guard. The monopole table is keyed by node id and so
+    # is never empty, and a padding entry under ``capacity="pow2"`` names node 0,
+    # whose monopole exists and is then masked by ``far_leaf_live`` -- so unlike
+    # the compacted table this once used, there is nothing here to fall off.
+    if int(topo.far_leaf_source.shape[0]) > 0:
         if far_backend == "jax":
             phi = phi + _accumulate_far_by_leaf(pos, sco, topo, h, n, d)
         else:

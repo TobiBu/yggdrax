@@ -587,9 +587,11 @@ def test_no_far_pairs_with_capacity_padding(capacity):
     """A partition that accepted nothing as far must still run, padded or not.
 
     ``capacity="pow2"`` -- the default for :func:`run_tree_svgd` -- rounds the
-    far entry list up to one entry even when there are none, and that entry
-    names a source node in a table that is empty. The guard is therefore on the
-    node table and not on the entry list.
+    far entry list up to one entry even when there are none. That entry names
+    source node 0, whose monopole exists (the table is keyed by node id and is
+    never empty) and is masked by ``far_leaf_live``, so the guard is the entry
+    count. An earlier revision compacted the table to the *distinct* far source
+    nodes, which made it empty here and the padding entry a read off the end.
     """
     key = jax.random.PRNGKey(6)
     particles = jax.random.normal(key, (128, 2), dtype=jnp.float64)
@@ -602,7 +604,10 @@ def test_no_far_pairs_with_capacity_padding(capacity):
         capacity=capacity,
     )
     assert int(topo.num_far_pairs) == 0
-    assert int(topo.far_node_start.shape[0]) == 0
+    assert int(np.asarray(topo.far_leaf_offsets)[-1]) == 0, "no live far entries"
+    # The monopole table is keyed by node id, so it is sized by the tree and not
+    # by the far list: full here, and never indexed, because the CSR is empty.
+    assert int(topo.far_node_start.shape[0]) == int(topo.far_node_offsets.shape[0]) - 1
     np.testing.assert_allclose(
         svgd_phi_from_topology(
             particles, -particles, 0.5, topo, accumulate="interpret"
@@ -610,4 +615,76 @@ def test_no_far_pairs_with_capacity_padding(capacity):
         svgd_phi_from_topology(particles, -particles, 0.5, topo, accumulate="scatter"),
         rtol=1e-12,
         atol=1e-14,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_particles,dim,backend", [(600, 2, "leaf_kdtree"), (800, 3, "radix")]
+)
+def test_the_device_and_host_far_assemblies_agree(num_particles, dim, backend):
+    """Two implementations of the same CSR, so they are checked against each other.
+
+    The device path exists only for speed -- at N = 1e5 the numpy one was 271 ms
+    of a 633 ms build -- so the thing worth pinning is that it is not a *different*
+    partition. Entry order within a leaf is free (they are summed), so the
+    comparison is per-leaf multiset, not elementwise.
+    """
+    from yggdrax.applications.svgd.sampler import (
+        _assemble_far_on_device,
+        _assemble_far_on_host,
+        build_svgd_traversal,
+    )
+
+    key = jax.random.PRNGKey(num_particles)
+    particles = jax.random.normal(key, (num_particles, dim), dtype=jnp.float64)
+    walk = build_svgd_traversal(
+        particles, theta=0.5, leaf_size=8, backend=backend, traversal_config=_CFG
+    )
+    node_ranges = np.asarray(walk.node_ranges)
+    leaf_start = node_ranges[np.asarray(walk.leaf_ids), 0]
+    num_leaves = int(walk.leaf_ids.shape[0])
+
+    host = _assemble_far_on_host(node_ranges, walk, leaf_start, num_leaves)
+    dev = _assemble_far_on_device(walk, leaf_start, num_leaves)
+    assert host[6] == dev[5], "entry counts differ"
+    assert host[7] == dev[6], "M differs"
+    np.testing.assert_array_equal(np.asarray(host[0]), np.asarray(dev[0]))
+    np.testing.assert_array_equal(np.asarray(host[2]), np.asarray(dev[2]))
+
+    offsets = np.asarray(host[0])
+    h_src, d_src = np.asarray(host[1]), np.asarray(dev[1])
+    for leaf in range(num_leaves):
+        lo, hi = offsets[leaf], offsets[leaf + 1]
+        np.testing.assert_array_equal(np.sort(h_src[lo:hi]), np.sort(d_src[lo:hi]))
+
+
+@pytest.mark.parametrize(
+    "num_particles,dim,backend", [(600, 2, "leaf_kdtree"), (800, 3, "radix")]
+)
+def test_the_transpose_csr_is_consistent_with_the_forward_one(
+    num_particles, dim, backend
+):
+    """``far_entry_perm`` must carry leaf order into source order, exactly.
+
+    Getting this backwards -- the permutation instead of its inverse -- leaves
+    every *value* correct and the gradient wrong, which is how it slipped through
+    once already (§6.3 of the report). This pins the property directly rather
+    than through a gradient.
+    """
+    key = jax.random.PRNGKey(num_particles + 1)
+    particles = jax.random.normal(key, (num_particles, dim), dtype=jnp.float64)
+    topo = build_svgd_topology(
+        particles, theta=0.5, leaf_size=8, backend=backend, traversal_config=_CFG
+    )
+    entries = int(np.asarray(topo.far_leaf_offsets)[-1])
+    assert entries > 0, "this test needs a far field"
+    source = np.asarray(topo.far_leaf_source)[:entries]
+    perm = np.asarray(topo.far_entry_perm)[:entries]
+    node_offsets = np.asarray(topo.far_node_offsets)
+
+    assert sorted(perm.tolist()) == list(range(entries)), "not a permutation"
+    assert np.all(np.diff(source[perm]) >= 0), "transpose is not grouped by source"
+    counts = np.bincount(source, minlength=node_offsets.shape[0] - 1)
+    np.testing.assert_array_equal(
+        node_offsets, np.concatenate([[0], np.cumsum(counts)])
     )
