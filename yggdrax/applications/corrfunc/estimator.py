@@ -1,0 +1,417 @@
+"""Differentiable, tree-accelerated two-point pair-count estimator.
+
+The estimator computes a soft-binned pair-count histogram
+``DD_k = sum_{i<j} w_k(r_ij)`` (see :mod:`~yggdrax.applications.corrfunc.binning`)
+using the yggdrax dual-tree traversal to avoid the :math:`O(N^2)` sum:
+
+* **Near field** (leaf--leaf pairs the traversal did not accept as far):
+  evaluated *exactly*, per particle pair, so the near contribution is exact.
+* **Far field** (well-separated node pairs accepted by the MAC): each far
+  node pair ``(A, B)`` contributes ``count_A * count_B * w_k(d_AB)`` where
+  ``d_AB`` is the distance between the node centres of mass -- a monopole
+  approximation whose error is controlled by the opening angle ``theta``.
+
+Design (matching the differentiability model in `docs/`): the tree
+topology and near/far partition are built once as an integer
+:class:`PairTopology` (non-differentiable), and the soft counts are a smooth,
+reverse-mode-differentiable function of the particle positions *given* that
+fixed topology. Gradients therefore flow through the continuous separations
+and centres of mass, exactly as characterised in section 2.
+
+Backend note: use ``backend="radix"`` (default) or ``"octree"``. These give
+provably exact, disjoint, complete pair coverage. The KD-tree stores a pivot
+particle at every internal node that is absent from the leaf near-list, so it
+does *not* cover all pairs and must not be used for this estimator.
+
+Accounting: both the far node-pair list and the near leaf-neighbour list are
+fully symmetric (every ``(A, B)`` also appears as ``(B, A)``), so those
+contributions are halved; within-leaf pairs are counted once directly.
+"""
+
+from __future__ import annotations
+
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array
+
+from yggdrax import (
+    DualTreeTraversalConfig,
+    MACType,
+    Tree,
+    build_interactions_and_neighbors,
+    compute_tree_geometry,
+)
+from yggdrax.applications.corrfunc.binning import soft_bin_weights
+
+# Default number of leaf pairs processed per chunk in the near-field reduction.
+# The near field materialises a (chunk, max_leaf, max_leaf, nbins) soft-weight
+# tensor per chunk; this caps that live intermediate instead of building the
+# full (P, max_leaf, max_leaf, nbins) tensor at once (which OOMs above
+# N ~ 1e4-2e4). See :func:`_accumulate_block_pairs`.
+_DEFAULT_NEAR_CHUNK = 1024
+
+
+class PairTopology(NamedTuple):
+    """Integer index structure describing the near/far partition of pairs.
+
+    All fields are integer/static (no gradient). The differentiable soft
+    counts are computed from particle positions *given* this topology by
+    :func:`soft_pair_counts_from_topology`.
+    """
+
+    order: Array  # (n,) sorted-slot -> original particle id
+    leaf_slots: Array  # (L, max_leaf) padded sorted-slot indices per leaf
+    leaf_mask: Array  # (L, max_leaf) 1.0 valid / 0.0 pad
+    near_target_row: Array  # (P,) target-leaf row index into leaf_slots
+    near_source_row: Array  # (P,) source-leaf row index into leaf_slots
+    far_src_start: Array  # (F,) inclusive start slot of far source node
+    far_src_end: Array  # (F,) inclusive end slot of far source node
+    far_tgt_start: Array  # (F,) inclusive start slot of far target node
+    far_tgt_end: Array  # (F,) inclusive end slot of far target node
+    num_particles: int
+
+
+def build_pair_topology(
+    positions: Array,
+    *,
+    theta: float = 0.5,
+    leaf_size: int = 16,
+    backend: str = "radix",
+    mac_type: MACType = "dehnen",
+    traversal_config: DualTreeTraversalConfig | None = None,
+) -> PairTopology:
+    """Build the near/far pair partition for ``positions`` (non-differentiable).
+
+    Args:
+        positions: Particle coordinates, shape ``(n, 3)``.
+        theta: Opening angle for the multipole acceptance criterion.
+        leaf_size: Target leaf occupancy for the tree build.
+        backend: ``"radix"``, ``"octree"``, or ``"kdtree"`` (all give exact
+            coverage). ``"kdtree"`` uses the leaf-only bucket KD-tree, which
+            stores every point in a leaf and so tiles all pairs; the heap
+            KD-tree used by the KNN kernels does not and is not used here.
+        mac_type: Acceptance criterion, e.g. ``"dehnen"``.
+        traversal_config: Optional explicit capacities; auto-sized if None.
+
+    Returns:
+        A :class:`PairTopology` describing leaf blocks, near leaf pairs, and
+        far node pairs.
+    """
+    masses = jnp.ones(positions.shape[0], dtype=positions.dtype)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        tree_type=backend,
+        build_mode="adaptive",
+        leaf_size=leaf_size,
+        return_reordered=True,
+    )
+    geometry = compute_tree_geometry(tree, tree.positions_sorted)
+    interactions, neighbors = build_interactions_and_neighbors(
+        tree,
+        geometry,
+        theta=theta,
+        mac_type=mac_type,
+        traversal_config=traversal_config,
+    )
+
+    node_ranges = np.asarray(tree.node_ranges)  # inclusive [start, end]
+    order = np.asarray(tree.particle_indices)
+    n = int(tree.num_particles)
+
+    # --- leaves: the near-list rows enumerate every leaf and tile [0, n) ---
+    leaf_ids = np.asarray(neighbors.leaf_indices)
+    leaf_start = node_ranges[leaf_ids, 0]
+    leaf_end = node_ranges[leaf_ids, 1]
+    leaf_len = leaf_end - leaf_start + 1
+    max_leaf = int(leaf_len.max())
+    num_leaves = leaf_ids.shape[0]
+
+    ramp = np.arange(max_leaf)[None, :]
+    leaf_slots = leaf_start[:, None] + ramp  # (L, max_leaf)
+    leaf_mask = (ramp < leaf_len[:, None]).astype(np.float32)
+    leaf_slots = np.clip(leaf_slots, 0, n - 1)  # padded entries masked out
+
+    # Map leaf node id -> row index (for the near-neighbour CSR).
+    node_to_row = np.full(int(node_ranges.shape[0]), -1, dtype=np.int64)
+    node_to_row[leaf_ids] = np.arange(num_leaves)
+
+    # --- near: expand the leaf-neighbour CSR to (target_row, source_row) ---
+    # Vectorized: row r owns neighbours[offsets[r]:offsets[r+1]]; repeat the row
+    # index by its count and map each neighbour node id to its leaf row.
+    n_off = np.asarray(neighbors.offsets)
+    n_nb = np.asarray(neighbors.neighbors)
+    row_counts = (n_off[1:] - n_off[:-1]).astype(np.int64)
+    near_target_row = np.repeat(np.arange(num_leaves, dtype=np.int64), row_counts)
+    near_source_row = node_to_row[n_nb[: int(n_off[-1])]].astype(np.int64)
+
+    # --- far: node pairs (inclusive slot spans) ---
+    far_src = np.asarray(interactions.sources)
+    far_tgt = np.asarray(interactions.targets)
+
+    return PairTopology(
+        order=jnp.asarray(order),
+        leaf_slots=jnp.asarray(leaf_slots),
+        leaf_mask=jnp.asarray(leaf_mask),
+        near_target_row=jnp.asarray(near_target_row),
+        near_source_row=jnp.asarray(near_source_row),
+        far_src_start=jnp.asarray(node_ranges[far_src, 0]),
+        far_src_end=jnp.asarray(node_ranges[far_src, 1]),
+        far_tgt_start=jnp.asarray(node_ranges[far_tgt, 0]),
+        far_tgt_end=jnp.asarray(node_ranges[far_tgt, 1]),
+        num_particles=n,
+    )
+
+
+def _leaf_blocks(pos_sorted: Array, topo: PairTopology) -> Array:
+    """Gather padded per-leaf particle blocks, shape ``(L, max_leaf, 3)``."""
+    return pos_sorted[topo.leaf_slots]
+
+
+def _pairwise_dist(a: Array, b: Array) -> Array:
+    """Euclidean distances between blocks ``a`` and ``b`` over last-but-one axis.
+
+    Args:
+        a: Array ``(..., m, 3)``.
+        b: Array ``(..., p, 3)``.
+
+    Returns:
+        Distances ``(..., m, p)``.
+    """
+    d = a[..., :, None, :] - b[..., None, :, :]
+    return jnp.sqrt(jnp.sum(d * d, axis=-1) + 1e-30)
+
+
+def _accumulate_block_pairs(
+    blocks: Array,
+    leaf_mask: Array,
+    tgt_rows: Array,
+    src_rows: Array,
+    edges: Array,
+    sharpness: float,
+    log: bool,
+    nbins: int,
+    triu: Array | None,
+    chunk_size: int,
+) -> Array:
+    """Chunked, differentiable reduction of soft-bin weights over leaf pairs.
+
+    Computes ``sum_p sum_{i,j} w_k(|t_pi - s_pj|) * mask_pi * mask_pj [* triu_ij]``
+    as a ``(nbins,)`` vector, where pair ``p`` uses leaf blocks
+    ``blocks[tgt_rows[p]]`` and ``blocks[src_rows[p]]``. The pair axis of length
+    ``Q = tgt_rows.shape[0]`` is scanned in fixed-size chunks so the large
+    ``(chunk, max_leaf, max_leaf, nbins)`` weight tensor is the only big live
+    intermediate -- replacing the previous single ``(Q, ...)`` tensor that set
+    the memory ceiling.
+
+    Reverse-mode differentiable in ``blocks`` (hence in ``positions``). The scan
+    body is rematerialised (:func:`jax.checkpoint`), so the backward pass
+    recomputes each chunk rather than stashing every chunk's weight/distance
+    tensor -- without that, the saved scan residuals would restore the O(Q)
+    memory ceiling that this function exists to remove.
+
+    Args:
+        blocks: Padded per-leaf particle blocks, shape ``(L, max_leaf, 3)``.
+        leaf_mask: Per-leaf validity, shape ``(L, max_leaf)`` (1 valid / 0 pad).
+        tgt_rows: Target-leaf row indices into ``blocks``, shape ``(Q,)``.
+        src_rows: Source-leaf row indices into ``blocks``, shape ``(Q,)``.
+        edges: Radial bin edges, shape ``(nbins + 1,)``.
+        sharpness: Soft-window sharpness.
+        log: Bin in ``log`` separation.
+        nbins: Number of bins (``edges.shape[0] - 1``).
+        triu: Optional ``(max_leaf, max_leaf)`` per-block weight (e.g. a strict
+            upper-triangular mask for within-leaf pairs), or None.
+        chunk_size: Number of leaf pairs per chunk.
+
+    Returns:
+        Per-bin accumulated soft counts, shape ``(nbins,)``.
+    """
+    dtype = blocks.dtype
+    q = int(tgt_rows.shape[0])
+    if q == 0:
+        return jnp.zeros(nbins, dtype=dtype)
+
+    def contrib(tr: Array, sr: Array, row_weight: Array | None) -> Array:
+        """Soft counts for one chunk of leaf pairs, reduced to ``(nbins,)``."""
+        tgt = blocks[tr]  # (m, max_leaf, 3)
+        src = blocks[sr]
+        tgt_mask = leaf_mask[tr]  # (m, max_leaf)
+        src_mask = leaf_mask[sr]
+        r = _pairwise_dist(tgt, src)  # (m, max_leaf, max_leaf)
+        w = soft_bin_weights(r, edges, sharpness, log=log)  # (m, ml, ml, nbins)
+        pair_mask = tgt_mask[:, :, None] * src_mask[:, None, :]  # (m, ml, ml)
+        if triu is not None:
+            pair_mask = pair_mask * triu
+        if row_weight is not None:
+            pair_mask = pair_mask * row_weight[:, None, None]
+        return jnp.sum(w * pair_mask[..., None], axis=(0, 1, 2))  # (nbins,)
+
+    # Small case: a single block reproduces the unchunked reduction exactly
+    # (no padding, no scan), so the result is bit-identical to the naive form.
+    if q <= chunk_size:
+        return contrib(tgt_rows, src_rows, None)
+
+    n_chunks = -(-q // chunk_size)  # ceil division
+    pad = n_chunks * chunk_size - q
+    idx_pad = jnp.zeros(pad, dtype=tgt_rows.dtype)
+    tgt = jnp.concatenate([tgt_rows, idx_pad]).reshape(n_chunks, chunk_size)
+    src = jnp.concatenate([src_rows, idx_pad]).reshape(n_chunks, chunk_size)
+    # Padded rows gather leaf 0 but carry weight 0, so they contribute nothing
+    # to the value or the gradient.
+    valid = jnp.concatenate(
+        [jnp.ones(q, dtype=dtype), jnp.zeros(pad, dtype=dtype)]
+    ).reshape(n_chunks, chunk_size)
+
+    @jax.checkpoint
+    def body(acc: Array, xs: tuple[Array, Array, Array]) -> tuple[Array, None]:
+        tr, sr, row_weight = xs
+        return acc + contrib(tr, sr, row_weight), None
+
+    acc0 = jnp.zeros(nbins, dtype=dtype)
+    total, _ = jax.lax.scan(body, acc0, (tgt, src, valid))
+    return total
+
+
+def soft_pair_counts_from_topology(
+    positions: Array,
+    topo: PairTopology,
+    edges: Array,
+    sharpness: float,
+    *,
+    log: bool = True,
+    chunk_size: int = _DEFAULT_NEAR_CHUNK,
+) -> Array:
+    """Differentiable soft-binned pair counts given a fixed pair topology.
+
+    Args:
+        positions: Particle coordinates, shape ``(n, 3)``. Differentiable input.
+        topo: Pair topology from :func:`build_pair_topology`.
+        edges: Radial bin edges, shape ``(nbins + 1,)``.
+        sharpness: Soft-window sharpness.
+        log: Bin in ``log`` separation.
+        chunk_size: Number of near leaf pairs reduced per chunk. The near field
+            is accumulated in fixed-size chunks over the (within-leaf and
+            cross-leaf) pair axes so the large per-chunk soft-weight tensor is
+            the only big live intermediate; this bounds memory to ``O(chunk_size
+            * max_leaf^2 * nbins)`` instead of ``O(P * max_leaf^2 * nbins)`` and
+            lets the estimator scale past N ~ 1e5. Does not change the result
+            (up to floating-point summation order); smaller uses less memory,
+            larger is faster until it OOMs.
+
+    Returns:
+        Per-bin soft pair counts, shape ``(nbins,)``, differentiable in
+        ``positions``.
+    """
+    pos_sorted = positions[topo.order]
+    nbins = int(edges.shape[0]) - 1
+
+    # --- near field: exact per-pair soft counts, accumulated in chunks ---
+    blocks = _leaf_blocks(pos_sorted, topo)  # (L, max_leaf, 3)
+    mask = topo.leaf_mask  # (L, max_leaf)
+    num_leaves, ml = blocks.shape[0], blocks.shape[1]
+
+    # within-leaf pairs (strict upper triangle), counted once. Each leaf pairs
+    # with itself, so target and source rows are both the leaf index range.
+    triu = jnp.triu(jnp.ones((ml, ml), dtype=pos_sorted.dtype), k=1)
+    leaf_rows = jnp.arange(num_leaves)
+    within = _accumulate_block_pairs(
+        blocks,
+        mask,
+        leaf_rows,
+        leaf_rows,
+        edges,
+        sharpness,
+        log,
+        nbins,
+        triu,
+        chunk_size,
+    )
+
+    # cross-leaf near pairs; the neighbour list is symmetric, so halve.
+    cross = 0.5 * _accumulate_block_pairs(
+        blocks,
+        mask,
+        topo.near_target_row,
+        topo.near_source_row,
+        edges,
+        sharpness,
+        log,
+        nbins,
+        None,
+        chunk_size,
+    )
+
+    # --- far field: monopole (centre-of-mass) approximation; halve ---
+    if topo.far_src_start.shape[0] > 0:
+        # Per-node centre of mass and count via prefix sums over sorted pos.
+        prefix = jnp.concatenate(
+            [jnp.zeros((1, 3), pos_sorted.dtype), jnp.cumsum(pos_sorted, axis=0)]
+        )
+        cnt_prefix = jnp.arange(topo.num_particles + 1, dtype=pos_sorted.dtype)
+
+        def com_and_count(start, end):
+            total = prefix[end + 1] - prefix[start]
+            count = cnt_prefix[end + 1] - cnt_prefix[start]
+            return total / count[..., None], count
+
+        com_src, cnt_src = com_and_count(topo.far_src_start, topo.far_src_end)
+        com_tgt, cnt_tgt = com_and_count(topo.far_tgt_start, topo.far_tgt_end)
+        d_far = jnp.sqrt(jnp.sum((com_src - com_tgt) ** 2, axis=-1) + 1e-30)
+        w_far = soft_bin_weights(d_far, edges, sharpness, log=log)  # (F, nbins)
+        far = 0.5 * jnp.sum((cnt_src * cnt_tgt)[:, None] * w_far, axis=0)
+    else:
+        far = jnp.zeros(nbins, dtype=pos_sorted.dtype)
+
+    return within + cross + far
+
+
+def soft_pair_counts(
+    positions: Array,
+    edges: Array,
+    *,
+    theta: float = 0.5,
+    sharpness: float = 100.0,
+    leaf_size: int = 16,
+    backend: str = "radix",
+    mac_type: MACType = "dehnen",
+    traversal_config: DualTreeTraversalConfig | None = None,
+    log: bool = True,
+    chunk_size: int = _DEFAULT_NEAR_CHUNK,
+) -> Array:
+    """Tree-accelerated differentiable soft pair counts (build + accumulate).
+
+    Convenience wrapper that builds the pair topology and evaluates the soft
+    counts. For gradients w.r.t. positions at a fixed topology (the intended
+    use), build the topology once with :func:`build_pair_topology` and
+    differentiate :func:`soft_pair_counts_from_topology`.
+
+    Args:
+        positions: Particle coordinates, shape ``(n, 3)``.
+        edges: Radial bin edges, shape ``(nbins + 1,)``.
+        theta: Opening angle for the MAC.
+        sharpness: Soft-window sharpness.
+        leaf_size: Target leaf occupancy.
+        backend: ``"radix"`` or ``"octree"``.
+        mac_type: Acceptance criterion.
+        traversal_config: Optional explicit traversal capacities.
+        log: Bin in ``log`` separation.
+        chunk_size: Number of near leaf pairs reduced per chunk (see
+            :func:`soft_pair_counts_from_topology`).
+
+    Returns:
+        Per-bin soft pair counts, shape ``(nbins,)``.
+    """
+    topo = build_pair_topology(
+        positions,
+        theta=theta,
+        leaf_size=leaf_size,
+        backend=backend,
+        mac_type=mac_type,
+        traversal_config=traversal_config,
+    )
+    return soft_pair_counts_from_topology(
+        positions, topo, edges, sharpness, log=log, chunk_size=chunk_size
+    )

@@ -54,9 +54,21 @@ docs = [
   "furo>=2024.1.29",
   "myst-parser>=2.0",
 ]
+# Optional dependencies of yggdrax/applications/. Only the two parameter-fitting
+# modules (svgd.bandwidth_learning, corrfunc.inference_demo) need them; the
+# estimators and samplers themselves are jax-only, so the core runtime stays lean.
+applications = [
+  "optax>=0.2.0",
+]
 
 [tool.setuptools]
-packages = ["yggdrax", "yggdrax.distributed"]
+packages = [
+  "yggdrax",
+  "yggdrax.distributed",
+  "yggdrax.applications",
+  "yggdrax.applications.corrfunc",
+  "yggdrax.applications.svgd",
+]
 
 [tool.setuptools.package-dir]
 yggdrax = "yggdrax"
