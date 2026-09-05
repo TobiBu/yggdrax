@@ -176,12 +176,72 @@ class SvgdTopology(NamedTuple):
     near_source_row: Array  # (Q,) the other row; row_a < row_b throughout
     near_dir_target: Array  # (2Q,) DIRECTED pairs, ascending in target row
     near_dir_source: Array  # (2Q,) the source row of each directed pair
+    near_live: Array  # (Q,) 1.0 real pair / 0.0 capacity padding
+    near_dir_live: Array  # (2Q,) the same for the directed list
     far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
     far_src_start: Array  # (M,) inclusive start slot of the far source node
     far_src_end: Array  # (M,) inclusive end slot of the far source node
+    far_live: Array  # (M,) 1.0 real entry / 0.0 capacity padding
     num_far_pairs: int  # far node pairs kept (M is their expansion, >= this)
     num_near_leaf_pairs: int  # DIRECTED near pairs, i.e. 2 * len(near_target_row)
     num_particles: int
+
+
+def _round_up_capacity(count: int, policy: str | int) -> int:
+    """Return the padded capacity for ``count`` under ``policy``.
+
+    Args:
+        count: The number of real entries.
+        policy: ``"exact"`` for no padding, ``"bucket"`` for the next eighth of
+            an octave, ``"pow2"`` for the next power of two, or an explicit
+            integer capacity.
+
+    Returns:
+        The capacity to allocate, never less than ``count``.
+
+    Raises:
+        ValueError: If an explicit capacity is smaller than ``count``, or the
+            policy name is unknown.
+    """
+    if isinstance(policy, int) and not isinstance(policy, bool):
+        if policy < count:
+            raise ValueError(
+                f"capacity {policy} is smaller than the {count} entries the "
+                "partition actually has; the update would silently drop pairs"
+            )
+        return int(policy)
+    if policy == "exact":
+        return int(count)
+    if count <= 1:
+        return 1
+    octave = 1 << (int(count) - 1).bit_length()
+    if policy == "pow2":
+        return octave
+    if policy == "bucket":
+        # An eighth of an octave: at most 12.5 % padding, and stable against
+        # fluctuations up to that size. The counts move by ~1 % between rebuilds
+        # (41075..41401 at N = 1e4), so this is far more headroom than needed,
+        # where "pow2" happens to cost 1.6x on the same data.
+        granule = max(1, octave >> 3)
+        return int(-(-int(count) // granule) * granule)
+    raise ValueError(
+        f"capacity must be 'exact', 'bucket', 'pow2' or an int; got {policy!r}"
+    )
+
+
+def _pad_int(values: np.ndarray, capacity: int, fill: int) -> np.ndarray:
+    """Pad a 1-D integer array up to ``capacity`` with ``fill``."""
+    if values.shape[0] >= capacity:
+        return values
+    tail = np.full((capacity - values.shape[0],), fill, dtype=values.dtype)
+    return np.concatenate([values, tail])
+
+
+def _live_mask(count: int, capacity: int) -> np.ndarray:
+    """Return a float32 0/1 mask marking the first ``count`` of ``capacity``."""
+    live = np.zeros((capacity,), dtype=np.float32)
+    live[:count] = 1.0
+    return live
 
 
 def _pad_to_3d(points: Array) -> Array:
@@ -302,7 +362,9 @@ def build_svgd_traversal(
     )
 
 
-def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
+def assemble_svgd_topology(
+    walk: SvgdTraversal, capacity: str | int = "exact"
+) -> SvgdTopology:
     """Turn a dual-tree walk into the near/far partition of the Stein update.
 
     The counterpart to :func:`build_svgd_traversal`. The leaf blocks and the
@@ -312,9 +374,25 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
 
     Args:
         walk: Device output of :func:`build_svgd_traversal`.
+        capacity: Padding policy for the two data-dependent lengths, the near
+            pair count and the far entry count *M*. ``"exact"`` (default) pads
+            nothing. ``"pow2"`` rounds both up to a power of two, which makes
+            the partition's **shapes** stable across rebuilds so the jitted
+            update compiles once instead of once per step; ``"bucket"`` does the
+            same at an eighth of an octave, which is stable on the observed ~1 %
+            rebuild-to-rebuild drift and wastes far less. An integer pins the
+            capacity explicitly.
 
     Returns:
         An :class:`SvgdTopology`.
+
+    Note:
+        Shape stability is worth more than it sounds for a per-step-rebuild
+        sampler. Six rebuilds of a perturbed N = 1e4 cloud produce six distinct
+        ``(near pairs, M)`` signatures -- 41075/428752, 41141/412000,
+        41168/420016, 41179/419152, 41401/406768, 41255/407584 -- so every step
+        retraces and recompiles the update. Padding costs a little arithmetic on
+        masked-out entries and buys back all of that.
     """
     node_ranges = np.asarray(walk.node_ranges)  # inclusive [start, end]
     order = np.asarray(walk.order)
@@ -367,6 +445,21 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     near_target_row = near_target_row[upper]
     near_source_row = near_source_row[upper]
 
+    num_pairs = int(near_target_row.shape[0])
+    pair_cap = _round_up_capacity(num_pairs, capacity)
+    near_live = _live_mask(num_pairs, pair_cap)
+    # Padding pairs a leaf with itself and weights it zero, so it contributes
+    # nothing through either accumulation.
+    near_target_row = _pad_int(near_target_row, pair_cap, 0)
+    near_source_row = _pad_int(near_source_row, pair_cap, 0)
+
+    dir_cap = _round_up_capacity(num_directed, capacity)
+    near_dir_live = _live_mask(num_directed, dir_cap)
+    # The directed list must stay non-decreasing in target row for the segmented
+    # reduction, so it pads with the *last* leaf, not the first.
+    dir_target = _pad_int(dir_target, dir_cap, num_leaves - 1)
+    dir_source = _pad_int(dir_source, dir_cap, num_leaves - 1)
+
     # Far field: expand each far pair's TARGET node to its particles; each such
     # particle receives the monopole of the paired SOURCE node.
     far_src = np.asarray(walk.far_src)
@@ -417,6 +510,19 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         far_src_start = jnp.asarray(np.repeat(node_ranges[far_src, 0], tgt_len))
         far_src_end = jnp.asarray(np.repeat(node_ranges[far_src, 1], tgt_len))
 
+    far_cap = _round_up_capacity(total, capacity)
+    far_live = _live_mask(total, far_cap)
+    if far_cap != total:
+        far_tgt_slot = jnp.concatenate(
+            [far_tgt_slot, jnp.zeros((far_cap - total,), far_tgt_slot.dtype)]
+        )
+        far_src_start = jnp.concatenate(
+            [far_src_start, jnp.zeros((far_cap - total,), far_src_start.dtype)]
+        )
+        far_src_end = jnp.concatenate(
+            [far_src_end, jnp.zeros((far_cap - total,), far_src_end.dtype)]
+        )
+
     return SvgdTopology(
         order=jnp.asarray(order),
         leaf_slots=jnp.asarray(leaf_slots),
@@ -425,9 +531,12 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         near_source_row=jnp.asarray(near_source_row),
         near_dir_target=jnp.asarray(dir_target),
         near_dir_source=jnp.asarray(dir_source),
+        near_live=jnp.asarray(near_live),
+        near_dir_live=jnp.asarray(near_dir_live),
         far_tgt_slot=far_tgt_slot,
         far_src_start=far_src_start,
         far_src_end=far_src_end,
+        far_live=jnp.asarray(far_live),
         num_far_pairs=int(far_src.shape[0]),
         num_near_leaf_pairs=num_directed,
         num_particles=n,
@@ -442,6 +551,7 @@ def build_svgd_topology(
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
     kernel_cutoff: float | None = None,
+    capacity: str | int = "exact",
 ) -> SvgdTopology:
     """Build the near/far Stein-update partition for ``particles``.
 
@@ -455,6 +565,8 @@ def build_svgd_topology(
         traversal_config: Optional explicit traversal capacities.
         kernel_cutoff: Optional kernel cutoff radius; see
             :func:`build_svgd_traversal`.
+        capacity: Shape-padding policy; see :func:`assemble_svgd_topology`.
+            ``"pow2"`` is what a per-step-rebuild sampler wants.
 
     Returns:
         An :class:`SvgdTopology`.
@@ -467,7 +579,8 @@ def build_svgd_topology(
             backend=backend,
             traversal_config=traversal_config,
             kernel_cutoff=kernel_cutoff,
-        )
+        ),
+        capacity=capacity,
     )
 
 
@@ -632,7 +745,7 @@ def _accumulate_near_by_segment(
     chunk = min(int(chunk_pairs), num_pairs)
     num_chunks = -(-num_pairs // chunk)
     pad = num_chunks * chunk - num_pairs
-    live = jnp.ones((num_pairs,), dtype=pos.dtype)
+    live = topo.near_dir_live.astype(pos.dtype)
     if pad:
         # Pad with the last leaf paired to itself and zero weight: the segment
         # ids stay non-decreasing, which is what makes the reduction segmented.
@@ -760,7 +873,7 @@ def svgd_phi_from_topology(
         pad = num_chunks * chunk - num_pairs
         rows_a = topo.near_target_row
         rows_b = topo.near_source_row
-        live = jnp.ones((num_pairs,), dtype=pos.dtype)
+        live = topo.near_live.astype(pos.dtype)
         if pad:
             zeros_i = jnp.zeros((pad,), dtype=rows_a.dtype)
             rows_a = jnp.concatenate([rows_a, zeros_i])
@@ -837,6 +950,9 @@ def _finish(
         d2 = jnp.sum((x_i - com) ** 2, axis=-1, keepdims=True)
         kB = jnp.exp(-d2 / (2.0 * h**2))
         contrib = kB * (sum_s + count * (x_i - com) / (h**2))  # (M, d)
+        # Capacity padding points at slot 0 with a degenerate source node, so it
+        # is masked rather than merely harmless.
+        contrib = contrib * topo.far_live.astype(contrib.dtype)[:, None]
         phi = phi.at[topo.far_tgt_slot].add(contrib)
 
     phi = phi / n
@@ -923,6 +1039,7 @@ def tree_svgd_step(
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
     cutoff_bandwidths: float | None = None,
+    capacity: str | int = "pow2",
 ) -> Float[Array, "n d"]:
     """One tree-accelerated SVGD step.
 
@@ -936,21 +1053,24 @@ def tree_svgd_step(
         backend: ``"radix"`` or ``"octree"``.
         traversal_config: Optional explicit traversal capacities.
         cutoff_bandwidths: Kernel cutoff in bandwidths; see :func:`svgd_phi`.
+        capacity: Shape-padding policy, defaulting to ``"pow2"`` because this
+            function rebuilds the partition every call; see
+            :func:`assemble_svgd_topology`.
 
     Returns:
         Updated particles, shape ``(n, d)``.
     """
     scores = score_fn(particles)
-    phi = svgd_phi(
+    topo = build_svgd_topology(
         particles,
-        scores,
-        h,
         theta=theta,
         leaf_size=leaf_size,
         backend=backend,
         traversal_config=traversal_config,
-        cutoff_bandwidths=cutoff_bandwidths,
+        kernel_cutoff=_cutoff_radius(cutoff_bandwidths, h),
+        capacity=capacity,
     )
+    phi = _jit_svgd_phi_from_topology(particles, scores, h, topo, accumulate="auto")
     return particles + step_size * phi
 
 
@@ -966,6 +1086,7 @@ def run_tree_svgd(
     backend: str = "leaf_kdtree",
     traversal_config: DualTreeTraversalConfig | None = None,
     cutoff_bandwidths: float | None = None,
+    capacity: str | int = "pow2",
 ) -> Float[Array, "n d"]:
     """Run tree-accelerated SVGD for ``num_steps`` steps.
 
@@ -980,6 +1101,11 @@ def run_tree_svgd(
         backend: ``"radix"`` or ``"octree"``.
         traversal_config: Optional explicit traversal capacities.
         cutoff_bandwidths: Kernel cutoff in bandwidths; see :func:`svgd_phi`.
+        capacity: Shape-padding policy, defaulting to ``"pow2"``. This is the
+            single most valuable setting in this module for a rebuilding
+            sampler: 8 steps at N = 1e4 take **35.5 s** with ``"exact"`` and
+            **2.2 s** with ``"pow2"``, because the partition's shapes otherwise
+            change every step and both the traversal and the update recompile.
 
     Returns:
         Final particles, shape ``(n, d)``.
@@ -996,5 +1122,6 @@ def run_tree_svgd(
             backend=backend,
             traversal_config=traversal_config,
             cutoff_bandwidths=cutoff_bandwidths,
+            capacity=capacity,
         )
     return p
