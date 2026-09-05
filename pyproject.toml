@@ -54,9 +54,14 @@ docs = [
   "furo>=2024.1.29",
   "myst-parser>=2.0",
 ]
-# Extra dependencies for the differentiable-applications paper code under
-# yggdrax/applications/ and the bench/ + examples/ pipeline. Kept out of the
-# core runtime deps so the maintained library stays lean.
+# Optional dependencies of yggdrax/applications/. Only the two parameter-fitting
+# modules (svgd.bandwidth_learning, corrfunc.inference_demo) need them; the
+# estimators and samplers themselves are jax-only, so the core runtime stays lean.
+applications = [
+  "optax>=0.2.0",
+]
+# Extra dependencies of the paper-only material on this branch: bench/,
+# examples/differentiable_paper/ and the figure notebooks. Not on main.
 paper = [
   "optax>=0.2.0",      # gradient-based parameter recovery (SVGD, corrfunc)
   "scipy>=1.10",       # scipy.spatial.cKDTree CPU baseline in scaling benches
@@ -65,7 +70,13 @@ paper = [
 ]
 
 [tool.setuptools]
-packages = ["yggdrax", "yggdrax.distributed"]
+packages = [
+  "yggdrax",
+  "yggdrax.distributed",
+  "yggdrax.applications",
+  "yggdrax.applications.corrfunc",
+  "yggdrax.applications.svgd",
+]
 
 [tool.setuptools.package-dir]
 yggdrax = "yggdrax"

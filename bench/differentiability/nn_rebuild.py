@@ -78,6 +78,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jaxtyping import Array
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -157,7 +159,9 @@ LIMITATIONS: dict[str, str] = {
 }
 
 
-def _nn_spacing_loss(positions, perm, *, target, k):
+def _nn_spacing_loss(
+    positions: Array, perm: Array, *, target: float, k: int
+) -> tuple[Array, Array]:
     """Mean-squared deviation of the Morton-neighbour NN distance from ``target``.
 
     Split out of the descent loop so the gradient check can evaluate the exact
@@ -203,7 +207,7 @@ def _nn_spacing_loss(positions, perm, *, target, k):
     return loss, nn_dist
 
 
-def _nn_partner_slots(positions, perm, *, k):
+def _nn_partner_slots(positions: Array, perm: Array, *, k: int) -> Array:
     """Return, per Morton slot, the slot of its nearest candidate neighbour.
 
     The objective takes a ``min`` over 2k candidates, so it carries a *second*
@@ -257,7 +261,9 @@ def _nn_partner_slots(positions, perm, *, k):
     return jnp.take_along_axis(partner, choice[:, None], axis=1)[:, 0]
 
 
-def _nn_spacing_loss_selected(positions, perm, partner, *, target):
+def _nn_spacing_loss_selected(
+    positions: Array, perm: Array, partner: Array, *, target: float
+) -> Array:
     """The objective with BOTH discrete choices frozen: ordering and argmin.
 
     Equal in value to :func:`_nn_spacing_loss` at the point where ``partner``
@@ -292,7 +298,7 @@ def _nn_spacing_loss_selected(positions, perm, partner, *, target):
 class DescentConfig:
     """One (N, seed) descent configuration.
 
-    Parameters
+    Attributes
     ----------
     num_particles
         Particle count ``N``; the free-parameter count is ``N * dim``.

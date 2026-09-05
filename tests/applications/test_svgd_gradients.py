@@ -45,7 +45,7 @@ def _far_active_setup(n=1000):
     topo = build_svgd_topology(
         p, theta=0.6, leaf_size=8, backend="radix", traversal_config=_CFG
     )
-    assert int(topo.far_tgt_slot.shape[0]) > 0
+    assert int(topo.num_far_contribs) > 0
     return p, sc, topo
 
 

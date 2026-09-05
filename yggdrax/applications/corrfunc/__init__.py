@@ -1,6 +1,6 @@
 """Differentiable two-point correlation functions on the yggdrax tree engine.
 
-Modules (see the paper plan, Phase 2):
+Modules:
 
 * ``binning``       -- soft/smooth bin-membership windows replacing hard bins.
 * ``estimator``     -- dual-tree pair counting accumulating per-bin soft counts.
