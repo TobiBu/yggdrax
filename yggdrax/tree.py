@@ -13,7 +13,7 @@ from jaxtyping import Array, jaxtyped
 
 from . import _tree_impl
 from .bounds import infer_bounds
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, is_traced
 from .kdtree import LeafKDTree as KDTreeTopology
 from .kdtree import build_leaf_kdtree
 from .octree import OctreeTopology, augment_radix_topology_with_octree
@@ -783,7 +783,7 @@ class OctreeTree(RadixTree):
             build_mode == "adaptive"
             and workspace is None
             and not return_workspace
-            and not isinstance(positions, jax.core.Tracer)
+            and not is_traced(positions)
         ):
             result = _build_octree_jit_result(
                 positions,
