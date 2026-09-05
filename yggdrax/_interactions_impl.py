@@ -38,6 +38,7 @@ from .tree import (
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
+    node_levels_from_parent,
 )
 
 # Each node only needs to interact with a bounded number of well-separated
@@ -978,37 +979,14 @@ def _propagate_extents(parent: Array, extents: Array) -> Array:
 def _compute_node_depths(parent: Array) -> Array:
     """Return the depth of every node (root depth = 0).
 
-    Uses pointer doubling for O(log depth) convergence.  Each node
-    keeps a *depth-to-root* counter and a shortcut pointer.  On each
-    round the shortcut doubles its reach and accumulated depth
-    contributions are propagated.
+    Thin alias for :func:`yggdrax.tree.node_levels_from_parent`, which is the
+    single implementation of the pointer-doubling depth pass -- the same one
+    ``get_node_levels`` falls back to when a topology carries no ``node_level``
+    field, so the walk's depths and the interaction list's levels cannot drift
+    apart.
     """
-    total_nodes = parent.shape[0]
-    is_root = parent < 0
-    # dist[i] = accumulated distance along the shortcut chain.
-    # Initially 1 for non-root nodes (edge to parent), 0 for root.
-    dist = jnp.where(is_root, as_index(0), as_index(1))
-    # shortcut[i] = parent[i] for non-root, i for root.
-    shortcut = jnp.where(
-        is_root,
-        jnp.arange(total_nodes, dtype=parent.dtype),
-        parent,
-    )
 
-    def cond_fn(state):
-        _sc, _d, changed = state
-        return changed
-
-    def body_fn(state):
-        sc, d, _changed = state
-        # Pointer doubling: add distance of shortcut target.
-        new_d = d + d[sc]
-        new_sc = sc[sc]
-        changed = jnp.any(new_sc != sc)
-        return new_sc, new_d, changed
-
-    _, depth, _ = lax.while_loop(cond_fn, body_fn, (shortcut, dist, jnp.bool_(True)))
-    return depth
+    return node_levels_from_parent(parent)
 
 
 def _compute_effective_extents(parent: Array, extents: Array) -> Array:
