@@ -47,6 +47,7 @@ from yggdrax import (
     compute_tree_geometry,
 )
 from yggdrax.applications.svgd.kernel import stein_pair_terms
+from yggdrax.applications.svgd.pallas_farfield import farfield_stein
 from yggdrax.applications.svgd.pallas_nearfield import (
     nearfield_stein,
     prefer_fused_nearfield,
@@ -183,11 +184,15 @@ class SvgdTopology(NamedTuple):
     near_dir_offsets: Array  # (L + 1,) CSR offsets into the LIVE directed pairs
     near_live: Array  # (Q,) 1.0 real pair / 0.0 capacity padding
     near_dir_live: Array  # (2Q,) the same for the directed list
-    far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
-    far_src_start: Array  # (M,) inclusive start slot of the far source node
-    far_src_end: Array  # (M,) inclusive end slot of the far source node
-    far_live: Array  # (M,) 1.0 real entry / 0.0 capacity padding
-    num_far_pairs: int  # far node pairs kept (M is their expansion, >= this)
+    far_leaf_offsets: Array  # (L + 1,) CSR offsets into the LIVE far entries
+    far_leaf_source: Array  # (P,) index into the far source-node table
+    far_leaf_live: Array  # (P,) 1.0 real entry / 0.0 capacity padding
+    far_node_start: Array  # (F,) inclusive start slot of each far source node
+    far_node_end: Array  # (F,) inclusive end slot of each far source node
+    far_node_offsets: Array  # (F + 1,) CSR offsets, the entry list by SOURCE
+    far_entry_perm: Array  # (P,) leaf-order entry index, in source order
+    num_far_pairs: int  # accepted far node pairs kept
+    num_far_contribs: int  # M, the per-particle expansion, never materialised
     num_near_leaf_pairs: int  # DIRECTED near pairs, i.e. 2 * len(near_target_row)
     num_particles: int
 
@@ -484,57 +489,76 @@ def assemble_svgd_topology(
             far_src = far_src[keep]
             far_tgt = far_tgt[keep]
     tgt_start = node_ranges[far_tgt, 0]
-    tgt_len = (node_ranges[far_tgt, 1] - tgt_start + 1).astype(np.int64)
-    total = int(tgt_len.sum())
+    tgt_end = node_ranges[far_tgt, 1]
+    # M, the per-particle expansion, is *reported* but never built. At N = 1e5
+    # it is 89,555,008 entries: ~2 GB of index arrays whose host assembly was
+    # 1074 ms of a 1438 ms build, and whose accumulation is a scatter with 899
+    # repeats per target -- 272 ms of the 269 ms float32 far field.
+    num_far_contribs = int((tgt_end - tgt_start + 1).sum())
 
-    if total >= _DEVICE_FAR_EXPANSION_MIN_ENTRIES:
-        # M is by far the largest array in the partition -- 89,555,008 entries at
-        # N = 1e5 -- and expanding it on the host means allocating ~2 GB of numpy
-        # and copying it back: 1091 ms of a 1456 ms build. On device that is
-        # 48 ms of 409 ms. Only ``total`` crosses to the host, to give the
-        # device arrays a shape.
-        ranges = jnp.asarray(node_ranges)
-        tgt_start_d = jnp.asarray(tgt_start)
-        tgt_len_d = jnp.asarray(tgt_len)
-        seg_start = jnp.cumsum(tgt_len_d) - tgt_len_d
-        within = jnp.arange(total, dtype=tgt_len_d.dtype) - jnp.repeat(
-            seg_start, tgt_len_d, total_repeat_length=total
-        )
-        far_tgt_slot = (
-            jnp.repeat(tgt_start_d, tgt_len_d, total_repeat_length=total) + within
-        )
-        src_nodes = jnp.asarray(far_src)
-        far_src_start = jnp.repeat(
-            ranges[src_nodes, 0], tgt_len_d, total_repeat_length=total
-        )
-        far_src_end = jnp.repeat(
-            ranges[src_nodes, 1], tgt_len_d, total_repeat_length=total
-        )
+    # Push each accepted pair down to the LEAVES under its target node instead.
+    # A node's slot range is a union of its descendant leaves' ranges, so this
+    # is exact, and it is ~ml times smaller: 2.8 million entries at N = 1e5.
+    # Leaf rows are not assumed to be slot-ordered, so the lookup goes through
+    # a sort of the leaf starts rather than through the row index.
+    by_start = np.argsort(leaf_start, kind="stable")
+    sorted_start = leaf_start[by_start]
+    first = np.searchsorted(sorted_start, tgt_start, side="right") - 1
+    last = np.searchsorted(sorted_start, tgt_end, side="right") - 1
+
+    # One monopole per DISTINCT far source node -- thousands, not millions --
+    # so the prefix-sum gather that summarises them is no longer O(M). A dense
+    # remap over the node ids beats np.unique's sort by 9x (5 vs 45 ms).
+    seen = np.zeros(int(node_ranges.shape[0]), dtype=bool)
+    seen[far_src] = True
+    uniq_src = np.flatnonzero(seen)
+    remap = np.zeros(int(node_ranges.shape[0]), dtype=np.int64)
+    remap[uniq_src] = np.arange(uniq_src.shape[0], dtype=np.int64)
+    pair_source = remap[far_src]
+
+    # Expand the pairs in SOURCE order, so the transpose CSR the reverse pass
+    # needs comes out sorted for free. Sorting 1.1 million pairs and then
+    # expanding costs 20 ms; expanding first and sorting the 2.8 million entries
+    # costs 180 ms, because the expanded key is no longer nearly ordered.
+    pair_order = np.argsort(pair_source, kind="stable")
+    counts_src = (last - first + 1).astype(np.int64)[pair_order]
+    num_far_entries = int(counts_src.sum())
+    seg_start = np.cumsum(counts_src) - counts_src
+    within = np.arange(num_far_entries, dtype=np.int64) - np.repeat(
+        seg_start, counts_src
+    )
+    entry_leaf = by_start[
+        np.repeat(first.astype(np.int64)[pair_order], counts_src) + within
+    ]
+    entry_source = np.repeat(pair_source[pair_order], counts_src)
+    far_node_offsets = np.concatenate(
+        [[0], np.cumsum(np.bincount(entry_source, minlength=uniq_src.shape[0]))]
+    ).astype(np.int64)
+
+    # Then the forward order: by target leaf. Only the grouping matters -- the
+    # entries within a leaf are summed -- so the sort need not be stable, and it
+    # goes to the device above a threshold: 11 ms against 239 ms in numpy for
+    # 2.8 million keys, which is most of what the host half of the build costs.
+    if num_far_entries >= _DEVICE_FAR_SORT_MIN_ENTRIES:
+        by_leaf = np.asarray(jnp.argsort(jnp.asarray(entry_leaf.astype(np.int32))))
     else:
-        # Below the threshold the device path's per-call dispatch costs more
-        # than the copy it avoids (host assembly 8.3 ms against 22.9 ms at
-        # N = 1e4), so expand in numpy -- vectorised, not the np.arange-per-pair
-        # loop this replaced, which was 132 ms of a 245 ms build at N = 2e4.
-        seg_start_h = np.cumsum(tgt_len) - tgt_len
-        within_h = np.arange(total, dtype=np.int64) - np.repeat(seg_start_h, tgt_len)
-        far_tgt_slot = jnp.asarray(
-            np.repeat(tgt_start.astype(np.int64), tgt_len) + within_h
-        )
-        far_src_start = jnp.asarray(np.repeat(node_ranges[far_src, 0], tgt_len))
-        far_src_end = jnp.asarray(np.repeat(node_ranges[far_src, 1], tgt_len))
+        by_leaf = np.argsort(entry_leaf, kind="stable")
+    far_leaf_offsets = np.concatenate(
+        [[0], np.cumsum(np.bincount(entry_leaf, minlength=num_leaves))]
+    ).astype(np.int64)
+    entry_source = entry_source[by_leaf]
+    # The reverse needs the map the other way: leaf-order index -> its position
+    # in source order, so its per-entry cotangents can be summed per node by a
+    # segmented reduction. That is the INVERSE of ``by_leaf``, built by scatter
+    # rather than by a second sort.
+    far_entry_perm = np.empty(num_far_entries, dtype=np.int64)
+    far_entry_perm[by_leaf] = np.arange(num_far_entries, dtype=np.int64)
 
-    far_cap = _round_up_capacity(total, capacity)
-    far_live = _live_mask(total, far_cap)
-    if far_cap != total:
-        far_tgt_slot = jnp.concatenate(
-            [far_tgt_slot, jnp.zeros((far_cap - total,), far_tgt_slot.dtype)]
-        )
-        far_src_start = jnp.concatenate(
-            [far_src_start, jnp.zeros((far_cap - total,), far_src_start.dtype)]
-        )
-        far_src_end = jnp.concatenate(
-            [far_src_end, jnp.zeros((far_cap - total,), far_src_end.dtype)]
-        )
+    far_cap = _round_up_capacity(num_far_entries, capacity)
+    far_leaf_live = _live_mask(num_far_entries, far_cap)
+    # Padding entries point at source node 0; the CSR bounds keep the kernel
+    # away from them and ``far_leaf_live`` masks them for the pure-JAX path.
+    far_leaf_source = _pad_int(entry_source, far_cap, 0)
 
     return SvgdTopology(
         order=jnp.asarray(order),
@@ -547,11 +571,15 @@ def assemble_svgd_topology(
         near_dir_offsets=as_index(jnp.asarray(dir_offsets)),
         near_live=jnp.asarray(near_live),
         near_dir_live=jnp.asarray(near_dir_live),
-        far_tgt_slot=far_tgt_slot,
-        far_src_start=far_src_start,
-        far_src_end=far_src_end,
-        far_live=jnp.asarray(far_live),
+        far_leaf_offsets=as_index(jnp.asarray(far_leaf_offsets)),
+        far_leaf_source=as_index(jnp.asarray(far_leaf_source)),
+        far_leaf_live=jnp.asarray(far_leaf_live),
+        far_node_start=as_index(jnp.asarray(node_ranges[uniq_src, 0])),
+        far_node_end=as_index(jnp.asarray(node_ranges[uniq_src, 1])),
+        far_node_offsets=as_index(jnp.asarray(far_node_offsets)),
+        far_entry_perm=as_index(jnp.asarray(_pad_int(far_entry_perm, far_cap, 0))),
         num_far_pairs=int(far_src.shape[0]),
+        num_far_contribs=num_far_contribs,
         num_near_leaf_pairs=num_directed,
         num_particles=n,
     )
@@ -619,14 +647,15 @@ def build_svgd_topology(
 #: marginally faster and bounds nothing (5 GiB by N = 3e4).
 _NEAR_CHUNK_BYTES = 256 << 20
 
-#: Far entries (*M*) above which the far-field expansion is assembled on device
-#: rather than in numpy. Measured on an A100: at N = 1e4 (M = 388,912) the host
-#: half of the build is 8.3 ms host-side against 22.9 ms device-side, because
-#: the device path pays ~10 eager dispatches and two synchronisations whatever
-#: the size; at N = 1e5 (M = 89,555,008) it is 1091 ms against 48 ms, because
-#: the host path has to allocate ~2 GB of numpy and copy it back. The crossover
-#: is around a million entries.
-_DEVICE_FAR_EXPANSION_MIN_ENTRIES = 1 << 21
+#: Target byte size of one chunk's ``(chunk, ml, d)`` far-field tensor, matching
+#: :data:`_NEAR_CHUNK_BYTES`'s role for the near field.
+_FAR_CHUNK_BYTES = 256 << 20
+
+#: Far entries above which the leaf-order sort runs on the device. numpy's
+#: stable sort of 2.8 million small-range integer keys costs 239 ms (217 ms as
+#: int32, 59 ms unstable); ``jnp.argsort`` plus both transfers costs 11 ms. Below
+#: a million or so the dispatch and the round trip cost more than they save.
+_DEVICE_FAR_SORT_MIN_ENTRIES = 1 << 20
 
 
 def _near_chunk_bothways(
@@ -895,15 +924,15 @@ def svgd_phi_from_topology(
     if accumulate == "auto" and prefer_fused_nearfield(topo.leaf_slots.shape[0]):
         accumulate = "pallas"
     if accumulate in ("pallas", "interpret"):
+        pos_s, sco_s = particles[topo.order], scores[topo.order]
         return _finish(
-            _accumulate_near_fused(
-                particles[topo.order], scores[topo.order], topo, h, accumulate
-            ),
-            particles[topo.order],
-            scores[topo.order],
+            _accumulate_near_fused(pos_s, sco_s, topo, h, accumulate),
+            pos_s,
+            sco_s,
             topo,
             h,
             *particles.shape,
+            far_backend=accumulate,
         )
     n, d = particles.shape
     pos = particles[topo.order]  # sorted order
@@ -988,6 +1017,189 @@ def svgd_phi_from_topology(
     return _finish(phi, pos, sco, topo, h, n, d)
 
 
+def _far_monopoles(
+    pos: Array, sco: Array, topo: SvgdTopology, n: int, d: int
+) -> tuple[Array, Array, Array]:
+    """Summarise every distinct far source node by count, centre and score sum.
+
+    One monopole per *node*, not per far entry: the prefix-sum gather is over
+    ``F`` nodes -- thousands -- where the old per-particle expansion made it
+    ``M``, which is 89,555,008 at N = 1e5.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        n: Particle count.
+        d: Dimension.
+
+    Returns:
+        ``(count, com, sum_s)`` with shapes ``(F, 1)``, ``(F, d)``, ``(F, d)``.
+    """
+    zero_x = jnp.zeros((1, d), pos.dtype)
+    pos_prefix = jnp.concatenate([zero_x, jnp.cumsum(pos, axis=0)])
+    sco_prefix = jnp.concatenate([zero_x, jnp.cumsum(sco, axis=0)])
+    cnt_prefix = jnp.arange(n + 1, dtype=pos.dtype)
+    start, end = topo.far_node_start, topo.far_node_end
+    count = (cnt_prefix[end + 1] - cnt_prefix[start])[:, None]
+    sum_x = pos_prefix[end + 1] - pos_prefix[start]
+    sum_s = sco_prefix[end + 1] - sco_prefix[start]
+    return count, sum_x / count, sum_s
+
+
+def _accumulate_far_fused(
+    pos: Array,
+    sco: Array,
+    topo: SvgdTopology,
+    h: float | Float[Array, ""],
+    n: int,
+    d: int,
+    backend: str,
+) -> Array:
+    """Accumulate the far field with the fused Pallas kernel.
+
+    The monopoles themselves stay in JAX: they are a prefix-sum gather over
+    ``F`` *nodes*, so reverse mode's transpose of them is a scatter over ``F``
+    entries -- thousands -- rather than over ``M``. Only the M2P evaluation,
+    which is the ``M``-sized part, goes to the kernel.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        h: Kernel bandwidth.
+        n: Particle count.
+        d: Dimension.
+        backend: ``"pallas"`` or ``"interpret"``.
+
+    Returns:
+        The far-field contribution in sorted-slot order, shape ``(n, d)``.
+    """
+    count, com, sum_s = _far_monopoles(pos, sco, topo, n, d)
+    acc = farfield_stein(
+        pos[topo.leaf_slots],
+        topo.leaf_mask > 0,
+        count[:, 0],
+        com,
+        sum_s,
+        topo.far_leaf_offsets,
+        topo.far_leaf_source,
+        topo.far_node_offsets,
+        topo.far_entry_perm,
+        h,
+        backend="pallas",
+        interpret=backend == "interpret",
+    )
+    return (
+        jnp.zeros_like(pos)
+        .at[topo.leaf_slots]
+        .add(acc * topo.leaf_mask[..., None].astype(pos.dtype))
+    )
+
+
+def _accumulate_far_by_leaf(
+    pos: Array,
+    sco: Array,
+    topo: SvgdTopology,
+    h: float | Float[Array, ""],
+    n: int,
+    d: int,
+    chunk_entries: int | None = None,
+) -> Array:
+    """Accumulate the far field into leaves, so placing it is a permutation.
+
+    The old form expanded every accepted pair to its target *particles* and
+    scattered ``M`` contributions back. Those indices repeat 899 times per
+    target at N = 1e5 -- against the near field's 62 -- so in float32 the
+    scatter alone was 271.71 ms of the 269.49 ms far field, and the arithmetic
+    was 25.57 ms. Here each pair is expanded to the *leaves* under its target
+    node instead, summed per leaf with a segmented reduction, and placed; leaves
+    tile ``[0, n)`` disjointly, so the placement writes each slot once.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        h: Kernel bandwidth.
+        n: Particle count.
+        d: Dimension.
+        chunk_entries: Far entries per rematerialised chunk. ``None`` picks the
+            largest whose ``(chunk, ml, d)`` tensor stays under 256 MiB.
+
+    Returns:
+        The far-field contribution in sorted-slot order, shape ``(n, d)``.
+    """
+    count, com, sum_s = _far_monopoles(pos, sco, topo, n, d)
+    num_leaves, max_leaf = topo.leaf_slots.shape
+    num_entries = int(topo.far_leaf_source.shape[0])
+    if chunk_entries is None:
+        per_entry = max(1, max_leaf * d * pos.dtype.itemsize)
+        chunk_entries = max(1, _FAR_CHUNK_BYTES // per_entry)
+    chunk = min(int(chunk_entries), num_entries)
+    num_chunks = -(-num_entries // chunk)
+    pad = num_chunks * chunk - num_entries
+
+    rows = _far_target_rows(topo.far_leaf_offsets, num_entries)
+    src = topo.far_leaf_source
+    live = topo.far_leaf_live.astype(pos.dtype)
+    if pad:
+        rows = jnp.concatenate([rows, jnp.full((pad,), num_leaves - 1, rows.dtype)])
+        src = jnp.concatenate([src, jnp.zeros((pad,), src.dtype)])
+        live = jnp.concatenate([live, jnp.zeros((pad,), pos.dtype)])
+
+    inv_h2 = 1.0 / (h * h)
+
+    @jax.checkpoint
+    def _step(carry, xs):
+        row, source, alive = xs
+        x_t = pos[topo.leaf_slots[row]]  # (chunk, ml, d)
+        sep = x_t - com[source][:, None, :]
+        kern = jnp.exp(-jnp.sum(sep * sep, axis=-1, keepdims=True) * (0.5 * inv_h2))
+        contrib = kern * (
+            sum_s[source][:, None, :] + count[source][:, None, :] * sep * inv_h2
+        )
+        contrib = contrib * alive[:, None, None]
+        return (
+            carry
+            + jax.ops.segment_sum(
+                contrib, row, num_segments=num_leaves, indices_are_sorted=True
+            ),
+            None,
+        )
+
+    acc, _ = jax.lax.scan(
+        _step,
+        jnp.zeros((num_leaves, max_leaf, d), dtype=pos.dtype),
+        (
+            rows.reshape(num_chunks, chunk),
+            src.reshape(num_chunks, chunk),
+            live.reshape(num_chunks, chunk),
+        ),
+    )
+    return (
+        jnp.zeros_like(pos)
+        .at[topo.leaf_slots]
+        .add(acc * topo.leaf_mask[..., None].astype(pos.dtype))
+    )
+
+
+def _far_target_rows(offsets: Array, num_entries: int) -> Array:
+    """Return the target leaf row of each far CSR entry.
+
+    Args:
+        offsets: CSR offsets, shape ``(L + 1,)``, non-decreasing.
+        num_entries: Length of the entry list, including capacity padding.
+
+    Returns:
+        Target leaf row per entry, shape ``(P,)``, non-decreasing. Padding past
+        ``offsets[-1]`` maps to the last leaf, which keeps the sequence sorted
+        for the segmented reduction; it is masked by ``far_leaf_live``.
+    """
+    positions = jnp.arange(num_entries, dtype=offsets.dtype)
+    rows = jnp.searchsorted(offsets, positions, side="right") - 1
+    return jnp.clip(rows, 0, offsets.shape[0] - 2)
+
+
 def _finish(
     phi: Array,
     pos: Array,
@@ -996,6 +1208,7 @@ def _finish(
     h: float | Float[Array, ""],
     n: int,
     d: int,
+    far_backend: str = "jax",
 ) -> Array:
     """Add the far field, average, and return to the caller's particle order.
 
@@ -1009,29 +1222,21 @@ def _finish(
         h: Kernel bandwidth.
         n: Particle count.
         d: Dimension.
+        far_backend: ``"jax"`` for the chunked segmented reduction,
+            ``"pallas"`` / ``"interpret"`` for the fused kernel.
 
     Returns:
         Update directions in the caller's particle order, shape ``(n, d)``.
     """
-    # --- far field: monopole (M2P) ---
-    if topo.far_tgt_slot.shape[0] > 0:
-        zero_x = jnp.zeros((1, d), pos.dtype)
-        pos_prefix = jnp.concatenate([zero_x, jnp.cumsum(pos, axis=0)])
-        sco_prefix = jnp.concatenate([zero_x, jnp.cumsum(sco, axis=0)])
-        cnt_prefix = jnp.arange(n + 1, dtype=pos.dtype)
-        s, e = topo.far_src_start, topo.far_src_end
-        count = (cnt_prefix[e + 1] - cnt_prefix[s])[:, None]  # (M, 1)
-        sum_x = pos_prefix[e + 1] - pos_prefix[s]  # (M, d)
-        sum_s = sco_prefix[e + 1] - sco_prefix[s]  # (M, d)
-        com = sum_x / count
-        x_i = pos[topo.far_tgt_slot]  # (M, d)
-        d2 = jnp.sum((x_i - com) ** 2, axis=-1, keepdims=True)
-        kB = jnp.exp(-d2 / (2.0 * h**2))
-        contrib = kB * (sum_s + count * (x_i - com) / (h**2))  # (M, d)
-        # Capacity padding points at slot 0 with a degenerate source node, so it
-        # is masked rather than merely harmless.
-        contrib = contrib * topo.far_live.astype(contrib.dtype)[:, None]
-        phi = phi.at[topo.far_tgt_slot].add(contrib)
+    # --- far field: monopole (M2P), leaf-major ---
+    # Guard on the *node* table, not the entry list: a partition that accepted
+    # nothing as far still carries a one-entry padded list under
+    # ``capacity="pow2"``, and that entry names a monopole that does not exist.
+    if int(topo.far_node_start.shape[0]) > 0:
+        if far_backend == "jax":
+            phi = phi + _accumulate_far_by_leaf(pos, sco, topo, h, n, d)
+        else:
+            phi = phi + _accumulate_far_fused(pos, sco, topo, h, n, d, far_backend)
 
     phi = phi / n
     # phi is in sorted order; scatter back to original particle order.

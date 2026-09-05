@@ -54,7 +54,7 @@ def test_nearfield_phi_is_exact(backend):
     topo = build_svgd_topology(
         p, theta=0.0, leaf_size=16, backend=backend, traversal_config=_CFG
     )
-    assert int(topo.far_tgt_slot.shape[0]) == 0
+    assert int(topo.num_far_contribs) == 0
     tree = svgd_phi_from_topology(p, sc, h, topo)
     rel = float(jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref))
     assert rel < 1e-10, f"{backend}: near-field not exact (rel {rel:.2e})"
@@ -76,7 +76,7 @@ def test_dimension_general_nearfield_exact(dim):
     topo = build_svgd_topology(
         p, theta=0.0, leaf_size=16, backend="leaf_kdtree", traversal_config=_CFG
     )
-    assert int(topo.far_tgt_slot.shape[0]) == 0
+    assert int(topo.num_far_contribs) == 0
     tree = svgd_phi_from_topology(p, sc, h, topo)
     rel = float(jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref))
     assert rel < 1e-10, f"d={dim}: near-field not exact (rel {rel:.2e})"
@@ -95,7 +95,7 @@ def test_far_monopole_error_shrinks_with_theta():
         topo = build_svgd_topology(
             p, theta=theta, leaf_size=8, backend="radix", traversal_config=_CFG
         )
-        saw_far = saw_far or int(topo.far_tgt_slot.shape[0]) > 0
+        saw_far = saw_far or int(topo.num_far_contribs) > 0
         tree = svgd_phi_from_topology(p, sc, h, topo)
         rel = float(jnp.linalg.norm(tree - ref) / jnp.linalg.norm(ref))
         if prev is not None:
@@ -190,8 +190,8 @@ def test_kernel_cutoff_collapses_the_far_field():
     base = build_svgd_topology(p, **kw)
     cut = build_svgd_topology(p, kernel_cutoff=6.0 * h, **kw)
 
-    assert base.far_tgt_slot.shape[0] > 0, "expected a non-trivial far field"
-    assert cut.far_tgt_slot.shape[0] < base.far_tgt_slot.shape[0]
+    assert int(base.num_far_contribs) > 0, "expected a non-trivial far field"
+    assert int(cut.num_far_contribs) < int(base.num_far_contribs)
 
     ref = exact_phi(p, sc, h)
     err_base = float(
@@ -223,7 +223,7 @@ def test_a_cutoff_wider_than_the_domain_changes_nothing():
     wide = build_svgd_topology(p, kernel_cutoff=1e6, **kw)
 
     assert int(wide.num_far_pairs) == int(base.num_far_pairs)
-    assert wide.far_tgt_slot.shape[0] == base.far_tgt_slot.shape[0]
+    assert int(wide.num_far_contribs) == int(base.num_far_contribs)
     assert wide.near_target_row.shape[0] == base.near_target_row.shape[0]
 
     a = svgd_phi_from_topology(p, sc, h, base)
@@ -342,7 +342,7 @@ def test_padding_reduces_shape_churn_and_an_explicit_capacity_removes_it():
                 jax.random.PRNGKey(200 + step), p0.shape
             )
             t = build_svgd_topology(p, capacity=cap, **kw)
-            seen.add((int(t.near_target_row.shape[0]), int(t.far_tgt_slot.shape[0])))
+            seen.add((int(t.near_target_row.shape[0]), int(t.far_leaf_source.shape[0])))
         return seen
 
     exact = shapes_for("exact")

@@ -169,6 +169,12 @@ def prefer_fused_nearfield(num_leaves: int) -> bool:
     ``accumulate="auto"`` in :mod:`~yggdrax.applications.svgd.sampler` go
     through this, so they cannot disagree.
 
+    It gates the **far**-field kernel too, though the threshold was measured on
+    the near field. That is sound rather than convenient: both kernels put one
+    program on one target leaf, so both are limited by the same thing below a
+    few hundred leaves -- there is not enough work to fill the device and the
+    launch is overhead. A far-field-specific threshold was not measured.
+
     Args:
         num_leaves: Leaves in the partition, i.e. programs the kernel launches.
 
