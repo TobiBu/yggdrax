@@ -26,9 +26,13 @@ jobs:
           cache: pip
 
       - name: Install package + dev tools
+        # The `applications` extra carries optax, which
+        # yggdrax/applications/{svgd/bandwidth_learning,corrfunc/inference_demo}
+        # import. Without it basedpyright cannot resolve the import and the
+        # type-check step fails before the tests ever run.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,applications]"
 
       - name: Black
         run: black --check .
@@ -165,9 +169,13 @@ jobs:
           python-version: "3.13"
           cache: pip
       - name: Install package + dev tools
+        # The `applications` extra carries optax, which
+        # yggdrax/applications/{svgd/bandwidth_learning,corrfunc/inference_demo}
+        # import. Without it basedpyright cannot resolve the import and the
+        # type-check step fails before the tests ever run.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,applications]"
       - name: Distributed tests (${{ matrix.shard }})
         # `--no-cov`: `addopts` carries `--cov-fail-under=80`, and these paths only
         # touch `yggdrax/distributed/*`, which the coverage config omits -- so the gate
