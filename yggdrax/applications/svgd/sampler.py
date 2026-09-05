@@ -174,6 +174,8 @@ class SvgdTopology(NamedTuple):
     leaf_mask: Array  # (L, max_leaf) 1.0 valid / 0.0 pad
     near_target_row: Array  # (Q,) one row of each UNORDERED near leaf pair
     near_source_row: Array  # (Q,) the other row; row_a < row_b throughout
+    near_dir_target: Array  # (2Q,) DIRECTED pairs, ascending in target row
+    near_dir_source: Array  # (2Q,) the source row of each directed pair
     far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
     far_src_start: Array  # (M,) inclusive start slot of the far source node
     far_src_end: Array  # (M,) inclusive end slot of the far source node
@@ -356,6 +358,12 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
             "Stein partition is only complete when every near pair appears in "
             "both directions."
         )
+    # Keep the directed list too: it is what the segment-sum accumulation needs,
+    # and it is already exactly what that wants -- np.repeat emits it ascending
+    # in target row, so there is nothing to sort. (Concatenating the halved list
+    # with its mirror would double it; it is *already* both directions.)
+    dir_target = near_target_row
+    dir_source = near_source_row
     near_target_row = near_target_row[upper]
     near_source_row = near_source_row[upper]
 
@@ -415,6 +423,8 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         leaf_mask=jnp.asarray(leaf_mask),
         near_target_row=jnp.asarray(near_target_row),
         near_source_row=jnp.asarray(near_source_row),
+        near_dir_target=jnp.asarray(dir_target),
+        near_dir_source=jnp.asarray(dir_source),
         far_tgt_slot=far_tgt_slot,
         far_src_start=far_src_start,
         far_src_end=far_src_end,
@@ -540,12 +550,129 @@ def _near_chunk_bothways(
     return phi.at[slots_b].add(to_b * mask_b[..., None])
 
 
+def _near_chunk_to_target(
+    pos: Array,
+    sco: Array,
+    leaf_slots: Array,
+    leaf_mask: Array,
+    rows_t: Array,
+    rows_s: Array,
+    live: Array,
+    h: float | Float[Array, ""],
+) -> Array:
+    """Return one chunk of directed near pairs' contribution to their targets.
+
+    One direction only, so the kernel is evaluated twice per unordered pair --
+    the opposite trade to :func:`_near_chunk_bothways`, and the right one when
+    the accumulation is a segmented reduction rather than a scatter.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        leaf_slots: Padded per-leaf slot blocks, shape ``(L, ml)``.
+        leaf_mask: Validity of ``leaf_slots``, shape ``(L, ml)``.
+        rows_t: Target leaf row of each pair, shape ``(chunk,)``.
+        rows_s: Source leaf row of each pair, shape ``(chunk,)``.
+        live: 1.0 for real pairs, 0.0 for the chunk's padding, ``(chunk,)``.
+        h: Kernel bandwidth.
+
+    Returns:
+        Per-pair target contributions, shape ``(chunk, ml, d)``.
+    """
+    slots_t, slots_s = leaf_slots[rows_t], leaf_slots[rows_s]
+    mask_s = leaf_mask[rows_s] * live[:, None]
+    x_t, x_s = pos[slots_t], pos[slots_s]
+    diff = x_t[:, :, None, :] - x_s[:, None, :, :]
+    k = jnp.exp(-jnp.sum(diff * diff, axis=-1) / (2.0 * h**2))[..., None]
+    terms = k * sco[slots_s][:, None, :, :] + k * diff / (h**2)
+    return jnp.sum(terms * mask_s[:, None, :, None], axis=2)
+
+
+def _accumulate_near_by_segment(
+    pos: Array,
+    sco: Array,
+    topo: SvgdTopology,
+    h: float | Float[Array, ""],
+    chunk_pairs: int,
+) -> Array:
+    """Accumulate the near field with a segmented reduction, not a scatter.
+
+    Leaves tile ``[0, n)`` disjointly, so summing each target leaf's directed
+    pairs into a ``(L, ml, d)`` array and then *placing* it is a permutation --
+    no index is written twice and no atomic is needed anywhere.
+
+    This is the float32 path. ``.at[].add()`` costs 258 ms of the 279 ms float32
+    near field at N = 1e5 against 6 ms of 29 ms in float64, because the scatter
+    indices repeat ~62x on average and float32 lowers to contended
+    ``atomicAdd``. Measured, near field only, N = 1e5 on an A100:
+
+    ==========================================  =========  =========
+    strategy                                      float64    float32
+    ==========================================  =========  =========
+    gather + arithmetic only (the floor)          22.60 ms   20.47 ms
+    halved pairs, two scatters                    28.60 ms  278.90 ms
+    directed pairs, segment_sum, chunked          56.20 ms   32.50 ms
+    ==========================================  =========  =========
+
+    Hence the split: float64 keeps the scatter, float32 comes here.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        h: Kernel bandwidth.
+        chunk_pairs: Directed pairs per chunk.
+
+    Returns:
+        The near-field contribution in sorted-slot order, shape ``(n, d)``.
+    """
+    rows_t, rows_s = topo.near_dir_target, topo.near_dir_source
+    num_pairs = int(rows_t.shape[0])
+    num_leaves, max_leaf = topo.leaf_slots.shape
+    chunk = min(int(chunk_pairs), num_pairs)
+    num_chunks = -(-num_pairs // chunk)
+    pad = num_chunks * chunk - num_pairs
+    live = jnp.ones((num_pairs,), dtype=pos.dtype)
+    if pad:
+        # Pad with the last leaf paired to itself and zero weight: the segment
+        # ids stay non-decreasing, which is what makes the reduction segmented.
+        tail = jnp.full((pad,), num_leaves - 1, dtype=rows_t.dtype)
+        rows_t = jnp.concatenate([rows_t, tail])
+        rows_s = jnp.concatenate([rows_s, tail])
+        live = jnp.concatenate([live, jnp.zeros((pad,), dtype=pos.dtype)])
+
+    @jax.checkpoint
+    def _step(carry, xs):
+        contrib = _near_chunk_to_target(
+            pos, sco, topo.leaf_slots, topo.leaf_mask, xs[0], xs[1], xs[2], h
+        )
+        return (
+            carry
+            + jax.ops.segment_sum(
+                contrib, xs[0], num_segments=num_leaves, indices_are_sorted=True
+            ),
+            None,
+        )
+
+    acc, _ = jax.lax.scan(
+        _step,
+        jnp.zeros((num_leaves, max_leaf, pos.shape[1]), dtype=pos.dtype),
+        (
+            rows_t.reshape(num_chunks, chunk),
+            rows_s.reshape(num_chunks, chunk),
+            live.reshape(num_chunks, chunk),
+        ),
+    )
+    return jnp.zeros_like(pos).at[topo.leaf_slots].add(acc * topo.leaf_mask[..., None])
+
+
 def svgd_phi_from_topology(
     particles: Float[Array, "n d"],
     scores: Float[Array, "n d"],
     h: float | Float[Array, ""],
     topo: SvgdTopology,
     chunk_pairs: int | None = None,
+    accumulate: str = "scatter",
 ) -> Float[Array, "n d"]:
     """Tree-accelerated Stein update given a fixed partition (differentiable).
 
@@ -556,11 +683,37 @@ def svgd_phi_from_topology(
         topo: Partition from :func:`build_svgd_topology`.
         chunk_pairs: Near leaf pairs per rematerialised chunk. ``None``
             (default) picks the largest chunk whose ``(chunk, ml, ml, d)``
-            tensor stays under 64 MB.
+            tensor stays under 256 MiB.
+        accumulate: How the near field is summed. ``"scatter"`` (default) sums
+            each unordered pair once and scatters both directions;
+            ``"segment"`` sums directed pairs with a segmented reduction, which
+            needs no atomics; ``"auto"`` picks ``"segment"`` for float32 and
+            ``"scatter"`` otherwise. **The default is deliberately the one that
+            is never worse under differentiation** -- see the note below.
 
     Returns:
         Update directions, shape ``(n, d)``.
+
+    Note:
+        ``"segment"`` is much faster *forward* in float32 -- 11.64 -> 2.93 ms at
+        N = 1e4 and 586 -> 321 ms at 1e5 on an A100 -- because it replaces a
+        contended ``atomicAdd`` with a segmented reduction. It is **slower under
+        reverse mode** (fwd+grad 2392 -> 3172 ms at N = 1e5), because the
+        transpose of a gather is a scatter: reverse mode reintroduces exactly
+        the operation the forward pass removed, and doubles the arithmetic
+        besides, since the directed list evaluates each kernel twice.
+
+        So a caller that only ever runs forward should ask for ``"auto"`` --
+        which is what :func:`svgd_phi` and :func:`run_tree_svgd` do -- and a
+        caller that differentiates should leave the default alone.
+
+    Raises:
+        ValueError: If ``accumulate`` is not one of the three names.
     """
+    if accumulate not in ("scatter", "segment", "auto"):
+        raise ValueError(
+            f"accumulate must be 'scatter', 'segment' or 'auto'; got " f"{accumulate!r}"
+        )
     n, d = particles.shape
     pos = particles[topo.order]  # sorted order
     sco = scores[topo.order]
@@ -578,14 +731,30 @@ def svgd_phi_from_topology(
     within = jnp.sum(terms * mask[:, None, :, None], axis=2)  # (L, ml, d)
     phi = phi.at[topo.leaf_slots].add(within * mask[..., None])
 
-    # cross-leaf near pairs: one entry per unordered pair, both directions
-    # scattered from one kernel evaluation, in rematerialised chunks.
+    # cross-leaf near pairs. Two accumulations, and which one is faster is a
+    # property of the dtype, not of the problem -- see _accumulate_near_by_segment
+    # for the table. float64's scatter is cheap and its segmented reduction is
+    # not; float32's scatter is 43x more expensive than float64's under index
+    # contention, and the reduction wins 8.6x.
     num_pairs = int(topo.near_target_row.shape[0])
     if num_pairs > 0:
         max_leaf = int(topo.leaf_slots.shape[1])
         if chunk_pairs is None:
             per_pair = max(1, max_leaf * max_leaf * d * particles.dtype.itemsize)
             chunk_pairs = max(1, _NEAR_CHUNK_BYTES // per_pair)
+        use_segment = accumulate == "segment" or (
+            accumulate == "auto" and particles.dtype.itemsize <= 4
+        )
+        if use_segment:
+            return _finish(
+                phi + _accumulate_near_by_segment(pos, sco, topo, h, chunk_pairs),
+                pos,
+                sco,
+                topo,
+                h,
+                n,
+                d,
+            )
         chunk = min(int(chunk_pairs), num_pairs)
         num_chunks = -(-num_pairs // chunk)
         pad = num_chunks * chunk - num_pairs
@@ -625,6 +794,34 @@ def svgd_phi_from_topology(
             ),
         )
 
+    return _finish(phi, pos, sco, topo, h, n, d)
+
+
+def _finish(
+    phi: Array,
+    pos: Array,
+    sco: Array,
+    topo: SvgdTopology,
+    h: float | Float[Array, ""],
+    n: int,
+    d: int,
+) -> Array:
+    """Add the far field, average, and return to the caller's particle order.
+
+    Shared by both near-field accumulations so they cannot drift apart.
+
+    Args:
+        phi: Near-field accumulator in sorted-slot order, shape ``(n, d)``.
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        h: Kernel bandwidth.
+        n: Particle count.
+        d: Dimension.
+
+    Returns:
+        Update directions in the caller's particle order, shape ``(n, d)``.
+    """
     # --- far field: monopole (M2P) ---
     if topo.far_tgt_slot.shape[0] > 0:
         zero_x = jnp.zeros((1, d), pos.dtype)
@@ -651,7 +848,7 @@ def svgd_phi_from_topology(
 # pure array computation; jitting it collapses the eager per-op dispatch into one
 # kernel (~1.5x faster per step even when the partition shapes vary a little).
 _jit_svgd_phi_from_topology = jax.jit(
-    svgd_phi_from_topology, static_argnames=("chunk_pairs",)
+    svgd_phi_from_topology, static_argnames=("chunk_pairs", "accumulate")
 )
 
 
@@ -709,7 +906,10 @@ def svgd_phi(
         traversal_config=traversal_config,
         kernel_cutoff=_cutoff_radius(cutoff_bandwidths, h),
     )
-    return _jit_svgd_phi_from_topology(particles, scores, h, topo)
+    # svgd_phi is the forward-only entry point, so it takes the accumulation
+    # that is fastest forward; svgd_phi_from_topology keeps the differentiable
+    # default for callers that wrap it in grad.
+    return _jit_svgd_phi_from_topology(particles, scores, h, topo, accumulate="auto")
 
 
 def tree_svgd_step(
