@@ -13,31 +13,72 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 
-from yggdrax.applications.svgd.kernel import stein_pair_terms
-
 
 def exact_phi(
     particles: Float[Array, "n d"],
     scores: Float[Array, "n d"],
     h: float | Float[Array, ""],
+    *,
+    block_size: int | None = None,
 ) -> Float[Array, "n d"]:
     """Exact Stein update direction phi(x_i) for every particle, O(N^2).
+
+    The pair sum is contracted, not materialised. Writing it out,
+
+    .. math::
+
+        \\phi_i = \\frac{1}{N}\\Big[(K S)_i
+                 + \\big(x_i (K \\mathbf{1})_i - (K X)_i\\big) / h^2\\Big],
+
+    with :math:`K_{ij} = \\exp(-\\lVert x_i - x_j\\rVert^2 / 2h^2)`, so the whole
+    update is one kernel matrix and **two matmuls**. The obvious form builds an
+    ``(n, n, d)`` tensor of per-pair terms, which is *d* times the memory, runs
+    at elementwise rather than GEMM throughput, and cannot be evaluated at all
+    beyond N ~ 2e4 -- which mattered, because this is the baseline the tree
+    update is judged against, and a weak baseline flatters the tree.
 
     Args:
         particles: Particle positions, shape ``(n, d)``.
         scores: Target score at each particle, shape ``(n, d)``.
         h: Kernel bandwidth.
+        block_size: Targets per block. ``None`` does every target at once,
+            which costs an ``(n, n)`` kernel matrix; pass a block size to cap
+            that at ``(block_size, n)`` and reach large N.
 
     Returns:
         Update directions, shape ``(n, d)``.
     """
-    n = particles.shape[0]
-    # target axis 0 (i), source axis 1 (j): terms[i, j] contributes to phi[i].
-    x_t = particles[:, None, :]
-    x_s = particles[None, :, :]
-    s_s = scores[None, :, :]
-    terms = stein_pair_terms(x_t, x_s, s_s, h)  # (n, n, d)
-    return jnp.sum(terms, axis=1) / n
+    n, d = particles.shape
+    if block_size is None:
+        block_size = n
+    block = max(1, min(int(block_size), n))
+
+    def _block(x_t: Array) -> Array:
+        """Contribution of every source to one block of targets."""
+        # (B, n) kernel, then two contractions -- no (B, n, d) tensor is ever
+        # built. sum_j k_ij s_j is a matmul, and
+        # sum_j k_ij (x_i - x_j) = x_i * sum_j k_ij - sum_j k_ij x_j is another.
+        d2 = (
+            jnp.sum(x_t * x_t, axis=-1)[:, None]
+            - 2.0 * (x_t @ particles.T)
+            + jnp.sum(particles * particles, axis=-1)[None, :]
+        )
+        k = jnp.exp(-jnp.maximum(d2, 0.0) / (2.0 * h**2))  # (B, n)
+        attract = k @ scores
+        repulse = x_t * jnp.sum(k, axis=1)[:, None] - k @ particles
+        return attract + repulse / (h**2)
+
+    if block >= n:
+        return _block(particles) / n
+
+    pad = (-n) % block
+    padded = (
+        particles
+        if pad == 0
+        else jnp.concatenate([particles, jnp.zeros((pad, d), particles.dtype)])
+    )
+    out = jax.lax.map(_block, padded.reshape(-1, block, d))
+    return out.reshape(-1, d)[:n] / n
 
 
 def svgd_step(
