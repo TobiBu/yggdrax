@@ -303,9 +303,10 @@ def build_svgd_traversal(
 def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     """Turn a dual-tree walk into the near/far partition of the Stein update.
 
-    This is the host half of :func:`build_svgd_topology`: it pulls the walk's
-    integer arrays to the host and expands them into per-leaf slot blocks, the
-    directional near-pair rows, and the far target/source slot ranges.
+    The counterpart to :func:`build_svgd_traversal`. The leaf blocks and the
+    near-pair rows are assembled on the host (they are ``O(L)`` and ``O(P)``,
+    both small); the far-entry expansion, which is by far the largest array in
+    the partition, is assembled on device.
 
     Args:
         walk: Device output of :func:`build_svgd_traversal`.
@@ -359,28 +360,35 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
     near_source_row = near_source_row[upper]
 
     # Far field: expand each far pair's TARGET node to its particles; each such
-    # particle receives the monopole of the paired SOURCE node.
-    far_src = np.asarray(walk.far_src)
-    far_tgt = np.asarray(walk.far_tgt)
-    far_tags = np.asarray(walk.far_tags)
-    if far_tags.shape[0] == far_src.shape[0]:
-        keep = far_tags != FAR_TAG_IGNORE
-        if not keep.all():
-            far_src = far_src[keep]
-            far_tgt = far_tgt[keep]
-    tgt_start = node_ranges[far_tgt, 0]
-    tgt_end = node_ranges[far_tgt, 1]
-    tgt_len = (tgt_end - tgt_start + 1).astype(np.int64)
-    # Expand each far pair's target node into its particle slots without a
-    # Python loop. The list-comprehension form (one np.arange per far pair) was
-    # 132 ms of a 245 ms build at N = 2e4 -- more than the whole device half --
-    # and grew superlinearly because it is one interpreter iteration per pair.
-    total = int(tgt_len.sum())
-    starts = np.cumsum(tgt_len) - tgt_len
-    within = np.arange(total, dtype=np.int64) - np.repeat(starts, tgt_len)
-    far_tgt_slot = np.repeat(tgt_start.astype(np.int64), tgt_len) + within
-    far_src_start = np.repeat(node_ranges[far_src, 0], tgt_len)
-    far_src_end = np.repeat(node_ranges[far_src, 1], tgt_len)
+    # particle receives the monopole of the paired SOURCE node. This runs on
+    # device. M is the largest array anywhere in the partition -- 89.5 million
+    # entries at N = 1e5 -- and building it on the host cost 1074 ms of a 1438 ms
+    # build, nearly all of it allocating ~2 GB of numpy and copying it back. Only
+    # two scalars cross to the host here: the kept pair count and M itself, both
+    # needed to give the device arrays a shape.
+    far_src_dev, far_tgt_dev = walk.far_src, walk.far_tgt
+    if walk.far_tags.shape[0] == far_src_dev.shape[0]:
+        keep = walk.far_tags != FAR_TAG_IGNORE
+        num_kept = int(jnp.count_nonzero(keep))
+        if num_kept != far_src_dev.shape[0]:
+            (kept_idx,) = jnp.nonzero(keep, size=num_kept)
+            far_src_dev = far_src_dev[kept_idx]
+            far_tgt_dev = far_tgt_dev[kept_idx]
+    num_far_pairs = int(far_src_dev.shape[0])
+
+    ranges = jnp.asarray(walk.node_ranges)
+    tgt_start = ranges[far_tgt_dev, 0]
+    tgt_len = ranges[far_tgt_dev, 1] - tgt_start + 1
+    total = int(jnp.sum(tgt_len))
+    seg_start = jnp.cumsum(tgt_len) - tgt_len
+    within = jnp.arange(total, dtype=tgt_len.dtype) - jnp.repeat(
+        seg_start, tgt_len, total_repeat_length=total
+    )
+    far_tgt_slot = jnp.repeat(tgt_start, tgt_len, total_repeat_length=total) + within
+    far_src_start = jnp.repeat(
+        ranges[far_src_dev, 0], tgt_len, total_repeat_length=total
+    )
+    far_src_end = jnp.repeat(ranges[far_src_dev, 1], tgt_len, total_repeat_length=total)
 
     return SvgdTopology(
         order=jnp.asarray(order),
@@ -388,10 +396,10 @@ def assemble_svgd_topology(walk: SvgdTraversal) -> SvgdTopology:
         leaf_mask=jnp.asarray(leaf_mask),
         near_target_row=jnp.asarray(near_target_row),
         near_source_row=jnp.asarray(near_source_row),
-        far_tgt_slot=jnp.asarray(far_tgt_slot.astype(np.int64)),
-        far_src_start=jnp.asarray(far_src_start.astype(np.int64)),
-        far_src_end=jnp.asarray(far_src_end.astype(np.int64)),
-        num_far_pairs=int(far_src.shape[0]),
+        far_tgt_slot=far_tgt_slot,
+        far_src_start=far_src_start,
+        far_src_end=far_src_end,
+        num_far_pairs=num_far_pairs,
         num_near_leaf_pairs=num_directed,
         num_particles=n,
     )
