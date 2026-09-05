@@ -47,6 +47,10 @@ from yggdrax import (
     compute_tree_geometry,
 )
 from yggdrax.applications.svgd.kernel import stein_pair_terms
+from yggdrax.applications.svgd.pallas_nearfield import (
+    nearfield_stein,
+    pallas_stein_nearfield_supported,
+)
 from yggdrax.dtypes import INDEX_DTYPE, as_index
 from yggdrax.kdtree import build_leaf_kdtree
 
@@ -176,6 +180,7 @@ class SvgdTopology(NamedTuple):
     near_source_row: Array  # (Q,) the other row; row_a < row_b throughout
     near_dir_target: Array  # (2Q,) DIRECTED pairs, ascending in target row
     near_dir_source: Array  # (2Q,) the source row of each directed pair
+    near_dir_offsets: Array  # (L + 1,) CSR offsets into the LIVE directed pairs
     near_live: Array  # (Q,) 1.0 real pair / 0.0 capacity padding
     near_dir_live: Array  # (2Q,) the same for the directed list
     far_tgt_slot: Array  # (M,) sorted-slot of each far target particle
@@ -453,6 +458,14 @@ def assemble_svgd_topology(
     near_target_row = _pad_int(near_target_row, pair_cap, 0)
     near_source_row = _pad_int(near_source_row, pair_cap, 0)
 
+    # CSR offsets over the directed list. np.repeat emits it ascending in target
+    # row, so the offsets are just the running counts -- and because they stop at
+    # ``num_directed`` they are also what tells a consumer where the capacity
+    # padding starts, without depending on the padding's contents. Their shape is
+    # (L + 1) whatever the pair count, so a kernel driven by them does not
+    # retrace when the count moves.
+    dir_offsets = np.concatenate([[0], np.cumsum(row_counts)]).astype(np.int64)
+
     dir_cap = _round_up_capacity(num_directed, capacity)
     near_dir_live = _live_mask(num_directed, dir_cap)
     # The directed list must stay non-decreasing in target row for the segmented
@@ -531,6 +544,7 @@ def assemble_svgd_topology(
         near_source_row=jnp.asarray(near_source_row),
         near_dir_target=jnp.asarray(dir_target),
         near_dir_source=jnp.asarray(dir_source),
+        near_dir_offsets=as_index(jnp.asarray(dir_offsets)),
         near_live=jnp.asarray(near_live),
         near_dir_live=jnp.asarray(near_dir_live),
         far_tgt_slot=far_tgt_slot,
@@ -701,6 +715,49 @@ def _near_chunk_to_target(
     return jnp.sum(terms * mask_s[:, None, :, None], axis=2)
 
 
+def _accumulate_near_fused(
+    pos: Array,
+    sco: Array,
+    topo: SvgdTopology,
+    h: float | Float[Array, ""],
+    backend: str,
+) -> Array:
+    """Accumulate the near field with the fused Pallas kernel.
+
+    Replaces *both* halves of the pure-JAX near field -- the within-leaf block
+    and the cross-leaf pairs -- because a leaf paired with itself is just one
+    more entry in the kernel's source loop.
+
+    Args:
+        pos: Positions in sorted order, shape ``(n, d)``.
+        sco: Scores in sorted order, shape ``(n, d)``.
+        topo: The partition.
+        h: Kernel bandwidth.
+        backend: ``"pallas"`` or ``"interpret"``; the latter runs Pallas with
+            CPU semantics, which is how the tests reach this path with no GPU.
+
+    Returns:
+        The whole near field in sorted-slot order, shape ``(n, d)``.
+    """
+    acc = nearfield_stein(
+        pos[topo.leaf_slots],
+        sco[topo.leaf_slots],
+        topo.leaf_mask > 0,
+        topo.near_dir_offsets,
+        topo.near_dir_source,
+        h,
+        include_self=True,
+        backend="pallas",
+        interpret=backend == "interpret",
+    )
+    # Leaves tile [0, n) disjointly, so this is a permutation, not a scatter.
+    return (
+        jnp.zeros_like(pos)
+        .at[topo.leaf_slots]
+        .add(acc * topo.leaf_mask[..., None].astype(pos.dtype))
+    )
+
+
 def _accumulate_near_by_segment(
     pos: Array,
     sco: Array,
@@ -800,9 +857,14 @@ def svgd_phi_from_topology(
         accumulate: How the near field is summed. ``"scatter"`` (default) sums
             each unordered pair once and scatters both directions;
             ``"segment"`` sums directed pairs with a segmented reduction, which
-            needs no atomics; ``"auto"`` picks ``"segment"`` for float32 and
-            ``"scatter"`` otherwise. **The default is deliberately the one that
-            is never worse under differentiation** -- see the note below.
+            needs no atomics; ``"pallas"`` uses the fused kernel in
+            :mod:`~yggdrax.applications.svgd.pallas_nearfield`, whose reverse is
+            a hand-written rule so neither pass scatters; ``"interpret"`` is the
+            same kernel under Pallas interpret mode, for testing without a GPU;
+            ``"auto"`` picks ``"pallas"`` where the kernel can run and float32
+            otherwise falls to ``"segment"``, with ``"scatter"`` for float64.
+            **The default is deliberately the one that is never worse under
+            differentiation** -- see the note below.
 
     Returns:
         Update directions, shape ``(n, d)``.
@@ -823,9 +885,23 @@ def svgd_phi_from_topology(
     Raises:
         ValueError: If ``accumulate`` is not one of the three names.
     """
-    if accumulate not in ("scatter", "segment", "auto"):
+    if accumulate not in ("scatter", "segment", "pallas", "interpret", "auto"):
         raise ValueError(
-            f"accumulate must be 'scatter', 'segment' or 'auto'; got " f"{accumulate!r}"
+            "accumulate must be 'scatter', 'segment', 'pallas', 'interpret' or "
+            f"'auto'; got {accumulate!r}"
+        )
+    if accumulate == "auto" and pallas_stein_nearfield_supported():
+        accumulate = "pallas"
+    if accumulate in ("pallas", "interpret"):
+        return _finish(
+            _accumulate_near_fused(
+                particles[topo.order], scores[topo.order], topo, h, accumulate
+            ),
+            particles[topo.order],
+            scores[topo.order],
+            topo,
+            h,
+            *particles.shape,
         )
     n, d = particles.shape
     pos = particles[topo.order]  # sorted order
