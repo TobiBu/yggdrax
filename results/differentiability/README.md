@@ -11,7 +11,12 @@ Jaccpot I §7). Produced by `bench/differentiability/*.py`; every payload carrie
 | `nn_rebuild_scaling.json` | `nn_rebuild.py --sweep-n` | **Series A** — fixed r\*, fixed lr. |
 | `nn_rebuild_scaling_density_matched.json` | `nn_rebuild.py --sweep-n` | **Series B** — density-matched r\*, fixed lr. |
 | `nn_rebuild_scaling_step_scaled.json` | `nn_rebuild.py --sweep-n` | **Series C** — density-matched r\*, N-scaled lr. **The citable curve.** |
-| `scaling.json` | `scaling.py` | Build/traverse timing vs N. |
+| `scaling.json` | `scaling.py` | Build/traverse timing vs N. **Current state**, after the KD-tree work of 2026-09-06. |
+| `scaling_pre_wp3.json` | `scaling.py` | Before the on-device tree builds (perf report 6.1), jax 0.9.0. |
+| `scaling_pre_kdtrav.json` | `scaling.py` | Before the KD-tree traversal and build work — the perf report's Gate 3 state, jax 0.10.2. |
+| `scaling_pre_kdtrav_jax090.json` | `scaling.py` | The same "before", re-measured on the machine and JAX version the after-runs used, so the before/after is controlled. |
+| `scaling_wp1.json` | `scaling.py` | After the traversal fix alone (Gate 1): KD-tree traversal 0.69–1.11× of radix, from 2.8–150×. |
+| `scaling_wp2.json` | `scaling.py` | After the build work as well (Gate 2). Same content as `scaling.json`. |
 | `autodiff_overhead.json` | `autodiff_overhead.py` | Reverse-mode cost relative to forward. |
 | `mac_accuracy.json` | `mac_accuracy.py` | MAC accuracy sweep. |
 
