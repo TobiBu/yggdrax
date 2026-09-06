@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Callable, Literal, Optional, TypedDict, cast
+from typing import Any, Callable, Literal, Optional, TypedDict, cast
 
 import jax
 import jax.numpy as jnp
@@ -482,11 +482,68 @@ def _build_octree_result(
     )
 
 
+def _with_static_leaf_size(result: Any, leaf_size: Optional[int]) -> Any:
+    """Put a static ``leaf_size`` back into a build result's topology.
+
+    ``leaf_size`` is static to a build, and the pytree registration below relies
+    on that: :func:`_register_binary_morton_tree_pytree` files it as *aux* data
+    rather than among the children, so that every ``int(topology.leaf_size)``
+    downstream keeps working on a tree that has been through ``jax.jit``.
+
+    A jitted builder breaks that on its own, and silently. The adaptive radix and
+    octree paths hand their work to a ``jax.jit`` that returns a *build result* --
+    a bare topology, or a tuple starting with one -- not a ``Tree``. The topology
+    is a ``NamedTuple``, so every field of it including ``leaf_size`` is an
+    ordinary pytree child of that output, and JAX converts each one to a device
+    array on the way out. A static ``leaf_size=8`` becomes
+    ``Array(8, dtype=int64, weak_type=True)``, against a field annotated
+    ``int | None``, and the flatten then files that array as aux.
+
+    Aux data *is* the treedef, and the treedef is part of every ``jax.jit`` cache
+    key. The bill lands at a cache lookup taken inside a trace: two trees built
+    the same way hold two distinct ``Array(8)`` objects, so the treedef
+    comparison falls past the identity fast path into ``Array.__eq__``, which --
+    with an outer trace live -- stages a ``bool[]`` tracer rather than returning
+    a bool. JAX surfaces that as ``ValueError: Exception raised while checking
+    equality of metadata fields of pytree``, from a
+    ``TracerBoolConversionError`` several frames down. Two independently built
+    trees and an enclosing ``jax.jit`` are the whole precondition, which is why
+    it reads as flaky: one tree reused holds the same array on both sides and the
+    identity check hides it. It cost jaccpot a red CI shard (TobiBu/jaccpot#330).
+
+    ``leaf_size=None`` needs nothing: ``None`` is pytree *structure*, not a leaf,
+    so it survives the jit boundary unchanged. That is why the two fixed-depth
+    paths, which pass ``None``, were never affected.
+
+    Parameters
+    ----------
+    result
+        A build result as the ``_build_*_result`` helpers return it: a topology,
+        or a tuple whose first element is one.
+    leaf_size
+        The static leaf size the build was asked for.
+
+    Returns
+    -------
+    Any
+        ``result`` with its topology's ``leaf_size`` set to ``leaf_size``, or
+        ``result`` unchanged when the topology has no such field to set.
+    """
+
+    topology = result[0] if isinstance(result, tuple) else result
+    if not hasattr(topology, "_replace") or not hasattr(topology, "leaf_size"):
+        return result
+    restored = topology._replace(leaf_size=leaf_size)
+    if isinstance(result, tuple):
+        return (restored,) + result[1:]
+    return restored
+
+
 @partial(
     jax.jit,
     static_argnames=("return_reordered", "leaf_size", "return_workspace"),
 )
-def _build_octree_jit_result(
+def _build_octree_jit_traced_result(
     positions: Array,
     masses: Array,
     bounds: tuple[Array, Array],
@@ -508,6 +565,60 @@ def _build_octree_jit_result(
         return_workspace=return_workspace,
         leaf_size=leaf_size,
         **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
+    )
+
+
+def _build_octree_jit_result(
+    positions: Array,
+    masses: Array,
+    bounds: tuple[Array, Array],
+    *,
+    return_reordered: bool = False,
+    leaf_size: int = 8,
+    workspace: Optional[RadixTreeWorkspace] = None,
+    return_workspace: bool = False,
+):
+    """Adaptive octree build under jit, with the static leaf size restored.
+
+    Thin wrapper over :func:`_build_octree_jit_traced_result`. The restoration is
+    here rather than at each caller so it cannot be forgotten by the next one --
+    see :func:`_with_static_leaf_size` for what the jit boundary does to
+    ``leaf_size`` and why it matters.
+
+    Parameters
+    ----------
+    positions
+        Particle coordinates ``[N, 3]``.
+    masses
+        Particle masses ``[N]``.
+    bounds
+        Resolved ``(min, max)`` domain corners.
+    return_reordered
+        Also return Morton-sorted positions, masses and the inverse permutation.
+    leaf_size
+        Maximum particles per Morton leaf. Static to the build.
+    workspace
+        Preallocated build workspace, or ``None``.
+    return_workspace
+        Also return the workspace used.
+
+    Returns
+    -------
+    Any
+        The build result, with ``topology.leaf_size`` a Python ``int``.
+    """
+
+    return _with_static_leaf_size(
+        _build_octree_jit_traced_result(
+            positions,
+            masses,
+            bounds,
+            return_reordered=return_reordered,
+            leaf_size=leaf_size,
+            workspace=workspace,
+            return_workspace=return_workspace,
+        ),
+        int(leaf_size),
     )
 
 
@@ -569,7 +680,7 @@ def _jit_radix_adaptive_builder(
 
     leaf_size_int = int(leaf_size)
     return_reordered_bool = bool(return_reordered)
-    return jax.jit(
+    jitted = jax.jit(
         lambda positions, masses, bounds: _tree_impl.build_tree(
             positions,
             masses,
@@ -580,6 +691,11 @@ def _jit_radix_adaptive_builder(
             return_workspace=False,
         )
     )
+
+    def build(positions, masses, bounds):
+        return _with_static_leaf_size(jitted(positions, masses, bounds), leaf_size_int)
+
+    return build
 
 
 @dataclass(frozen=True)
@@ -1597,14 +1713,18 @@ def build_tree_jit(
         return_workspace=return_workspace,
     )
     bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_tree_jit(
-        positions,
-        masses,
-        bounds_resolved,
-        return_reordered=resolved.return_reordered,
-        leaf_size=config.leaf_size if config is not None else leaf_size,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
+    resolved_leaf_size = config.leaf_size if config is not None else leaf_size
+    result = _with_static_leaf_size(
+        _tree_impl.build_tree_jit(
+            positions,
+            masses,
+            bounds_resolved,
+            return_reordered=resolved.return_reordered,
+            leaf_size=resolved_leaf_size,
+            workspace=resolved.workspace,
+            return_workspace=resolved.return_workspace,
+        ),
+        int(resolved_leaf_size),
     )
     return _wrap_radix_public_result(
         result=result,
