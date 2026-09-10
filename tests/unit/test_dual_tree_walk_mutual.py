@@ -22,6 +22,7 @@ import pytest
 
 from yggdrax import DualTreeTraversalConfig, Tree, compute_tree_geometry
 from yggdrax._interactions_impl import (
+    MutualWalkResult,
     _build_mac_extents,
     build_interactions_and_neighbors,
     dual_tree_walk_mutual,
@@ -337,3 +338,43 @@ def test_index_dtype_follows_the_child_arrays():
             res.rounds,
         ):
             assert leaf.dtype == jnp.dtype(idx), (idx, leaf.dtype)
+
+
+def test_wavefront_ladder_is_bit_identical_to_the_full_width_body(monkeypatch):
+    """Every rung of the ladder yields the same pairs in the same order.
+
+    The 3000-particle tree peaks at a few thousand live pairs, so the floor is
+    lowered to exercise five rungs (64, 256, 1024, 4096, 16384) in one walk.
+    """
+    from yggdrax import _interactions_impl as impl
+
+    topology, geometry = _tree()
+    left, right, centers, radii, root, _ = _mutual_inputs(topology, geometry, "dehnen")
+    monkeypatch.setattr(impl, "_WAVEFRONT_LADDER_FLOOR", 64)
+    assert impl._wavefront_ladder(1 << 14) == (64, 256, 1024, 4096, 1 << 14)
+    kw = dict(
+        max_pair_queue=1 << 14, far_cap=1 << 16, near_cap=1 << 16, mac_type="dehnen"
+    )
+    args = (left, right, centers, radii, 0.5, root)
+    ladder = dual_tree_walk_mutual(*args, **kw, wavefront_ladder=True)
+    full = dual_tree_walk_mutual(*args, **kw, wavefront_ladder=False)
+    assert int(ladder.far_count) > 0 and int(ladder.near_count) > 0
+    for name in MutualWalkResult._fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(ladder, name)),
+            np.asarray(getattr(full, name)),
+            err_msg=name,
+        )
+    assert int(ladder.rounds) == int(full.rounds)
+    assert int(ladder.peak_wavefront) > 64  # more than one rung was needed
+
+
+def test_wavefront_ladder_reports_queue_overflow_like_the_full_width_body():
+    topology, geometry = _tree()
+    left, right, centers, radii, root, _ = _mutual_inputs(topology, geometry, "dehnen")
+    kw = dict(max_pair_queue=256, far_cap=1 << 16, near_cap=1 << 16, mac_type="dehnen")
+    args = (left, right, centers, radii, 0.5, root)
+    ladder = dual_tree_walk_mutual(*args, **kw, wavefront_ladder=True)
+    full = dual_tree_walk_mutual(*args, **kw, wavefront_ladder=False)
+    assert bool(ladder.queue_overflow) and bool(full.queue_overflow)
+    assert int(ladder.peak_wavefront) == int(full.peak_wavefront) > 256
