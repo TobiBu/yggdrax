@@ -45,9 +45,32 @@ sort, no `segment_sum`, no conditional, no post-loop flatten. Its acceptance rul
 size its queue from data instead of from a capacity that merely did not overflow; its index dtype follows
 the child arrays (int32 halves every byte).
 
-What is left is a per-round floor: 46-61 rounds per walk at ~0.15 ms each (the tail of the wavefront is
-long and thin). A narrow-width branch for rounds with a small live set (a `lax.switch` over a static ladder
-of widths) is the next lever if the in-step numbers ask for it.
+What was left after that is a per-round floor: 46-61 rounds per walk at ~0.15 ms each, most of them far
+below the queue capacity.
+
+## The width ladder (2026-09-11)
+
+Every round used to evaluate all `max_pair_queue` slots. The live wavefront, measured round by round on the
+200k Plummer tree (`_wavefront_ladder` commit; eager profile with dynamic shapes):
+
+| leaf / theta | rounds | peak live | rounds with < 4096 live | slot evaluations at full width | with the ladder | live pairs summed |
+|---|---|---|---|---|---|---|
+| 64 / 0.6 | 55 | 191,798 | first 18, last 3 | 28.8 M (Q = 2^19) | 5.2 M | 2.7 M |
+| 32 / 0.6 | 61 | 393,552 | first 18, last 3 | 64.0 M (Q = 2^20) | 13.7 M | 5.6 M |
+| 64 / 0.8 | 55 | 92,478 | first 18, last 4 | 14.4 M (Q = 2^18) | 3.3 M | 1.3 M |
+| 256 / 0.6 | 46 | 35,366 | first 19, last 3 | 3.0 M (Q = 2^16) | 1.1 M | 0.45 M |
+
+The wavefront rises by ~1.4x per round from the root, sits on a plateau near the peak for ~10 rounds and
+decays for ~20 (leaf 64 / 0.6: 3, 5, 12, 28, ..., 191,798, ..., 33,614, 33,222, 31,248, 28,838, 24,522,
+19,044, 13,588, 6,762, 1,928, 212). `dual_tree_walk_mutual` now compiles its round body once per width of a
+static ladder (powers of 4 from 4096 up to the queue, `_wavefront_ladder`) and a `lax.switch` runs each round
+at the narrowest width that holds its live set; the pushed pairs still compact into the full-width queue, so
+`peak_wavefront`, `rounds` and the overflow flags are unchanged and every rung yields the same pairs in the
+same order (`test_wavefront_ladder_is_bit_identical_to_the_full_width_body`). Slot work drops 4.4-5.5x at
+leaf 32-64; the per-round launch floor stays. `wavefront_ladder=False` (or `YGGDRAX_MUTUAL_WALK_LADDER=0`,
+read at import) keeps the single-width body for A/B runs; `bench/traversal_walk_bench.py --no-ladder`.
+
+TIMINGS_PLACEHOLDER
 
 ## Reproduce
 
