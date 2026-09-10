@@ -6443,9 +6443,11 @@ class MutualWalkResult(NamedTuple):
 # rounds hold fewer than 4096 and the last 10 decay from 33k to 200, so the full
 # width did 28.8M slot evaluations for 2.7M live pairs. The body is compiled once
 # per width in the ladder (powers of ``_WAVEFRONT_LADDER_STEP`` from
-# ``_WAVEFRONT_LADDER_FLOOR`` up to the queue) and ``lax.switch`` picks the
-# narrowest width that holds the round's live wavefront: 5.2M slot evaluations
-# on the same tree, at most a factor ``_WAVEFRONT_LADDER_STEP`` over live.
+# ``_WAVEFRONT_LADDER_FLOOR`` up to the queue) and the walk runs one
+# ``while_loop`` per rung -- ascending, the widest, descending, then a
+# full-width catch-all -- so every round runs at (about) the narrowest width
+# that holds its live wavefront: 5.2M slot evaluations on the same tree, at
+# most a factor ``_WAVEFRONT_LADDER_STEP`` over live.
 _WAVEFRONT_LADDER_FLOOR = 4096
 _WAVEFRONT_LADDER_STEP = 4
 # Default of ``dual_tree_walk_mutual(wavefront_ladder=...)``; the environment
@@ -6614,11 +6616,6 @@ def dual_tree_walk_mutual(
         ix(0),  # rounds
     )
 
-    def cond_fun(state):
-        size = state[2]
-        far_over, near_over, wf_over = state[9], state[10], state[11]
-        return (size > 0) & (~far_over) & (~near_over) & (~wf_over)
-
     def make_round(width: int):
         # One round of the wavefront loop at a static width ``width`` >= the live
         # wavefront: the first ``width`` queue slots are read, the pushed pairs are
@@ -6754,20 +6751,43 @@ def dual_tree_walk_mutual(
     widths = (
         _wavefront_ladder(max_pair_queue) if wavefront_ladder else (max_pair_queue,)
     )
-    rounds_by_width = [make_round(w) for w in widths]
 
-    def body_fun(state):
-        if len(widths) == 1:
-            return rounds_by_width[0](state)
+    def healthy(state):
         size = state[2]
-        # Index of the narrowest width that holds the live wavefront; ``size``
-        # never exceeds ``max_pair_queue``, the last rung.
-        branch = jnp.zeros((), dtype=jnp.int32)
-        for w in widths[:-1]:
-            branch = branch + (size > ix(w)).astype(jnp.int32)
-        return lax.switch(branch, rounds_by_width, state)
+        far_over, near_over, wf_over = state[9], state[10], state[11]
+        return (size > 0) & (~far_over) & (~near_over) & (~wf_over)
 
-    final = lax.while_loop(cond_fun, body_fun, init)
+    def run_rung(state, width, lower=None, upper=None):
+        # One ``while_loop`` per rung, so the carry is updated IN PLACE. A
+        # ``lax.switch`` over the widths would copy every loop-carried buffer
+        # (queue, far, near: six full-size memcpys) into the conditional each
+        # round -- the pathology the dual walk's ``lax.cond`` emissions had.
+        def cond(state):
+            ok = healthy(state)
+            if lower is not None:
+                ok = ok & (state[2] > ix(lower))
+            if upper is not None:
+                ok = ok & (state[2] <= ix(upper))
+            return ok
+
+        return lax.while_loop(cond, make_round(width), state)
+
+    if len(widths) == 1:
+        final = lax.while_loop(healthy, make_round(max_pair_queue), init)
+    else:
+        # The live wavefront rises from the root, plateaus and decays. Ascend the
+        # rungs while the wavefront fits each width, run the widest rung while it
+        # exceeds the one below, descend while it fits each width but not the one
+        # below, and let a full-width loop finish whatever a non-monotone tail
+        # leaves over -- correctness never depends on the profile's shape.
+        state = init
+        for w in widths[:-1]:
+            state = run_rung(state, w, upper=w)
+        state = run_rung(state, max_pair_queue, lower=widths[-2])
+        lowers = (None,) + widths[:-2]
+        for w, lo in zip(reversed(widths[:-1]), reversed(lowers)):
+            state = run_rung(state, w, lower=lo, upper=w)
+        final = lax.while_loop(healthy, make_round(max_pair_queue), state)
     return MutualWalkResult(
         far_a=final[3],
         far_b=final[4],

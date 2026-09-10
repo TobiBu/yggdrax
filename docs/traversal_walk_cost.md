@@ -63,12 +63,25 @@ Every round used to evaluate all `max_pair_queue` slots. The live wavefront, mea
 The wavefront rises by ~1.4x per round from the root, sits on a plateau near the peak for ~10 rounds and
 decays for ~20 (leaf 64 / 0.6: 3, 5, 12, 28, ..., 191,798, ..., 33,614, 33,222, 31,248, 28,838, 24,522,
 19,044, 13,588, 6,762, 1,928, 212). `dual_tree_walk_mutual` now compiles its round body once per width of a
-static ladder (powers of 4 from 4096 up to the queue, `_wavefront_ladder`) and a `lax.switch` runs each round
-at the narrowest width that holds its live set; the pushed pairs still compact into the full-width queue, so
+static ladder (powers of 4 from 4096 up to the queue, `_wavefront_ladder`) and runs one `while_loop` per rung --
+ascending while the wavefront fits each width, the widest while it exceeds the rung below, descending, then a
+full-width catch-all for any non-monotone tail -- so each round runs at about the narrowest width that holds its
+live set. NOT a `lax.switch` over the widths: compiled for GPU, the conditional copied every loop-carried buffer
+(queue, far and near lists: six full-size memcpys, 14 `copy` ops per round against 3) into its operands each
+round -- the same pathology the dual walk's `lax.cond` emissions had. With one loop per rung every rung body
+has the baseline's 3 copies and 28-40 kernels per round. The pushed pairs still compact into the full-width queue, so
 `peak_wavefront`, `rounds` and the overflow flags are unchanged and every rung yields the same pairs in the
 same order (`test_wavefront_ladder_is_bit_identical_to_the_full_width_body`). Slot work drops 4.4-5.5x at
 leaf 32-64; the per-round launch floor stays. `wavefront_ladder=False` (or `YGGDRAX_MUTUAL_WALK_LADDER=0`,
 read at import) keeps the single-width body for A/B runs; `bench/traversal_walk_bench.py --no-ladder`.
+
+What remains is the launch floor itself: 28-40 kernels per round (GPU HLO of the loop body: ~25 fusions, 3
+queue-sized copies from the fresh-queue pattern, the far/near/push prefix scans and six scatters), times 55-61
+rounds -- about 2,200 launches per walk. At the ~5 us an A100 spends per small kernel inside a `while_loop`
+that is ~11 ms, which is the whole of the 13.4 ms measured at leaf 64 / Q = 2^18. The ladder removes the
+slot work above that floor; lowering the floor means fewer kernels per round (one prefix scan for the three
+lists, one scatter per list with the pair packed, no fresh-queue copy) or fewer rounds (two tree levels per
+round), which is the next lever.
 
 TIMINGS_PLACEHOLDER
 
