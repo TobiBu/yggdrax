@@ -57,9 +57,17 @@ def _gpu_util(index: int | None) -> int | None:
         return None
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
-             "-i", str(index)],
-            capture_output=True, text=True, timeout=10, check=False,
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+                "-i",
+                str(index),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         ).stdout.strip()
         return int(out)
     except Exception:  # pragma: no cover - diagnostics only
@@ -88,13 +96,25 @@ def main() -> int:
     ap.add_argument("--max-pair-queue", type=int, default=1 << 20)
     ap.add_argument("--max-interactions-per-node", type=int, default=16384)
     ap.add_argument("--max-neighbors-per-leaf", type=int, default=8192)
-    ap.add_argument("--far-cap", type=int, default=1 << 21,
-                    help="mutual walk: canonical far pairs capacity")
-    ap.add_argument("--near-cap", type=int, default=1 << 21,
-                    help="mutual walk: canonical near pairs capacity")
+    ap.add_argument(
+        "--far-cap",
+        type=int,
+        default=1 << 21,
+        help="mutual walk: canonical far pairs capacity",
+    )
+    ap.add_argument(
+        "--near-cap",
+        type=int,
+        default=1 << 21,
+        help="mutual walk: canonical near pairs capacity",
+    )
     ap.add_argument("--repeats", type=int, default=5)
-    ap.add_argument("--index", default=None, choices=[None, "int32", "int64"],
-                    help="YGGDRAX_INDEX_PRECISION (read at import)")
+    ap.add_argument(
+        "--index",
+        default=None,
+        choices=[None, "int32", "int64"],
+        help="YGGDRAX_INDEX_PRECISION (read at import)",
+    )
     ap.add_argument("--walks", default="dual,mutual,scatter")
     ap.add_argument("--cpu", action="store_true", help="force the CPU backend")
     ap.add_argument("--smoke", action="store_true", help="tiny CPU run")
@@ -111,7 +131,9 @@ def main() -> int:
     if args.cpu:
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
-        from autocvd import autocvd  # site tool: picks a free card, sets CUDA_VISIBLE_DEVICES
+        from autocvd import (  # site tool: picks a free card, sets CUDA_VISIBLE_DEVICES
+            autocvd,
+        )
 
         gpu = int(autocvd(num_gpus=1, least_used=False, timeout=600, progress=False)[0])
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -135,24 +157,38 @@ def main() -> int:
     tree = Tree.from_particles(
         jnp.asarray(pos), jnp.asarray(mass), leaf_size=args.leaf_size, tree_type="radix"
     )
-    geometry = compute_tree_geometry(tree, tree.positions_sorted, max_leaf_size=args.leaf_size)
+    geometry = compute_tree_geometry(
+        tree, tree.positions_sorted, max_leaf_size=args.leaf_size
+    )
     topo = tree.topology
     num_internal = int(topo.left_child.shape[0])
     total_nodes = int(topo.parent.shape[0])
     num_leaves = total_nodes - num_internal
     result = dict(
-        n=args.n, leaf_size=args.leaf_size, theta=args.theta, mac_type=args.mac_type,
-        num_leaves=num_leaves, total_nodes=total_nodes, index_dtype=str(jnp.dtype(INDEX_DTYPE)),
-        max_pair_queue=args.max_pair_queue, device=str(jax.devices()[0]), gpu=gpu,
-        gpu_util_before=util_before, walks={},
+        n=args.n,
+        leaf_size=args.leaf_size,
+        theta=args.theta,
+        mac_type=args.mac_type,
+        num_leaves=num_leaves,
+        total_nodes=total_nodes,
+        index_dtype=str(jnp.dtype(INDEX_DTYPE)),
+        max_pair_queue=args.max_pair_queue,
+        device=str(jax.devices()[0]),
+        gpu=gpu,
+        gpu_util_before=util_before,
+        walks={},
     )
-    print(f"{result['device']} N={args.n} leaf {args.leaf_size} -> {num_leaves} leaves, "
-          f"{total_nodes} nodes, index {result['index_dtype']}, Q={args.max_pair_queue}", flush=True)
+    print(
+        f"{result['device']} N={args.n} leaf {args.leaf_size} -> {num_leaves} leaves, "
+        f"{total_nodes} nodes, index {result['index_dtype']}, Q={args.max_pair_queue}",
+        flush=True,
+    )
     walks = set(args.walks.split(","))
 
     if "dual" in walks:
         config = DualTreeTraversalConfig(
-            max_pair_queue=args.max_pair_queue, process_block=256,
+            max_pair_queue=args.max_pair_queue,
+            process_block=256,
             max_interactions_per_node=args.max_interactions_per_node,
             max_neighbors_per_leaf=args.max_neighbors_per_leaf,
         )
@@ -160,50 +196,98 @@ def main() -> int:
         @jax.jit
         def dual(topology, geom):
             _far, _near, res = build_interactions_and_neighbors(
-                topology, geom, theta=args.theta, traversal_config=config,
-                mac_type=args.mac_type, return_result=True,
+                topology,
+                geom,
+                theta=args.theta,
+                traversal_config=config,
+                mac_type=args.mac_type,
+                return_result=True,
             )
-            return (res.far_pair_count, res.near_pair_count, res.queue_overflow,
-                    res.far_overflow, res.near_overflow)
+            return (
+                res.far_pair_count,
+                res.near_pair_count,
+                res.queue_overflow,
+                res.far_overflow,
+                res.near_overflow,
+            )
 
-        (far, near, qo, fo, no), tmin, tmed = _timed(lambda: dual(topo, geometry), args.repeats)
-        row = dict(ms_min=tmin, ms_median=tmed, far_pairs=int(far), near_pairs=int(near),
-                   queue_overflow=bool(qo), far_overflow=bool(fo), near_overflow=bool(no))
+        (far, near, qo, fo, no), tmin, tmed = _timed(
+            lambda: dual(topo, geometry), args.repeats
+        )
+        row = dict(
+            ms_min=tmin,
+            ms_median=tmed,
+            far_pairs=int(far),
+            near_pairs=int(near),
+            queue_overflow=bool(qo),
+            far_overflow=bool(fo),
+            near_overflow=bool(no),
+        )
         result["walks"]["dual"] = row
-        print(f"dual   : {tmin:8.2f} ms (median {tmed:8.2f})  far {int(far)}  near {int(near)}  "
-              f"overflow q/f/n {bool(qo)}/{bool(fo)}/{bool(no)}", flush=True)
+        print(
+            f"dual   : {tmin:8.2f} ms (median {tmed:8.2f})  far {int(far)}  near {int(near)}  "
+            f"overflow q/f/n {bool(qo)}/{bool(fo)}/{bool(no)}",
+            flush=True,
+        )
 
     if "mutual" in walks:
         idx = topo.parent.dtype
-        left_full = jnp.concatenate([jnp.asarray(topo.left_child, idx), jnp.full((num_leaves,), -1, idx)])
-        right_full = jnp.concatenate([jnp.asarray(topo.right_child, idx), jnp.full((num_leaves,), -1, idx)])
+        left_full = jnp.concatenate(
+            [jnp.asarray(topo.left_child, idx), jnp.full((num_leaves,), -1, idx)]
+        )
+        right_full = jnp.concatenate(
+            [jnp.asarray(topo.right_child, idx), jnp.full((num_leaves,), -1, idx)]
+        )
         root = jnp.argmin(topo.parent).astype(idx)
         centers = jnp.asarray(geometry.center)
-        extents = _build_mac_extents(topo.parent, geometry, num_internal, args.mac_type, 1.0)[0]
+        extents = _build_mac_extents(
+            topo.parent, geometry, num_internal, args.mac_type, 1.0
+        )[0]
         extents = jnp.asarray(extents, dtype=centers.dtype)
 
         @jax.jit
         def mutual(lf, rf, c, r, rt):
             return dual_tree_walk_mutual(
-                lf, rf, c, r, args.theta, rt, max_pair_queue=args.max_pair_queue,
-                far_cap=args.far_cap, near_cap=args.near_cap,
+                lf,
+                rf,
+                c,
+                r,
+                args.theta,
+                rt,
+                max_pair_queue=args.max_pair_queue,
+                far_cap=args.far_cap,
+                near_cap=args.near_cap,
             )
 
-        res, tmin, tmed = _timed(lambda: mutual(left_full, right_full, centers, extents, root), args.repeats)
-        row = dict(ms_min=tmin, ms_median=tmed, far_pairs_canonical=int(res.far_count),
-                   near_pairs_canonical=int(res.near_count), far_pairs_directed=2 * int(res.far_count),
-                   near_pairs_directed=2 * int(res.near_count),
-                   queue_overflow=bool(res.queue_overflow), far_overflow=bool(res.far_overflow),
-                   near_overflow=bool(res.near_overflow))
+        res, tmin, tmed = _timed(
+            lambda: mutual(left_full, right_full, centers, extents, root), args.repeats
+        )
+        row = dict(
+            ms_min=tmin,
+            ms_median=tmed,
+            far_pairs_canonical=int(res.far_count),
+            near_pairs_canonical=int(res.near_count),
+            far_pairs_directed=2 * int(res.far_count),
+            near_pairs_directed=2 * int(res.near_count),
+            queue_overflow=bool(res.queue_overflow),
+            far_overflow=bool(res.far_overflow),
+            near_overflow=bool(res.near_overflow),
+        )
         for extra in ("peak_wavefront", "rounds"):
             if hasattr(res, extra):
                 row[extra] = int(getattr(res, extra))
         result["walks"]["mutual"] = row
-        print(f"mutual : {tmin:8.2f} ms (median {tmed:8.2f})  far {2*int(res.far_count)} (directed)  "
-              f"near {2*int(res.near_count)}  overflow q/f/n {bool(res.queue_overflow)}/"
-              f"{bool(res.far_overflow)}/{bool(res.near_overflow)}"
-              + (f"  peak_wf {row['peak_wavefront']} rounds {row['rounds']}" if "rounds" in row else ""),
-              flush=True)
+        print(
+            f"mutual : {tmin:8.2f} ms (median {tmed:8.2f})  far {2*int(res.far_count)} (directed)  "
+            f"near {2*int(res.near_count)}  overflow q/f/n {bool(res.queue_overflow)}/"
+            f"{bool(res.far_overflow)}/{bool(res.near_overflow)}"
+            + (
+                f"  peak_wf {row['peak_wavefront']} rounds {row['rounds']}"
+                if "rounds" in row
+                else ""
+            ),
+            flush=True,
+        )
 
     if "scatter" in walks:
         Q = int(args.max_pair_queue)
@@ -220,14 +304,22 @@ def main() -> int:
 
         @jax.jit
         def promised(s, v):
-            return jnp.full((Q,), -1, dtype=v.dtype).at[s].set(v, mode="drop", unique_indices=True)
+            return (
+                jnp.full((Q,), -1, dtype=v.dtype)
+                .at[s]
+                .set(v, mode="drop", unique_indices=True)
+            )
 
         a, t_plain, _ = _timed(lambda: plain(slot_j, vals), args.repeats)
         b, t_prom, _ = _timed(lambda: promised(slot_j, vals), args.repeats)
         same = bool(jnp.array_equal(a, b))
-        result["walks"]["scatter"] = dict(Q=Q, ms_plain=t_plain, ms_unique=t_prom, identical=same)
-        print(f"scatter: Q={Q} plain {t_plain:7.3f} ms  unique_indices {t_prom:7.3f} ms  identical {same}",
-              flush=True)
+        result["walks"]["scatter"] = dict(
+            Q=Q, ms_plain=t_plain, ms_unique=t_prom, identical=same
+        )
+        print(
+            f"scatter: Q={Q} plain {t_plain:7.3f} ms  unique_indices {t_prom:7.3f} ms  identical {same}",
+            flush=True,
+        )
 
     result["gpu_util_after"] = _gpu_util(gpu)
     if args.out:

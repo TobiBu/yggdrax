@@ -82,11 +82,17 @@ def _dual_sets(topology, geometry, theta, mac_type, scale=1.0):
         dehnen_radius_scale=scale,
         return_result=True,
     )
-    assert not (bool(result.queue_overflow) or bool(result.far_overflow) or bool(result.near_overflow))
+    assert not (
+        bool(result.queue_overflow)
+        or bool(result.far_overflow)
+        or bool(result.near_overflow)
+    )
     src = np.asarray(result.interaction_sources)
     tgt = np.asarray(result.interaction_targets)
     live = (src >= 0) & (tgt >= 0)
-    far = {(min(a, b), max(a, b)) for a, b in zip(tgt[live].tolist(), src[live].tolist())}
+    far = {
+        (min(a, b), max(a, b)) for a, b in zip(tgt[live].tolist(), src[live].tolist())
+    }
     # every accepted pair appears in both directions
     directed = set(zip(tgt[live].tolist(), src[live].tolist()))
     assert all((b, a) in directed for a, b in directed)
@@ -108,8 +114,12 @@ def _mutual_sets(res):
     na, nb = np.asarray(res.near_a), np.asarray(res.near_b)
     nf, nn = int(res.far_count), int(res.near_count)
     assert np.all(fa[:nf] < fb[:nf]) and np.all(na[:nn] < nb[:nn]), "canonical a < b"
-    assert np.all(fa[nf:] == -1) and np.all(na[nn:] == -1), "-1 tail after the live prefix"
-    return set(zip(fa[:nf].tolist(), fb[:nf].tolist())), set(zip(na[:nn].tolist(), nb[:nn].tolist()))
+    assert np.all(fa[nf:] == -1) and np.all(
+        na[nn:] == -1
+    ), "-1 tail after the live prefix"
+    return set(zip(fa[:nf].tolist(), fb[:nf].tolist())), set(
+        zip(na[:nn].tolist(), nb[:nn].tolist())
+    )
 
 
 @pytest.mark.parametrize("mac_type", ["bh", "dehnen"])
@@ -119,12 +129,24 @@ def test_mutual_walk_matches_the_dual_walk_as_sets(mac_type, theta):
     far_ref, near_ref, n_far_directed, n_near_directed = _dual_sets(
         topology, geometry, theta, mac_type
     )
-    left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, mac_type)
-    res = dual_tree_walk_mutual(
-        left, right, centers, extents, theta, root,
-        max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17, mac_type=mac_type,
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, mac_type
     )
-    assert not (bool(res.queue_overflow) or bool(res.far_overflow) or bool(res.near_overflow))
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        theta,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type=mac_type,
+    )
+    assert not (
+        bool(res.queue_overflow) or bool(res.far_overflow) or bool(res.near_overflow)
+    )
     far, near = _mutual_sets(res)
     assert far == far_ref
     assert near == near_ref
@@ -135,10 +157,20 @@ def test_mutual_walk_matches_the_dual_walk_as_sets(mac_type, theta):
 def test_dehnen_radius_scale_reaches_the_acceptance():
     topology, geometry = _tree(seed=3)
     far_ref, near_ref, _, _ = _dual_sets(topology, geometry, 0.5, "dehnen", scale=1.3)
-    left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, "dehnen", scale=1.3)
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, "dehnen", scale=1.3
+    )
     res = dual_tree_walk_mutual(
-        left, right, centers, extents, 0.5, root,
-        max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17, mac_type="dehnen",
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type="dehnen",
     )
     far, near = _mutual_sets(res)
     assert far == far_ref and near == near_ref
@@ -153,11 +185,18 @@ def test_strict_default_differs_from_the_dual_walk_at_most_on_equality():
     far_ref, near_ref, _, _ = _dual_sets(topology, geometry, 0.5, "bh")
     left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, "bh")
     res = dual_tree_walk_mutual(
-        left, right, centers, extents, 0.5, root,
-        max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17,
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
     )
     far, near = _mutual_sets(res)
-    theta_sq = 0.5 ** 2
+    theta_sq = 0.5**2
     c = np.asarray(centers)
     e = np.asarray(extents)
     for a, b in far ^ far_ref:
@@ -167,13 +206,23 @@ def test_strict_default_differs_from_the_dual_walk_at_most_on_equality():
 
 def test_traces_under_jit_and_reports_peak_and_rounds():
     topology, geometry = _tree(seed=7)
-    left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, "dehnen")
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
     q = 1 << 15
 
     @jax.jit
     def run(lf, rf, c, r, rt):
         return dual_tree_walk_mutual(
-            lf, rf, c, r, 0.5, rt, max_pair_queue=q, far_cap=1 << 17, near_cap=1 << 17,
+            lf,
+            rf,
+            c,
+            r,
+            0.5,
+            rt,
+            max_pair_queue=q,
+            far_cap=1 << 17,
+            near_cap=1 << 17,
             mac_type="dehnen",
         )
 
@@ -182,41 +231,109 @@ def test_traces_under_jit_and_reports_peak_and_rounds():
     peak, rounds = int(res.peak_wavefront), int(res.rounds)
     assert 1 <= peak <= q and rounds > 0
     # a queue exactly at the peak does not overflow; below it does
-    ok = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                               max_pair_queue=peak, far_cap=1 << 17, near_cap=1 << 17,
-                               mac_type="dehnen")
+    ok = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=peak,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type="dehnen",
+    )
     assert not bool(ok.queue_overflow) and int(ok.far_count) == int(res.far_count)
     if peak > 4:
-        short = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                                      max_pair_queue=peak - 1, far_cap=1 << 17,
-                                      near_cap=1 << 17, mac_type="dehnen")
+        short = dual_tree_walk_mutual(
+            left,
+            right,
+            centers,
+            extents,
+            0.5,
+            root,
+            max_pair_queue=peak - 1,
+            far_cap=1 << 17,
+            near_cap=1 << 17,
+            mac_type="dehnen",
+        )
         assert bool(short.queue_overflow)
 
 
 def test_far_and_near_overflow_flags_fire_and_counts_report_the_need():
     topology, geometry = _tree(seed=11)
-    left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, "dehnen")
-    full = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                                 max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17,
-                                 mac_type="dehnen")
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
+    full = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type="dehnen",
+    )
     nf, nn = int(full.far_count), int(full.near_count)
-    tight_far = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                                      max_pair_queue=1 << 16, far_cap=max(4, nf // 2),
-                                      near_cap=1 << 17, mac_type="dehnen")
+    tight_far = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=max(4, nf // 2),
+        near_cap=1 << 17,
+        mac_type="dehnen",
+    )
     assert bool(tight_far.far_overflow) and int(tight_far.far_count) > max(4, nf // 2)
-    tight_near = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                                       max_pair_queue=1 << 16, far_cap=1 << 17,
-                                       near_cap=max(4, nn // 2), mac_type="dehnen")
-    assert bool(tight_near.near_overflow) and int(tight_near.near_count) > max(4, nn // 2)
+    tight_near = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=max(4, nn // 2),
+        mac_type="dehnen",
+    )
+    assert bool(tight_near.near_overflow) and int(tight_near.near_count) > max(
+        4, nn // 2
+    )
 
 
 def test_index_dtype_follows_the_child_arrays():
     topology, geometry = _tree(seed=13)
     for idx in (jnp.int32, jnp.int64):
-        left, right, centers, extents, root, _ = _mutual_inputs(topology, geometry, "dehnen", idx=idx)
-        res = dual_tree_walk_mutual(left, right, centers, extents, 0.5, root,
-                                    max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17,
-                                    mac_type="dehnen")
-        for leaf in (res.far_a, res.far_b, res.near_a, res.near_b, res.far_count,
-                     res.near_count, res.peak_wavefront, res.rounds):
+        left, right, centers, extents, root, _ = _mutual_inputs(
+            topology, geometry, "dehnen", idx=idx
+        )
+        res = dual_tree_walk_mutual(
+            left,
+            right,
+            centers,
+            extents,
+            0.5,
+            root,
+            max_pair_queue=1 << 16,
+            far_cap=1 << 17,
+            near_cap=1 << 17,
+            mac_type="dehnen",
+        )
+        for leaf in (
+            res.far_a,
+            res.far_b,
+            res.near_a,
+            res.near_b,
+            res.far_count,
+            res.near_count,
+            res.peak_wavefront,
+            res.rounds,
+        ):
             assert leaf.dtype == jnp.dtype(idx), (idx, leaf.dtype)

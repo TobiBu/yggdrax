@@ -6462,9 +6462,7 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
     return buf_a, buf_b, count + jnp.sum(live, dtype=idx), overflow
 
 
-@partial(
-    jax.jit, static_argnames=("max_pair_queue", "far_cap", "near_cap", "mac_type")
-)
+@partial(jax.jit, static_argnames=("max_pair_queue", "far_cap", "near_cap", "mac_type"))
 def dual_tree_walk_mutual(
     left_child_full: Array,
     right_child_full: Array,
