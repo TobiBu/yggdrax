@@ -6448,6 +6448,12 @@ class MutualWalkResult(NamedTuple):
 # on the same tree, at most a factor ``_WAVEFRONT_LADDER_STEP`` over live.
 _WAVEFRONT_LADDER_FLOOR = 4096
 _WAVEFRONT_LADDER_STEP = 4
+# Default of ``dual_tree_walk_mutual(wavefront_ladder=...)``; the environment
+# switch exists so a caller that cannot reach the static argument (jaccpot's
+# fused lane inside a compiled scan) can still A/B the ladder. Read at import.
+_WAVEFRONT_LADDER_DEFAULT = os.environ.get(
+    "YGGDRAX_MUTUAL_WALK_LADDER", "1"
+).strip().lower() not in ("0", "false", "off", "no")
 
 
 def _wavefront_ladder(max_pair_queue: int) -> tuple[int, ...]:
@@ -6520,7 +6526,7 @@ def dual_tree_walk_mutual(
     far_cap: int,
     near_cap: int,
     mac_type: Optional[MACType] = None,
-    wavefront_ladder: bool = True,
+    wavefront_ladder: Optional[bool] = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6568,8 +6574,9 @@ def dual_tree_walk_mutual(
     wavefront_ladder:
         Compile the round body for the static widths of
         :func:`_wavefront_ladder` and let each round run at the narrowest width
-        that holds its live wavefront (default). ``False`` runs every round at
-        the full ``max_pair_queue`` width. The two produce identical results --
+        that holds its live wavefront. ``False`` runs every round at the full
+        ``max_pair_queue`` width. ``None`` (default) takes
+        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
         the same pairs in the same order -- and differ only in per-round cost
         and compile time. Static.
 
@@ -6742,6 +6749,8 @@ def dual_tree_walk_mutual(
 
         return round_fun
 
+    if wavefront_ladder is None:
+        wavefront_ladder = _WAVEFRONT_LADDER_DEFAULT
     widths = (
         _wavefront_ladder(max_pair_queue) if wavefront_ladder else (max_pair_queue,)
     )

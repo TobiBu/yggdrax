@@ -378,3 +378,26 @@ def test_wavefront_ladder_reports_queue_overflow_like_the_full_width_body():
     full = dual_tree_walk_mutual(*args, **kw, wavefront_ladder=False)
     assert bool(ladder.queue_overflow) and bool(full.queue_overflow)
     assert int(ladder.peak_wavefront) == int(full.peak_wavefront) > 256
+
+
+def test_env_switch_sets_the_ladder_default(monkeypatch):
+    import importlib
+    import subprocess
+    import sys
+
+    code = (
+        "from yggdrax import _interactions_impl as m; "
+        "print(int(m._WAVEFRONT_LADDER_DEFAULT))"
+    )
+    for value, expect in (("0", "0"), ("1", "1"), (None, "1")):
+        env = dict(__import__("os").environ)
+        env.pop("YGGDRAX_MUTUAL_WALK_LADDER", None)
+        if value is not None:
+            env["YGGDRAX_MUTUAL_WALK_LADDER"] = value
+        env["JAX_PLATFORMS"] = "cpu"
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == expect, (value, out.stdout)
+    del importlib, monkeypatch
