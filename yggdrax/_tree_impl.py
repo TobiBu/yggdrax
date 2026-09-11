@@ -701,6 +701,113 @@ def _static_radix_node_ranges_from_leaf_ranges(
     return node_ranges
 
 
+STATIC_RADIX_LEAF_PARTITIONS = ("buckets", "cells")
+
+
+def build_static_cells_tree(
+    positions: Array,
+    masses: Array,
+    bounds: Bounds,
+    *,
+    leaf_size: int,
+    leaf_capacity: int,
+    return_reordered: bool = False,
+    return_overflow: bool = False,
+):
+    """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
+
+    Leaves are the coarsest Morton cells holding at most ``leaf_size``
+    particles (:func:`yggdrax._cell_partition.adaptive_cell_leaf_partition`),
+    padded with EMPTY leaves (``start = end = n``) to the static
+    ``leaf_capacity``; the internal structure is the Morton-aligned radix tree
+    over the leaf codes (:func:`_build_tree_from_leaf_partitions`), so every
+    array has a static shape and the whole build traces. Padding leaves carry
+    the largest code and sit in one subtree at the right end; their nodes have
+    empty ranges, which is what a walk must test to leave them alone
+    (``dual_tree_walk_mutual(node_active=...)``).
+
+    Why: count buckets in a low-density shell straddle several cells and become
+    huge; the mutual MAC then makes each a neighbour of most of the tree (56 %
+    of the near-field volume from 11 % of the particles at N=2e5, Plummer,
+    leaf 64). Cell leaves are bounded in extent: the same walk summed 0.0052 N
+    directly instead of 0.1225 N at theta 0.8 (2026-09-11).
+
+    Parameters
+    ----------
+    positions : Array
+        Particle positions ``(n, 3)``.
+    masses : Array
+        Particle masses ``(n,)``.
+    bounds : Bounds
+        Morton domain ``(min_corner, max_corner)``.
+    leaf_size : int
+        Maximum particles per leaf (the leaf table width downstream).
+    leaf_capacity : int
+        Static leaf count the tree is padded to.
+    return_reordered : bool
+        Also return the Morton-ordered positions, masses and the inverse
+        permutation.
+    return_overflow : bool
+        Also return the partition's overflow flag (a traced bool): ``True``
+        when more than ``leaf_capacity`` leaves were needed, in which case the
+        tree does NOT cover every particle. Eager callers must raise on it;
+        traced callers must fold it into their capacity guard.
+
+    Returns
+    -------
+    RadixTree or tuple
+        ``tree`` [, ``positions_sorted, masses_sorted, inverse``] [, ``overflow``].
+
+    Raises
+    ------
+    ValueError
+        If ``leaf_size`` or ``leaf_capacity`` is not positive.
+    """
+    from ._cell_partition import adaptive_cell_leaf_partition
+    from .morton import morton_encode  # local import to avoid circulars
+
+    n = positions.shape[0]
+    if n < 1:
+        raise ValueError("Need at least one particle")
+    if int(leaf_size) < 1:
+        raise ValueError("leaf_size must be >= 1")
+    if int(leaf_capacity) < 1:
+        raise ValueError("leaf_capacity must be >= 1")
+    morton_codes = morton_encode(positions, bounds)
+    sorted_indices = jnp.argsort(morton_codes, stable=True)
+    sorted_codes = morton_codes[sorted_indices]
+    part = adaptive_cell_leaf_partition(
+        sorted_codes, leaf_size=int(leaf_size), capacity=int(leaf_capacity)
+    )
+    live = part.leaf_starts < as_index(int(n))
+    safe_start = jnp.minimum(part.leaf_starts, as_index(max(int(n) - 1, 0)))
+    # padding leaves take the largest code: the Karras split puts them in one
+    # subtree at the right end, ties broken by index inside it
+    sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
+    leaf_codes = jnp.where(live, sorted_codes[safe_start], sentinel)
+    out = _build_tree_from_leaf_partitions(
+        positions,
+        masses,
+        jnp.asarray(sorted_indices, dtype=INDEX_DTYPE),
+        sorted_codes,
+        part.leaf_starts,
+        part.leaf_ends,
+        bounds,
+        leaf_size=int(leaf_size),
+        use_morton_geometry=False,
+        return_reordered=bool(return_reordered),
+        workspace=None,
+        return_workspace=False,
+        leaf_codes_override=leaf_codes,
+        leaf_depths_override=part.leaf_depths,
+    )
+    # a bare RadixTree is itself a NamedTuple: test for the container first
+    outputs = [out] if isinstance(out, RadixTree) else list(out)
+    if return_overflow:
+        outputs.append(part.overflow)
+    return tuple(outputs) if len(outputs) > 1 else outputs[0]
+
+
 def build_static_radix_tree(
     positions: Array,
     masses: Array,
@@ -709,6 +816,8 @@ def build_static_radix_tree(
     leaf_size: int = 8,
     return_reordered: bool = False,
     return_workspace: bool = False,
+    leaf_partition: str = "buckets",
+    leaf_capacity: Optional[int] = None,
 ):
     """Build a fixed-shape radix tree from equal-size Morton-order buckets.
 
@@ -717,9 +826,33 @@ def build_static_radix_tree(
     ``leaf_size`` particles.  Refreshes may change particle order, node ranges,
     and geometry, while preserving the balanced parent/child structure for a
     fixed particle count and leaf size.
+
+    ``leaf_partition="cells"`` builds :func:`build_static_cells_tree` instead
+    (adaptive Morton-cell leaves padded to ``leaf_capacity``; the structure is
+    rebuilt on device each time, still with static shapes); it has no reusable
+    workspace.
     """
 
     from .morton import morton_encode  # local import to avoid circulars
+
+    if leaf_partition not in STATIC_RADIX_LEAF_PARTITIONS:
+        raise ValueError(
+            "leaf_partition must be one of "
+            f"{STATIC_RADIX_LEAF_PARTITIONS}, got {leaf_partition!r}"
+        )
+    if leaf_partition == "cells":
+        if leaf_capacity is None:
+            raise ValueError("leaf_partition='cells' needs leaf_capacity")
+        if return_workspace:
+            raise ValueError("leaf_partition='cells' has no reusable workspace")
+        return build_static_cells_tree(
+            positions,
+            masses,
+            bounds,
+            leaf_size=int(leaf_size),
+            leaf_capacity=int(leaf_capacity),
+            return_reordered=bool(return_reordered),
+        )
 
     n = positions.shape[0]
     if n < 1:
@@ -819,11 +952,28 @@ def rebuild_static_radix_tree_from_template(
     *,
     bounds: Optional[Bounds] = None,
     return_reordered: bool = False,
+    leaf_partition: str = "buckets",
+    return_overflow: bool = False,
 ):
-    """Refresh particles against a fixed-shape static radix bucket topology."""
+    """Refresh particles against a fixed-shape static radix bucket topology.
+
+    With ``leaf_partition="cells"`` the template fixes only the SHAPE (leaf
+    capacity = its leaf count, ``leaf_size`` = its leaf width, bounds): the
+    cell leaves and the radix structure over them are rebuilt from the new
+    positions on device (:func:`build_static_cells_tree`). ``return_overflow``
+    then appends the partition's overflow flag; for buckets it is refused
+    (their leaf count is a function of ``n`` and ``leaf_size`` alone).
+    """
 
     from .morton import morton_encode  # local import to avoid circulars
 
+    if leaf_partition not in STATIC_RADIX_LEAF_PARTITIONS:
+        raise ValueError(
+            "leaf_partition must be one of "
+            f"{STATIC_RADIX_LEAF_PARTITIONS}, got {leaf_partition!r}"
+        )
+    if return_overflow and leaf_partition != "cells":
+        raise ValueError("return_overflow is only meaningful for leaf_partition='cells'")
     if template.leaf_size is None or int(template.leaf_size) < 1:
         raise ValueError("static_radix template must declare a positive leaf_size")
     n = positions.shape[0]
@@ -841,6 +991,17 @@ def rebuild_static_radix_tree_from_template(
         )
     else:
         bounds_resolved = bounds
+
+    if leaf_partition == "cells":
+        return build_static_cells_tree(
+            positions,
+            masses,
+            bounds_resolved,
+            leaf_size=int(template.leaf_size),
+            leaf_capacity=int(template.leaf_codes.shape[0]),
+            return_reordered=bool(return_reordered),
+            return_overflow=bool(return_overflow),
+        )
 
     morton_codes = morton_encode(positions, bounds_resolved)
     # Stable sort by Morton code (ties break by input order == original index),
