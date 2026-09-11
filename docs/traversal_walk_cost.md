@@ -83,7 +83,31 @@ slot work above that floor; lowering the floor means fewer kernels per round (on
 lists, one scatter per list with the pair packed, no fresh-queue copy) or fewer rounds (two tree levels per
 round), which is the next lever.
 
-TIMINGS_PLACEHOLDER
+### What the ladder bought (idle A100, N=200k Plummer, p=4, int32, 2026-09-11)
+
+Isolated walk (`bench/results/walk_{ladder,noladder}_leaf{64,32}.json`, min of 7; same pair counts, same rounds):
+
+| leaf | Q | rounds | full width | ladder | gain |
+|---|---|---|---|---|---|
+| 64 | 2^19 | 55 | 13.19 ms | 12.53 ms | 1.05x |
+| 32 | 2^20 | 61 | 21.31 ms | 16.12 ms | 1.32x |
+
+In the jaccpot fused step (`smallleaf_baseline.py --modes refresh`, flat walk + CSR M2L at their defaults; ladder
+off = `YGGDRAX_MUTUAL_WALK_LADDER=0`), ms/step at theta 0.6:
+
+| leaf | ladder off | ladder on | step trace (on) |
+|---|---|---|---|
+| 32 | 80.48 | **72.59** | downward 54.8 -> 49.2 |
+| 64 | 62.60 | **59.26** | launches 4623 -> 4464/step; scatter 4.27 -> 2.67, reduce 2.10 -> 0.70 ms |
+| 128 | (71.3 earlier) | 69.04 | |
+| 32, theta 0.8 | (53.6 earlier) | 50.40 | |
+
+The ladder cut the slot work 5x but the walk only 1.05x (leaf 64) to 1.3x (leaf 32): the per-round launch floor
+is the wall it was predicted to be. At leaf 64 the walk costs 12.5 ms for 55 rounds -- 0.23 ms per round, ~40
+kernels -- which is the launch floor almost exactly. The per-step optimum stays at leaf 64 (59.3 vs 72.6 at leaf
+32 and 69.0 at leaf 128). What the launch-floor plan can still buy is bounded: a free walk would take leaf 64 to
+~47 ms and leaf 32 to ~57 ms -- at leaf 32 the CSR M2L over 2.34M directed far pairs (~28 ms at 12 ns/pair) and
+the list build are now larger than the walk.
 
 ## Reproduce
 
