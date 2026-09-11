@@ -6475,6 +6475,7 @@ def dual_tree_walk_mutual(
     far_cap: int,
     near_cap: int,
     mac_type: Optional[MACType] = None,
+    node_active: Optional[Array] = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6519,6 +6520,15 @@ def dual_tree_walk_mutual(
         ``dehnen`` (they differ from the strict rule only on exact equality) and
         the Engblom form -- so a caller that feeds the dual walk's own
         ``mac_extents`` gets the dual walk's far and near lists as sets. Static.
+
+    node_active:
+        Optional ``(total_nodes,)`` boolean mask. A pair whose target or source
+        node is inactive is DEAD: never accepted, never a near pair, never
+        refined. Empty padding nodes of a capacity-padded leaf partition
+        (``yggdrax._cell_partition``) are what this is for -- with all of them
+        at one centre and radius zero they otherwise fail the MAC against each
+        other and flood the near list. ``None`` = every node active (no extra
+        gathers; bit-identical to the walk without the argument).
 
     Returns
     -------
@@ -6579,6 +6589,9 @@ def dual_tree_walk_mutual(
         live = (jnp.arange(max_pair_queue, dtype=idx) < size) & (cur_a >= 0)
         sa = jnp.asarray(jnp.where(live, cur_a, ix(0)))
         sb = jnp.asarray(jnp.where(live, cur_b, ix(0)))
+        if node_active is not None:
+            # dead pairs: gathered once, then excluded from accept/near/refine
+            live = live & node_active[sa] & node_active[sb]
         # Every per-node quantity is gathered ONCE per round and reused below.
         left_a = left_child_full[sa]
         left_b = left_child_full[sb]
