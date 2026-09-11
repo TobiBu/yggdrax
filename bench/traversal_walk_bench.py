@@ -117,6 +117,11 @@ def main() -> int:
     )
     ap.add_argument("--walks", default="dual,mutual,scatter")
     ap.add_argument("--cpu", action="store_true", help="force the CPU backend")
+    ap.add_argument(
+        "--no-ladder",
+        action="store_true",
+        help="run the mutual walk at the full queue width every round (A/B)",
+    )
     ap.add_argument("--smoke", action="store_true", help="tiny CPU run")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -257,12 +262,14 @@ def main() -> int:
                 max_pair_queue=args.max_pair_queue,
                 far_cap=args.far_cap,
                 near_cap=args.near_cap,
+                wavefront_ladder=not args.no_ladder,
             )
 
         res, tmin, tmed = _timed(
             lambda: mutual(left_full, right_full, centers, extents, root), args.repeats
         )
         row = dict(
+            wavefront_ladder=not args.no_ladder,
             ms_min=tmin,
             ms_median=tmed,
             far_pairs_canonical=int(res.far_count),
