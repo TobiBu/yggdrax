@@ -1983,8 +1983,16 @@ def rebuild_static_radix_tree_from_template(
     *,
     bounds: Optional[tuple[Array, Array]] = None,
     return_reordered: bool = False,
+    leaf_partition: str = "buckets",
+    return_overflow: bool = False,
 ):
-    """Refresh particles using an existing static-radix data structure."""
+    """Refresh particles using an existing static-radix data structure.
+
+    ``leaf_partition="cells"`` rebuilds adaptive Morton-cell leaves at the
+    template's leaf capacity and width (see
+    :func:`yggdrax._tree_impl.build_static_cells_tree`); ``return_overflow``
+    then appends the partition's overflow flag to the returned tuple.
+    """
 
     if isinstance(template, RadixTree):
         if template.build_mode != "static_radix":
@@ -2001,13 +2009,23 @@ def rebuild_static_radix_tree_from_template(
         topology,
         bounds=bounds,
         return_reordered=return_reordered,
+        leaf_partition=leaf_partition,
+        return_overflow=return_overflow,
     )
-    return _wrap_radix_public_result(
+    overflow = None
+    if return_overflow:
+        *core, overflow = result
+        result = tuple(core) if len(core) > 1 else core[0]
+    wrapped = _wrap_radix_public_result(
         result=result,
         build_mode="static_radix",
         return_reordered=return_reordered,
         return_workspace=False,
     )
+    if return_overflow:
+        items = list(wrapped) if isinstance(wrapped, tuple) else [wrapped]
+        return (*items, overflow)
+    return wrapped
 
 
 @jaxtyped(typechecker=beartype)
