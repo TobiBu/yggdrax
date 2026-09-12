@@ -45,9 +45,69 @@ sort, no `segment_sum`, no conditional, no post-loop flatten. Its acceptance rul
 size its queue from data instead of from a capacity that merely did not overflow; its index dtype follows
 the child arrays (int32 halves every byte).
 
-What is left is a per-round floor: 46-61 rounds per walk at ~0.15 ms each (the tail of the wavefront is
-long and thin). A narrow-width branch for rounds with a small live set (a `lax.switch` over a static ladder
-of widths) is the next lever if the in-step numbers ask for it.
+What was left after that is a per-round floor: 46-61 rounds per walk at ~0.15 ms each, most of them far
+below the queue capacity.
+
+## The width ladder (2026-09-11)
+
+Every round used to evaluate all `max_pair_queue` slots. The live wavefront, measured round by round on the
+200k Plummer tree (`_wavefront_ladder` commit; eager profile with dynamic shapes):
+
+| leaf / theta | rounds | peak live | rounds with < 4096 live | slot evaluations at full width | with the ladder | live pairs summed |
+|---|---|---|---|---|---|---|
+| 64 / 0.6 | 55 | 191,798 | first 18, last 3 | 28.8 M (Q = 2^19) | 5.2 M | 2.7 M |
+| 32 / 0.6 | 61 | 393,552 | first 18, last 3 | 64.0 M (Q = 2^20) | 13.7 M | 5.6 M |
+| 64 / 0.8 | 55 | 92,478 | first 18, last 4 | 14.4 M (Q = 2^18) | 3.3 M | 1.3 M |
+| 256 / 0.6 | 46 | 35,366 | first 19, last 3 | 3.0 M (Q = 2^16) | 1.1 M | 0.45 M |
+
+The wavefront rises by ~1.4x per round from the root, sits on a plateau near the peak for ~10 rounds and
+decays for ~20 (leaf 64 / 0.6: 3, 5, 12, 28, ..., 191,798, ..., 33,614, 33,222, 31,248, 28,838, 24,522,
+19,044, 13,588, 6,762, 1,928, 212). `dual_tree_walk_mutual` now compiles its round body once per width of a
+static ladder (powers of 4 from 4096 up to the queue, `_wavefront_ladder`) and runs one `while_loop` per rung --
+ascending while the wavefront fits each width, the widest while it exceeds the rung below, descending, then a
+full-width catch-all for any non-monotone tail -- so each round runs at about the narrowest width that holds its
+live set. NOT a `lax.switch` over the widths: compiled for GPU, the conditional copied every loop-carried buffer
+(queue, far and near lists: six full-size memcpys, 14 `copy` ops per round against 3) into its operands each
+round -- the same pathology the dual walk's `lax.cond` emissions had. With one loop per rung every rung body
+has the baseline's 3 copies and 28-40 kernels per round. The pushed pairs still compact into the full-width queue, so
+`peak_wavefront`, `rounds` and the overflow flags are unchanged and every rung yields the same pairs in the
+same order (`test_wavefront_ladder_is_bit_identical_to_the_full_width_body`). Slot work drops 4.4-5.5x at
+leaf 32-64; the per-round launch floor stays. `wavefront_ladder=False` (or `YGGDRAX_MUTUAL_WALK_LADDER=0`,
+read at import) keeps the single-width body for A/B runs; `bench/traversal_walk_bench.py --no-ladder`.
+
+What remains is the launch floor itself: 28-40 kernels per round (GPU HLO of the loop body: ~25 fusions, 3
+queue-sized copies from the fresh-queue pattern, the far/near/push prefix scans and six scatters), times 55-61
+rounds -- about 2,200 launches per walk. At the ~5 us an A100 spends per small kernel inside a `while_loop`
+that is ~11 ms, which is the whole of the 13.4 ms measured at leaf 64 / Q = 2^18. The ladder removes the
+slot work above that floor; lowering the floor means fewer kernels per round (one prefix scan for the three
+lists, one scatter per list with the pair packed, no fresh-queue copy) or fewer rounds (two tree levels per
+round), which is the next lever.
+
+### What the ladder bought (idle A100, N=200k Plummer, p=4, int32, 2026-09-11)
+
+Isolated walk (`bench/results/walk_{ladder,noladder}_leaf{64,32}.json`, min of 7; same pair counts, same rounds):
+
+| leaf | Q | rounds | full width | ladder | gain |
+|---|---|---|---|---|---|
+| 64 | 2^19 | 55 | 13.19 ms | 12.53 ms | 1.05x |
+| 32 | 2^20 | 61 | 21.31 ms | 16.12 ms | 1.32x |
+
+In the jaccpot fused step (`smallleaf_baseline.py --modes refresh`, flat walk + CSR M2L at their defaults; ladder
+off = `YGGDRAX_MUTUAL_WALK_LADDER=0`), ms/step at theta 0.6:
+
+| leaf | ladder off | ladder on | step trace (on) |
+|---|---|---|---|
+| 32 | 80.48 | **72.59** | downward 54.8 -> 49.2 |
+| 64 | 62.60 | **59.26** | launches 4623 -> 4464/step; scatter 4.27 -> 2.67, reduce 2.10 -> 0.70 ms |
+| 128 | (71.3 earlier) | 69.04 | |
+| 32, theta 0.8 | (53.6 earlier) | 50.40 | |
+
+The ladder cut the slot work 5x but the walk only 1.05x (leaf 64) to 1.3x (leaf 32): the per-round launch floor
+is the wall it was predicted to be. At leaf 64 the walk costs 12.5 ms for 55 rounds -- 0.23 ms per round, ~40
+kernels -- which is the launch floor almost exactly. The per-step optimum stays at leaf 64 (59.3 vs 72.6 at leaf
+32 and 69.0 at leaf 128). What the launch-floor plan can still buy is bounded: a free walk would take leaf 64 to
+~47 ms and leaf 32 to ~57 ms -- at leaf 32 the CSR M2L over 2.34M directed far pairs (~28 ms at 12 ns/pair) and
+the list build are now larger than the walk.
 
 ## Reproduce
 
