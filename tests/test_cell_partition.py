@@ -35,7 +35,9 @@ def _sorted_codes(n, seed=0, duplicates=0):
     return jnp.sort(codes)
 
 
-def _check_partition(codes_np, starts, ends, depths, leaf_size, max_level=MORTON_LEVELS):
+def _check_partition(
+    codes_np, starts, ends, depths, leaf_size, max_level=MORTON_LEVELS
+):
     n = codes_np.shape[0]
     assert starts[0] == 0 and ends[-1] == n
     assert np.all(ends[:-1] == starts[1:]), "leaves tile the particles"
@@ -57,7 +59,9 @@ def _check_partition(codes_np, starts, ends, depths, leaf_size, max_level=MORTON
 @pytest.mark.parametrize("leaf_size", [8, 32])
 def test_numpy_reference_is_a_valid_coarsest_cell_partition(leaf_size):
     codes = np.asarray(_sorted_codes(4096, seed=1)).astype(np.uint64)
-    starts, ends, depths = adaptive_cell_leaf_partition_numpy(codes, leaf_size=leaf_size)
+    starts, ends, depths = adaptive_cell_leaf_partition_numpy(
+        codes, leaf_size=leaf_size
+    )
     _check_partition(codes, starts, ends, depths, leaf_size)
 
 
@@ -65,7 +69,9 @@ def test_numpy_reference_is_a_valid_coarsest_cell_partition(leaf_size):
 def test_device_partition_matches_numpy_and_pads(leaf_size):
     codes = _sorted_codes(4096, seed=2)
     codes_np = np.asarray(codes).astype(np.uint64)
-    s_ref, e_ref, d_ref = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=leaf_size)
+    s_ref, e_ref, d_ref = adaptive_cell_leaf_partition_numpy(
+        codes_np, leaf_size=leaf_size
+    )
     cap = int(s_ref.size) + 37
     part = adaptive_cell_leaf_partition(codes, leaf_size=leaf_size, capacity=cap)
     k = int(part.num_leaves)
@@ -81,8 +87,12 @@ def test_device_partition_matches_numpy_and_pads(leaf_size):
 
 def test_overflow_is_flagged_not_silent():
     codes = _sorted_codes(2048, seed=3)
-    s_ref, _, _ = adaptive_cell_leaf_partition_numpy(np.asarray(codes).astype(np.uint64), leaf_size=8)
-    part = adaptive_cell_leaf_partition(codes, leaf_size=8, capacity=int(s_ref.size) // 2)
+    s_ref, _, _ = adaptive_cell_leaf_partition_numpy(
+        np.asarray(codes).astype(np.uint64), leaf_size=8
+    )
+    part = adaptive_cell_leaf_partition(
+        codes, leaf_size=8, capacity=int(s_ref.size) // 2
+    )
     assert bool(part.overflow)
     assert int(part.num_leaves) == s_ref.size
 

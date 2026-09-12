@@ -973,7 +973,9 @@ def rebuild_static_radix_tree_from_template(
             f"{STATIC_RADIX_LEAF_PARTITIONS}, got {leaf_partition!r}"
         )
     if return_overflow and leaf_partition != "cells":
-        raise ValueError("return_overflow is only meaningful for leaf_partition='cells'")
+        raise ValueError(
+            "return_overflow is only meaningful for leaf_partition='cells'"
+        )
     if template.leaf_size is None or int(template.leaf_size) < 1:
         raise ValueError("static_radix template must declare a positive leaf_size")
     n = positions.shape[0]

@@ -141,23 +141,37 @@ def adaptive_cell_leaf_partition(
         is_boundary = agree < d
         start_idx = lax.cummax(jnp.where(is_boundary, idx, jnp.asarray(0, INDEX_DTYPE)))
         nxt = jnp.where(is_boundary, idx, n_i)
-        end_idx = jnp.concatenate([lax.cummin(nxt[1:], reverse=True), jnp.asarray([n], INDEX_DTYPE)])
+        end_idx = jnp.concatenate(
+            [lax.cummin(nxt[1:], reverse=True), jnp.asarray([n], INDEX_DTYPE)]
+        )
         occ = end_idx - start_idx
         fit = (occ <= leaf_size_i) & ~assigned
         depth = jnp.where(fit, jnp.asarray(d, INDEX_DTYPE), depth)
         assigned = assigned | fit
     shift_p = (3 * (MORTON_LEVELS - depth)).astype(jnp.uint64)
     key = jnp.right_shift(codes, shift_p)
-    first = jnp.concatenate([jnp.ones((1,), bool), (key[1:] != key[:-1]) | (depth[1:] != depth[:-1])])
+    first = jnp.concatenate(
+        [jnp.ones((1,), bool), (key[1:] != key[:-1]) | (depth[1:] != depth[:-1])]
+    )
     slot = jnp.cumsum(first.astype(INDEX_DTYPE)) - 1  # leaf index of each particle
     num_leaves = slot[-1] + 1 if n > 0 else jnp.asarray(0, INDEX_DTYPE)
     overflow = num_leaves > capacity
-    target = jnp.where(first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE))
+    target = jnp.where(
+        first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE)
+    )
     starts = jnp.full((capacity + 1,), n, INDEX_DTYPE).at[target].min(idx)[:capacity]
-    depths_out = jnp.full((capacity + 1,), -1, INDEX_DTYPE).at[target].max(depth)[:capacity]
+    depths_out = (
+        jnp.full((capacity + 1,), -1, INDEX_DTYPE).at[target].max(depth)[:capacity]
+    )
     live = jnp.arange(capacity, dtype=INDEX_DTYPE) < jnp.minimum(num_leaves, capacity)
     next_start = jnp.concatenate([starts[1:], jnp.asarray([n], INDEX_DTYPE)])
-    ends = jnp.where(live, jnp.where(jnp.arange(capacity) + 1 < jnp.minimum(num_leaves, capacity), next_start, n), n)
+    ends = jnp.where(
+        live,
+        jnp.where(
+            jnp.arange(capacity) + 1 < jnp.minimum(num_leaves, capacity), next_start, n
+        ),
+        n,
+    )
     starts = jnp.where(live, starts, n)
     depths_out = jnp.where(live, depths_out, -1)
     return CellLeafPartition(

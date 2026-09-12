@@ -44,8 +44,16 @@ def _check_tree(tree, n, cap, leaf_size):
     lc, rc = np.asarray(tree.left_child), np.asarray(tree.right_child)
     for i in range(num_internal):
         a, b = node_ranges[lc[i]], node_ranges[rc[i]]
-        lo = min(x[0] for x in (a, b) if x[1] >= x[0]) if (a[1] >= a[0] or b[1] >= b[0]) else n
-        hi = max(x[1] for x in (a, b) if x[1] >= x[0]) if (a[1] >= a[0] or b[1] >= b[0]) else n - 1
+        lo = (
+            min(x[0] for x in (a, b) if x[1] >= x[0])
+            if (a[1] >= a[0] or b[1] >= b[0])
+            else n
+        )
+        hi = (
+            max(x[1] for x in (a, b) if x[1] >= x[0])
+            if (a[1] >= a[0] or b[1] >= b[0])
+            else n - 1
+        )
         assert node_ranges[i, 0] == lo and node_ranges[i, 1] == hi
     # padding leaves are dead: empty ranges and depth -1
     assert np.all(np.asarray(tree.leaf_depths)[k:] == -1)
@@ -63,22 +71,34 @@ def test_cells_tree_has_cell_leaves_padded_to_capacity(leaf_size):
     s_ref, _, _ = adaptive_cell_leaf_partition_numpy(codes, leaf_size=leaf_size)
     cap = int(s_ref.size) + 50
     tree, ps, ms, inv, overflow = build_static_cells_tree(
-        P, M, bounds, leaf_size=leaf_size, leaf_capacity=cap, return_reordered=True, return_overflow=True
+        P,
+        M,
+        bounds,
+        leaf_size=leaf_size,
+        leaf_capacity=cap,
+        return_reordered=True,
+        return_overflow=True,
     )
     assert not bool(overflow)
     k = _check_tree(tree, n, cap, leaf_size)
     assert k == s_ref.size
     assert tree.leaf_size == leaf_size and int(tree.leaf_codes.shape[0]) == cap
     # sorted order really is Morton order of the original particles
-    assert np.array_equal(np.asarray(ps), np.asarray(P)[np.asarray(tree.particle_indices)])
-    assert np.array_equal(np.asarray(inv)[np.asarray(tree.particle_indices)], np.arange(n))
+    assert np.array_equal(
+        np.asarray(ps), np.asarray(P)[np.asarray(tree.particle_indices)]
+    )
+    assert np.array_equal(
+        np.asarray(inv)[np.asarray(tree.particle_indices)], np.arange(n)
+    )
 
 
 def test_overflow_flag_when_capacity_is_too_small():
     n = 3000
     P = jnp.asarray(_plummer(n, 1), jnp.float32)
     M = jnp.ones((n,), jnp.float32)
-    tree, overflow = build_static_cells_tree(P, M, infer_bounds(P), leaf_size=8, leaf_capacity=64, return_overflow=True)
+    tree, overflow = build_static_cells_tree(
+        P, M, infer_bounds(P), leaf_size=8, leaf_capacity=64, return_overflow=True
+    )
     assert bool(overflow)
     assert int(tree.leaf_codes.shape[0]) == 64
 
@@ -91,8 +111,12 @@ def test_partition_knob_and_template_rebuild_trace():
     with pytest.raises(ValueError):
         build_static_radix_tree(P, M, bounds, leaf_size=32, leaf_partition="cells")
     with pytest.raises(ValueError):
-        build_static_radix_tree(P, M, bounds, leaf_size=32, leaf_partition="hex", leaf_capacity=8)
-    tree = build_static_radix_tree(P, M, bounds, leaf_size=32, leaf_partition="cells", leaf_capacity=1024)
+        build_static_radix_tree(
+            P, M, bounds, leaf_size=32, leaf_partition="hex", leaf_capacity=8
+        )
+    tree = build_static_radix_tree(
+        P, M, bounds, leaf_size=32, leaf_partition="cells", leaf_capacity=1024
+    )
     cap = int(tree.leaf_codes.shape[0])
     assert cap == 1024
     # buckets are untouched
@@ -104,12 +128,19 @@ def test_partition_knob_and_template_rebuild_trace():
     @jax.jit
     def refresh(pos):
         t, ps, ms, inv, over = rebuild_static_radix_tree_from_template(
-            pos, M, tree, return_reordered=True, leaf_partition="cells", return_overflow=True
+            pos,
+            M,
+            tree,
+            return_reordered=True,
+            leaf_partition="cells",
+            return_overflow=True,
         )
         return t.node_ranges, t.parent, over
 
     ranges2, parent2, over2 = refresh(P2)
     assert not bool(over2)
-    assert ranges2.shape == tree.node_ranges.shape and parent2.shape == tree.parent.shape
+    assert (
+        ranges2.shape == tree.node_ranges.shape and parent2.shape == tree.parent.shape
+    )
     with pytest.raises(ValueError):
         rebuild_static_radix_tree_from_template(P2, M, bt, return_overflow=True)
