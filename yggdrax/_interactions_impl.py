@@ -6574,15 +6574,6 @@ def dual_tree_walk_mutual(
         ``dehnen`` (they differ from the strict rule only on exact equality) and
         the Engblom form -- so a caller that feeds the dual walk's own
         ``mac_extents`` gets the dual walk's far and near lists as sets. Static.
-    wavefront_ladder:
-        Compile the round body for the static widths of
-        :func:`_wavefront_ladder` and let each round run at the narrowest width
-        that holds its live wavefront. ``False`` runs every round at the full
-        ``max_pair_queue`` width. ``None`` (default) takes
-        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
-        the same pairs in the same order -- and differ only in per-round cost
-        and compile time. Static.
-
     node_active:
         Optional ``(total_nodes,)`` boolean mask. A pair whose target or source
         node is inactive is DEAD: never accepted, never a near pair, never
@@ -6591,6 +6582,14 @@ def dual_tree_walk_mutual(
         at one centre and radius zero they otherwise fail the MAC against each
         other and flood the near list. ``None`` = every node active (no extra
         gathers; bit-identical to the walk without the argument).
+    wavefront_ladder:
+        Compile the round body for the static widths of
+        :func:`_wavefront_ladder` and let each round run at the narrowest width
+        that holds its live wavefront. ``False`` runs every round at the full
+        ``max_pair_queue`` width. ``None`` (default) takes
+        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
+        the same pairs in the same order -- and differ only in per-round cost
+        and compile time. Static.
 
     Returns
     -------

@@ -9,7 +9,7 @@ import math
 import os
 from collections import deque
 from functools import partial
-from typing import NamedTuple, Optional, Union
+from typing import Any, NamedTuple, Optional, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -734,20 +734,20 @@ def build_static_cells_tree(
 
     Parameters
     ----------
-    positions : Array
+    positions
         Particle positions ``(n, 3)``.
-    masses : Array
+    masses
         Particle masses ``(n,)``.
-    bounds : Bounds
+    bounds
         Morton domain ``(min_corner, max_corner)``.
-    leaf_size : int
+    leaf_size
         Maximum particles per leaf (the leaf table width downstream).
-    leaf_capacity : int
+    leaf_capacity
         Static leaf count the tree is padded to.
-    return_reordered : bool
+    return_reordered
         Also return the Morton-ordered positions, masses and the inverse
         permutation.
-    return_overflow : bool
+    return_overflow
         Also return the partition's overflow flag (a traced bool): ``True``
         when more than ``leaf_capacity`` leaves were needed, in which case the
         tree does NOT cover every particle. Eager callers must raise on it;
@@ -784,7 +784,13 @@ def build_static_cells_tree(
     # padding leaves take the largest code: the Karras split puts them in one
     # subtree at the right end, ties broken by index inside it
     sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
-    leaf_codes = jnp.where(live, sorted_codes[safe_start], sentinel)
+    # `cast`, not a runtime conversion: jax's stubs declare `jnp.where` as returning
+    # `Array | tuple[Array, ...]` -- the tuple is the one-argument (nonzero) form --
+    # so this three-argument call is an `Array` at runtime but a union to the checker,
+    # and `leaf_codes_override` below is annotated `Optional[Array]`. Narrow at the
+    # source rather than widening the parameter to a type it cannot accept (the
+    # codebase's existing idiom; see `cross_walk.py`, `tree.py`, `octree_uvwx.py`).
+    leaf_codes = cast(Array, jnp.where(live, sorted_codes[safe_start], sentinel))
     out = _build_tree_from_leaf_partitions(
         positions,
         masses,
@@ -801,8 +807,11 @@ def build_static_cells_tree(
         leaf_codes_override=leaf_codes,
         leaf_depths_override=part.leaf_depths,
     )
-    # a bare RadixTree is itself a NamedTuple: test for the container first
-    outputs = [out] if isinstance(out, RadixTree) else list(out)
+    # a bare RadixTree is itself a NamedTuple: test for the container first.
+    # Annotated `list[Any]` because the list is genuinely heterogeneous -- a
+    # `RadixTree` followed by plain arrays -- which pyright would otherwise pin to
+    # `list[RadixTree]` from the first element (as in `octree_uvwx.py`).
+    outputs: list[Any] = [out] if isinstance(out, RadixTree) else list(out)
     if return_overflow:
         outputs.append(part.overflow)
     return tuple(outputs) if len(outputs) > 1 else outputs[0]

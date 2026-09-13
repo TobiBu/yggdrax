@@ -87,14 +87,14 @@ def adaptive_cell_leaf_partition(
 
     Parameters
     ----------
-    sorted_codes : Array
+    sorted_codes
         Morton codes in nondecreasing order, ``(n,)``, ``uint64`` (21 bits per
         axis).
-    leaf_size : int
+    leaf_size
         Maximum particles per leaf. Static.
-    capacity : int
+    capacity
         Static leaf capacity the arrays are padded to.
-    max_level : int
+    max_level
         Deepest level examined; cells at this level are leaves whatever they
         hold. Static, at most :data:`MORTON_LEVELS`.
 
@@ -190,11 +190,11 @@ def adaptive_cell_leaf_partition_numpy(
 
     Parameters
     ----------
-    sorted_codes : np.ndarray
+    sorted_codes
         Morton codes in nondecreasing order, ``uint64``.
-    leaf_size : int
+    leaf_size
         Maximum particles per leaf.
-    max_level : int
+    max_level
         Deepest level examined.
 
     Returns
