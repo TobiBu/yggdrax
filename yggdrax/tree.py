@@ -1985,6 +1985,7 @@ def rebuild_static_radix_tree_from_template(
     return_reordered: bool = False,
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
+    num_valid: Optional[Array] = None,
 ):
     """Refresh particles using an existing static-radix data structure.
 
@@ -1992,6 +1993,9 @@ def rebuild_static_radix_tree_from_template(
     template's leaf capacity and width (see
     :func:`yggdrax._tree_impl.build_static_cells_tree`); ``return_overflow``
     then appends the partition's overflow flag to the returned tuple.
+
+    ``num_valid`` is the live row count of a capacity-padded shard (the
+    distributed lane); ``None`` treats every row as live. Cells only.
     """
 
     if isinstance(template, RadixTree):
@@ -2011,6 +2015,7 @@ def rebuild_static_radix_tree_from_template(
         return_reordered=return_reordered,
         leaf_partition=leaf_partition,
         return_overflow=return_overflow,
+        num_valid=num_valid,
     )
     overflow = None
     if return_overflow:
