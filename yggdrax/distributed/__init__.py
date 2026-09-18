@@ -19,6 +19,7 @@ from .comm import (
     resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
+from .export import ExportLists, export_walk
 from .let import (
     ClassifyMetrics,
     CoarseFrontier,
@@ -71,6 +72,8 @@ __all__ = [
     "device_count",
     "distributed_let_import",
     "distributed_tree_moments",
+    "ExportLists",
+    "export_walk",
     "TreeSummary",
     "occupancy_cut",
     "subtree_leaf_counts",
