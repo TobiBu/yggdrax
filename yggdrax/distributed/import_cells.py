@@ -36,7 +36,13 @@ from ..dtypes import INDEX_DTYPE, as_index
 from .comm import ragged_all_to_all_exchange
 from .sharding import AXIS_NAME
 
-__all__ = ["ImportedCells", "exchange_export_list", "rebase_csr"]
+__all__ = [
+    "ImportedCells",
+    "ReceiverLists",
+    "exchange_export_list",
+    "rebase_csr",
+    "receiver_interaction_lists",
+]
 
 
 class ImportedCells(NamedTuple):
@@ -183,4 +189,148 @@ def exchange_export_list(
         num_csr=jnp.sum(as_index(csr_recv_sizes), dtype=INDEX_DTYPE),
         payload_sizes=as_index(payload_sizes),
         csr_sizes=as_index(csr_recv_sizes),
+    )
+
+
+class ReceiverLists(NamedTuple):
+    """The receiver's own interaction lists against the imported set.
+
+    Attributes
+    ----------
+    far_target, far_source:
+        ``(far_cap,)`` LOCAL node and imported PAYLOAD ROW, ``-1``-padded. Feed
+        straight to an M2L over ``[local ; imported]`` with ``n_targets = n_local``.
+    far_count:
+        Live far pairs.
+    near_target, near_source:
+        ``(near_cap,)`` local LEAF and imported payload row.
+    near_count:
+        Live near pairs.
+    far_overflow, near_overflow, queue_overflow:
+        **Must be read.**
+    """
+
+    far_target: Array
+    far_source: Array
+    far_count: Array
+    near_target: Array
+    near_source: Array
+    near_count: Array
+    far_overflow: Array
+    near_overflow: Array
+    queue_overflow: Array
+
+
+def receiver_interaction_lists(
+    left_child_full: Array,
+    right_child_full: Array,
+    centers: Array,
+    extents: Array,
+    n_local: int,
+    cell_roots: Array,
+    csr_cell: Array,
+    csr_row: Array,
+    num_csr: Array,
+    theta: float,
+    *,
+    max_pair_queue: int,
+    far_cap: int,
+    near_cap: int,
+    mac_type: str = "dehnen",
+    node_active: Array | None = None,
+) -> ReceiverLists:
+    """Expand the imported per-cell lists down to this device's own targets.
+
+    The sender decided at the granularity of a CELL. Every target inside that cell is
+    smaller than it, so anything the cell accepted is acceptable for the target, and
+    anything it refused gets refined here -- locally, because the imported entries
+    carry no children. The walk is seeded once per imported CSR entry with
+    ``(local root of that cell, imported entry)``.
+
+    **Per cell, never over the pooled import.** A cell's list is a cut, so each target
+    below it receives a partition of the sender. The pooled union of all cells is NOT
+    a cut -- different cells accept at different depths, so it holds nodes together
+    with their own descendants -- and seeding against it double-counts on every target
+    leaf while leaving momentum exact. That is measured, not feared.
+
+    Parameters
+    ----------
+    left_child_full, right_child_full:
+        ``(n_local + n_import,)`` children over the COMBINED space: the local tree
+        first, then the imported entries with ``-1`` children.
+    centers, extents:
+        ``(n_local + n_import, 3)`` and ``(n_local + n_import,)``, likewise combined.
+    n_local:
+        Where the imported block begins. Static, and load-bearing: it is what makes
+        every local index sort below every imported one, which is what turns the
+        walk's ``(min, max)`` canonicalisation into an exact (target, source)
+        ordering.
+    cell_roots:
+        ``(max_cells,)`` local node index of each of THIS device's summary cells --
+        its own :class:`~yggdrax.distributed.summary.TreeSummary.cells`.
+    csr_cell, csr_row, num_csr:
+        The imported CSR, with ``csr_row`` already re-offset by :func:`rebase_csr`.
+    theta:
+        MAC parameter, matching the one the sender exported under.
+    max_pair_queue, far_cap, near_cap:
+        Static capacities. The seed alone is ``num_csr`` pairs wide, so the queue
+        must exceed the CSR length.
+    mac_type:
+        MAC variant. Static.
+    node_active:
+        Optional ``(n_local + n_import,)`` mask over the combined space.
+
+    Returns
+    -------
+    ReceiverLists
+        Far and near pairs as (local node, imported payload row).
+    """
+    from ..interactions import dual_tree_walk_mutual
+
+    idx = jnp.asarray(left_child_full).dtype
+    K = int(jnp.asarray(csr_cell).shape[0])
+    nl = as_index(n_local)
+
+    slot = jnp.arange(K, dtype=INDEX_DTYPE)
+    live = (slot < as_index(num_csr)) & (as_index(csr_cell) >= 0)
+    seed_a = jnp.where(
+        live, as_index(cell_roots)[jnp.where(live, as_index(csr_cell), 0)], as_index(-1)
+    )
+    seed_b = jnp.where(live, nl + as_index(csr_row), as_index(-1))
+
+    res = dual_tree_walk_mutual(
+        jnp.asarray(left_child_full),
+        jnp.asarray(right_child_full),
+        jnp.asarray(centers),
+        jnp.asarray(extents),
+        theta,
+        jnp.asarray(0, idx),  # unused: the seed replaces the root pair
+        max_pair_queue=max_pair_queue,
+        far_cap=far_cap,
+        near_cap=near_cap,
+        mac_type=mac_type,  # pyright: ignore[reportArgumentType]
+        node_active=node_active,
+        seed_a=seed_a.astype(idx),
+        seed_b=seed_b.astype(idx),
+    )
+
+    def split(a, b, n):
+        keep = jnp.arange(a.shape[0], dtype=idx) < n
+        return (
+            jnp.where(keep, a, as_index(-1).astype(idx)),
+            jnp.where(keep, b - nl.astype(idx), as_index(-1).astype(idx)),
+        )
+
+    far_t, far_s = split(res.far_a, res.far_b, res.far_count)
+    near_t, near_s = split(res.near_a, res.near_b, res.near_count)
+    return ReceiverLists(
+        far_target=far_t,
+        far_source=far_s,
+        far_count=res.far_count,
+        near_target=near_t,
+        near_source=near_s,
+        near_count=res.near_count,
+        far_overflow=res.far_overflow,
+        near_overflow=res.near_overflow,
+        queue_overflow=res.queue_overflow,
     )
