@@ -48,6 +48,7 @@ from .partition import (
     sfc_partition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
+from .summary import TreeSummary, occupancy_cut, subtree_leaf_counts
 
 __all__ = [
     "AXIS_NAME",
@@ -70,6 +71,9 @@ __all__ = [
     "device_count",
     "distributed_let_import",
     "distributed_tree_moments",
+    "TreeSummary",
+    "occupancy_cut",
+    "subtree_leaf_counts",
     "dual_tree_walk_cross",
     "dual_tree_walk_cross_impl",
     "equalize_domain",
