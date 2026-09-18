@@ -307,3 +307,118 @@ def test_shape_validation():
             far_cap=1 << 12,
             near_cap=1 << 12,
         )
+
+
+# --------------------------------------------------------------- send buffers
+
+
+def _buffers(res, which, ndev, cap, n_nodes, node_capacity=4096, csr_capacity=1 << 16):
+    from yggdrax.distributed.export import build_send_buffers
+
+    c, n, k = (
+        (res.far_cell, res.far_node, res.far_count)
+        if which == "far"
+        else (res.near_cell, res.near_node, res.near_count)
+    )
+    return build_send_buffers(
+        c,
+        n,
+        k,
+        ndev=ndev,
+        max_cells=cap,
+        num_nodes=n_nodes,
+        node_capacity=node_capacity,
+        csr_capacity=csr_capacity,
+    )
+
+
+def _decode(sb, ndev):
+    """Reconstruct, per destination, the (receiver cell, sender node) pairs sent.
+
+    Reads the buffers exactly as the RECEIVER will: take this device's block, index
+    `csr_row` into it, and never look at anything outside the block.
+    """
+    nr = np.asarray(sb.node_rows)
+    ns = np.asarray(sb.node_sizes)
+    cc, cr, cs = (
+        np.asarray(sb.csr_cell),
+        np.asarray(sb.csr_row),
+        np.asarray(sb.csr_sizes),
+    )
+    n_off = np.concatenate([[0], np.cumsum(ns)])
+    c_off = np.concatenate([[0], np.cumsum(cs)])
+    out = {}
+    for d in range(ndev):
+        block = nr[n_off[d] : n_off[d] + ns[d]]
+        pairs = set()
+        for j in range(c_off[d], c_off[d] + cs[d]):
+            assert 0 <= cr[j] < ns[d], "csr_row must index inside this device's block"
+            pairs.add((int(cc[j]), int(block[cr[j]])))
+        out[d] = (pairs, block)
+    return out
+
+
+@pytest.mark.parametrize("which", ["far", "near"])
+@pytest.mark.parametrize("ndev", [2, 3])
+def test_the_buffers_round_trip_to_the_pairs_the_walk_emitted(which, ndev):
+    """Everything sent, nothing invented, and addressable from the block alone."""
+    doms = _domains(ndev)
+    cen, rad, act, cap, _ = _summaries(doms)
+    me = 0
+    res = _run(doms, me, cen, rad, act)
+    n_nodes = int(doms[me][0].parent.shape[0])
+    sb = _buffers(res, which, ndev, cap, n_nodes)
+    assert not (bool(sb.node_overflow) or bool(sb.csr_overflow))
+
+    f, n = _pairs(res)
+    want = f if which == "far" else n
+    got = _decode(sb, ndev)
+    for d in range(ndev):
+        expect = {(c - d * cap, node) for c, node in want if c // cap == d}
+        assert got[d][0] == expect
+    assert sum(len(got[d][0]) for d in range(ndev)) == len(want)
+
+
+@pytest.mark.parametrize("which", ["far", "near"])
+def test_each_node_is_shipped_once_per_destination(which):
+    """The point of splitting payload from CSR: pay for a node once, refer often."""
+    doms = _domains(3)
+    cen, rad, act, cap, _ = _summaries(doms)
+    res = _run(doms, 0, cen, rad, act)
+    n_nodes = int(doms[0][0].parent.shape[0])
+    sb = _buffers(res, which, 3, cap, n_nodes)
+    got = _decode(sb, 3)
+    total_refs = 0
+    for d in range(3):
+        pairs, block = got[d]
+        assert len(set(block.tolist())) == len(block), f"device {d} got a node twice"
+        assert set(block.tolist()) == {node for _c, node in pairs}
+        total_refs += len(pairs)
+    shipped = int(np.asarray(sb.node_sizes).sum())
+    assert shipped > 0
+    if total_refs:
+        assert total_refs >= shipped  # references are never fewer than payloads
+
+
+def test_the_padding_is_not_addressable():
+    doms = _domains(2)
+    cen, rad, act, cap, _ = _summaries(doms)
+    res = _run(doms, 0, cen, rad, act)
+    n_nodes = int(doms[0][0].parent.shape[0])
+    sb = _buffers(res, "far", 2, cap, n_nodes)
+    ns = np.asarray(sb.node_sizes)
+    cs = np.asarray(sb.csr_sizes)
+    nr, cc = np.asarray(sb.node_rows), np.asarray(sb.csr_cell)
+    assert np.all(nr[int(ns.sum()) :] == -1)
+    assert np.all(cc[int(cs.sum()) :] == -1)
+
+
+@pytest.mark.parametrize("field", ["node", "csr"])
+def test_send_capacity_overflow_is_reported(field):
+    doms = _domains(2)
+    cen, rad, act, cap, _ = _summaries(doms)
+    res = _run(doms, 0, cen, rad, act)
+    n_nodes = int(doms[0][0].parent.shape[0])
+    kw = {"node_capacity": 2} if field == "node" else {"csr_capacity": 2}
+    sb = _buffers(res, "far", 2, cap, n_nodes, **kw)
+    assert bool(sb.node_overflow if field == "node" else sb.csr_overflow)

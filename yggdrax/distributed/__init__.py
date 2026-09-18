@@ -19,7 +19,8 @@ from .comm import (
     resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
-from .export import ExportLists, export_walk
+from .export import ExportLists, SendBuffers, build_send_buffers, export_walk
+from .import_cells import ImportedCells, exchange_export_list, rebase_csr
 from .let import (
     ClassifyMetrics,
     CoarseFrontier,
@@ -73,7 +74,12 @@ __all__ = [
     "distributed_let_import",
     "distributed_tree_moments",
     "ExportLists",
+    "ImportedCells",
+    "SendBuffers",
+    "build_send_buffers",
+    "exchange_export_list",
     "export_walk",
+    "rebase_csr",
     "TreeSummary",
     "occupancy_cut",
     "subtree_leaf_counts",

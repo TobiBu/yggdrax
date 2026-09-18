@@ -34,13 +34,14 @@ from __future__ import annotations
 
 from typing import NamedTuple, Optional
 
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
 from ..dtypes import INDEX_DTYPE, as_index
 from ..interactions import dual_tree_walk_mutual
 
-__all__ = ["ExportLists", "export_walk"]
+__all__ = ["ExportLists", "SendBuffers", "build_send_buffers", "export_walk"]
 
 
 class ExportLists(NamedTuple):
@@ -213,4 +214,159 @@ def export_walk(
         far_overflow=res.far_overflow,
         near_overflow=res.near_overflow,
         queue_overflow=res.queue_overflow,
+    )
+
+
+class SendBuffers(NamedTuple):
+    """One export list, laid out for :func:`ragged_all_to_all_exchange`.
+
+    Rows destined for device ``i`` form a contiguous block starting at
+    ``exclusive_cumsum(sizes)[i]``, which is the layout that primitive requires.
+
+    Attributes
+    ----------
+    node_rows:
+        ``(node_capacity,)`` LOCAL node indices to ship, deduplicated per
+        destination and grouped by it. ``-1`` in the padding.
+    node_sizes:
+        ``(ndev,)`` rows destined for each device.
+    csr_cell:
+        ``(csr_capacity,)`` the RECEIVER's own cell index, already rebased out of
+        the global cell block, so the receiver reads it without knowing who sent it.
+    csr_row:
+        ``(csr_capacity,)`` which row of the block that receiver will receive holds
+        this entry's node. Rebased the same way: an index into what the receiver
+        gets, not into the sender's buffer.
+    csr_sizes:
+        ``(ndev,)`` CSR entries destined for each device.
+    node_overflow, csr_overflow:
+        **Must be read.** A truncated send drops somebody's force silently.
+    """
+
+    node_rows: Array
+    node_sizes: Array
+    csr_cell: Array
+    csr_row: Array
+    csr_sizes: Array
+    node_overflow: Array
+    csr_overflow: Array
+
+
+def build_send_buffers(
+    cell: Array,
+    node: Array,
+    count: Array,
+    *,
+    ndev: int,
+    max_cells: int,
+    num_nodes: int,
+    node_capacity: int,
+    csr_capacity: int,
+) -> SendBuffers:
+    """Group one export list by destination and deduplicate its payload.
+
+    A node named by many of a receiver's cells is SHIPPED ONCE and referenced many
+    times: that is the whole reason the payload and the CSR are separate objects. The
+    measured duplication is 3-25 references per node, and a CSR entry is 4 bytes
+    against 120-164 for a node payload, so this is what keeps the exchange one round
+    instead of a per-pair broadcast.
+
+    Everything is a sort and two scans -- no per-device loop, so the cost does not
+    grow with the mesh.
+
+    Parameters
+    ----------
+    cell, node, count:
+        One list out of :class:`ExportLists` -- far or near, never both, because
+        their payloads are different objects (a multipole against particles).
+    ndev, max_cells:
+        Mesh size and the common summary capacity; ``cell // max_cells`` is the
+        destination and ``cell % max_cells`` the receiver's own cell index.
+    num_nodes:
+        Local node count, used only to key the sort. Static.
+    node_capacity, csr_capacity:
+        Static send-buffer lengths. Read the overflow flags.
+
+    Returns
+    -------
+    SendBuffers
+        Grouped, deduplicated, and rebased into the receiver's frame.
+    """
+    idx = jnp.asarray(node).dtype
+    P = int(jnp.asarray(cell).shape[0])
+    ndev_i, mc = as_index(ndev), as_index(max_cells)
+
+    live = (jnp.arange(P, dtype=INDEX_DTYPE) < as_index(count)) & (
+        jnp.asarray(cell) >= 0
+    )
+    dev = jnp.where(live, as_index(cell) // mc, ndev_i)
+    # dead rows sort last, so the live prefix is contiguous and grouped by device
+    key = dev * as_index(num_nodes + 1) + jnp.where(
+        live, as_index(node), as_index(num_nodes)
+    )
+    order = jnp.argsort(key, stable=True)
+    s_dev, s_node, s_cell = dev[order], jnp.asarray(node)[order], as_index(cell)[order]
+    s_live = s_dev < ndev_i
+
+    first = (
+        jnp.concatenate(
+            [
+                jnp.ones((1,), bool),
+                (s_dev[1:] != s_dev[:-1]) | (s_node[1:] != s_node[:-1]),
+            ]
+        )
+        & s_live
+    )
+    # position of each kept node among all kept nodes, in destination order
+    g_row = jnp.cumsum(first.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
+
+    node_sizes = jax.ops.segment_sum(
+        first.astype(INDEX_DTYPE),
+        jnp.where(s_live, s_dev, ndev_i),
+        num_segments=ndev + 1,
+    )[:ndev]
+    node_offsets = jnp.concatenate(
+        [jnp.zeros((1,), INDEX_DTYPE), jnp.cumsum(node_sizes, dtype=INDEX_DTYPE)[:-1]]
+    )
+
+    n_nodes_out = jnp.sum(node_sizes, dtype=INDEX_DTYPE)
+    keep = first & (g_row < as_index(node_capacity))
+    node_rows = (
+        jnp.full((node_capacity,), -1, dtype=idx)
+        .at[jnp.where(keep, g_row, as_index(node_capacity))]
+        .set(s_node, mode="drop")
+    )
+
+    n_csr = jnp.sum(s_live.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    pos = jnp.arange(P, dtype=INDEX_DTYPE)
+    csr_keep = s_live & (pos < as_index(csr_capacity))
+    safe = jnp.where(csr_keep, pos, as_index(csr_capacity))
+    # rebase BOTH columns into the receiver's frame: it must not need to know the
+    # sender's cell block or the sender's own buffer offsets to read this
+    csr_cell = (
+        jnp.full((csr_capacity,), -1, dtype=idx)
+        .at[safe]
+        .set((s_cell - s_dev * mc).astype(idx), mode="drop")
+    )
+    csr_row = (
+        jnp.full((csr_capacity,), -1, dtype=idx)
+        .at[safe]
+        .set(
+            (g_row - node_offsets[jnp.where(s_live, s_dev, 0)]).astype(idx), mode="drop"
+        )
+    )
+    csr_sizes = jax.ops.segment_sum(
+        s_live.astype(INDEX_DTYPE),
+        jnp.where(s_live, s_dev, ndev_i),
+        num_segments=ndev + 1,
+    )[:ndev]
+
+    return SendBuffers(
+        node_rows=node_rows,
+        node_sizes=node_sizes,
+        csr_cell=csr_cell,
+        csr_row=csr_row,
+        csr_sizes=csr_sizes,
+        node_overflow=n_nodes_out > as_index(node_capacity),
+        csr_overflow=n_csr > as_index(csr_capacity),
     )
