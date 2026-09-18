@@ -103,8 +103,14 @@ def _choose_pivots(
     return _align_pivots(all_samples[piv_idx], align_level)
 
 
-def _resort_by_code(positions, masses, codes, count):
-    """Re-sort a padded shard by Morton code (padding sentinel -> tail)."""
+def _resort_by_code(positions, masses, codes, count, payload=None):
+    """Re-sort a padded shard by Morton code (padding sentinel -> tail).
+
+    ``payload`` rides the SAME permutation, which is the whole point of routing it
+    here rather than reconstructing it afterwards: two particles may share a Morton
+    code, so a caller re-deriving the order from codes alone cannot recover which row
+    went where.
+    """
 
     order = jnp.argsort(codes)
     positions = positions[order]
@@ -114,11 +120,28 @@ def _resort_by_code(positions, masses, codes, count):
     valid = jnp.arange(cap) < count
     code_lo = jnp.min(jnp.where(valid, codes, _CODE_SENTINEL))
     code_hi = jnp.max(jnp.where(valid, codes, jnp.uint64(0)))
-    return positions, masses, codes, code_lo, code_hi
+    return (
+        positions,
+        masses,
+        codes,
+        code_lo,
+        code_hi,
+        None if payload is None else payload[order],
+    )
 
 
-def _route(positions, masses, codes, send_sizes, output_capacity, axis_name):
-    """Ragged-exchange a shard already grouped by destination device."""
+def _route(
+    positions, masses, codes, send_sizes, output_capacity, axis_name, payload=None
+):
+    """Ragged-exchange a shard already grouped by destination device.
+
+    ``payload`` is routed as a fourth round so that whatever identifies a particle
+    travels WITH it. Reconstructing it afterwards from a host-side array is the
+    documented way to get this wrong: the host order and the shard order coincide
+    only while ``capacity == count``, and `docs/distributed_padding_force_defect.md`
+    records what that looks like once they stop -- "plausible, smooth, and wrong by
+    tens of percent".
+    """
 
     pos_out, recv_sizes, _ = ragged_all_to_all_exchange(
         positions, send_sizes, output_capacity=output_capacity, axis_name=axis_name
@@ -137,7 +160,24 @@ def _route(positions, masses, codes, send_sizes, output_capacity, axis_name):
         fill_value=_CODE_SENTINEL,
     )
     count = jnp.sum(recv_sizes).astype(_COUNT_DTYPE)
-    return pos_out, mass_out[:, 0], code_out[:, 0], count
+    if payload is None:
+        return pos_out, mass_out[:, 0], code_out[:, 0], count, None
+    pl = jnp.asarray(payload)
+    flat = pl.reshape(pl.shape[0], -1)
+    pl_out, _, _ = ragged_all_to_all_exchange(
+        flat,
+        send_sizes,
+        output_capacity=output_capacity,
+        axis_name=axis_name,
+        fill_value=-1.0,
+    )
+    return (
+        pos_out,
+        mass_out[:, 0],
+        code_out[:, 0],
+        count,
+        pl_out.reshape((output_capacity,) + pl.shape[1:]).astype(pl.dtype),
+    )
 
 
 def sfc_partition(
@@ -150,12 +190,28 @@ def sfc_partition(
     num_samples: int = 8,
     align_level: Optional[int] = None,
     axis_name: str = AXIS_NAME,
+    payload: Optional[Array] = None,
 ):
     """Sample-sort this device's shard into contiguous Morton domains.
 
     Returns ``(positions, masses, codes, count)`` for this device: a padded
     shard (leading ``count`` rows valid, Morton-sorted) owning a contiguous
     code range disjoint from every other device's.
+
+    The fifth element is ``payload`` routed along the same exchange and permuted by
+    the same sorts, or ``None`` when none was given -- the arity is fixed either way,
+    because a return whose LENGTH depends on an argument cannot be type-checked at
+    the call sites.
+
+    Pass the global particle ids through it: a particle's identity has to travel WITH
+    the particle, because the input order and the shard order coincide only while
+    ``capacity == count``, and a host-side id array silently stops matching once they
+    diverge.
+
+    Parameters
+    ----------
+    payload:
+        Optional per-particle data to route alongside, e.g. global ids.
     """
 
     if bounds is None:
@@ -173,13 +229,23 @@ def sfc_partition(
     dest = jnp.searchsorted(pivots, codes, side="right").astype(_COUNT_DTYPE)
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
-    pos_out, mass_out, code_out, count = _route(
-        positions, masses, codes, send_sizes, output_capacity, axis_name
+    if payload is None:
+        pos_out, mass_out, code_out, count, _ = _route(
+            positions, masses, codes, send_sizes, output_capacity, axis_name
+        )
+        pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
+            pos_out, mass_out, code_out, count
+        )
+        return pos_out, mass_out, code_out, count, None
+
+    pl = jnp.asarray(payload)[order]
+    pos_out, mass_out, code_out, count, pl_out = _route(
+        positions, masses, codes, send_sizes, output_capacity, axis_name, payload=pl
     )
-    pos_out, mass_out, code_out, _, _ = _resort_by_code(
-        pos_out, mass_out, code_out, count
+    pos_out, mass_out, code_out, _, _, pl_out = _resort_by_code(
+        pos_out, mass_out, code_out, count, payload=pl_out
     )
-    return pos_out, mass_out, code_out, count
+    return pos_out, mass_out, code_out, count, pl_out
 
 
 def equalize_domain(
@@ -223,10 +289,10 @@ def equalize_domain(
     dest = jnp.where(valid, dest, ndev)  # drop padding rows from routing
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
-    pos_out, mass_out, code_out, new_count = _route(
+    pos_out, mass_out, code_out, new_count, _ = _route(
         positions, masses, codes, send_sizes, output_capacity, axis_name
     )
-    pos_out, mass_out, code_out, _, _ = _resort_by_code(
+    pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
         pos_out, mass_out, code_out, new_count
     )
     return pos_out, mass_out, code_out, new_count
@@ -261,7 +327,7 @@ def sfc_decompose(
     ndev = mesh.size
 
     def fn(pos, mass):
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,

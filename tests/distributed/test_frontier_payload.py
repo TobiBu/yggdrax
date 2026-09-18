@@ -57,7 +57,7 @@ def _run():
 
     def fn(pos, m):
         bounds = global_bounds(pos, axis_name=AXIS_NAME)
-        p_, m_, c_, cnt = sfc_partition(
+        p_, m_, c_, cnt, _g = sfc_partition(
             pos, m, _NDEV, output_capacity=_CAP, bounds=bounds, axis_name=AXIS_NAME
         )
         p_, m_ = sanitize_padding(p_, m_, cnt)
@@ -135,7 +135,7 @@ def test_omitting_the_payload_costs_nothing():
 
     def fn(pos, m):
         bounds = global_bounds(pos, axis_name=AXIS_NAME)
-        p_, m_, c_, cnt = sfc_partition(
+        p_, m_, c_, cnt, _g = sfc_partition(
             pos, m, _NDEV, output_capacity=_CAP, bounds=bounds, axis_name=AXIS_NAME
         )
         p_, m_ = sanitize_padding(p_, m_, cnt)
