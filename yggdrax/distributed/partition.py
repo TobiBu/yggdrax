@@ -455,11 +455,19 @@ def maybe_repartition(
 ):
     """Repartition under ``should``, with both branches the same shapes.
 
-    The branches must agree in shape or the ``lax.cond`` will not compile; they do,
-    because the shard is already ``output_capacity`` rows and stays so. That is why
-    this is a function rather than three lines at the call site -- the identity branch
-    has to reconstruct codes and re-pad the payload to match, and getting that wrong
-    is a recompile at best.
+    The branches must agree in shape AND in manual-axis variance, and the second is
+    the one that bites. ``sfc_partition`` ends in collectives, and under the NATIVE
+    ``ragged_all_to_all`` JAX infers its result as axis-INVARIANT, while the identity
+    branch passes through a sharded input and is ``{V:gpus}`` varying -- so the
+    ``cond`` is rejected for "manual axis types do not match" even though every shape
+    and dtype agrees. Both branches are therefore pushed to varying with
+    :func:`jax.lax.pcast`.
+
+    **This does not reproduce on forced CPU devices**, because
+    :func:`~yggdrax.distributed.comm.resolve_ragged_method` picks the ``buf``
+    all-gather fallback there and ``native`` on GPU, and the two infer variance
+    differently. Testing distributed code on forced CPU devices does not cover the
+    GPU tracing path.
 
     ``should`` must come from :func:`repartition_due`, or from something else that is
     mesh-uniform. A locally-computed predicate deadlocks.
@@ -481,29 +489,53 @@ def maybe_repartition(
     if bounds is None:
         bounds = global_bounds(positions, axis_name=axis_name)
 
+    def _to_varying(x):
+        """Make ``x`` axis-varying, whichever it already is.
+
+        ``pcast`` converts invariant -> varying and RAISES on an input that is
+        already varying, and the variance is not exposed as an attribute to test.
+        Which case applies depends on the backend -- the native
+        ``ragged_all_to_all`` leaves `sfc_partition`'s result invariant, the ``buf``
+        fallback leaves it varying -- so the branch is decided by trying it. This is
+        trace time; nothing is attempted at runtime.
+        """
+        if not hasattr(x, "shape"):
+            return x
+        try:
+            return jax.lax.pcast(x, axis_name, to="varying")
+        except (ValueError, TypeError):
+            return x
+
+    def _varying(tree):
+        return jax.tree.map(_to_varying, tree)
+
     def _do(_):
-        return sfc_partition(
-            positions,
-            masses,
-            ndev,
-            output_capacity=output_capacity,
-            bounds=bounds,
-            num_samples=num_samples,
-            align_level=None,
-            axis_name=axis_name,
-            payload=payload,
-            count=count,
+        return _varying(
+            sfc_partition(
+                positions,
+                masses,
+                ndev,
+                output_capacity=output_capacity,
+                bounds=bounds,
+                num_samples=num_samples,
+                align_level=None,
+                axis_name=axis_name,
+                payload=payload,
+                count=count,
+            )
         )
 
     def _keep(_):
         codes = morton_encode_impl(positions, bounds)
         valid = jnp.arange(codes.shape[0]) < count
-        return (
-            positions,
-            masses,
-            jnp.where(valid, codes, _CODE_SENTINEL),
-            count,
-            payload,
+        return _varying(
+            (
+                positions,
+                masses,
+                jnp.where(valid, codes, _CODE_SENTINEL),
+                count,
+                payload,
+            )
         )
 
     return jax.lax.cond(jnp.asarray(should), _do, _keep, operand=None)

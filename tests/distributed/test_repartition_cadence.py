@@ -1,5 +1,11 @@
 """The repartition cadence: one verdict for the whole mesh, or it deadlocks.
 
+RUN THIS ON REAL GPUs TOO, not only on forced CPU devices. `resolve_ragged_method`
+picks the `buf` all-gather fallback on CPU and the native `ragged_all_to_all` on GPU,
+and the two infer manual-axis VARIANCE differently -- `maybe_repartition`'s `lax.cond`
+was rejected on GPU for "manual axis types do not match" while passing on CPU, with
+every shape and dtype agreeing. Forced CPU devices do not cover the GPU tracing path.
+
 ``sfc_partition`` contains collectives. If one device repartitions and another does
 not, the first blocks on a collective the second never enters. A test cannot observe a
 deadlock without hanging, so what is tested is the property that prevents it: the
