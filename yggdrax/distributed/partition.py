@@ -91,11 +91,17 @@ def _choose_pivots(
     num_samples: int,
     axis_name: str,
     align_level: Optional[int],
+    count: Optional[Array] = None,
 ) -> Array:
-    """Sample-based splitter selection: returns ``ndev-1`` ascending pivots."""
+    """Sample-based splitter selection: returns ``ndev-1`` ascending pivots.
 
-    n = codes_sorted.shape[0]
-    idx = (jnp.arange(num_samples) * n) // num_samples
+    ``count`` restricts sampling to the live prefix. Sampling a padded shard at even
+    ranks over the whole array draws mostly the padding sentinel, which drags every
+    pivot to the top of the code range and sends the real particles to one device.
+    """
+
+    n = codes_sorted.shape[0] if count is None else count
+    idx = (jnp.arange(num_samples) * jnp.asarray(n)) // num_samples
     samples = codes_sorted[idx]
     all_samples = jnp.sort(jax.lax.all_gather(samples, axis_name, tiled=True))
     total = all_samples.shape[0]
@@ -191,6 +197,7 @@ def sfc_partition(
     align_level: Optional[int] = None,
     axis_name: str = AXIS_NAME,
     payload: Optional[Array] = None,
+    count: Optional[Array] = None,
 ):
     """Sample-sort this device's shard into contiguous Morton domains.
 
@@ -212,11 +219,23 @@ def sfc_partition(
     ----------
     payload:
         Optional per-particle data to route alongside, e.g. global ids.
+    count:
+        Live rows of an already-padded input. ``None`` treats every row as a
+        particle, which is right for a fresh decomposition and WRONG for
+        re-partitioning a shard that is already capacity-padded: the padding would
+        be routed as particles and push real ones out of the capacity. Measured --
+        it silently lost half the particles before this argument existed.
     """
 
     if bounds is None:
         bounds = global_bounds(positions_local, axis_name=axis_name)
     codes = morton_encode_impl(positions_local, bounds)
+    if count is not None:
+        # dead rows take the sentinel so the sort puts them last, and are then
+        # excluded from every destination: they are capacity, not particles
+        codes = jnp.where(
+            jnp.arange(codes.shape[0]) < jnp.asarray(count), codes, _CODE_SENTINEL
+        )
 
     # Local Morton sort -> particles become grouped by destination device
     # automatically, since both codes and pivots are ascending.
@@ -225,8 +244,13 @@ def sfc_partition(
     masses = masses_local[order]
     codes = codes[order]
 
-    pivots = _choose_pivots(codes, ndev, num_samples, axis_name, align_level)
+    pivots = _choose_pivots(
+        codes, ndev, num_samples, axis_name, align_level, count=count
+    )
     dest = jnp.searchsorted(pivots, codes, side="right").astype(_COUNT_DTYPE)
+    if count is not None:
+        live = jnp.arange(codes.shape[0]) < jnp.asarray(count)
+        dest = jnp.where(live, dest, _COUNT_DTYPE(ndev))
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
     if payload is None:
@@ -355,6 +379,131 @@ __all__ = [
     "ShardedDomain",
     "equalize_domain",
     "global_bounds",
+    "maybe_repartition",
+    "repartition_due",
     "sfc_decompose",
     "sfc_partition",
 ]
+
+
+def repartition_due(
+    count: Array,
+    capacity: int,
+    step: Array,
+    *,
+    interval: int = 16,
+    headroom: float = 0.9,
+    axis_name: str = AXIS_NAME,
+) -> Array:
+    """Whether to re-run :func:`sfc_partition` this step -- the SAME answer everywhere.
+
+    **The verdict must be mesh-uniform, and that is the whole point of this function.**
+    ``sfc_partition`` contains collectives: two ``all_gather`` rounds and a ragged
+    all-to-all. If one device repartitions and another does not, the first blocks on a
+    collective the second never enters and the mesh DEADLOCKS. So the drift test cannot
+    be the local ``count``; it is an all-reduced maximum over every device's occupancy.
+
+    Two triggers, both uniform by construction:
+
+    * **scheduled** -- every ``interval`` steps. Particles move, so device ownership
+      goes stale, but only on the dynamical time: the fused lane re-Morton-sorts and
+      rebuilds its local tree every step anyway, so drift WITHIN a domain is absorbed
+      for free and only the assignment needs refreshing. ``step`` is replicated, so
+      this needs no reduction.
+    * **drift guard** -- any device's ``count`` passing ``headroom`` of ``capacity``.
+      ``capacity`` is a compile-time constant that every shape depends on, so a count
+      reaching it is not a slowdown but an overflow.
+
+    Parameters
+    ----------
+    count:
+        This device's live particle count.
+    capacity:
+        The static shard capacity. Static.
+    step:
+        Step index, replicated across the mesh.
+    interval:
+        Scheduled cadence in steps. Static.
+    headroom:
+        Fraction of ``capacity`` above which the guard fires, regardless of schedule.
+    axis_name:
+        Mesh axis; must match the enclosing ``shard_map``.
+
+    Returns
+    -------
+    Array
+        Scalar bool, **identical on every device**.
+    """
+    frac = jnp.asarray(count, jnp.float32) / jnp.float32(max(int(capacity), 1))
+    worst = jax.lax.pmax(frac, axis_name)
+    scheduled = (jnp.asarray(step).astype(jnp.int32) % jnp.int32(int(interval))) == 0
+    return jnp.logical_or(scheduled, worst > jnp.float32(headroom))
+
+
+def maybe_repartition(
+    positions: Array,
+    masses: Array,
+    count: Array,
+    should: Array,
+    ndev: int,
+    *,
+    output_capacity: int,
+    bounds: Optional[tuple[Array, Array]] = None,
+    num_samples: int = 8,
+    axis_name: str = AXIS_NAME,
+    payload: Optional[Array] = None,
+):
+    """Repartition under ``should``, with both branches the same shapes.
+
+    The branches must agree in shape or the ``lax.cond`` will not compile; they do,
+    because the shard is already ``output_capacity`` rows and stays so. That is why
+    this is a function rather than three lines at the call site -- the identity branch
+    has to reconstruct codes and re-pad the payload to match, and getting that wrong
+    is a recompile at best.
+
+    ``should`` must come from :func:`repartition_due`, or from something else that is
+    mesh-uniform. A locally-computed predicate deadlocks.
+
+    Parameters
+    ----------
+    positions, masses, count:
+        The current padded shard and its live count.
+    should:
+        Mesh-uniform verdict.
+    ndev, output_capacity, bounds, num_samples, axis_name, payload:
+        As :func:`sfc_partition`.
+
+    Returns
+    -------
+    tuple
+        ``(positions, masses, codes, count, payload)``, repartitioned or not.
+    """
+    if bounds is None:
+        bounds = global_bounds(positions, axis_name=axis_name)
+
+    def _do(_):
+        return sfc_partition(
+            positions,
+            masses,
+            ndev,
+            output_capacity=output_capacity,
+            bounds=bounds,
+            num_samples=num_samples,
+            align_level=None,
+            axis_name=axis_name,
+            payload=payload,
+            count=count,
+        )
+
+    def _keep(_):
+        codes = morton_encode_impl(positions, bounds)
+        valid = jnp.arange(codes.shape[0]) < count
+        return (
+            positions,
+            masses,
+            jnp.where(valid, codes, _CODE_SENTINEL),
+            count,
+            payload,
+        )
+
+    return jax.lax.cond(jnp.asarray(should), _do, _keep, operand=None)

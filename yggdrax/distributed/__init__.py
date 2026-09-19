@@ -52,6 +52,8 @@ from .partition import (
     ShardedDomain,
     equalize_domain,
     global_bounds,
+    maybe_repartition,
+    repartition_due,
     sfc_decompose,
     sfc_partition,
 )
@@ -105,5 +107,7 @@ __all__ = [
     "RAGGED_NATIVE_FIXED_JAX",
     "sanitize_padding",
     "sfc_decompose",
+    "maybe_repartition",
+    "repartition_due",
     "sfc_partition",
 ]
