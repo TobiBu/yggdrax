@@ -312,6 +312,11 @@ def receiver_interaction_lists(
         node_active=node_active,
         seed_a=seed_a.astype(idx),
         seed_b=seed_b.astype(idx),
+        # Without this the wavefront's first round is sized by the CSR CAPACITY
+        # rather than by what arrived, so it reads every padded slot. The dead
+        # slots carry -1 and are filtered, so the pairs are identical either way --
+        # this is width, not correctness, and the test asserts exactly that.
+        seed_count=as_index(num_csr),
     )
 
     def split(a, b, n):
