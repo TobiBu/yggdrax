@@ -49,6 +49,7 @@ from .local_tree import (
     sanitize_padding,
 )
 from .partition import (
+    RepartitionResult,
     ShardedDomain,
     equalize_domain,
     global_bounds,
@@ -56,6 +57,7 @@ from .partition import (
     repartition_due,
     sfc_decompose,
     sfc_partition,
+    sfc_repartition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
 from .summary import TreeSummary, occupancy_cut, subtree_leaf_counts
@@ -110,4 +112,6 @@ __all__ = [
     "maybe_repartition",
     "repartition_due",
     "sfc_partition",
+    "sfc_repartition",
+    "RepartitionResult",
 ]

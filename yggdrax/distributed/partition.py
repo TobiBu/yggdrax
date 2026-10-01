@@ -24,7 +24,7 @@ buffer shapes (padded to ``output_capacity``) with a dynamic valid ``count``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Any, NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -103,10 +103,80 @@ def _choose_pivots(
     n = codes_sorted.shape[0] if count is None else count
     idx = (jnp.arange(num_samples) * jnp.asarray(n)) // num_samples
     samples = codes_sorted[idx]
+    total = num_samples * ndev
+    if count is not None:
+        # A device with NO live particle samples its padding sentinel; those sort
+        # last, so they are excluded by ranking over the live devices' samples only.
+        # Bit-identical to the plain form whenever every device holds particles.
+        live_dev = (jnp.asarray(count) > 0).astype(_COUNT_DTYPE)
+        samples = jnp.where(live_dev > 0, samples, _CODE_SENTINEL)
+        total = num_samples * jnp.maximum(jax.lax.psum(live_dev, axis_name), 1)
     all_samples = jnp.sort(jax.lax.all_gather(samples, axis_name, tiled=True))
-    total = all_samples.shape[0]
     piv_idx = (jnp.arange(1, ndev) * total) // ndev
     return _align_pivots(all_samples[piv_idx], align_level)
+
+
+def _tree_take(payload: Any, order: Array) -> Any:
+    """Apply one row permutation to every leaf of a payload pytree."""
+    return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf)[order], payload)
+
+
+def _leaf_fills(payload: Any, payload_fill: Any) -> list:
+    """One fill value per payload leaf: ``None`` -> -1 everywhere, a scalar -> that
+    value everywhere, else a pytree with the payload's structure."""
+    leaves = jax.tree_util.tree_leaves(payload)
+    if payload_fill is None:
+        return [-1] * len(leaves)
+    fills = jax.tree_util.tree_leaves(payload_fill)
+    if len(fills) == 1 and len(leaves) != 1:
+        return fills * len(leaves)
+    if len(fills) != len(leaves):
+        raise ValueError(
+            f"payload_fill has {len(fills)} leaves, the payload has {len(leaves)}"
+        )
+    return fills
+
+
+def _route_payload(
+    payload: Any,
+    send_sizes: Array,
+    output_capacity: int,
+    axis_name: str,
+    payload_fill: Any = None,
+) -> Any:
+    """Ragged-exchange a payload PYTREE: one round per (dtype, fill) group.
+
+    Leaves keep their own dtype end to end -- the exchange never casts -- so an int32
+    global id is exact however large, which a float32 column packed beside velocities
+    is not beyond 2^24. Leaves sharing a dtype and a fill are concatenated into one
+    ``(rows, k)`` block, so velocities + ids cost two rounds, not one per leaf.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(payload)
+    fills = _leaf_fills(payload, payload_fill)
+    flat = [
+        jnp.asarray(leaf).reshape(jnp.asarray(leaf).shape[0], -1) for leaf in leaves
+    ]
+    groups: dict = {}
+    for i, (leaf, fill) in enumerate(zip(flat, fills)):
+        groups.setdefault((jnp.dtype(leaf.dtype).name, float(fill)), []).append(i)
+    out: list = [None] * len(leaves)
+    for (_dtype, fill), members in groups.items():
+        block = jnp.concatenate([flat[i] for i in members], axis=1)
+        routed, _, _ = ragged_all_to_all_exchange(
+            block,
+            send_sizes,
+            output_capacity=output_capacity,
+            axis_name=axis_name,
+            fill_value=fill,
+        )
+        col = 0
+        for i in members:
+            width = flat[i].shape[1]
+            piece = routed[:, col : col + width]
+            col += width
+            shape = (output_capacity,) + tuple(jnp.asarray(leaves[i]).shape[1:])
+            out[i] = piece.reshape(shape).astype(jnp.asarray(leaves[i]).dtype)
+    return jax.tree_util.tree_unflatten(treedef, out)
 
 
 def _resort_by_code(positions, masses, codes, count, payload=None):
@@ -132,12 +202,19 @@ def _resort_by_code(positions, masses, codes, count, payload=None):
         codes,
         code_lo,
         code_hi,
-        None if payload is None else payload[order],
+        None if payload is None else _tree_take(payload, order),
     )
 
 
 def _route(
-    positions, masses, codes, send_sizes, output_capacity, axis_name, payload=None
+    positions,
+    masses,
+    codes,
+    send_sizes,
+    output_capacity,
+    axis_name,
+    payload=None,
+    payload_fill=None,
 ):
     """Ragged-exchange a shard already grouped by destination device.
 
@@ -168,22 +245,10 @@ def _route(
     count = jnp.sum(recv_sizes).astype(_COUNT_DTYPE)
     if payload is None:
         return pos_out, mass_out[:, 0], code_out[:, 0], count, None
-    pl = jnp.asarray(payload)
-    flat = pl.reshape(pl.shape[0], -1)
-    pl_out, _, _ = ragged_all_to_all_exchange(
-        flat,
-        send_sizes,
-        output_capacity=output_capacity,
-        axis_name=axis_name,
-        fill_value=-1.0,
+    pl_out = _route_payload(
+        payload, send_sizes, output_capacity, axis_name, payload_fill=payload_fill
     )
-    return (
-        pos_out,
-        mass_out[:, 0],
-        code_out[:, 0],
-        count,
-        pl_out.reshape((output_capacity,) + pl.shape[1:]).astype(pl.dtype),
-    )
+    return pos_out, mass_out[:, 0], code_out[:, 0], count, pl_out
 
 
 def sfc_partition(
@@ -196,8 +261,9 @@ def sfc_partition(
     num_samples: int = 8,
     align_level: Optional[int] = None,
     axis_name: str = AXIS_NAME,
-    payload: Optional[Array] = None,
+    payload: Any = None,
     count: Optional[Array] = None,
+    payload_fill: Any = None,
 ):
     """Sample-sort this device's shard into contiguous Morton domains.
 
@@ -218,7 +284,11 @@ def sfc_partition(
     Parameters
     ----------
     payload:
-        Optional per-particle data to route alongside, e.g. global ids.
+        Optional per-particle data to route alongside, e.g. global ids: an array or
+        any PYTREE of arrays with a leading row axis. Every leaf keeps its dtype.
+    payload_fill:
+        Fill for the padding rows of each payload leaf: ``None`` gives -1 (right for
+        ids), a scalar applies to every leaf, a pytree matches the payload.
     count:
         Live rows of an already-padded input. ``None`` treats every row as a
         particle, which is right for a fresh decomposition and WRONG for
@@ -266,14 +336,160 @@ def sfc_partition(
         )
         return pos_out, mass_out, code_out, count, None
 
-    pl = jnp.asarray(payload)[order]
+    pl = _tree_take(payload, order)
     pos_out, mass_out, code_out, count, pl_out = _route(
-        positions, masses, codes, send_sizes, output_capacity, axis_name, payload=pl
+        positions,
+        masses,
+        codes,
+        send_sizes,
+        output_capacity,
+        axis_name,
+        payload=pl,
+        payload_fill=payload_fill,
     )
     pos_out, mass_out, code_out, _, _, pl_out = _resort_by_code(
         pos_out, mass_out, code_out, count, payload=pl_out
     )
     return pos_out, mass_out, code_out, count, pl_out
+
+
+class RepartitionResult(NamedTuple):
+    """One device's view of a capacity-checked repartition.
+
+    Attributes
+    ----------
+    positions, masses, codes:
+        The new padded shard, Morton-sorted, live rows first (``live_count`` of them).
+    live_count:
+        Live rows on this device after the repartition. (Not ``count``: a
+        NamedTuple field of that name shadows ``tuple.count``.)
+    payload:
+        The routed payload pytree (``None`` when none was given).
+    declined:
+        Replicated bool. ``True`` when routing would have overfilled some device's
+        capacity, in which case NOTHING moved: every device kept its own particles
+        (re-sorted), which is still a valid partition.
+    recv_counts:
+        ``(ndev,)`` replicated: what each device WOULD have received. Reported in both
+        outcomes, so a decline names the device that did not fit.
+    sent_off_device:
+        Live rows this device sent to another device (0 when declined). A positive
+        mesh total is the proof that a repartition actually moved something.
+    max_util:
+        Replicated ``max(recv_counts) / capacity``.
+    """
+
+    positions: Array
+    masses: Array
+    codes: Array
+    live_count: Array
+    payload: Any
+    declined: Array
+    recv_counts: Array
+    sent_off_device: Array
+    max_util: Array
+
+
+def sfc_repartition(
+    positions: Array,
+    masses: Array,
+    count: Array,
+    ndev: int,
+    *,
+    output_capacity: int,
+    bounds: tuple[Array, Array],
+    num_samples: int = 256,
+    axis_name: str = AXIS_NAME,
+    payload: Any = None,
+    payload_fill: Any = None,
+) -> RepartitionResult:
+    """Re-partition an already padded shard, checking every receiver's capacity FIRST.
+
+    The send-size matrix is all-gathered before anything moves. If any device would
+    receive more than ``output_capacity`` rows the repartition is DECLINED on every
+    device at once: each device routes its live rows to itself, so nothing can
+    overflow and the old ownership stands. Overflow cannot be detected afterwards --
+    the native ``ragged_all_to_all`` writing past the end of its output buffer is not
+    a defined truncation.
+
+    ``bounds`` is required: the box must be the one the force builds its tree in
+    (dead rows excluded), not :func:`global_bounds`, which would count padding rows.
+
+    Parameters
+    ----------
+    positions, masses:
+        This device's padded shard.
+    count:
+        Its live rows (leading).
+    ndev:
+        Mesh size. Static.
+    output_capacity:
+        The shard capacity every device shares. Static.
+    bounds:
+        The global Morton box, identical on every device.
+    num_samples:
+        Samples per device for the pivots. Balance overshoot is about
+        ``2 * ndev / num_samples`` of a shard; 8 gives ~50 % at ndev 2. Static.
+    axis_name:
+        Mesh axis; must match the enclosing ``shard_map``.
+    payload:
+        Optional pytree routed with the particles (velocities, global ids, ...).
+    payload_fill:
+        As :func:`sfc_partition`.
+
+    Returns
+    -------
+    RepartitionResult
+        The new shard and the replicated outcome diagnostics.
+    """
+    cap = int(output_capacity)
+    live_in = jnp.arange(positions.shape[0]) < jnp.asarray(count)
+    codes = morton_encode_impl(positions, bounds)
+    codes = cast(Array, jnp.where(live_in, codes, _CODE_SENTINEL))
+    order = jnp.argsort(codes)
+    positions = positions[order]
+    masses = masses[order]
+    codes = codes[order]
+    live = jnp.arange(codes.shape[0]) < jnp.asarray(count)
+
+    pivots = _choose_pivots(codes, ndev, num_samples, axis_name, None, count=count)
+    dest = jnp.searchsorted(pivots, codes, side="right").astype(_COUNT_DTYPE)
+    dest = cast(Array, jnp.where(live, dest, _COUNT_DTYPE(ndev)))
+    proposed = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
+    # full[s, r] = rows device s would send to device r -- replicated
+    full = jax.lax.all_gather(proposed, axis_name, tiled=False)
+    recv_counts = jnp.sum(full, axis=0)
+    declined = jnp.any(recv_counts > cap)
+    me = jax.lax.axis_index(axis_name).astype(_COUNT_DTYPE)
+    dest = cast(Array, jnp.where(declined & live, me, dest))
+    send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
+    sent_off = jnp.sum((live & (dest != me)).astype(_COUNT_DTYPE))
+
+    pl = None if payload is None else _tree_take(payload, order)
+    pos_out, mass_out, code_out, new_count, pl_out = _route(
+        positions,
+        masses,
+        codes,
+        send_sizes,
+        cap,
+        axis_name,
+        payload=pl,
+        payload_fill=payload_fill,
+    )
+    pos_out, mass_out, code_out, _lo, _hi, pl_out = _resort_by_code(
+        pos_out, mass_out, code_out, new_count, payload=pl_out
+    )
+    return RepartitionResult(
+        positions=pos_out,
+        masses=mass_out,
+        codes=code_out,
+        live_count=new_count,
+        payload=pl_out,
+        declined=declined,
+        recv_counts=recv_counts,
+        sent_off_device=sent_off,
+        max_util=jnp.max(recv_counts).astype(jnp.float32) / jnp.float32(max(cap, 1)),
+    )
 
 
 def equalize_domain(
@@ -380,6 +596,7 @@ def sfc_decompose(
 
 
 __all__ = [
+    "RepartitionResult",
     "ShardedDomain",
     "equalize_domain",
     "global_bounds",
@@ -387,6 +604,7 @@ __all__ = [
     "repartition_due",
     "sfc_decompose",
     "sfc_partition",
+    "sfc_repartition",
 ]
 
 
