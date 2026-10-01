@@ -6585,10 +6585,12 @@ def dual_tree_walk_mutual(
         at one centre and radius zero they otherwise fail the MAC against each
         other and flood the near list. ``None`` = every node active (no extra
         gathers; bit-identical to the walk without the argument).
-    seed_a, seed_b:
-        Optional ``(K,)`` node-index arrays seeding the wavefront with K pairs
-        instead of the single ``(root, root)`` pair. Given together or not at all;
-        ``root`` is then unused. Pairs are canonicalised to ``(min, max)`` here, as
+    seed_a:
+        Optional ``(K,)`` node-index array, the first node of each of K seed pairs
+        that replace the single ``(root, root)`` pair. Given together with
+        ``seed_b`` or not at all; ``root`` is then unused.
+    seed_b:
+        Optional ``(K,)`` node-index array, the second node of each seed pair. Pairs are canonicalised to ``(min, max)`` here, as
         every refined pair already is, so the caller's order does not matter and a
         seed cannot be emitted in the opposite orientation from its own descendants.
 
@@ -6619,6 +6621,13 @@ def dual_tree_walk_mutual(
         ``near_cap``, with their live counts, the three overflow flags, the peak
         wavefront and the round count. Index dtype follows ``left_child_full``.
         The flags must be read -- see :class:`MutualWalkResult`.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``seed_a`` / ``seed_b`` is given, if they are not
+        matching 1-D arrays, or if the seed holds more pairs than
+        ``max_pair_queue``.
     """
     idx = jnp.asarray(left_child_full).dtype
 
