@@ -350,7 +350,7 @@ def build_distributed_coarse_tree(
 
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,
@@ -548,7 +548,7 @@ def classify_against_remote(
 
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,
@@ -847,7 +847,7 @@ def distributed_let_import(
 
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,

@@ -24,7 +24,7 @@ buffer shapes (padded to ``output_capacity``) with a dynamic valid ``count``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -91,11 +91,17 @@ def _choose_pivots(
     num_samples: int,
     axis_name: str,
     align_level: Optional[int],
+    count: Optional[Array] = None,
 ) -> Array:
-    """Sample-based splitter selection: returns ``ndev-1`` ascending pivots."""
+    """Sample-based splitter selection: returns ``ndev-1`` ascending pivots.
 
-    n = codes_sorted.shape[0]
-    idx = (jnp.arange(num_samples) * n) // num_samples
+    ``count`` restricts sampling to the live prefix. Sampling a padded shard at even
+    ranks over the whole array draws mostly the padding sentinel, which drags every
+    pivot to the top of the code range and sends the real particles to one device.
+    """
+
+    n = codes_sorted.shape[0] if count is None else count
+    idx = (jnp.arange(num_samples) * jnp.asarray(n)) // num_samples
     samples = codes_sorted[idx]
     all_samples = jnp.sort(jax.lax.all_gather(samples, axis_name, tiled=True))
     total = all_samples.shape[0]
@@ -103,8 +109,14 @@ def _choose_pivots(
     return _align_pivots(all_samples[piv_idx], align_level)
 
 
-def _resort_by_code(positions, masses, codes, count):
-    """Re-sort a padded shard by Morton code (padding sentinel -> tail)."""
+def _resort_by_code(positions, masses, codes, count, payload=None):
+    """Re-sort a padded shard by Morton code (padding sentinel -> tail).
+
+    ``payload`` rides the SAME permutation, which is the whole point of routing it
+    here rather than reconstructing it afterwards: two particles may share a Morton
+    code, so a caller re-deriving the order from codes alone cannot recover which row
+    went where.
+    """
 
     order = jnp.argsort(codes)
     positions = positions[order]
@@ -114,11 +126,28 @@ def _resort_by_code(positions, masses, codes, count):
     valid = jnp.arange(cap) < count
     code_lo = jnp.min(jnp.where(valid, codes, _CODE_SENTINEL))
     code_hi = jnp.max(jnp.where(valid, codes, jnp.uint64(0)))
-    return positions, masses, codes, code_lo, code_hi
+    return (
+        positions,
+        masses,
+        codes,
+        code_lo,
+        code_hi,
+        None if payload is None else payload[order],
+    )
 
 
-def _route(positions, masses, codes, send_sizes, output_capacity, axis_name):
-    """Ragged-exchange a shard already grouped by destination device."""
+def _route(
+    positions, masses, codes, send_sizes, output_capacity, axis_name, payload=None
+):
+    """Ragged-exchange a shard already grouped by destination device.
+
+    ``payload`` is routed as a fourth round so that whatever identifies a particle
+    travels WITH it. Reconstructing it afterwards from a host-side array is the
+    documented way to get this wrong: the host order and the shard order coincide
+    only while ``capacity == count``, and `docs/distributed_padding_force_defect.md`
+    records what that looks like once they stop -- "plausible, smooth, and wrong by
+    tens of percent".
+    """
 
     pos_out, recv_sizes, _ = ragged_all_to_all_exchange(
         positions, send_sizes, output_capacity=output_capacity, axis_name=axis_name
@@ -137,7 +166,24 @@ def _route(positions, masses, codes, send_sizes, output_capacity, axis_name):
         fill_value=_CODE_SENTINEL,
     )
     count = jnp.sum(recv_sizes).astype(_COUNT_DTYPE)
-    return pos_out, mass_out[:, 0], code_out[:, 0], count
+    if payload is None:
+        return pos_out, mass_out[:, 0], code_out[:, 0], count, None
+    pl = jnp.asarray(payload)
+    flat = pl.reshape(pl.shape[0], -1)
+    pl_out, _, _ = ragged_all_to_all_exchange(
+        flat,
+        send_sizes,
+        output_capacity=output_capacity,
+        axis_name=axis_name,
+        fill_value=-1.0,
+    )
+    return (
+        pos_out,
+        mass_out[:, 0],
+        code_out[:, 0],
+        count,
+        pl_out.reshape((output_capacity,) + pl.shape[1:]).astype(pl.dtype),
+    )
 
 
 def sfc_partition(
@@ -150,17 +196,50 @@ def sfc_partition(
     num_samples: int = 8,
     align_level: Optional[int] = None,
     axis_name: str = AXIS_NAME,
+    payload: Optional[Array] = None,
+    count: Optional[Array] = None,
 ):
     """Sample-sort this device's shard into contiguous Morton domains.
 
     Returns ``(positions, masses, codes, count)`` for this device: a padded
     shard (leading ``count`` rows valid, Morton-sorted) owning a contiguous
     code range disjoint from every other device's.
+
+    The fifth element is ``payload`` routed along the same exchange and permuted by
+    the same sorts, or ``None`` when none was given -- the arity is fixed either way,
+    because a return whose LENGTH depends on an argument cannot be type-checked at
+    the call sites.
+
+    Pass the global particle ids through it: a particle's identity has to travel WITH
+    the particle, because the input order and the shard order coincide only while
+    ``capacity == count``, and a host-side id array silently stops matching once they
+    diverge.
+
+    Parameters
+    ----------
+    payload:
+        Optional per-particle data to route alongside, e.g. global ids.
+    count:
+        Live rows of an already-padded input. ``None`` treats every row as a
+        particle, which is right for a fresh decomposition and WRONG for
+        re-partitioning a shard that is already capacity-padded: the padding would
+        be routed as particles and push real ones out of the capacity. Measured --
+        it silently lost half the particles before this argument existed.
     """
 
     if bounds is None:
         bounds = global_bounds(positions_local, axis_name=axis_name)
     codes = morton_encode_impl(positions_local, bounds)
+    if count is not None:
+        # dead rows take the sentinel so the sort puts them last, and are then
+        # excluded from every destination: they are capacity, not particles
+        # cast: three-argument `jnp.where` is always an Array (stubs: `Array | tuple`)
+        codes = cast(
+            Array,
+            jnp.where(
+                jnp.arange(codes.shape[0]) < jnp.asarray(count), codes, _CODE_SENTINEL
+            ),
+        )
 
     # Local Morton sort -> particles become grouped by destination device
     # automatically, since both codes and pivots are ascending.
@@ -169,17 +248,32 @@ def sfc_partition(
     masses = masses_local[order]
     codes = codes[order]
 
-    pivots = _choose_pivots(codes, ndev, num_samples, axis_name, align_level)
+    pivots = _choose_pivots(
+        codes, ndev, num_samples, axis_name, align_level, count=count
+    )
     dest = jnp.searchsorted(pivots, codes, side="right").astype(_COUNT_DTYPE)
+    if count is not None:
+        live = jnp.arange(codes.shape[0]) < jnp.asarray(count)
+        dest = cast(Array, jnp.where(live, dest, _COUNT_DTYPE(ndev)))
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
-    pos_out, mass_out, code_out, count = _route(
-        positions, masses, codes, send_sizes, output_capacity, axis_name
+    if payload is None:
+        pos_out, mass_out, code_out, count, _ = _route(
+            positions, masses, codes, send_sizes, output_capacity, axis_name
+        )
+        pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
+            pos_out, mass_out, code_out, count
+        )
+        return pos_out, mass_out, code_out, count, None
+
+    pl = jnp.asarray(payload)[order]
+    pos_out, mass_out, code_out, count, pl_out = _route(
+        positions, masses, codes, send_sizes, output_capacity, axis_name, payload=pl
     )
-    pos_out, mass_out, code_out, _, _ = _resort_by_code(
-        pos_out, mass_out, code_out, count
+    pos_out, mass_out, code_out, _, _, pl_out = _resort_by_code(
+        pos_out, mass_out, code_out, count, payload=pl_out
     )
-    return pos_out, mass_out, code_out, count
+    return pos_out, mass_out, code_out, count, pl_out
 
 
 def equalize_domain(
@@ -223,10 +317,10 @@ def equalize_domain(
     dest = jnp.where(valid, dest, ndev)  # drop padding rows from routing
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
-    pos_out, mass_out, code_out, new_count = _route(
+    pos_out, mass_out, code_out, new_count, _ = _route(
         positions, masses, codes, send_sizes, output_capacity, axis_name
     )
-    pos_out, mass_out, code_out, _, _ = _resort_by_code(
+    pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
         pos_out, mass_out, code_out, new_count
     )
     return pos_out, mass_out, code_out, new_count
@@ -261,7 +355,7 @@ def sfc_decompose(
     ndev = mesh.size
 
     def fn(pos, mass):
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,
@@ -289,6 +383,163 @@ __all__ = [
     "ShardedDomain",
     "equalize_domain",
     "global_bounds",
+    "maybe_repartition",
+    "repartition_due",
     "sfc_decompose",
     "sfc_partition",
 ]
+
+
+def repartition_due(
+    count: Array,
+    capacity: int,
+    step: Array,
+    *,
+    interval: int = 16,
+    headroom: float = 0.9,
+    axis_name: str = AXIS_NAME,
+) -> Array:
+    """Whether to re-run :func:`sfc_partition` this step -- the SAME answer everywhere.
+
+    **The verdict must be mesh-uniform, and that is the whole point of this function.**
+    ``sfc_partition`` contains collectives: two ``all_gather`` rounds and a ragged
+    all-to-all. If one device repartitions and another does not, the first blocks on a
+    collective the second never enters and the mesh DEADLOCKS. So the drift test cannot
+    be the local ``count``; it is an all-reduced maximum over every device's occupancy.
+
+    Two triggers, both uniform by construction:
+
+    * **scheduled** -- every ``interval`` steps. Particles move, so device ownership
+      goes stale, but only on the dynamical time: the fused lane re-Morton-sorts and
+      rebuilds its local tree every step anyway, so drift WITHIN a domain is absorbed
+      for free and only the assignment needs refreshing. ``step`` is replicated, so
+      this needs no reduction.
+    * **drift guard** -- any device's ``count`` passing ``headroom`` of ``capacity``.
+      ``capacity`` is a compile-time constant that every shape depends on, so a count
+      reaching it is not a slowdown but an overflow.
+
+    Parameters
+    ----------
+    count:
+        This device's live particle count.
+    capacity:
+        The static shard capacity. Static.
+    step:
+        Step index, replicated across the mesh.
+    interval:
+        Scheduled cadence in steps. Static.
+    headroom:
+        Fraction of ``capacity`` above which the guard fires, regardless of schedule.
+    axis_name:
+        Mesh axis; must match the enclosing ``shard_map``.
+
+    Returns
+    -------
+    Array
+        Scalar bool, **identical on every device**.
+    """
+    frac = jnp.asarray(count, jnp.float32) / jnp.float32(max(int(capacity), 1))
+    worst = jax.lax.pmax(frac, axis_name)
+    scheduled = (jnp.asarray(step).astype(jnp.int32) % jnp.int32(int(interval))) == 0
+    return jnp.logical_or(scheduled, worst > jnp.float32(headroom))
+
+
+def maybe_repartition(
+    positions: Array,
+    masses: Array,
+    count: Array,
+    should: Array,
+    ndev: int,
+    *,
+    output_capacity: int,
+    bounds: Optional[tuple[Array, Array]] = None,
+    num_samples: int = 8,
+    axis_name: str = AXIS_NAME,
+    payload: Optional[Array] = None,
+):
+    """Repartition under ``should``, with both branches the same shapes.
+
+    The branches must agree in shape AND in manual-axis variance, and the second is
+    the one that bites. ``sfc_partition`` ends in collectives, and under the NATIVE
+    ``ragged_all_to_all`` JAX infers its result as axis-INVARIANT, while the identity
+    branch passes through a sharded input and is ``{V:gpus}`` varying -- so the
+    ``cond`` is rejected for "manual axis types do not match" even though every shape
+    and dtype agrees. Both branches are therefore pushed to varying with
+    :func:`jax.lax.pcast`.
+
+    **This does not reproduce on forced CPU devices**, because
+    :func:`~yggdrax.distributed.comm.resolve_ragged_method` picks the ``buf``
+    all-gather fallback there and ``native`` on GPU, and the two infer variance
+    differently. Testing distributed code on forced CPU devices does not cover the
+    GPU tracing path.
+
+    ``should`` must come from :func:`repartition_due`, or from something else that is
+    mesh-uniform. A locally-computed predicate deadlocks.
+
+    Parameters
+    ----------
+    positions, masses, count:
+        The current padded shard and its live count.
+    should:
+        Mesh-uniform verdict.
+    ndev, output_capacity, bounds, num_samples, axis_name, payload:
+        As :func:`sfc_partition`.
+
+    Returns
+    -------
+    tuple
+        ``(positions, masses, codes, count, payload)``, repartitioned or not.
+    """
+    if bounds is None:
+        bounds = global_bounds(positions, axis_name=axis_name)
+
+    def _to_varying(x):
+        """Make ``x`` axis-varying, whichever it already is.
+
+        ``pcast`` converts invariant -> varying and RAISES on an input that is
+        already varying, and the variance is not exposed as an attribute to test.
+        Which case applies depends on the backend -- the native
+        ``ragged_all_to_all`` leaves `sfc_partition`'s result invariant, the ``buf``
+        fallback leaves it varying -- so the branch is decided by trying it. This is
+        trace time; nothing is attempted at runtime.
+        """
+        if not hasattr(x, "shape"):
+            return x
+        try:
+            return jax.lax.pcast(x, axis_name, to="varying")
+        except (ValueError, TypeError):
+            return x
+
+    def _varying(tree):
+        return jax.tree.map(_to_varying, tree)
+
+    def _do(_):
+        return _varying(
+            sfc_partition(
+                positions,
+                masses,
+                ndev,
+                output_capacity=output_capacity,
+                bounds=bounds,
+                num_samples=num_samples,
+                align_level=None,
+                axis_name=axis_name,
+                payload=payload,
+                count=count,
+            )
+        )
+
+    def _keep(_):
+        codes = morton_encode_impl(positions, bounds)
+        valid = jnp.arange(codes.shape[0]) < count
+        return _varying(
+            (
+                positions,
+                masses,
+                jnp.where(valid, codes, _CODE_SENTINEL),
+                count,
+                payload,
+            )
+        )
+
+    return jax.lax.cond(jnp.asarray(should), _do, _keep, operand=None)

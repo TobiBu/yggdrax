@@ -713,6 +713,7 @@ def build_static_cells_tree(
     leaf_capacity: int,
     return_reordered: bool = False,
     return_overflow: bool = False,
+    num_valid: Array | int | None = None,
 ):
     """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
 
@@ -752,6 +753,14 @@ def build_static_cells_tree(
         when more than ``leaf_capacity`` leaves were needed, in which case the
         tree does NOT cover every particle. Eager callers must raise on it;
         traced callers must fold it into their capacity guard.
+    num_valid
+        Number of leading live rows of ``positions``/``masses`` for a
+        capacity-padded input (a distributed shard); may be traced. ``None``
+        means every row is live. The dead rows are given the reserved sentinel
+        code so the stable sort puts them last, and the partition is then cut at
+        ``num_valid`` -- both halves are needed, see
+        :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`. The dead
+        rows end up in no leaf, so nothing downstream gathers them.
 
     Returns
     -------
@@ -774,10 +783,29 @@ def build_static_cells_tree(
     if int(leaf_capacity) < 1:
         raise ValueError("leaf_capacity must be >= 1")
     morton_codes = morton_encode(positions, bounds)
+    # Dead rows of a padded shard take the reserved sentinel so the stable sort
+    # lands them in [num_valid, n) -- which is what lets the partition cut by
+    # index. The sentinel is already reserved for padding leaves below, so a
+    # live particle is assumed not to hold it (bounds carry a pad, so the
+    # maximal code is not attained).
+    if num_valid is not None:
+        # cast: the stubs type `jnp.where` as `Array | tuple` (the one-argument
+        # nonzero form); this three-argument call is always an Array
+        morton_codes = cast(
+            Array,
+            jnp.where(
+                jnp.arange(int(n), dtype=INDEX_DTYPE) < as_index(num_valid),
+                morton_codes,
+                jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64),
+            ),
+        )
     sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]
     part = adaptive_cell_leaf_partition(
-        sorted_codes, leaf_size=int(leaf_size), capacity=int(leaf_capacity)
+        sorted_codes,
+        leaf_size=int(leaf_size),
+        capacity=int(leaf_capacity),
+        num_valid=num_valid,
     )
     live = part.leaf_starts < as_index(int(n))
     safe_start = jnp.minimum(part.leaf_starts, as_index(max(int(n) - 1, 0)))
@@ -827,6 +855,7 @@ def build_static_radix_tree(
     return_workspace: bool = False,
     leaf_partition: str = "buckets",
     leaf_capacity: Optional[int] = None,
+    num_valid: Array | int | None = None,
 ):
     """Build a fixed-shape radix tree from equal-size Morton-order buckets.
 
@@ -861,7 +890,10 @@ def build_static_radix_tree(
             leaf_size=int(leaf_size),
             leaf_capacity=int(leaf_capacity),
             return_reordered=bool(return_reordered),
+            num_valid=num_valid,
         )
+    if num_valid is not None:
+        raise ValueError("num_valid is only supported for leaf_partition='cells'")
 
     n = positions.shape[0]
     if n < 1:
@@ -963,6 +995,7 @@ def rebuild_static_radix_tree_from_template(
     return_reordered: bool = False,
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
+    num_valid: Array | int | None = None,
 ):
     """Refresh particles against a fixed-shape static radix bucket topology.
 
@@ -985,6 +1018,11 @@ def rebuild_static_radix_tree_from_template(
         raise ValueError(
             "return_overflow is only meaningful for leaf_partition='cells'"
         )
+    if num_valid is not None and leaf_partition != "cells":
+        # Buckets cut the sorted particles into fixed runs of leaf_size, so a
+        # live/dead cut would silently reshape every leaf. Refuse rather than
+        # ignore: a padded shard on the bucket path is a caller error.
+        raise ValueError("num_valid is only supported for leaf_partition='cells'")
     if template.leaf_size is None or int(template.leaf_size) < 1:
         raise ValueError("static_radix template must declare a positive leaf_size")
     n = positions.shape[0]
@@ -1012,6 +1050,7 @@ def rebuild_static_radix_tree_from_template(
             leaf_capacity=int(template.leaf_codes.shape[0]),
             return_reordered=bool(return_reordered),
             return_overflow=bool(return_overflow),
+            num_valid=num_valid,
         )
 
     morton_codes = morton_encode(positions, bounds_resolved)

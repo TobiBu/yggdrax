@@ -217,7 +217,7 @@ def distributed_tree_moments(
 
     def fn(pos, mass):
         bounds = global_bounds(pos, axis_name=axis_name)
-        p, m, c, cnt = sfc_partition(
+        p, m, c, cnt, _ = sfc_partition(
             pos,
             mass,
             ndev,

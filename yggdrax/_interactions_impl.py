@@ -6529,6 +6529,9 @@ def dual_tree_walk_mutual(
     near_cap: int,
     mac_type: Optional[MACType] = None,
     node_active: Optional[Array] = None,
+    seed_a: Optional[Array] = None,
+    seed_b: Optional[Array] = None,
+    seed_count: Optional[Array] = None,
     wavefront_ladder: Optional[bool] = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
@@ -6582,6 +6585,26 @@ def dual_tree_walk_mutual(
         at one centre and radius zero they otherwise fail the MAC against each
         other and flood the near list. ``None`` = every node active (no extra
         gathers; bit-identical to the walk without the argument).
+    seed_a:
+        Optional ``(K,)`` node-index array, the first node of each of K seed pairs
+        that replace the single ``(root, root)`` pair. Given together with
+        ``seed_b`` or not at all; ``root`` is then unused.
+    seed_b:
+        Optional ``(K,)`` node-index array, the second node of each seed pair. Pairs are canonicalised to ``(min, max)`` here, as
+        every refined pair already is, so the caller's order does not matter and a
+        seed cannot be emitted in the opposite orientation from its own descendants.
+
+        This is what makes a ONE-SIDED cross-domain evaluation need no new kernel.
+        Concatenate an imported source set onto the local nodes at indices
+        ``[n_local, n_local + n_remote)`` and seed ``(local_root, imported_i)``: the
+        canonicalisation then orders every emitted pair as (local target, imported
+        source) exactly, for free, because every local index is strictly below every
+        imported one. The imported entries carry ``left = right = -1``, so the walk
+        refines only on the local side and terminates there.
+    seed_count:
+        Optional live prefix length of the seed, traced. ``None`` means all K. Seeds
+        beyond it are dead, as are ``-1`` entries, so a caller with a
+        capacity-padded seed buffer passes the count and pads with ``-1``.
     wavefront_ladder:
         Compile the round body for the static widths of
         :func:`_wavefront_ladder` and let each round run at the narrowest width
@@ -6598,6 +6621,13 @@ def dual_tree_walk_mutual(
         ``near_cap``, with their live counts, the three overflow flags, the peak
         wavefront and the round count. Index dtype follows ``left_child_full``.
         The flags must be read -- see :class:`MutualWalkResult`.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``seed_a`` / ``seed_b`` is given, if they are not
+        matching 1-D arrays, or if the seed holds more pairs than
+        ``max_pair_queue``.
     """
     idx = jnp.asarray(left_child_full).dtype
 
@@ -6606,12 +6636,37 @@ def dual_tree_walk_mutual(
 
     index_neg1 = ix(-1)
     theta_sq = jnp.asarray(theta, dtype=centers.dtype) ** 2
-    wf_a = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
-    wf_b = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
+    if (seed_a is None) != (seed_b is None):
+        raise ValueError("seed_a and seed_b must be given together")
+    if seed_a is None:
+        wf_a = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
+        wf_b = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
+        init_size = ix(1)
+    else:
+        sa_seed = jnp.asarray(seed_a, dtype=idx)
+        sb_seed = jnp.asarray(seed_b, dtype=idx)
+        if sa_seed.shape != sb_seed.shape or sa_seed.ndim != 1:
+            raise ValueError(
+                f"seed_a and seed_b must be matching 1-D arrays, got "
+                f"{sa_seed.shape} and {sb_seed.shape}"
+            )
+        k_seed = int(sa_seed.shape[0])
+        if k_seed > max_pair_queue:
+            raise ValueError(
+                f"seed of {k_seed} pairs exceeds max_pair_queue={max_pair_queue}; "
+                "the wavefront cannot hold its own seed"
+            )
+        # canonicalised exactly as ``_count_sorted_pair`` canonicalises every
+        # refined pair, so a seed and its descendants share one orientation
+        lo = jnp.minimum(sa_seed, sb_seed)
+        hi = jnp.maximum(sa_seed, sb_seed)
+        wf_a = jnp.full((max_pair_queue,), -1, dtype=idx).at[:k_seed].set(lo)
+        wf_b = jnp.full((max_pair_queue,), -1, dtype=idx).at[:k_seed].set(hi)
+        init_size = ix(k_seed) if seed_count is None else ix(seed_count)
     init = (
         wf_a,
         wf_b,
-        ix(1),
+        init_size,
         jnp.full((far_cap,), -1, dtype=idx),
         jnp.full((far_cap,), -1, dtype=idx),
         ix(0),
@@ -6621,7 +6676,7 @@ def dual_tree_walk_mutual(
         jnp.asarray(False),
         jnp.asarray(False),
         jnp.asarray(False),
-        ix(1),  # peak wavefront (the root pair)
+        init_size,  # peak wavefront (the seed)
         ix(0),  # rounds
     )
 

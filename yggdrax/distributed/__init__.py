@@ -19,6 +19,14 @@ from .comm import (
     resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
+from .export import ExportLists, SendBuffers, build_send_buffers, export_walk
+from .import_cells import (
+    ImportedCells,
+    ReceiverLists,
+    exchange_export_list,
+    rebase_csr,
+    receiver_interaction_lists,
+)
 from .let import (
     ClassifyMetrics,
     CoarseFrontier,
@@ -44,10 +52,13 @@ from .partition import (
     ShardedDomain,
     equalize_domain,
     global_bounds,
+    maybe_repartition,
+    repartition_due,
     sfc_decompose,
     sfc_partition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
+from .summary import TreeSummary, occupancy_cut, subtree_leaf_counts
 
 __all__ = [
     "AXIS_NAME",
@@ -70,6 +81,18 @@ __all__ = [
     "device_count",
     "distributed_let_import",
     "distributed_tree_moments",
+    "ExportLists",
+    "ImportedCells",
+    "ReceiverLists",
+    "SendBuffers",
+    "build_send_buffers",
+    "exchange_export_list",
+    "export_walk",
+    "rebase_csr",
+    "receiver_interaction_lists",
+    "TreeSummary",
+    "occupancy_cut",
+    "subtree_leaf_counts",
     "dual_tree_walk_cross",
     "dual_tree_walk_cross_impl",
     "equalize_domain",
@@ -84,5 +107,7 @@ __all__ = [
     "RAGGED_NATIVE_FIXED_JAX",
     "sanitize_padding",
     "sfc_decompose",
+    "maybe_repartition",
+    "repartition_due",
     "sfc_partition",
 ]

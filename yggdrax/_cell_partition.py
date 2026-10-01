@@ -82,6 +82,7 @@ def adaptive_cell_leaf_partition(
     leaf_size: int,
     capacity: int,
     max_level: int = MORTON_LEVELS,
+    num_valid: Array | int | None = None,
 ) -> CellLeafPartition:
     """Adaptive Morton-cell leaves of Morton-sorted codes, padded to ``capacity``.
 
@@ -97,6 +98,21 @@ def adaptive_cell_leaf_partition(
     max_level
         Deepest level examined; cells at this level are leaves whatever they
         hold. Static, at most :data:`MORTON_LEVELS`.
+    num_valid
+        Number of leading live codes, for a capacity-padded input whose trailing
+        rows are dead (a distributed shard). May be traced. ``None`` means every
+        row is live, and the result is then bit-identical to omitting it.
+
+        Dead rows must already sort last -- give them the maximal Morton code --
+        but that alone is not enough, and the failure is not obvious: every dead
+        row then carries the *same* code, so their common-prefix depth is total,
+        no level ever satisfies ``occ <= leaf_size``, and they collapse into one
+        leaf of ``n - num_valid`` rows. Wider than the leaf table, that leaf
+        either trips the eager leaf-size check or, under trace, truncates into a
+        live leaf of mass 0 and radius 0 sitting at a real position -- which
+        fails the MAC against everything near it and floods the near list. So
+        ``num_valid`` cuts the run boundaries, the leaf starts, the leaf count
+        and the last leaf's end; the dead rows then belong to no leaf at all.
 
     Returns
     -------
@@ -120,6 +136,11 @@ def adaptive_cell_leaf_partition(
     capacity = int(capacity)
     leaf_size_i = jnp.asarray(int(leaf_size), INDEX_DTYPE)
     idx = jnp.arange(n, dtype=INDEX_DTYPE)
+    # Live/dead cut. ``None`` -> every row live, and every use below degenerates
+    # to the unpadded expression, so the result is unchanged bit for bit.
+    padded = num_valid is not None
+    n_valid = jnp.asarray(n if num_valid is None else num_valid, INDEX_DTYPE)
+    is_dead = idx >= n_valid if padded else jnp.zeros((n,), dtype=bool)
     # Common Morton depth of each consecutive pair (the boundary BEFORE particle
     # i): codes use 63 bits, 3 per level, so the pair agrees through
     # floor((clz64(xor) - 1) / 3) whole levels. Boundary 0 agrees through nothing.
@@ -138,7 +159,11 @@ def adaptive_cell_leaf_partition(
     # least d levels; its start is the last boundary with agree < d at or before
     # i (prefix max) and its end the first such boundary after i (suffix min).
     for d in range(0, int(max_level)):
-        is_boundary = agree < d
+        # A dead row is a boundary at every level: without this the last live
+        # cell's occupancy would count the padding, so a shard whose live part
+        # fits in one cell would be split into several -- a legal partition, but
+        # not the one the same particles get unpadded.
+        is_boundary = (agree < d) | is_dead
         start_idx = lax.cummax(jnp.where(is_boundary, idx, jnp.asarray(0, INDEX_DTYPE)))
         nxt = jnp.where(is_boundary, idx, n_i)
         end_idx = jnp.concatenate(
@@ -153,8 +178,13 @@ def adaptive_cell_leaf_partition(
     first = jnp.concatenate(
         [jnp.ones((1,), bool), (key[1:] != key[:-1]) | (depth[1:] != depth[:-1])]
     )
+    first = first & ~is_dead
     slot = jnp.cumsum(first.astype(INDEX_DTYPE)) - 1  # leaf index of each particle
-    num_leaves = slot[-1] + 1 if n > 0 else jnp.asarray(0, INDEX_DTYPE)
+    # Live-leaf count. Equal to ``slot[-1] + 1`` once ``first`` is masked, but
+    # stated directly so it cannot be read as counting padding.
+    num_leaves = (
+        jnp.sum(first.astype(INDEX_DTYPE)) if n > 0 else jnp.asarray(0, INDEX_DTYPE)
+    )
     overflow = num_leaves > capacity
     target = jnp.where(
         first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE)
@@ -168,9 +198,11 @@ def adaptive_cell_leaf_partition(
     ends = jnp.where(
         live,
         jnp.where(
-            jnp.arange(capacity) + 1 < jnp.minimum(num_leaves, capacity), next_start, n
+            jnp.arange(capacity) + 1 < jnp.minimum(num_leaves, capacity),
+            next_start,
+            n_valid,  # the LAST live leaf stops at the cut, not at the array end
         ),
-        n,
+        n,  # padding leaves keep start == end == n, which reads as an empty range
     )
     starts = jnp.where(live, starts, n)
     depths_out = jnp.where(live, depths_out, -1)

@@ -115,3 +115,108 @@ def test_partition_is_jittable_with_static_capacity():
     ref = adaptive_cell_leaf_partition(codes, leaf_size=16, capacity=512)
     for a, b in zip(part, ref):
         assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+# --- capacity-padded shards (the distributed lane) ------------------------------
+
+#: Dead rows sort last only if they carry the maximal Morton code.
+_SENTINEL = np.uint64(2**63 - 1)
+
+
+def _pad_with_sentinel(codes, rows):
+    """Capacity-pad sorted codes the way a distributed shard is padded."""
+    codes = np.asarray(codes, np.uint64)
+    return jnp.asarray(
+        np.concatenate([codes, np.full(rows - codes.size, _SENTINEL, np.uint64)])
+    )
+
+
+def _live_triples(part):
+    k = int(part.num_leaves)
+    return set(
+        zip(
+            np.asarray(part.leaf_starts)[:k].tolist(),
+            np.asarray(part.leaf_ends)[:k].tolist(),
+            np.asarray(part.leaf_depths)[:k].tolist(),
+        )
+    )
+
+
+@pytest.mark.parametrize("n_live, rows", [(2000, 4096), (5000, 8192), (50, 4096)])
+def test_num_valid_reproduces_the_unpadded_partition(n_live, rows):
+    """A padded shard partitions exactly like the same particles unpadded.
+
+    This is the contract the distributed lane needs: one device's shard is a
+    capacity-padded array, and its tree must not depend on how much padding
+    happens to follow the live rows.
+    """
+    codes = _sorted_codes(n_live)
+    padded = _pad_with_sentinel(codes, rows)
+
+    unpadded = adaptive_cell_leaf_partition(codes, leaf_size=64, capacity=1024)
+    shard = adaptive_cell_leaf_partition(
+        padded, leaf_size=64, capacity=1024, num_valid=n_live
+    )
+
+    assert not bool(shard.overflow)
+    assert int(shard.num_leaves) == int(unpadded.num_leaves)
+    assert _live_triples(shard) == _live_triples(unpadded)
+
+
+def test_the_sentinel_alone_builds_one_oversized_padding_leaf():
+    """Why ``num_valid`` exists, pinned as a negative control.
+
+    Sorting the dead rows last is necessary but not sufficient: they all carry
+    the *same* code, so no Morton level ever splits them and they collapse into
+    a single leaf far wider than ``leaf_size``. Under trace that leaf truncates
+    into a live, mass-0, radius-0 leaf at a real position, which fails the MAC
+    against everything near it. If this test ever starts failing because the
+    naive partition became well behaved, ``num_valid`` may be reconsidered --
+    until then it is load bearing.
+    """
+    leaf_size, n_live, rows = 64, 5000, 8192
+    padded = _pad_with_sentinel(_sorted_codes(n_live), rows)
+
+    naive = adaptive_cell_leaf_partition(padded, leaf_size=leaf_size, capacity=1024)
+    widest = int(np.max(np.asarray(naive.leaf_ends) - np.asarray(naive.leaf_starts)))
+    assert widest > leaf_size, "expected the padding run to exceed one leaf"
+    assert widest >= rows - n_live
+
+    guarded = adaptive_cell_leaf_partition(
+        padded, leaf_size=leaf_size, capacity=1024, num_valid=n_live
+    )
+    k = int(guarded.num_leaves)
+    occ = np.asarray(guarded.leaf_ends)[:k] - np.asarray(guarded.leaf_starts)[:k]
+    assert int(occ.max()) <= leaf_size
+    assert int(np.asarray(guarded.leaf_ends)[:k].max()) == n_live
+
+
+def test_num_valid_is_traceable_and_default_is_unchanged():
+    """``num_valid`` arrives as a tracer under ``shard_map``; ``None`` is a no-op."""
+    n_live, rows = 5000, 8192
+    padded = _pad_with_sentinel(_sorted_codes(n_live), rows)
+
+    fn = jax.jit(
+        lambda c, nv: adaptive_cell_leaf_partition(
+            c, leaf_size=64, capacity=1024, num_valid=nv
+        )
+    )
+    traced = fn(padded, jnp.asarray(n_live, jnp.int32))
+    eager = adaptive_cell_leaf_partition(
+        padded, leaf_size=64, capacity=1024, num_valid=n_live
+    )
+    for field in eager._fields:
+        assert jnp.array_equal(getattr(traced, field), getattr(eager, field))
+
+    # Fewer live rows through the SAME compiled program must give fewer leaves.
+    assert int(fn(padded, jnp.asarray(2000, jnp.int32)).num_leaves) < int(
+        traced.num_leaves
+    )
+
+    codes = _sorted_codes(n_live)
+    omitted = adaptive_cell_leaf_partition(codes, leaf_size=64, capacity=1024)
+    explicit = adaptive_cell_leaf_partition(
+        codes, leaf_size=64, capacity=1024, num_valid=codes.shape[0]
+    )
+    for field in omitted._fields:
+        assert jnp.array_equal(getattr(omitted, field), getattr(explicit, field))
