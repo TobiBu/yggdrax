@@ -32,7 +32,7 @@ double-counts on every target leaf.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -197,9 +197,11 @@ def export_walk(
     def split(a, b, n):
         """(cell, local node) with the walk's padding preserved as -1."""
         live = jnp.arange(a.shape[0], dtype=idx) < n
+        # cast: three-argument `jnp.where` is always an Array; the stubs say
+        # `Array | tuple` because of the one-argument (nonzero) form
         return (
-            jnp.where(live, a, as_index(-1).astype(idx)),
-            jnp.where(live, b - shift, as_index(-1).astype(idx)),
+            cast(Array, jnp.where(live, a, as_index(-1).astype(idx))),
+            cast(Array, jnp.where(live, b - shift, as_index(-1).astype(idx))),
         )
 
     far_cell, far_node = split(res.far_a, res.far_b, res.far_count)

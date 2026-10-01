@@ -789,10 +789,15 @@ def build_static_cells_tree(
     # live particle is assumed not to hold it (bounds carry a pad, so the
     # maximal code is not attained).
     if num_valid is not None:
-        morton_codes = jnp.where(
-            jnp.arange(int(n), dtype=INDEX_DTYPE) < as_index(num_valid),
-            morton_codes,
-            jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64),
+        # cast: the stubs type `jnp.where` as `Array | tuple` (the one-argument
+        # nonzero form); this three-argument call is always an Array
+        morton_codes = cast(
+            Array,
+            jnp.where(
+                jnp.arange(int(n), dtype=INDEX_DTYPE) < as_index(num_valid),
+                morton_codes,
+                jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64),
+            ),
         )
     sorted_indices = jnp.argsort(morton_codes, stable=True)
     sorted_codes = morton_codes[sorted_indices]

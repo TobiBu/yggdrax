@@ -26,7 +26,7 @@ sender, which is exactly what the re-offsetting needs.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -321,9 +321,11 @@ def receiver_interaction_lists(
 
     def split(a, b, n):
         keep = jnp.arange(a.shape[0], dtype=idx) < n
+        # cast: three-argument `jnp.where` is always an Array; the stubs say
+        # `Array | tuple` because of the one-argument (nonzero) form
         return (
-            jnp.where(keep, a, as_index(-1).astype(idx)),
-            jnp.where(keep, b - nl.astype(idx), as_index(-1).astype(idx)),
+            cast(Array, jnp.where(keep, a, as_index(-1).astype(idx))),
+            cast(Array, jnp.where(keep, b - nl.astype(idx), as_index(-1).astype(idx))),
         )
 
     far_t, far_s = split(res.far_a, res.far_b, res.far_count)

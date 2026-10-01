@@ -24,7 +24,7 @@ buffer shapes (padded to ``output_capacity``) with a dynamic valid ``count``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -233,8 +233,12 @@ def sfc_partition(
     if count is not None:
         # dead rows take the sentinel so the sort puts them last, and are then
         # excluded from every destination: they are capacity, not particles
-        codes = jnp.where(
-            jnp.arange(codes.shape[0]) < jnp.asarray(count), codes, _CODE_SENTINEL
+        # cast: three-argument `jnp.where` is always an Array (stubs: `Array | tuple`)
+        codes = cast(
+            Array,
+            jnp.where(
+                jnp.arange(codes.shape[0]) < jnp.asarray(count), codes, _CODE_SENTINEL
+            ),
         )
 
     # Local Morton sort -> particles become grouped by destination device
@@ -250,7 +254,7 @@ def sfc_partition(
     dest = jnp.searchsorted(pivots, codes, side="right").astype(_COUNT_DTYPE)
     if count is not None:
         live = jnp.arange(codes.shape[0]) < jnp.asarray(count)
-        dest = jnp.where(live, dest, _COUNT_DTYPE(ndev))
+        dest = cast(Array, jnp.where(live, dest, _COUNT_DTYPE(ndev)))
     send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
 
     if payload is None:
