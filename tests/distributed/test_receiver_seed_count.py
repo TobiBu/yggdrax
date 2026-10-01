@@ -88,9 +88,9 @@ def test_seed_count_does_not_change_the_lists(capacity):
     )
     assert not bool(out.far_overflow) and not bool(out.near_overflow)
     _SEEN.setdefault("k", []).append(return_key)
-    assert _SEEN["k"][0] == return_key, (
-        "the walk's answer depends on the CSR capacity, so the padding is not inert"
-    )
+    assert (
+        _SEEN["k"][0] == return_key
+    ), "the walk's answer depends on the CSR capacity, so the padding is not inert"
 
 
 _SEEN: dict = {}

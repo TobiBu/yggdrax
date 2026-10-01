@@ -19,8 +19,8 @@ import pytest
 
 from yggdrax.distributed.export import build_send_buffers
 
-MC = 32          # max_cells
-NDEV = 3         # more than two, so the destination blocks really are distinct
+MC = 32  # max_cells
+NDEV = 3  # more than two, so the destination blocks really are distinct
 NUM_NODES = 200
 
 
@@ -79,15 +79,15 @@ def test_every_input_pair_survives_with_its_own_node(n):
             c = int(csr_cell[j])
             r = int(csr_row[j])
             assert 0 <= c < MC, f"rebased cell {c} out of range for destination {d}"
-            assert 0 <= r < node_sizes[d], (
-                f"csr_row {r} outside destination {d}'s block of {node_sizes[d]}"
-            )
+            assert (
+                0 <= r < node_sizes[d]
+            ), f"csr_row {r} outside destination {d}'s block of {node_sizes[d]}"
             got.add((d, c, int(node_rows[node_off[d] + r])))
 
     want = {(int(a), int(b), int(c)) for a, b, c in zip(dev, slot, node)}
-    assert got == want, (
-        f"pairing changed: {len(want - got)} lost, {len(got - want)} invented"
-    )
+    assert (
+        got == want
+    ), f"pairing changed: {len(want - got)} lost, {len(got - want)} invented"
 
 
 def test_the_poisoned_padding_would_show_up_if_read():
@@ -116,4 +116,6 @@ def test_the_poisoned_padding_would_show_up_if_read():
         )
         return int(jnp.sum(sb.csr_sizes))
 
-    assert run(cap) != run(n), "the padding is inert in this fixture, so the test above is weak"
+    assert run(cap) != run(
+        n
+    ), "the padding is inert in this fixture, so the test above is weak"

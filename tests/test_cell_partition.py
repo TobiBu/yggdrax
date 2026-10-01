@@ -126,7 +126,9 @@ _SENTINEL = np.uint64(2**63 - 1)
 def _pad_with_sentinel(codes, rows):
     """Capacity-pad sorted codes the way a distributed shard is padded."""
     codes = np.asarray(codes, np.uint64)
-    return jnp.asarray(np.concatenate([codes, np.full(rows - codes.size, _SENTINEL, np.uint64)]))
+    return jnp.asarray(
+        np.concatenate([codes, np.full(rows - codes.size, _SENTINEL, np.uint64)])
+    )
 
 
 def _live_triples(part):
