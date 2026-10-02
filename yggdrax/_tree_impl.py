@@ -714,6 +714,7 @@ def build_static_cells_tree(
     return_reordered: bool = False,
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
+    min_level: int = 0,
 ):
     """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
 
@@ -761,6 +762,10 @@ def build_static_cells_tree(
         ``num_valid`` -- both halves are needed, see
         :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`. The dead
         rows end up in no leaf, so nothing downstream gathers them.
+    min_level
+        No leaf coarser than this Morton level (see
+        :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`). ``0``:
+        unconstrained.
 
     Returns
     -------
@@ -806,6 +811,7 @@ def build_static_cells_tree(
         leaf_size=int(leaf_size),
         capacity=int(leaf_capacity),
         num_valid=num_valid,
+        min_level=int(min_level),
     )
     live = part.leaf_starts < as_index(int(n))
     safe_start = jnp.minimum(part.leaf_starts, as_index(max(int(n) - 1, 0)))
@@ -856,6 +862,7 @@ def build_static_radix_tree(
     leaf_partition: str = "buckets",
     leaf_capacity: Optional[int] = None,
     num_valid: Array | int | None = None,
+    cell_min_level: int = 0,
 ):
     """Build a fixed-shape radix tree from equal-size Morton-order buckets.
 
@@ -891,6 +898,7 @@ def build_static_radix_tree(
             leaf_capacity=int(leaf_capacity),
             return_reordered=bool(return_reordered),
             num_valid=num_valid,
+            min_level=int(cell_min_level),
         )
     if num_valid is not None:
         raise ValueError("num_valid is only supported for leaf_partition='cells'")
@@ -996,6 +1004,7 @@ def rebuild_static_radix_tree_from_template(
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
+    cell_min_level: int = 0,
 ):
     """Refresh particles against a fixed-shape static radix bucket topology.
 
@@ -1051,6 +1060,7 @@ def rebuild_static_radix_tree_from_template(
             return_reordered=bool(return_reordered),
             return_overflow=bool(return_overflow),
             num_valid=num_valid,
+            min_level=int(cell_min_level),
         )
 
     morton_codes = morton_encode(positions, bounds_resolved)

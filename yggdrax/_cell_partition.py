@@ -83,6 +83,7 @@ def adaptive_cell_leaf_partition(
     capacity: int,
     max_level: int = MORTON_LEVELS,
     num_valid: Array | int | None = None,
+    min_level: int = 0,
 ) -> CellLeafPartition:
     """Adaptive Morton-cell leaves of Morton-sorted codes, padded to ``capacity``.
 
@@ -114,6 +115,14 @@ def adaptive_cell_leaf_partition(
         ``num_valid`` cuts the run boundaries, the leaf starts, the leaf count
         and the last leaf's end; the dead rows then belong to no leaf at all.
 
+    min_level
+        No leaf coarser than this Morton level: a cell shallower than it is split
+        even when it already holds at most ``leaf_size`` particles. Static. A
+        sparse outskirt cell (a few far-apart outliers) otherwise stays ONE leaf
+        whose bounding sphere spans much of the box, fails the MAC against nearly
+        everything and pulls a whole remote domain into the cross-domain near
+        export. ``0`` (default) is the unconstrained partition, bit for bit.
+
     Returns
     -------
     CellLeafPartition
@@ -122,8 +131,8 @@ def adaptive_cell_leaf_partition(
     Raises
     ------
     ValueError
-        If ``leaf_size`` or ``capacity`` is not positive, or ``max_level`` is
-        out of range.
+        If ``leaf_size`` or ``capacity`` is not positive, or ``max_level`` or
+        ``min_level`` is out of range.
     """
     if int(leaf_size) < 1:
         raise ValueError("leaf_size must be >= 1")
@@ -131,6 +140,8 @@ def adaptive_cell_leaf_partition(
         raise ValueError("capacity must be >= 1")
     if not 0 <= int(max_level) <= MORTON_LEVELS:
         raise ValueError(f"max_level must be in [0, {MORTON_LEVELS}]")
+    if not 0 <= int(min_level) <= int(max_level):
+        raise ValueError(f"min_level must be in [0, max_level={int(max_level)}]")
     codes = jnp.asarray(sorted_codes).astype(jnp.uint64)
     n = int(codes.shape[0])
     capacity = int(capacity)
@@ -158,7 +169,7 @@ def adaptive_cell_leaf_partition(
     # at depth d is a maximal run whose interior boundaries all agree through at
     # least d levels; its start is the last boundary with agree < d at or before
     # i (prefix max) and its end the first such boundary after i (suffix min).
-    for d in range(0, int(max_level)):
+    for d in range(int(min_level), int(max_level)):
         # A dead row is a boundary at every level: without this the last live
         # cell's occupancy would count the padding, so a shard whose live part
         # fits in one cell would be split into several -- a legal partition, but
@@ -216,7 +227,11 @@ def adaptive_cell_leaf_partition(
 
 
 def adaptive_cell_leaf_partition_numpy(
-    sorted_codes: np.ndarray, *, leaf_size: int, max_level: int = MORTON_LEVELS
+    sorted_codes: np.ndarray,
+    *,
+    leaf_size: int,
+    max_level: int = MORTON_LEVELS,
+    min_level: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """NumPy reference of :func:`adaptive_cell_leaf_partition` (unpadded).
 
@@ -228,6 +243,8 @@ def adaptive_cell_leaf_partition_numpy(
         Maximum particles per leaf.
     max_level
         Deepest level examined.
+    min_level
+        No leaf coarser than this level (see the device version).
 
     Returns
     -------
@@ -238,7 +255,7 @@ def adaptive_cell_leaf_partition_numpy(
     n = codes.shape[0]
     depth = np.full(n, int(max_level), np.int64)
     assigned = np.zeros(n, bool)
-    for d in range(0, int(max_level)):
+    for d in range(int(min_level), int(max_level)):
         cell = codes >> np.uint64(3 * (MORTON_LEVELS - d))
         change = np.concatenate([[True], cell[1:] != cell[:-1]])
         starts = np.flatnonzero(change)
