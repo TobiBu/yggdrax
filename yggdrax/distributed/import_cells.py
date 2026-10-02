@@ -26,7 +26,7 @@ sender, which is exactly what the re-offsetting needs.
 
 from __future__ import annotations
 
-from typing import NamedTuple, cast
+from typing import Any, Callable, NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -208,6 +208,9 @@ class ReceiverLists(NamedTuple):
         Live near pairs.
     far_overflow, near_overflow, queue_overflow:
         **Must be read.**
+    peak_wavefront:
+        Largest queue occupancy the walk reached -- what ``max_pair_queue`` has to
+        cover. ``None`` when the walk did not report it.
     """
 
     far_target: Array
@@ -219,6 +222,7 @@ class ReceiverLists(NamedTuple):
     far_overflow: Array
     near_overflow: Array
     queue_overflow: Array
+    peak_wavefront: Optional[Array] = None
 
 
 def receiver_interaction_lists(
@@ -238,6 +242,7 @@ def receiver_interaction_lists(
     near_cap: int,
     mac_type: str = "dehnen",
     node_active: Array | None = None,
+    walk_fn: Callable[..., Any] | None = None,
 ) -> ReceiverLists:
     """Expand the imported per-cell lists down to this device's own targets.
 
@@ -279,6 +284,11 @@ def receiver_interaction_lists(
         MAC variant. Static.
     node_active:
         Optional ``(n_local + n_import,)`` mask over the combined space.
+    walk_fn:
+        The walk to run, with :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s
+        signature and result fields; ``None`` runs that one. Lets a caller plug in
+        a faster implementation of the same contract (jaccpot passes its one-launch-
+        per-round Pallas walk) without this module depending on it.
 
     Returns
     -------
@@ -298,7 +308,7 @@ def receiver_interaction_lists(
     )
     seed_b = jnp.where(live, nl + as_index(csr_row), as_index(-1))
 
-    res = dual_tree_walk_mutual(
+    res = (walk_fn or dual_tree_walk_mutual)(
         jnp.asarray(left_child_full),
         jnp.asarray(right_child_full),
         jnp.asarray(centers),
@@ -340,4 +350,5 @@ def receiver_interaction_lists(
         far_overflow=res.far_overflow,
         near_overflow=res.near_overflow,
         queue_overflow=res.queue_overflow,
+        peak_wavefront=getattr(res, "peak_wavefront", None),
     )

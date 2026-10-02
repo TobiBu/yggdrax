@@ -32,9 +32,8 @@ double-counts on every target leaf.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, cast
+from typing import Any, Callable, NamedTuple, Optional, cast
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
@@ -63,6 +62,9 @@ class ExportLists(NamedTuple):
         **Must be read.** A truncated export silently drops part of somebody's
         force, which shows up as a percent-level error and never as a conservation
         violation.
+    peak_wavefront:
+        Largest queue occupancy the walk reached -- what ``max_pair_queue`` has to
+        cover. ``None`` when the walk did not report it.
     """
 
     far_cell: Array
@@ -74,6 +76,7 @@ class ExportLists(NamedTuple):
     far_overflow: Array
     near_overflow: Array
     queue_overflow: Array
+    peak_wavefront: Optional[Array] = None
 
 
 def export_walk(
@@ -93,6 +96,7 @@ def export_walk(
     near_cap: int,
     mac_type: str = "dehnen",
     node_active: Optional[Array] = None,
+    walk_fn: Optional[Callable[..., Any]] = None,
 ) -> ExportLists:
     """Walk this device's tree against every other device's summary cells.
 
@@ -124,6 +128,11 @@ def export_walk(
     node_active:
         Optional ``(total_nodes,)`` mask over the LOCAL tree, for a
         capacity-padded shard.
+    walk_fn:
+        The walk to run, with :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s
+        signature and result fields; ``None`` runs that one. Lets a caller plug in
+        a faster implementation of the same contract (jaccpot passes its one-launch-
+        per-round Pallas walk) without this module depending on it.
 
     Returns
     -------
@@ -178,7 +187,7 @@ def export_walk(
     active = jnp.concatenate([ca.reshape(n_cells), local_active])
 
     root_shifted = (jnp.asarray(root, idx) + shift).astype(idx)
-    res = dual_tree_walk_mutual(
+    res = (walk_fn or dual_tree_walk_mutual)(
         left,
         right,
         all_centers,
@@ -216,6 +225,7 @@ def export_walk(
         far_overflow=res.far_overflow,
         near_overflow=res.near_overflow,
         queue_overflow=res.queue_overflow,
+        peak_wavefront=getattr(res, "peak_wavefront", None),
     )
 
 
@@ -322,11 +332,16 @@ def build_send_buffers(
     # position of each kept node among all kept nodes, in destination order
     g_row = jnp.cumsum(first.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
 
-    node_sizes = jax.ops.segment_sum(
-        first.astype(INDEX_DTYPE),
-        jnp.where(s_live, s_dev, ndev_i),
-        num_segments=ndev + 1,
-    )[:ndev]
+    # Per-destination counts from the device BOUNDARIES of the sorted order, not a
+    # segment_sum: summing P capacity-sized rows into ndev counters is P atomic adds
+    # onto ndev addresses -- 2.6 ms per call at P = 2^23 on an A100, four calls per
+    # force. `s_dev` is sorted (dead rows last, as `ndev`), so device d occupies
+    # [bounds[d], bounds[d + 1]) and its counts are two lookups.
+    bounds = jnp.searchsorted(
+        s_dev, jnp.arange(ndev + 1, dtype=s_dev.dtype), side="left"
+    ).astype(INDEX_DTYPE)
+    kept_before = jnp.concatenate([jnp.zeros((1,), INDEX_DTYPE), g_row + 1])
+    node_sizes = kept_before[bounds[1:]] - kept_before[bounds[:-1]]
     node_offsets = jnp.concatenate(
         [jnp.zeros((1,), INDEX_DTYPE), jnp.cumsum(node_sizes, dtype=INDEX_DTYPE)[:-1]]
     )
@@ -357,11 +372,7 @@ def build_send_buffers(
             (g_row - node_offsets[jnp.where(s_live, s_dev, 0)]).astype(idx), mode="drop"
         )
     )
-    csr_sizes = jax.ops.segment_sum(
-        s_live.astype(INDEX_DTYPE),
-        jnp.where(s_live, s_dev, ndev_i),
-        num_segments=ndev + 1,
-    )[:ndev]
+    csr_sizes = bounds[1:] - bounds[:-1]
 
     return SendBuffers(
         node_rows=node_rows,

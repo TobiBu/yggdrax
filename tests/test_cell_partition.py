@@ -220,3 +220,50 @@ def test_num_valid_is_traceable_and_default_is_unchanged():
     )
     for field in omitted._fields:
         assert jnp.array_equal(getattr(omitted, field), getattr(explicit, field))
+
+
+@pytest.mark.parametrize("min_level", [0, 4, 8])
+def test_min_level_device_and_numpy_agree_and_no_leaf_is_coarser(min_level):
+    """``min_level`` splits sparse cells shallower than it even when they fit."""
+    codes = _sorted_codes(6000, seed=7)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    s_np, e_np, d_np = adaptive_cell_leaf_partition_numpy(
+        codes_np, leaf_size=32, min_level=min_level
+    )
+    part = adaptive_cell_leaf_partition(
+        codes, leaf_size=32, capacity=4096, min_level=min_level
+    )
+    k = int(part.num_leaves)
+    assert not bool(part.overflow)
+    np.testing.assert_array_equal(np.asarray(part.leaf_starts)[:k], s_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_ends)[:k], e_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_depths)[:k], d_np)
+    assert d_np.min() >= min_level
+    assert s_np[0] == 0 and e_np[-1] == codes_np.shape[0]
+    assert np.all(e_np[:-1] == s_np[1:]), "leaves tile the particles"
+    assert np.all(e_np - s_np <= 32)
+
+
+def test_min_level_zero_is_the_unconstrained_partition():
+    """CONTROL: the default must be bit-identical to omitting the argument, and a
+    positive level must actually change a Plummer partition (its outskirt leaves
+    are coarse), or the test above checks nothing."""
+    codes = _sorted_codes(6000, seed=7)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    a = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32)
+    b = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32, min_level=0)
+    for x, y in zip(a, b):
+        np.testing.assert_array_equal(x, y)
+    assert a[2].min() < 4, "vacuous: no coarse leaf to split"
+    c = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32, min_level=4)
+    assert len(c[0]) > len(a[0])
+
+
+def test_min_level_out_of_range_is_refused():
+    codes = _sorted_codes(100)
+    with pytest.raises(ValueError, match="min_level"):
+        adaptive_cell_leaf_partition(codes, leaf_size=8, capacity=64, min_level=-1)
+    with pytest.raises(ValueError, match="min_level"):
+        adaptive_cell_leaf_partition(
+            codes, leaf_size=8, capacity=64, max_level=10, min_level=11
+        )

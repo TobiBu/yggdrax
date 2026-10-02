@@ -203,3 +203,57 @@ def test_validation(bad):
         occupancy_cut(parent, ranges, nint, max_leaves=bad, capacity=8)
     with pytest.raises(ValueError):
         occupancy_cut(parent, ranges, nint, max_leaves=4, capacity=bad)
+
+
+def _node_extents(n=2000, seed=0):
+    """Per-node axis-aligned extent (largest edge) over the sorted particles."""
+    P = np.asarray(_plummer(n, seed), np.float32)
+    codes = np.asarray(morton_encode(jnp.asarray(P), infer_bounds(jnp.asarray(P))))
+    Ps = P[np.argsort(codes, kind="stable")]
+    parent, ranges, nint, k, n = _structure(n=n, seed=seed)
+    nr = np.asarray(ranges)
+    ext = np.zeros(nr.shape[0], np.float32)
+    for i, (a, b) in enumerate(nr.tolist()):
+        if b >= a:
+            seg = Ps[a : b + 1]
+            ext[i] = float((seg.max(0) - seg.min(0)).max())
+    return parent, ranges, nint, k, n, ext
+
+
+@pytest.mark.parametrize("frac", [1 / 16, 1 / 128])
+def test_a_size_bound_keeps_the_cut_exact_and_its_cells_small(frac):
+    """With a size bound the result is still a cut (each live leaf exactly once), and
+    every INTERNAL cell respects the bound; leaves may exceed it (they cannot split)."""
+    parent, ranges, nint, k, n, ext = _node_extents()
+    root = int(np.argmin(np.asarray(parent)))
+    bound = float(ext[root]) * frac
+    s = occupancy_cut(
+        parent,
+        ranges,
+        nint,
+        max_leaves=4,
+        capacity=k + 8,
+        node_extent=jnp.asarray(ext),
+        max_extent=bound,
+    )
+    assert not bool(s.overflow)
+    cells = np.asarray(s.cells)[: int(s.num_cells)]
+    cut = set(cells.tolist())
+    par = np.asarray(parent)
+    for leaf in _live_leaves(ranges, nint, n).tolist():
+        hits = [x for x in _ancestors(par, leaf, root) if x in cut]
+        assert len(hits) == 1, f"leaf {leaf} has {len(hits)} cut ancestors"
+    internal = cells[cells < nint]
+    assert np.all(ext[internal] <= bound)
+    plain = occupancy_cut(parent, ranges, nint, max_leaves=4, capacity=k + 8)
+    assert int(s.num_cells) > int(plain.num_cells), "vacuous: the bound split nothing"
+
+
+def test_no_size_bound_is_the_plain_cut():
+    """CONTROL: node_extent without max_extent (or vice versa) changes nothing."""
+    parent, ranges, nint, k, n, ext = _node_extents()
+    a = occupancy_cut(parent, ranges, nint, max_leaves=4, capacity=k + 8)
+    b = occupancy_cut(
+        parent, ranges, nint, max_leaves=4, capacity=k + 8, node_extent=jnp.asarray(ext)
+    )
+    np.testing.assert_array_equal(np.asarray(a.cells), np.asarray(b.cells))
