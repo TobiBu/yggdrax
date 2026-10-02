@@ -38,6 +38,7 @@ from .tree import (
     get_level_offsets,
     get_node_levels,
     get_nodes_by_level,
+    node_levels_from_parent,
 )
 
 # Each node only needs to interact with a bounded number of well-separated
@@ -978,37 +979,14 @@ def _propagate_extents(parent: Array, extents: Array) -> Array:
 def _compute_node_depths(parent: Array) -> Array:
     """Return the depth of every node (root depth = 0).
 
-    Uses pointer doubling for O(log depth) convergence.  Each node
-    keeps a *depth-to-root* counter and a shortcut pointer.  On each
-    round the shortcut doubles its reach and accumulated depth
-    contributions are propagated.
+    Thin alias for :func:`yggdrax.tree.node_levels_from_parent`, which is the
+    single implementation of the pointer-doubling depth pass -- the same one
+    ``get_node_levels`` falls back to when a topology carries no ``node_level``
+    field, so the walk's depths and the interaction list's levels cannot drift
+    apart.
     """
-    total_nodes = parent.shape[0]
-    is_root = parent < 0
-    # dist[i] = accumulated distance along the shortcut chain.
-    # Initially 1 for non-root nodes (edge to parent), 0 for root.
-    dist = jnp.where(is_root, as_index(0), as_index(1))
-    # shortcut[i] = parent[i] for non-root, i for root.
-    shortcut = jnp.where(
-        is_root,
-        jnp.arange(total_nodes, dtype=parent.dtype),
-        parent,
-    )
 
-    def cond_fn(state):
-        _sc, _d, changed = state
-        return changed
-
-    def body_fn(state):
-        sc, d, _changed = state
-        # Pointer doubling: add distance of shortcut target.
-        new_d = d + d[sc]
-        new_sc = sc[sc]
-        changed = jnp.any(new_sc != sc)
-        return new_sc, new_d, changed
-
-    _, depth, _ = lax.while_loop(cond_fn, body_fn, (shortcut, dist, jnp.bool_(True)))
-    return depth
+    return node_levels_from_parent(parent)
 
 
 def _compute_effective_extents(parent: Array, extents: Array) -> Array:
@@ -1621,18 +1599,21 @@ def _dual_tree_walk_impl(
                     far_overflow_c,
                 )
 
+            # Unconditional: with an empty ``accept_mask`` every write lands on the
+            # out-of-bounds sink and is dropped and every increment is zero, so the
+            # update is an exact no-op. The ``lax.cond`` this replaced cost a
+            # device-to-host predicate sync per round and, because its identity
+            # branch cannot alias operand to result, a copy of the dense
+            # ``far_buffer``/``far_tag_buffer`` in and out every round.
             far_buffer, far_tag_buffer, far_counts, far_pair_total, far_overflow = (
-                lax.cond(
-                    jnp.any(accept_mask),
-                    _far_update,
-                    lambda c: c,
+                _far_update(
                     (
                         far_buffer,
                         far_tag_buffer,
                         far_counts,
                         far_pair_total,
                         far_overflow,
-                    ),
+                    )
                 )
             )
 
@@ -1730,16 +1711,14 @@ def _dual_tree_walk_impl(
                     near_overflow_c,
                 )
 
-            neighbor_buffer, near_counts, near_pair_total, near_overflow = lax.cond(
-                jnp.any(near_mask),
-                _near_update,
-                lambda c: c,
+            # Unconditional for the same reason as the far update above.
+            neighbor_buffer, near_counts, near_pair_total, near_overflow = _near_update(
                 (
                     neighbor_buffer,
                     near_counts,
                     near_pair_total,
                     near_overflow,
-                ),
+                )
             )
 
         refine_pairs = refine_vm(
@@ -2287,8 +2266,9 @@ def _dual_tree_walk_octree_impl(
         batch_near = jnp.sum(should_near.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
         batch_refine = jnp.sum(do_refine.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
 
-        extent_target = mac_extents[safe_targets]
-        extent_source = mac_extents[safe_sources]
+        # The same gathers as the MAC test above; reused rather than re-issued.
+        extent_target = extent_mac_target
+        extent_source = extent_mac_source
         split_target = (
             do_refine
             & target_internal
@@ -6435,6 +6415,12 @@ class MutualWalkResult(NamedTuple):
     otherwise, and a truncated mutual list still conserves momentum exactly
     (dropping a canonical pair drops both its halves), so the diagnostic this
     lane is usually judged on would not notice.
+
+    ``peak_wavefront`` is the largest number of pairs any round *tried* to push
+    (before truncation to ``max_pair_queue``), so an overflowing probe still
+    reports the queue it needed; ``rounds`` is the number of wavefront rounds.
+    Both let a caller size the queue of a later traced call from data instead of
+    from a capacity that merely did not overflow.
     """
 
     far_a: Array
@@ -6446,6 +6432,52 @@ class MutualWalkResult(NamedTuple):
     far_overflow: Array
     near_overflow: Array
     queue_overflow: Array
+    peak_wavefront: Array
+    rounds: Array
+
+
+# Width ladder of the flat mutual walk (Tier 3 of the tree-walk plan, 2026-09-11).
+# Every round of the wavefront loop used to evaluate all ``max_pair_queue`` slots
+# whether 3 or 100 % were live. Profiled on a 200k Plummer tree at leaf 64 /
+# theta 0.6 the walk runs 55 rounds with a peak of 192k live pairs; the first 18
+# rounds hold fewer than 4096 and the last 10 decay from 33k to 200, so the full
+# width did 28.8M slot evaluations for 2.7M live pairs. The body is compiled once
+# per width in the ladder (powers of ``_WAVEFRONT_LADDER_STEP`` from
+# ``_WAVEFRONT_LADDER_FLOOR`` up to the queue) and the walk runs one
+# ``while_loop`` per rung -- ascending, the widest, descending, then a
+# full-width catch-all -- so every round runs at (about) the narrowest width
+# that holds its live wavefront: 5.2M slot evaluations on the same tree, at
+# most a factor ``_WAVEFRONT_LADDER_STEP`` over live.
+_WAVEFRONT_LADDER_FLOOR = 4096
+_WAVEFRONT_LADDER_STEP = 4
+# Default of ``dual_tree_walk_mutual(wavefront_ladder=...)``; the environment
+# switch exists so a caller that cannot reach the static argument (jaccpot's
+# fused lane inside a compiled scan) can still A/B the ladder. Read at import.
+_WAVEFRONT_LADDER_DEFAULT = os.environ.get(
+    "YGGDRAX_MUTUAL_WALK_LADDER", "1"
+).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _wavefront_ladder(max_pair_queue: int) -> tuple[int, ...]:
+    """Static widths the mutual walk compiles its round body for.
+
+    Parameters
+    ----------
+    max_pair_queue:
+        Wavefront capacity; always the last (widest) rung.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Strictly increasing widths ending in ``max_pair_queue``.
+    """
+    widths = []
+    w = _WAVEFRONT_LADDER_FLOOR
+    while w < int(max_pair_queue):
+        widths.append(int(w))
+        w *= _WAVEFRONT_LADDER_STEP
+    widths.append(int(max_pair_queue))
+    return tuple(widths)
 
 
 def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
@@ -6453,22 +6485,37 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
 
     Returns ``(buf_a, buf_b, new_count, overflow)``. ``new_count`` counts what
     *would* have been written, so the caller can detect overflow even though the
-    writes themselves are dropped.
+    writes themselves are dropped. Index dtype follows ``buf_a``.
     """
-    live = mask.astype(INDEX_DTYPE)
-    prefix = jnp.cumsum(live, dtype=INDEX_DTYPE) - live
+    idx = buf_a.dtype
+    live = mask.astype(idx)
+    prefix = jnp.cumsum(live, dtype=idx) - live
     slot = count + prefix
-    ok = mask & (slot < as_index(cap))
-    overflow = jnp.any(mask & (slot >= as_index(cap)))
+    ok = mask & (slot < jnp.asarray(cap, idx))
+    overflow = jnp.any(mask & (slot >= jnp.asarray(cap, idx)))
     # Out-of-range slots go to `cap` and are dropped, rather than wrapping onto
-    # a live entry.
-    safe = jnp.where(ok, slot, as_index(cap))
-    buf_a = buf_a.at[safe].set(jnp.where(ok, values_a, as_index(-1)), mode="drop")
-    buf_b = buf_b.at[safe].set(jnp.where(ok, values_b, as_index(-1)), mode="drop")
-    return buf_a, buf_b, count + jnp.sum(live, dtype=INDEX_DTYPE), overflow
+    # a live entry. In-bounds slots are an exclusive prefix, hence unique.
+    safe = jnp.where(ok, slot, jnp.asarray(cap, idx))
+    neg1 = jnp.asarray(-1, idx)
+    buf_a = buf_a.at[safe].set(
+        jnp.where(ok, values_a, neg1), mode="drop", unique_indices=True
+    )
+    buf_b = buf_b.at[safe].set(
+        jnp.where(ok, values_b, neg1), mode="drop", unique_indices=True
+    )
+    return buf_a, buf_b, count + jnp.sum(live, dtype=idx), overflow
 
 
-@partial(jax.jit, static_argnames=("max_pair_queue", "far_cap", "near_cap"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "max_pair_queue",
+        "far_cap",
+        "near_cap",
+        "mac_type",
+        "wavefront_ladder",
+    ),
+)
 def dual_tree_walk_mutual(
     left_child_full: Array,
     right_child_full: Array,
@@ -6480,6 +6527,12 @@ def dual_tree_walk_mutual(
     max_pair_queue: int,
     far_cap: int,
     near_cap: int,
+    mac_type: Optional[MACType] = None,
+    node_active: Optional[Array] = None,
+    seed_a: Optional[Array] = None,
+    seed_b: Optional[Array] = None,
+    seed_count: Optional[Array] = None,
+    wavefront_ladder: Optional[bool] = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6517,151 +6570,291 @@ def dual_tree_walk_mutual(
         Output capacity for the canonical far list.
     near_cap:
         Output capacity for the canonical near list.
+    mac_type:
+        ``None`` (default) keeps the strict rule above. A ``MACType`` routes the
+        test through :func:`_compute_mac_ok` instead -- the non-strict
+        ``(r_a + r_b)^2 <= theta^2 d^2`` of the dual-tree walk for ``bh`` and
+        ``dehnen`` (they differ from the strict rule only on exact equality) and
+        the Engblom form -- so a caller that feeds the dual walk's own
+        ``mac_extents`` gets the dual walk's far and near lists as sets. Static.
+    node_active:
+        Optional ``(total_nodes,)`` boolean mask. A pair whose target or source
+        node is inactive is DEAD: never accepted, never a near pair, never
+        refined. Empty padding nodes of a capacity-padded leaf partition
+        (``yggdrax._cell_partition``) are what this is for -- with all of them
+        at one centre and radius zero they otherwise fail the MAC against each
+        other and flood the near list. ``None`` = every node active (no extra
+        gathers; bit-identical to the walk without the argument).
+    seed_a:
+        Optional ``(K,)`` node-index array, the first node of each of K seed pairs
+        that replace the single ``(root, root)`` pair. Given together with
+        ``seed_b`` or not at all; ``root`` is then unused.
+    seed_b:
+        Optional ``(K,)`` node-index array, the second node of each seed pair. Pairs are canonicalised to ``(min, max)`` here, as
+        every refined pair already is, so the caller's order does not matter and a
+        seed cannot be emitted in the opposite orientation from its own descendants.
+
+        This is what makes a ONE-SIDED cross-domain evaluation need no new kernel.
+        Concatenate an imported source set onto the local nodes at indices
+        ``[n_local, n_local + n_remote)`` and seed ``(local_root, imported_i)``: the
+        canonicalisation then orders every emitted pair as (local target, imported
+        source) exactly, for free, because every local index is strictly below every
+        imported one. The imported entries carry ``left = right = -1``, so the walk
+        refines only on the local side and terminates there.
+    seed_count:
+        Optional live prefix length of the seed, traced. ``None`` means all K. Seeds
+        beyond it are dead, as are ``-1`` entries, so a caller with a
+        capacity-padded seed buffer passes the count and pads with ``-1``.
+    wavefront_ladder:
+        Compile the round body for the static widths of
+        :func:`_wavefront_ladder` and let each round run at the narrowest width
+        that holds its live wavefront. ``False`` runs every round at the full
+        ``max_pair_queue`` width. ``None`` (default) takes
+        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
+        the same pairs in the same order -- and differ only in per-round cost
+        and compile time. Static.
 
     Returns
     -------
     MutualWalkResult
         The canonical far and near pair lists, ``-1``-padded to ``far_cap`` and
-        ``near_cap``, with their live counts and the three overflow flags. The
-        flags must be read -- see :class:`MutualWalkResult`.
+        ``near_cap``, with their live counts, the three overflow flags, the peak
+        wavefront and the round count. Index dtype follows ``left_child_full``.
+        The flags must be read -- see :class:`MutualWalkResult`.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``seed_a`` / ``seed_b`` is given, if they are not
+        matching 1-D arrays, or if the seed holds more pairs than
+        ``max_pair_queue``.
     """
-    index_neg1 = as_index(-1)
+    idx = jnp.asarray(left_child_full).dtype
+
+    def ix(x):
+        return jnp.asarray(x, dtype=idx)
+
+    index_neg1 = ix(-1)
     theta_sq = jnp.asarray(theta, dtype=centers.dtype) ** 2
-
-    wf_a = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
-    wf_b = jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE).at[0].set(as_index(root))
-
+    if (seed_a is None) != (seed_b is None):
+        raise ValueError("seed_a and seed_b must be given together")
+    if seed_a is None:
+        wf_a = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
+        wf_b = jnp.full((max_pair_queue,), -1, dtype=idx).at[0].set(ix(root))
+        init_size = ix(1)
+    else:
+        sa_seed = jnp.asarray(seed_a, dtype=idx)
+        sb_seed = jnp.asarray(seed_b, dtype=idx)
+        if sa_seed.shape != sb_seed.shape or sa_seed.ndim != 1:
+            raise ValueError(
+                f"seed_a and seed_b must be matching 1-D arrays, got "
+                f"{sa_seed.shape} and {sb_seed.shape}"
+            )
+        k_seed = int(sa_seed.shape[0])
+        if k_seed > max_pair_queue:
+            raise ValueError(
+                f"seed of {k_seed} pairs exceeds max_pair_queue={max_pair_queue}; "
+                "the wavefront cannot hold its own seed"
+            )
+        # canonicalised exactly as ``_count_sorted_pair`` canonicalises every
+        # refined pair, so a seed and its descendants share one orientation
+        lo = jnp.minimum(sa_seed, sb_seed)
+        hi = jnp.maximum(sa_seed, sb_seed)
+        wf_a = jnp.full((max_pair_queue,), -1, dtype=idx).at[:k_seed].set(lo)
+        wf_b = jnp.full((max_pair_queue,), -1, dtype=idx).at[:k_seed].set(hi)
+        init_size = ix(k_seed) if seed_count is None else ix(seed_count)
     init = (
         wf_a,
         wf_b,
-        as_index(1),
-        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
-        jnp.full((far_cap,), -1, dtype=INDEX_DTYPE),
-        as_index(0),
-        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
-        jnp.full((near_cap,), -1, dtype=INDEX_DTYPE),
-        as_index(0),
+        init_size,
+        jnp.full((far_cap,), -1, dtype=idx),
+        jnp.full((far_cap,), -1, dtype=idx),
+        ix(0),
+        jnp.full((near_cap,), -1, dtype=idx),
+        jnp.full((near_cap,), -1, dtype=idx),
+        ix(0),
         jnp.asarray(False),
         jnp.asarray(False),
         jnp.asarray(False),
+        init_size,  # peak wavefront (the seed)
+        ix(0),  # rounds
     )
 
-    def cond_fun(state):
+    def make_round(width: int):
+        # One round of the wavefront loop at a static width ``width`` >= the live
+        # wavefront: the first ``width`` queue slots are read, the pushed pairs are
+        # compacted into a fresh full-width queue. Dead slots contribute nothing
+        # anywhere, so every width yields the same pairs in the same order.
+        flat = width * _MAX_REFINEMENT_PAIRS
+
+        def round_fun(state):
+            (
+                cur_a,
+                cur_b,
+                size,
+                far_a,
+                far_b,
+                far_n,
+                near_a,
+                near_b,
+                near_n,
+                far_over,
+                near_over,
+                wf_over,
+                peak,
+                rounds,
+            ) = state
+            cur_a = cur_a[:width]
+            cur_b = cur_b[:width]
+            live = (jnp.arange(width, dtype=idx) < size) & (cur_a >= 0)
+            sa = jnp.asarray(jnp.where(live, cur_a, ix(0)))
+            sb = jnp.asarray(jnp.where(live, cur_b, ix(0)))
+            if node_active is not None:
+                # dead pairs: gathered once, then excluded from accept/near/refine
+                live = live & node_active[sa] & node_active[sb]
+            # Every per-node quantity is gathered ONCE per round and reused below.
+            left_a = left_child_full[sa]
+            left_b = left_child_full[sb]
+            right_a = right_child_full[sa]
+            right_b = right_child_full[sb]
+            radius_a = radii[sa]
+            radius_b = radii[sb]
+            a_leaf = left_a < 0
+            b_leaf = left_b < 0
+            same = jnp.asarray(sa == sb)
+            delta = centers[sb] - centers[sa]
+            dist_sq = jnp.sum(delta * delta, axis=-1)
+            if mac_type is None:
+                radius_sum = radius_a + radius_b
+                accept = live & (~same) & (theta_sq * dist_sq > radius_sum * radius_sum)
+            else:
+                accept = _compute_mac_ok(
+                    mac_type=mac_type,
+                    theta_sq=theta_sq,
+                    dist_sq=dist_sq,
+                    extent_target=radius_a,
+                    extent_source=radius_b,
+                    valid_pairs=live,
+                    different_nodes=~same,
+                )
+            both_leaf = a_leaf & b_leaf
+            is_near = live & (~accept) & both_leaf & (~same)
+            refine = live & (~accept) & (~both_leaf)
+            far_a, far_b, far_n, far_of = _flat_append(
+                far_a, far_b, far_n, accept, sa, sb, far_cap
+            )
+            near_a, near_b, near_n, near_of = _flat_append(
+                near_a, near_b, near_n, is_near, sa, sb, near_cap
+            )
+            split_a = refine & (~a_leaf) & (same | b_leaf | (radius_a >= radius_b))
+            split_b = refine & (~b_leaf) & (same | a_leaf | (radius_b > radius_a))
+            split_both = split_a & split_b
+            refined = _COUNT_REFINE_VM(
+                sa,
+                sb,
+                same,
+                split_both,
+                split_a & ~split_both,
+                split_b & ~split_both,
+                left_a,
+                right_a,
+                left_b,
+                right_b,
+            )
+            # ``_COUNT_REFINE_VM`` works in the module INDEX_DTYPE; bring its
+            # output to this walk's dtype before it meets the queue buffers.
+            push_a = refined[..., 0].reshape((flat,)).astype(idx)
+            push_b = refined[..., 1].reshape((flat,)).astype(idx)
+            valid_push = (push_a >= 0) & (push_b >= 0)
+            pp = valid_push.astype(idx)
+            push_prefix = jnp.cumsum(pp, dtype=idx) - pp
+            push_total = jnp.sum(pp, dtype=idx)  # what this round NEEDED
+            push_ok = valid_push & (push_prefix < ix(max_pair_queue))
+            wf_over = wf_over | (push_total > ix(max_pair_queue))
+            # In-bounds slots are an exclusive prefix (unique); the rest sink to
+            # ``max_pair_queue`` and are dropped before any write.
+            safe_slot = jnp.where(push_ok, push_prefix, ix(max_pair_queue))
+            lo = jnp.minimum(push_a, push_b)
+            hi = jnp.maximum(push_a, push_b)
+            new_a = (
+                jnp.full((max_pair_queue,), -1, dtype=idx)
+                .at[safe_slot]
+                .set(
+                    jnp.where(push_ok, lo, index_neg1),
+                    mode="drop",
+                    unique_indices=True,
+                )
+            )
+            new_b = (
+                jnp.full((max_pair_queue,), -1, dtype=idx)
+                .at[safe_slot]
+                .set(
+                    jnp.where(push_ok, hi, index_neg1),
+                    mode="drop",
+                    unique_indices=True,
+                )
+            )
+            return (
+                new_a,
+                new_b,
+                jnp.minimum(push_total, ix(max_pair_queue)),
+                far_a,
+                far_b,
+                far_n,
+                near_a,
+                near_b,
+                near_n,
+                far_over | far_of,
+                near_over | near_of,
+                wf_over,
+                jnp.maximum(peak, push_total),
+                rounds + ix(1),
+            )
+
+        return round_fun
+
+    if wavefront_ladder is None:
+        wavefront_ladder = _WAVEFRONT_LADDER_DEFAULT
+    widths = (
+        _wavefront_ladder(max_pair_queue) if wavefront_ladder else (max_pair_queue,)
+    )
+
+    def healthy(state):
         size = state[2]
         far_over, near_over, wf_over = state[9], state[10], state[11]
         return (size > 0) & (~far_over) & (~near_over) & (~wf_over)
 
-    def body_fun(state):
-        (
-            cur_a,
-            cur_b,
-            size,
-            far_a,
-            far_b,
-            far_n,
-            near_a,
-            near_b,
-            near_n,
-            far_over,
-            near_over,
-            wf_over,
-        ) = state
+    def run_rung(state, width, lower=None, upper=None):
+        # One ``while_loop`` per rung, so the carry is updated IN PLACE. A
+        # ``lax.switch`` over the widths would copy every loop-carried buffer
+        # (queue, far, near: six full-size memcpys) into the conditional each
+        # round -- the pathology the dual walk's ``lax.cond`` emissions had.
+        def cond(state):
+            ok = healthy(state)
+            if lower is not None:
+                ok = ok & (state[2] > ix(lower))
+            if upper is not None:
+                ok = ok & (state[2] <= ix(upper))
+            return ok
 
-        live = (jnp.arange(max_pair_queue, dtype=INDEX_DTYPE) < size) & (cur_a >= 0)
-        # `jnp.asarray` here is for the type checker, not the runtime: a
-        # `lax.while_loop` carry is a heterogeneous tuple, so unpacking it widens
-        # every element to the union of the tuple's member types, and that union
-        # then propagates through `jnp.where` into the refiner's `Array`
-        # parameters. Narrowing once here keeps the rest of the body clean.
-        sa = jnp.asarray(jnp.where(live, cur_a, as_index(0)))
-        sb = jnp.asarray(jnp.where(live, cur_b, as_index(0)))
+        return lax.while_loop(cond, make_round(width), state)
 
-        a_leaf = left_child_full[sa] < 0
-        b_leaf = left_child_full[sb] < 0
-        same = jnp.asarray(sa == sb)
-
-        delta = centers[sb] - centers[sa]
-        dist_sq = jnp.sum(delta * delta, axis=-1)
-        radius_sum = radii[sa] + radii[sb]
-        # theta * d > r_a + r_b, squared. Strict, and never for a self-pair.
-        accept = live & (~same) & (theta_sq * dist_sq > radius_sum * radius_sum)
-
-        both_leaf = a_leaf & b_leaf
-        # A leaf pair the MAC rejected is near field; a leaf self-pair is the
-        # caller's implicit intra-leaf block and is dropped here.
-        is_near = live & (~accept) & both_leaf & (~same)
-        refine = live & (~accept) & (~both_leaf)
-
-        far_a, far_b, far_n, far_of = _flat_append(
-            far_a, far_b, far_n, accept, sa, sb, far_cap
-        )
-        near_a, near_b, near_n, near_of = _flat_append(
-            near_a, near_b, near_n, is_near, sa, sb, near_cap
-        )
-
-        # Split the larger node; split both when they tie or the pair is
-        # diagonal. Matches the host traversal's heuristic.
-        split_a = refine & (~a_leaf) & (same | b_leaf | (radii[sa] >= radii[sb]))
-        split_b = refine & (~b_leaf) & (same | a_leaf | (radii[sb] > radii[sa]))
-        split_both = split_a & split_b
-
-        # `_COUNT_REFINE_VM` is the module-level, already-vmapped twin of the
-        # traversal's nested refiner -- same signature, same canonical ordering,
-        # same (L,L)/(L,R)/(R,R) diagonal split. Reused rather than re-derived so
-        # the two walks cannot drift apart on the case analysis.
-        refined = _COUNT_REFINE_VM(
-            sa,
-            sb,
-            same,
-            split_both,
-            split_a & ~split_both,
-            split_b & ~split_both,
-            left_child_full[sa],
-            right_child_full[sa],
-            left_child_full[sb],
-            right_child_full[sb],
-        )
-
-        flat = max_pair_queue * _MAX_REFINEMENT_PAIRS
-        push_a = refined[..., 0].reshape((flat,))
-        push_b = refined[..., 1].reshape((flat,))
-        valid_push = (push_a >= 0) & (push_b >= 0)
-        pp = valid_push.astype(INDEX_DTYPE)
-        push_prefix = jnp.cumsum(pp, dtype=INDEX_DTYPE) - pp
-        push_ok = valid_push & (push_prefix < as_index(max_pair_queue))
-        wf_over = wf_over | jnp.any(
-            valid_push & (push_prefix >= as_index(max_pair_queue))
-        )
-        safe_slot = jnp.where(push_ok, push_prefix, as_index(max_pair_queue))
-        lo = jnp.minimum(push_a, push_b)
-        hi = jnp.maximum(push_a, push_b)
-        new_a = (
-            jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE)
-            .at[safe_slot]
-            .set(jnp.where(push_ok, lo, index_neg1), mode="drop")
-        )
-        new_b = (
-            jnp.full((max_pair_queue,), -1, dtype=INDEX_DTYPE)
-            .at[safe_slot]
-            .set(jnp.where(push_ok, hi, index_neg1), mode="drop")
-        )
-
-        return (
-            new_a,
-            new_b,
-            jnp.sum(push_ok.astype(INDEX_DTYPE), dtype=INDEX_DTYPE),
-            far_a,
-            far_b,
-            far_n,
-            near_a,
-            near_b,
-            near_n,
-            far_over | far_of,
-            near_over | near_of,
-            wf_over,
-        )
-
-    final = lax.while_loop(cond_fun, body_fun, init)
+    if len(widths) == 1:
+        final = lax.while_loop(healthy, make_round(max_pair_queue), init)
+    else:
+        # The live wavefront rises from the root, plateaus and decays. Ascend the
+        # rungs while the wavefront fits each width, run the widest rung while it
+        # exceeds the one below, descend while it fits each width but not the one
+        # below, and let a full-width loop finish whatever a non-monotone tail
+        # leaves over -- correctness never depends on the profile's shape.
+        state = init
+        for w in widths[:-1]:
+            state = run_rung(state, w, upper=w)
+        state = run_rung(state, max_pair_queue, lower=widths[-2])
+        lowers = (None,) + widths[:-2]
+        for w, lo in zip(reversed(widths[:-1]), reversed(lowers)):
+            state = run_rung(state, w, lower=lo, upper=w)
+        final = lax.while_loop(healthy, make_round(max_pair_queue), state)
     return MutualWalkResult(
         far_a=final[3],
         far_b=final[4],
@@ -6672,4 +6865,6 @@ def dual_tree_walk_mutual(
         far_overflow=final[9],
         near_overflow=final[10],
         queue_overflow=final[11],
+        peak_wavefront=final[12],
+        rounds=final[13],
     )

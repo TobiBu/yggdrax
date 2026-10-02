@@ -89,7 +89,7 @@ def _run(width):
 
     def fn(pos, m):
         bounds = global_bounds(pos, axis_name=AXIS_NAME)
-        p_, m_, _c, cnt = sfc_partition(
+        p_, m_, _c, cnt, _g = sfc_partition(
             pos, m, _NDEV, output_capacity=_CAP, bounds=bounds, axis_name=AXIS_NAME
         )
         p_, m_ = sanitize_padding(p_, m_, cnt)

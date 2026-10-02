@@ -184,6 +184,8 @@ def dual_tree_walk_cross_impl(
     collect_near: bool = True,
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
+    target_node_active: Optional[Array] = None,
+    source_node_active: Optional[Array] = None,
 ) -> DualTreeWalkResult:
     """Dual walk of target-tree nodes against source-tree nodes (un-jitted impl).
 
@@ -203,6 +205,29 @@ def dual_tree_walk_cross_impl(
     indexed over ``source_tree`` and its ``target_*`` entries over
     ``target_tree``; nothing checks that, and getting it wrong reads the wrong
     node rather than raising.
+
+    ``target_node_active`` / ``source_node_active`` are the cross-walk form of
+    :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s ``node_active``, split
+    in two because this walk spans two index spaces. Each is an optional boolean
+    mask over its tree's ``total_nodes``; a pair whose target OR source node is
+    inactive is DEAD -- never accepted, never a near pair, never refined. ``None``
+    (either one) means every node of that tree is active, and is bit-identical to
+    the walk without the argument.
+
+    They exist because a capacity-padded shard cannot cross without them. Padding
+    leaves of a ``yggdrax._cell_partition`` shard carry no particles, so they sit
+    at one degenerate centre with radius zero and pass no MAC against anything:
+    unmasked they become a near neighbour of every node in the other tree, which
+    is how a cap sized for the real import overflows at the whole live leaf count.
+
+    Unlike ``policy_state`` above, these ARE checked -- their shapes are static, so
+    a mask built over the wrong tree raises here instead of gathering the wrong
+    node. What is not checked, because it is not a shape, is that the mask is
+    ancestor-closed: an inactive node is never refined, so marking an internal node
+    inactive prunes every live descendant with it. The rule that satisfies this is
+    the one the padding produces naturally -- inactive exactly when the node's own
+    particle range is empty (``node_ranges[:, 1] < node_ranges[:, 0]``), which is
+    true of a pure-padding subtree and false of every ancestor of a live leaf.
     """
 
     t_parent = target_tree.parent
@@ -214,6 +239,24 @@ def dual_tree_walk_cross_impl(
     s_total = s_parent.shape[0]
     s_internal = source_tree.left_child.shape[0]
     s_leaves = s_total - s_internal
+
+    def _active(mask, total, name, tree_name):
+        if mask is None:
+            return None
+        mask = jnp.asarray(mask)
+        if mask.shape != (total,):
+            raise ValueError(
+                f"{name} must be a ({total},) mask over {tree_name}'s total nodes, "
+                f"got {mask.shape}"
+            )
+        return mask.astype(jnp.bool_)
+
+    target_node_active = _active(
+        target_node_active, t_total, "target_node_active", "target_tree"
+    )
+    source_node_active = _active(
+        source_node_active, s_total, "source_node_active", "source_tree"
+    )
 
     t_leaf_indices, t_leaf_position, _a, _b = _resolve_leaf_ordering(
         target_tree, total_nodes=t_total, num_internal=t_internal
@@ -335,6 +378,16 @@ def dual_tree_walk_cross_impl(
         # `tree.py` and `octree_uvwx.py`).
         st_t = cast(Array, jnp.where(valid, wf_t, as_index(0)))
         st_s = cast(Array, jnp.where(valid, wf_s, as_index(0)))
+
+        # Dead pairs: gathered once on the already-safe indices, then excluded from
+        # accept / near / refine alike. `valid` keeps its slot-hygiene meaning below
+        # (it is what makes `st_*` safe to gather with); `vb` is what decides whether
+        # a pair counts, so narrowing it here is enough -- every emission and every
+        # split downstream is gated on `vb`.
+        if target_node_active is not None:
+            vb = vb & target_node_active[st_t]
+        if source_node_active is not None:
+            vb = vb & source_node_active[st_s]
 
         ct = t_centers[st_t]
         cs = s_centers[st_s]

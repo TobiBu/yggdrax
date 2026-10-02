@@ -576,9 +576,22 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
     # is 702 apply_primitive calls and ~190 ms, and its shapes depend only on
     # the leaf count, so one compilation serves every rebuild of that size.
     try:
-        return _jit_augment_radix_topology_with_octree(topology)
+        augmented = _jit_augment_radix_topology_with_octree(topology)
     except Exception:  # pragma: no cover - fall back rather than fail a build
         return _augment_radix_topology_with_octree_eager(topology)
+    # Every field of the topology is an ordinary pytree child of that jit's
+    # output, so every one of them comes back as a device array -- including
+    # `leaf_size`, which is static to the build, is annotated `int | None`, and
+    # is filed as pytree AUX by the tree registration. An array there poisons
+    # every jit cache key the tree takes part in; `yggdrax.tree.
+    # _with_static_leaf_size` documents what that costs and where it surfaced.
+    # It is the only field to put back: the rest genuinely are arrays.
+    static_leaf_size = getattr(topology, "leaf_size", None)
+    if static_leaf_size is None:
+        # Nothing to put back. `None` is pytree *structure* rather than a leaf,
+        # so a fixed-depth topology crosses the boundary with it intact.
+        return augmented
+    return augmented._replace(leaf_size=static_leaf_size)
 
 
 def _augment_radix_topology_with_octree_eager(topology: object) -> OctreeTopology:

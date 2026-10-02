@@ -10,13 +10,23 @@ all-to-all as the central communication primitive.
 from __future__ import annotations
 
 from .comm import (
+    RAGGED_NATIVE_FIXED_JAX,
     ShardedArray,
     all_to_all_dense,
     exchange_pytree,
     exchange_sizes,
     ragged_all_to_all_exchange,
+    resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
+from .export import ExportLists, SendBuffers, build_send_buffers, export_walk
+from .import_cells import (
+    ImportedCells,
+    ReceiverLists,
+    exchange_export_list,
+    rebase_csr,
+    receiver_interaction_lists,
+)
 from .let import (
     ClassifyMetrics,
     CoarseFrontier,
@@ -39,13 +49,18 @@ from .local_tree import (
     sanitize_padding,
 )
 from .partition import (
+    RepartitionResult,
     ShardedDomain,
     equalize_domain,
     global_bounds,
+    maybe_repartition,
+    repartition_due,
     sfc_decompose,
     sfc_partition,
+    sfc_repartition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
+from .summary import TreeSummary, occupancy_cut, subtree_leaf_counts
 
 __all__ = [
     "AXIS_NAME",
@@ -68,6 +83,18 @@ __all__ = [
     "device_count",
     "distributed_let_import",
     "distributed_tree_moments",
+    "ExportLists",
+    "ImportedCells",
+    "ReceiverLists",
+    "SendBuffers",
+    "build_send_buffers",
+    "exchange_export_list",
+    "export_walk",
+    "rebase_csr",
+    "receiver_interaction_lists",
+    "TreeSummary",
+    "occupancy_cut",
+    "subtree_leaf_counts",
     "dual_tree_walk_cross",
     "dual_tree_walk_cross_impl",
     "equalize_domain",
@@ -78,7 +105,13 @@ __all__ = [
     "global_bounds",
     "make_mesh",
     "ragged_all_to_all_exchange",
+    "resolve_ragged_method",
+    "RAGGED_NATIVE_FIXED_JAX",
     "sanitize_padding",
     "sfc_decompose",
+    "maybe_repartition",
+    "repartition_due",
     "sfc_partition",
+    "sfc_repartition",
+    "RepartitionResult",
 ]
