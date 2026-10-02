@@ -144,3 +144,43 @@ def test_partition_knob_and_template_rebuild_trace():
     )
     with pytest.raises(ValueError):
         rebuild_static_radix_tree_from_template(P2, M, bt, return_overflow=True)
+
+
+def test_the_public_template_rebuild_honours_cell_min_level():
+    """jaccpot's traced refresh rebuilds through yggdrax.tree's public wrapper, so
+    the option must reach the partition through it too -- not only through the
+    private builder."""
+    from yggdrax._tree_impl import build_static_cells_tree
+    from yggdrax.tree import RadixTree, rebuild_static_radix_tree_from_template
+
+    rng = np.random.default_rng(3)
+    x = rng.uniform(0.0, 1.0, size=3000)
+    r = 1.0 / np.sqrt(x ** (-2.0 / 3.0) - 1.0)
+    d = rng.normal(size=(3000, 3))
+    P = jnp.asarray(
+        d / np.linalg.norm(d, axis=1, keepdims=True) * r[:, None], jnp.float32
+    )
+    M = jnp.ones((3000,), jnp.float32)
+    bounds = infer_bounds(P)
+    topo, *_ = build_static_cells_tree(
+        P, M, bounds, leaf_size=16, leaf_capacity=4096, return_reordered=True
+    )
+    template = RadixTree(topology=topo, build_mode="static_radix")
+
+    def live_leaves(level):
+        out = rebuild_static_radix_tree_from_template(
+            P,
+            M,
+            template,
+            bounds=bounds,
+            return_reordered=True,
+            leaf_partition="cells",
+            cell_min_level=level,
+        )
+        tree = out[0]
+        t = tree.topology if hasattr(tree, "topology") else tree
+        ni = int(t.left_child.shape[0])
+        rr = np.asarray(t.node_ranges)[ni:]
+        return int(np.sum(rr[:, 1] >= rr[:, 0]))
+
+    assert live_leaves(6) > live_leaves(0)

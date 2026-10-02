@@ -1986,6 +1986,7 @@ def rebuild_static_radix_tree_from_template(
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
     num_valid: Optional[Array] = None,
+    cell_min_level: int = 0,
 ):
     """Refresh particles using an existing static-radix data structure.
 
@@ -1996,6 +1997,9 @@ def rebuild_static_radix_tree_from_template(
 
     ``num_valid`` is the live row count of a capacity-padded shard (the
     distributed lane); ``None`` treats every row as live. Cells only.
+
+    ``cell_min_level``: no cell leaf coarser than this Morton level (see
+    :func:`yggdrax._cell_partition.adaptive_cell_leaf_partition`). Cells only.
     """
 
     if isinstance(template, RadixTree):
@@ -2016,6 +2020,7 @@ def rebuild_static_radix_tree_from_template(
         leaf_partition=leaf_partition,
         return_overflow=return_overflow,
         num_valid=num_valid,
+        cell_min_level=int(cell_min_level),
     )
     overflow = None
     if return_overflow:
