@@ -19,7 +19,13 @@ from .comm import (
     resolve_ragged_method,
 )
 from .cross_walk import dual_tree_walk_cross, dual_tree_walk_cross_impl
-from .export import ExportLists, SendBuffers, build_send_buffers, export_walk
+from .export import (
+    ExportLists,
+    SendBuffers,
+    build_send_buffers,
+    export_walk,
+    export_walk_two_sided,
+)
 from .import_cells import (
     ImportedCells,
     ReceiverLists,
@@ -60,7 +66,13 @@ from .partition import (
     sfc_repartition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
-from .summary import TreeSummary, occupancy_cut, subtree_leaf_counts
+from .summary import (
+    SummaryTree,
+    TreeSummary,
+    occupancy_cut,
+    subtree_leaf_counts,
+    summary_tree,
+)
 
 __all__ = [
     "AXIS_NAME",
@@ -90,11 +102,14 @@ __all__ = [
     "build_send_buffers",
     "exchange_export_list",
     "export_walk",
+    "export_walk_two_sided",
     "rebase_csr",
     "receiver_interaction_lists",
+    "SummaryTree",
     "TreeSummary",
     "occupancy_cut",
     "subtree_leaf_counts",
+    "summary_tree",
     "dual_tree_walk_cross",
     "dual_tree_walk_cross_impl",
     "equalize_domain",
