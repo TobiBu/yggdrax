@@ -125,6 +125,8 @@ def occupancy_cut(
     max_leaves: int,
     capacity: int,
     num_valid: Optional[Array] = None,
+    node_extent: Optional[Array] = None,
+    max_extent: Optional[Array | float] = None,
 ) -> TreeSummary:
     """The shallowest cut whose cells each hold at most ``max_leaves`` live leaves.
 
@@ -154,6 +156,15 @@ def occupancy_cut(
     num_valid:
         Live particle count of a capacity-padded shard; see
         :func:`subtree_leaf_counts`.
+    node_extent, max_extent:
+        Optional SIZE bound: an internal node is a cell only when it also has
+        ``node_extent <= max_extent`` (leaves always qualify, so every live leaf
+        stays covered). Use an axis-aligned extent: a node's box contains its
+        children's, so the bound is monotone down the tree and the result is still
+        a cut. Without it, a sparse node holding a few tiny far-apart leaves is one
+        huge cell, and whatever a sender decides against that cell's bounding
+        sphere -- near, typically, for an entire remote domain -- applies to all of
+        it. ``None`` (default): the occupancy bound alone.
 
     Returns
     -------
@@ -174,10 +185,15 @@ def occupancy_cut(
     sub = subtree_leaf_counts(node_ranges, num_internal, num_valid)
     m = as_index(int(max_leaves))
     is_root = par < 0
-    parent_sub = sub[jnp.where(is_root, 0, par)]
     # the root is in the cut only when the whole tree fits; otherwise a node is in
     # it when it fits and its parent does not
-    in_cut = (sub > 0) & (sub <= m) & jnp.where(is_root, True, parent_sub > m)
+    fits = (sub > 0) & (sub <= m)
+    if node_extent is not None and max_extent is not None:
+        ext = jnp.asarray(node_extent)
+        is_leaf = jnp.arange(par.shape[0], dtype=INDEX_DTYPE) >= as_index(num_internal)
+        fits = fits & (is_leaf | (ext <= jnp.asarray(max_extent, ext.dtype)))
+    parent_fits = fits[jnp.where(is_root, 0, par)]
+    in_cut = fits & jnp.where(is_root, True, ~parent_fits)
 
     idx = jnp.arange(par.shape[0], dtype=INDEX_DTYPE)
     order = jnp.argsort(jnp.where(in_cut, idx, as_index(par.shape[0])), stable=True)
