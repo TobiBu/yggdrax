@@ -32,7 +32,7 @@ double-counts on every target leaf.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, cast
+from typing import Any, Callable, NamedTuple, Optional, cast
 
 import jax.numpy as jnp
 from jaxtyping import Array
@@ -62,6 +62,9 @@ class ExportLists(NamedTuple):
         **Must be read.** A truncated export silently drops part of somebody's
         force, which shows up as a percent-level error and never as a conservation
         violation.
+    peak_wavefront:
+        Largest queue occupancy the walk reached -- what ``max_pair_queue`` has to
+        cover. ``None`` when the walk did not report it.
     """
 
     far_cell: Array
@@ -73,6 +76,7 @@ class ExportLists(NamedTuple):
     far_overflow: Array
     near_overflow: Array
     queue_overflow: Array
+    peak_wavefront: Optional[Array] = None
 
 
 def export_walk(
@@ -92,6 +96,7 @@ def export_walk(
     near_cap: int,
     mac_type: str = "dehnen",
     node_active: Optional[Array] = None,
+    walk_fn: Optional[Callable[..., Any]] = None,
 ) -> ExportLists:
     """Walk this device's tree against every other device's summary cells.
 
@@ -123,6 +128,11 @@ def export_walk(
     node_active:
         Optional ``(total_nodes,)`` mask over the LOCAL tree, for a
         capacity-padded shard.
+    walk_fn:
+        The walk to run, with :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s
+        signature and result fields; ``None`` runs that one. Lets a caller plug in
+        a faster implementation of the same contract (jaccpot passes its one-launch-
+        per-round Pallas walk) without this module depending on it.
 
     Returns
     -------
@@ -177,7 +187,7 @@ def export_walk(
     active = jnp.concatenate([ca.reshape(n_cells), local_active])
 
     root_shifted = (jnp.asarray(root, idx) + shift).astype(idx)
-    res = dual_tree_walk_mutual(
+    res = (walk_fn or dual_tree_walk_mutual)(
         left,
         right,
         all_centers,
@@ -215,6 +225,7 @@ def export_walk(
         far_overflow=res.far_overflow,
         near_overflow=res.near_overflow,
         queue_overflow=res.queue_overflow,
+        peak_wavefront=getattr(res, "peak_wavefront", None),
     )
 
 
