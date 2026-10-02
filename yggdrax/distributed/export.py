@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from typing import NamedTuple, Optional, cast
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
@@ -322,11 +321,16 @@ def build_send_buffers(
     # position of each kept node among all kept nodes, in destination order
     g_row = jnp.cumsum(first.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
 
-    node_sizes = jax.ops.segment_sum(
-        first.astype(INDEX_DTYPE),
-        jnp.where(s_live, s_dev, ndev_i),
-        num_segments=ndev + 1,
-    )[:ndev]
+    # Per-destination counts from the device BOUNDARIES of the sorted order, not a
+    # segment_sum: summing P capacity-sized rows into ndev counters is P atomic adds
+    # onto ndev addresses -- 2.6 ms per call at P = 2^23 on an A100, four calls per
+    # force. `s_dev` is sorted (dead rows last, as `ndev`), so device d occupies
+    # [bounds[d], bounds[d + 1]) and its counts are two lookups.
+    bounds = jnp.searchsorted(
+        s_dev, jnp.arange(ndev + 1, dtype=s_dev.dtype), side="left"
+    ).astype(INDEX_DTYPE)
+    kept_before = jnp.concatenate([jnp.zeros((1,), INDEX_DTYPE), g_row + 1])
+    node_sizes = kept_before[bounds[1:]] - kept_before[bounds[:-1]]
     node_offsets = jnp.concatenate(
         [jnp.zeros((1,), INDEX_DTYPE), jnp.cumsum(node_sizes, dtype=INDEX_DTYPE)[:-1]]
     )
@@ -357,11 +361,7 @@ def build_send_buffers(
             (g_row - node_offsets[jnp.where(s_live, s_dev, 0)]).astype(idx), mode="drop"
         )
     )
-    csr_sizes = jax.ops.segment_sum(
-        s_live.astype(INDEX_DTYPE),
-        jnp.where(s_live, s_dev, ndev_i),
-        num_segments=ndev + 1,
-    )[:ndev]
+    csr_sizes = bounds[1:] - bounds[:-1]
 
     return SendBuffers(
         node_rows=node_rows,
