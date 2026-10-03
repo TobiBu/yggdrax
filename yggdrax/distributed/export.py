@@ -40,7 +40,13 @@ from jaxtyping import Array
 from ..dtypes import INDEX_DTYPE, as_index
 from ..interactions import dual_tree_walk_mutual
 
-__all__ = ["ExportLists", "SendBuffers", "build_send_buffers", "export_walk"]
+__all__ = [
+    "ExportLists",
+    "SendBuffers",
+    "build_send_buffers",
+    "export_walk",
+    "export_walk_two_sided",
+]
 
 
 class ExportLists(NamedTuple):
@@ -203,8 +209,28 @@ def export_walk(
         seed_b=jnp.full((n_cells,), root_shifted, dtype=idx),
     )
 
+    return _export_lists(res, shift)
+
+
+def _export_lists(res: Any, shift: Array) -> ExportLists:
+    """The walk's (summary entry, shifted local node) pairs as :class:`ExportLists`.
+
+    Parameters
+    ----------
+    res:
+        The walk result (``dual_tree_walk_mutual`` fields).
+    shift:
+        Where the local nodes start in the combined index space.
+
+    Returns
+    -------
+    ExportLists
+        Local node indices un-shifted, padding preserved as ``-1``.
+    """
+    idx = jnp.asarray(res.far_a).dtype
+
     def split(a, b, n):
-        """(cell, local node) with the walk's padding preserved as -1."""
+        """(summary entry, local node) with the walk's padding preserved as -1."""
         live = jnp.arange(a.shape[0], dtype=idx) < n
         # cast: three-argument `jnp.where` is always an Array; the stubs say
         # `Array | tuple` because of the one-argument (nonzero) form
@@ -227,6 +253,172 @@ def export_walk(
         queue_overflow=res.queue_overflow,
         peak_wavefront=getattr(res, "peak_wavefront", None),
     )
+
+
+def export_walk_two_sided(
+    left_child_full: Array,
+    right_child_full: Array,
+    centers: Array,
+    extents: Array,
+    root: Array,
+    summary_centers: Array,
+    summary_radii: Array,
+    summary_left: Array,
+    summary_right: Array,
+    summary_active: Array,
+    theta: float,
+    my_device: Array,
+    *,
+    max_pair_queue: int,
+    far_cap: int,
+    near_cap: int,
+    mac_type: str = "dehnen",
+    node_active: Optional[Array] = None,
+    walk_fn: Optional[Callable[..., Any]] = None,
+) -> ExportLists:
+    """Walk this device's tree against every other device's summary TREE.
+
+    :func:`export_walk` refines only the sender: the receiver's cells are childless,
+    so every cell collects a treecode-style list of sender nodes (~360 per cell at
+    10^6 particles per device). Here each receiver publishes the top of its tree --
+    the cut plus every ancestor of it, with child links
+    (:func:`~yggdrax.distributed.summary.summary_tree`) -- and the walk splits
+    whichever side is larger, as the local mutual walk does. A big sender node far
+    from a whole region of the receiver then pairs with ONE receiver ancestor, and
+    the receiver's L2L cascade carries the expansion down.
+
+    Index space: ``[ndev x S summary nodes ; local nodes]``, summary children offset
+    into their own device's block, local children shifted behind all the blocks.
+    Seeds: ``(summary root of device d, local root)`` for every OTHER device; the
+    summary root is index 0 of each block by the ``SummaryTree`` convention. Every
+    summary index is below every local one, so the walk's ``(min, max)`` order makes
+    every pair ``(summary node, local node)``.
+
+    **Coverage.** The live summary leaves (the cut cells) tile the receiver's live
+    leaves exactly once, and a mutual walk over two disjoint trees reaches every
+    (summary leaf, local leaf) product exactly once -- splitting one side of a pair
+    partitions it. So every (receiver particle, sender particle) pair is covered
+    once: by a far pair at some level of both trees, or by a near pair, which is
+    always (cut cell, local leaf) because only cells are active summary leaves.
+
+    Parameters
+    ----------
+    left_child_full, right_child_full:
+        ``(total_nodes,)`` child arrays of the LOCAL tree, ``-1`` at leaves.
+    centers, extents:
+        ``(total_nodes, 3)`` and ``(total_nodes,)`` local node MAC centres and
+        extents.
+    root:
+        Index of the local root, in the LOCAL index space.
+    summary_centers, summary_radii:
+        ``(ndev, S, 3)`` and ``(ndev, S)``, every device's published summary-tree
+        geometry. The radii must bound their nodes.
+    summary_left, summary_right:
+        ``(ndev, S)`` children in each device's OWN summary index space, ``-1`` at
+        summary leaves. An internal summary node must have both.
+    summary_active:
+        ``(ndev, S)`` bool; False on empty summary leaves and in the padding.
+    theta:
+        MAC parameter, the same one the receiver will evaluate with.
+    my_device:
+        This device's index along the mesh axis. Its own block is never walked.
+    max_pair_queue, far_cap, near_cap:
+        Static capacities. Read the overflow flags.
+    mac_type:
+        MAC variant, passed through. Static.
+    node_active:
+        Optional ``(total_nodes,)`` mask over the LOCAL tree.
+    walk_fn:
+        The walk to run, with :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s
+        signature and result fields; ``None`` runs that one.
+
+    Returns
+    -------
+    ExportLists
+        ``far_cell`` / ``near_cell`` hold the GLOBAL summary index ``d * S + i``, so
+        :func:`build_send_buffers` routes them with ``max_cells=S``. Far pairs may
+        name any summary node; near pairs name cut cells only.
+
+    Raises
+    ------
+    ValueError
+        On inconsistent summary array shapes.
+    """
+    sc = jnp.asarray(summary_centers)
+    if sc.ndim != 3 or sc.shape[2] != 3:
+        raise ValueError(f"summary_centers must be (ndev, S, 3), got {sc.shape}")
+    shape2 = tuple(sc.shape[:2])
+    for name, arr in (
+        ("summary_radii", summary_radii),
+        ("summary_left", summary_left),
+        ("summary_right", summary_right),
+        ("summary_active", summary_active),
+    ):
+        if tuple(jnp.asarray(arr).shape) != shape2:
+            raise ValueError(
+                f"{name} must be (ndev, S) = {shape2}, got {jnp.asarray(arr).shape}"
+            )
+    ndev, S = shape2
+    n_sum = ndev * S
+
+    idx = jnp.asarray(left_child_full).dtype
+    n_local = int(jnp.asarray(left_child_full).shape[0])
+    base = (jnp.arange(ndev, dtype=idx) * S)[:, None]
+
+    def summary_kids(k):
+        k = jnp.asarray(k).astype(idx)
+        return cast(
+            Array, jnp.where(k >= 0, k + base, as_index(-1).astype(idx))
+        ).reshape(n_sum)
+
+    shift = as_index(n_sum).astype(idx)
+
+    def local_kids(k):
+        k = jnp.asarray(k, idx)
+        return cast(Array, jnp.where(k >= 0, k + shift, k))
+
+    left = jnp.concatenate([summary_kids(summary_left), local_kids(left_child_full)])
+    right = jnp.concatenate([summary_kids(summary_right), local_kids(right_child_full)])
+
+    dtype = jnp.asarray(centers).dtype
+    all_centers = jnp.concatenate(
+        [sc.reshape(n_sum, 3).astype(dtype), jnp.asarray(centers, dtype)]
+    )
+    all_extents = jnp.concatenate(
+        [
+            jnp.asarray(summary_radii).reshape(n_sum).astype(dtype),
+            jnp.asarray(extents, dtype),
+        ]
+    )
+    # never export to myself (see `export_walk`): my block is dead AND unseeded
+    me = as_index(my_device).astype(idx)
+    dev = jnp.arange(ndev, dtype=idx)
+    mine = dev[:, None] == me
+    sa = jnp.asarray(summary_active, bool) & ~mine
+    local_active = (
+        jnp.ones((n_local,), bool)
+        if node_active is None
+        else jnp.asarray(node_active, bool)
+    )
+    active = jnp.concatenate([sa.reshape(n_sum), local_active])
+
+    root_shifted = (jnp.asarray(root, idx) + shift).astype(idx)
+    res = (walk_fn or dual_tree_walk_mutual)(
+        left,
+        right,
+        all_centers,
+        all_extents,
+        theta,
+        root_shifted,
+        max_pair_queue=max_pair_queue,
+        far_cap=far_cap,
+        near_cap=near_cap,
+        mac_type=mac_type,  # pyright: ignore[reportArgumentType]
+        node_active=active,
+        seed_a=cast(Array, jnp.where(dev == me, as_index(-1).astype(idx), dev * S)),
+        seed_b=jnp.full((ndev,), root_shifted, dtype=idx),
+    )
+    return _export_lists(res, shift)
 
 
 class SendBuffers(NamedTuple):
