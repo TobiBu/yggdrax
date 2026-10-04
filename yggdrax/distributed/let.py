@@ -40,6 +40,9 @@ from .sharding import AXIS_NAME
 # Global particle id = source_domain * _GID_STRIDE + local_sorted_index. Lets an
 # importer verify provenance (which domain/index a halo particle came from).
 _GID_STRIDE = 1 << 40
+#: Global ids are int64 whatever ``INDEX_DTYPE`` is: ``domain * 2**40`` needs the
+#: width (x64 is on wherever yggdrax is imported).
+_GID_DTYPE = jnp.int64
 
 
 @dataclass
@@ -737,7 +740,12 @@ def import_near_halo(
     safe_idx = jnp.clip(idx, 0, n_local - 1)
     resp_pos = jnp.where(in_leaf[..., None], positions_sorted[safe_idx], 0.0)
     resp_mass = jnp.where(in_leaf, masses_sorted[safe_idx], 0.0)
-    resp_gid = jnp.where(in_leaf, me * as_index(_GID_STRIDE) + safe_idx, as_index(-1))
+    resp_gid = jnp.where(
+        in_leaf,
+        jnp.asarray(me, _GID_DTYPE) * jnp.asarray(_GID_STRIDE, _GID_DTYPE)
+        + safe_idx.astype(_GID_DTYPE),
+        jnp.asarray(-1, _GID_DTYPE),
+    )
     R = max_recv_leaves
     # The payload joins the position/mass buffer rather than getting an exchange of
     # its own: same rows, same sizes, same ordering, so it cannot drift out of step
@@ -899,7 +907,9 @@ def distributed_let_import(
         )
         me = jax.lax.axis_index(axis_name)
         halo_domain = jnp.where(
-            halo.valid, halo.gid // as_index(_GID_STRIDE), as_index(-1)
+            halo.valid,
+            jnp.asarray(halo.gid, _GID_DTYPE) // jnp.asarray(_GID_STRIDE, _GID_DTYPE),
+            jnp.asarray(-1, _GID_DTYPE),
         )
         wrong = jnp.any(halo.valid & (halo_domain == me))
         return (
