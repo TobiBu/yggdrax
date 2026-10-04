@@ -294,6 +294,31 @@ def _maybe_refine_fixed_depth_leaf_partitions(
     )
 
 
+def _morton_sort(codes: Array) -> tuple[Array, Array]:
+    """Stable sort by Morton code: ``(permutation, sorted codes)`` from ONE sort.
+
+    ``jnp.argsort(codes, stable=True)`` sorts ``(codes, iota)`` with the iota at
+    the default integer width (int64 under x64) and returns only the permutation,
+    after which the caller gathered the codes a second time. Sorting the pair
+    ``(codes, INDEX_DTYPE iota)`` with ``is_stable`` gives the same permutation
+    (ties break by input order) and the sorted codes together.
+
+    Parameters
+    ----------
+    codes
+        ``(n,)`` Morton codes.
+
+    Returns
+    -------
+    tuple[Array, Array]
+        ``(sorted_indices, sorted_codes)``: ``codes[sorted_indices] ==
+        sorted_codes``, the indices in ``INDEX_DTYPE``.
+    """
+    iota = lax.broadcasted_iota(INDEX_DTYPE, codes.shape, 0)
+    sorted_codes, sorted_indices = lax.sort((codes, iota), num_keys=1, is_stable=True)
+    return sorted_indices, sorted_codes
+
+
 def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     """
     Count leading zeros for uint64 values (returns int32).
@@ -398,8 +423,7 @@ def build_tree(
     morton_codes = morton_encode(positions, bounds)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     # Determine leaf groups in Morton order
     leaf_starts = jnp.arange(0, n, leaf_size, dtype=INDEX_DTYPE)
@@ -456,8 +480,7 @@ def build_fixed_depth_tree(
     morton_codes = morton_encode(positions, bounds)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     max_allowed_depth = min(MAX_TREE_LEVELS - 1, _MAX_MORTON_LEVEL)
     if max_depth is not None:
@@ -804,8 +827,7 @@ def build_static_cells_tree(
                 jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64),
             ),
         )
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
     part = adaptive_cell_leaf_partition(
         sorted_codes,
         leaf_size=int(leaf_size),
@@ -912,8 +934,7 @@ def build_static_radix_tree(
     morton_codes = morton_encode(positions, bounds)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(int(n), int(leaf_size))
     (
@@ -1066,8 +1087,7 @@ def rebuild_static_radix_tree_from_template(
     morton_codes = morton_encode(positions, bounds_resolved)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(
         int(n),
@@ -1128,7 +1148,10 @@ def inverse_permutation(sorted_indices: Array) -> Array:
     """
     n = sorted_indices.shape[0]
     inv = jnp.empty((n,), dtype=INDEX_DTYPE)
-    return inv.at[sorted_indices].set(jnp.arange(n, dtype=INDEX_DTYPE))
+    # a permutation: every index once, so the scatter needs no atomics
+    return inv.at[sorted_indices].set(
+        jnp.arange(n, dtype=INDEX_DTYPE), unique_indices=True
+    )
 
 
 @jaxtyped(typechecker=beartype)

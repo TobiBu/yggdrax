@@ -445,3 +445,73 @@ def test_zero_mass_nodes_return_zero_center():
     assert jnp.allclose(multipole.octupole, 0.0)
     assert jnp.allclose(multipole.fourth_moment, 0.0)
     assert jnp.allclose(multipole.hexadecapole, 0.0)
+
+
+def test_prefix_range_sums_do_not_cancel_at_large_n():
+    """A small range at the END of a long prefix keeps its own precision.
+
+    In float32 a node's mass is the difference of two prefixes that grow to the total
+    mass; at N = 4e6 with masses 1/N that difference for 20 particles carries a
+    relative error of order 1e-2. The wide accumulation must not.
+    """
+    import numpy as np
+
+    from yggdrax.tree_moments import _accumulation_dtype, _prefix_range_sums
+
+    # not a power of two (1/2^k masses sum exactly in float32) and positive
+    # positions, so both prefixes grow to O(1) as they do in Morton order
+    n = 4_000_000
+    masses = jnp.full((n,), 1.0 / n, dtype=jnp.float32)
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.uniform(0.5, 1.5, n), dtype=jnp.float32)
+    starts = jnp.asarray([n - 20], dtype=INDEX_DTYPE)
+    ends = jnp.asarray([n], dtype=INDEX_DTYPE)
+    exact_m = float(np.sum(np.asarray(masses[-20:], np.float64)))
+    exact_c = float(
+        np.sum(np.asarray(masses[-20:], np.float64) * np.asarray(x[-20:], np.float64))
+        / exact_m
+    )
+
+    acc = _accumulation_dtype(jnp.float32)
+    m = _prefix_range_sums(masses.astype(acc), starts, ends)
+    c = _prefix_range_sums((masses * x).astype(acc), starts, ends) / m
+    assert abs(float(c[0]) - exact_c) < 1e-6
+
+    # the control: the same range query accumulated in float32 is visibly wrong
+    m32 = _prefix_range_sums(masses, starts, ends)
+    c32 = _prefix_range_sums(masses * x, starts, ends) / m32
+    assert abs(float(c32[0]) - exact_c) > 1e-4
+
+
+def test_leaf_centres_of_mass_are_exact_at_moderate_n():
+    """Leaf centres from the prefix sums equal per-leaf float64 means (250k particles)."""
+    import numpy as np
+
+    n = 250_000
+    rng = np.random.default_rng(1)
+    positions = jnp.asarray(rng.uniform(0.0, 2.0, (n, 3)), dtype=jnp.float32)
+    masses = jnp.full((n,), 1.0 / n, dtype=jnp.float32)
+    bounds = (
+        jnp.array([0.0, 0.0, 0.0], jnp.float32),
+        jnp.array([2.0, 2.0, 2.0], jnp.float32),
+    )
+    tree, pos_sorted, mass_sorted, _ = build_tree(
+        positions, masses, bounds, return_reordered=True, leaf_size=16
+    )
+    moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
+    assert moments.center_of_mass.dtype == pos_sorted.dtype
+
+    ranges = np.asarray(tree.node_ranges)
+    num_internal = int(np.asarray(tree.left_child).shape[0])
+    p64 = np.asarray(pos_sorted, np.float64)
+    m64 = np.asarray(mass_sorted, np.float64)
+    com = np.asarray(moments.center_of_mass, np.float64)
+    worst = 0.0
+    for node in range(num_internal, ranges.shape[0]):
+        s, e = int(ranges[node, 0]), int(ranges[node, 1]) + 1
+        if e <= s:
+            continue
+        exact = (m64[s:e, None] * p64[s:e]).sum(0) / m64[s:e].sum()
+        worst = max(worst, float(np.abs(com[node] - exact).max()))
+    # float32 rounding of the result only (the float32 prefixes were ~1e-4 off here)
+    assert worst < 1e-6

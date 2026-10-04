@@ -22,9 +22,11 @@ depth, and leaves are the runs of equal keys -- consistent because a cell's
 occupancy is a property of the cell, so every particle of a qualifying cell
 picks the same depth.
 
-Cost: one pass per Morton level -- a prefix-max and a suffix-min scan over the
-per-boundary common-prefix depth (no ``searchsorted``: 14 -> ~1 ms at N = 2e5),
-21 levels at most; ``max_level`` can stop earlier.
+Cost: no pass per Morton level. A particle's cell at level ``d`` overflows
+exactly when a window of ``leaf_size + 1`` consecutive particles containing it
+shares the level-``d`` prefix, so the depth follows from one xor/clz between
+particles ``j`` and ``j + leaf_size`` and one sliding maximum (the numpy
+reference keeps the per-level prefix-max / suffix-min loop it replaced).
 """
 
 from __future__ import annotations
@@ -145,45 +147,41 @@ def adaptive_cell_leaf_partition(
     codes = jnp.asarray(sorted_codes).astype(jnp.uint64)
     n = int(codes.shape[0])
     capacity = int(capacity)
-    leaf_size_i = jnp.asarray(int(leaf_size), INDEX_DTYPE)
     idx = jnp.arange(n, dtype=INDEX_DTYPE)
     # Live/dead cut. ``None`` -> every row live, and every use below degenerates
     # to the unpadded expression, so the result is unchanged bit for bit.
     padded = num_valid is not None
     n_valid = jnp.asarray(n if num_valid is None else num_valid, INDEX_DTYPE)
     is_dead = idx >= n_valid if padded else jnp.zeros((n,), dtype=bool)
-    # Common Morton depth of each consecutive pair (the boundary BEFORE particle
-    # i): codes use 63 bits, 3 per level, so the pair agrees through
-    # floor((clz64(xor) - 1) / 3) whole levels. Boundary 0 agrees through nothing.
-    if n > 1:
-        x = jnp.bitwise_xor(codes[1:], codes[:-1])
+    # A particle's level-d cell holds more than S = leaf_size particles exactly
+    # when some window of S + 1 consecutive (live) particles containing it shares
+    # the level-d prefix (sorted codes: both ends share it iff all between do).
+    # With g_j the levels particles j and j + S share (codes use 63 bits, 3 per
+    # level: floor((clz64(xor) - 1) / 3)) and G(i) the max of g over the windows
+    # [i - S, i], the cell fits from level G(i) + 1 on, so the depth -- the
+    # shallowest fitting level, at least min_level, at most max_level -- is
+    # max(min_level, G(i) + 1) capped at max_level. One xor/clz and one sliding
+    # max instead of a prefix-max and a suffix-min scan per level (26 scans over
+    # N per refresh at min_level 8); the numpy reference keeps the level loop.
+    S = int(leaf_size)
+    minus1 = jnp.asarray(-1, INDEX_DTYPE)
+    if n > S:
+        x = jnp.bitwise_xor(codes[S:], codes[:-S])
         clz = lax.clz(x).astype(INDEX_DTYPE)  # 64 when equal
-        agree = jnp.minimum((clz - 1) // 3, MORTON_LEVELS)
-        agree = jnp.concatenate([jnp.asarray([-1], INDEX_DTYPE), agree])
-    else:
-        agree = jnp.asarray([-1], INDEX_DTYPE)
-    depth = jnp.full((n,), int(max_level), INDEX_DTYPE)
-    assigned = jnp.zeros((n,), dtype=bool)
-    n_i = jnp.asarray(n, INDEX_DTYPE)
-    # Static level loop: the trip count is the Morton depth, not the data. A cell
-    # at depth d is a maximal run whose interior boundaries all agree through at
-    # least d levels; its start is the last boundary with agree < d at or before
-    # i (prefix max) and its end the first such boundary after i (suffix min).
-    for d in range(int(min_level), int(max_level)):
-        # A dead row is a boundary at every level: without this the last live
-        # cell's occupancy would count the padding, so a shard whose live part
-        # fits in one cell would be split into several -- a legal partition, but
-        # not the one the same particles get unpadded.
-        is_boundary = (agree < d) | is_dead
-        start_idx = lax.cummax(jnp.where(is_boundary, idx, jnp.asarray(0, INDEX_DTYPE)))
-        nxt = jnp.where(is_boundary, idx, n_i)
-        end_idx = jnp.concatenate(
-            [lax.cummin(nxt[1:], reverse=True), jnp.asarray([n], INDEX_DTYPE)]
+        g = jnp.minimum((clz - 1) // 3, MORTON_LEVELS)
+        # a window must lie in the live rows (dead rows are boundaries at every
+        # level), so one ending at or past n_valid shares nothing
+        g = jnp.where(jnp.arange(n - S, dtype=INDEX_DTYPE) + S < n_valid, g, minus1)
+        g = jnp.concatenate(
+            [jnp.full((S,), -1, INDEX_DTYPE), g, jnp.full((S,), -1, INDEX_DTYPE)]
         )
-        occ = end_idx - start_idx
-        fit = (occ <= leaf_size_i) & ~assigned
-        depth = jnp.where(fit, jnp.asarray(d, INDEX_DTYPE), depth)
-        assigned = assigned | fit
+        shared = lax.reduce_window(g, minus1, lax.max, (S + 1,), (1,), "VALID")
+    else:
+        shared = jnp.full((n,), -1, INDEX_DTYPE)
+    fit_level = jnp.maximum(jnp.asarray(int(min_level), INDEX_DTYPE), shared + 1)
+    depth = jnp.where(
+        fit_level < int(max_level), fit_level, jnp.asarray(int(max_level), INDEX_DTYPE)
+    )
     shift_p = (3 * (MORTON_LEVELS - depth)).astype(jnp.uint64)
     key = jnp.right_shift(codes, shift_p)
     first = jnp.concatenate(
@@ -197,12 +195,28 @@ def adaptive_cell_leaf_partition(
         jnp.sum(first.astype(INDEX_DTYPE)) if n > 0 else jnp.asarray(0, INDEX_DTYPE)
     )
     overflow = num_leaves > capacity
+    # One writer per leaf (its first particle); every other lane points PAST the
+    # table at its own index (out of range and distinct) and is dropped. The old
+    # min/max scatter onto one sentinel row serialised ~N atomics on one address.
+    # (``capacity + idx`` must stay positive: a wrapped index would be normalised
+    # back INTO the table.)
+    index_max = 2 ** (8 * jnp.dtype(INDEX_DTYPE).itemsize - 1) - 1
+    if int(capacity) + int(n) >= index_max:
+        raise ValueError(
+            f"capacity + n = {int(capacity) + int(n)} overflows {INDEX_DTYPE}"
+        )
     target = jnp.where(
-        first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE)
+        first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE) + idx
     )
-    starts = jnp.full((capacity + 1,), n, INDEX_DTYPE).at[target].min(idx)[:capacity]
+    starts = (
+        jnp.full((capacity,), n, INDEX_DTYPE)
+        .at[target]
+        .set(idx, mode="drop", unique_indices=True)
+    )
     depths_out = (
-        jnp.full((capacity + 1,), -1, INDEX_DTYPE).at[target].max(depth)[:capacity]
+        jnp.full((capacity,), -1, INDEX_DTYPE)
+        .at[target]
+        .set(depth, mode="drop", unique_indices=True)
     )
     live = jnp.arange(capacity, dtype=INDEX_DTYPE) < jnp.minimum(num_leaves, capacity)
     next_start = jnp.concatenate([starts[1:], jnp.asarray([n], INDEX_DTYPE)])
