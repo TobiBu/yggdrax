@@ -200,7 +200,8 @@ def adaptive_cell_leaf_partition(
     # min/max scatter onto one sentinel row serialised ~N atomics on one address.
     # (``capacity + idx`` must stay positive: a wrapped index would be normalised
     # back INTO the table.)
-    if int(capacity) + int(n) >= int(np.iinfo(np.dtype(INDEX_DTYPE)).max):
+    index_max = 2 ** (8 * jnp.dtype(INDEX_DTYPE).itemsize - 1) - 1
+    if int(capacity) + int(n) >= index_max:
         raise ValueError(
             f"capacity + n = {int(capacity) + int(n)} overflows {INDEX_DTYPE}"
         )
