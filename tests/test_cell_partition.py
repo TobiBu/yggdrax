@@ -267,3 +267,41 @@ def test_min_level_out_of_range_is_refused():
         adaptive_cell_leaf_partition(
             codes, leaf_size=8, capacity=64, max_level=10, min_level=11
         )
+
+
+@pytest.mark.parametrize(
+    "n, leaf_size, min_level, max_level, duplicates",
+    [
+        (3000, 1, 0, MORTON_LEVELS, 0),
+        (3000, 7, 3, MORTON_LEVELS, 40),
+        (5000, 64, 8, MORTON_LEVELS, 0),
+        (500, 64, 0, 12, 0),
+        (40, 64, 0, MORTON_LEVELS, 0),  # fewer particles than one window
+        (2000, 16, 5, 5, 0),  # min_level == max_level: everything at max_level
+    ],
+)
+def test_window_depths_equal_the_level_loop(
+    n, leaf_size, min_level, max_level, duplicates
+):
+    """The device depth (one sliding window) is the numpy level loop's, bit for bit.
+
+    Dense centres, sparse outskirts, coincident runs longer than a leaf, a
+    max_level cut, fewer particles than a window, min_level == max_level.
+    """
+    codes = _sorted_codes(n, seed=n + leaf_size, duplicates=duplicates)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    s_np, e_np, d_np = adaptive_cell_leaf_partition_numpy(
+        codes_np, leaf_size=leaf_size, min_level=min_level, max_level=max_level
+    )
+    part = adaptive_cell_leaf_partition(
+        codes,
+        leaf_size=leaf_size,
+        capacity=int(s_np.size) + 5,
+        min_level=min_level,
+        max_level=max_level,
+    )
+    k = int(part.num_leaves)
+    assert k == s_np.size and not bool(part.overflow)
+    np.testing.assert_array_equal(np.asarray(part.leaf_starts)[:k], s_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_ends)[:k], e_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_depths)[:k], d_np)
