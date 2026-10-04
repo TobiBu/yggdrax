@@ -197,12 +197,27 @@ def adaptive_cell_leaf_partition(
         jnp.sum(first.astype(INDEX_DTYPE)) if n > 0 else jnp.asarray(0, INDEX_DTYPE)
     )
     overflow = num_leaves > capacity
+    # One writer per leaf (its first particle); every other lane points PAST the
+    # table at its own index (out of range and distinct) and is dropped. The old
+    # min/max scatter onto one sentinel row serialised ~N atomics on one address.
+    # (``capacity + idx`` must stay positive: a wrapped index would be normalised
+    # back INTO the table.)
+    if int(capacity) + int(n) >= int(np.iinfo(np.dtype(INDEX_DTYPE)).max):
+        raise ValueError(
+            f"capacity + n = {int(capacity) + int(n)} overflows {INDEX_DTYPE}"
+        )
     target = jnp.where(
-        first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE)
+        first & (slot < capacity), slot, jnp.asarray(capacity, INDEX_DTYPE) + idx
     )
-    starts = jnp.full((capacity + 1,), n, INDEX_DTYPE).at[target].min(idx)[:capacity]
+    starts = (
+        jnp.full((capacity,), n, INDEX_DTYPE)
+        .at[target]
+        .set(idx, mode="drop", unique_indices=True)
+    )
     depths_out = (
-        jnp.full((capacity + 1,), -1, INDEX_DTYPE).at[target].max(depth)[:capacity]
+        jnp.full((capacity,), -1, INDEX_DTYPE)
+        .at[target]
+        .set(depth, mode="drop", unique_indices=True)
     )
     live = jnp.arange(capacity, dtype=INDEX_DTYPE) < jnp.minimum(num_leaves, capacity)
     next_start = jnp.concatenate([starts[1:], jnp.asarray([n], INDEX_DTYPE)])
