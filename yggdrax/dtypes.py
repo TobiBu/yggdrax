@@ -13,22 +13,21 @@ def _resolve_index_dtype() -> DTypeLike:
     """Resolve index dtype from environment.
 
     Supported values:
-    - ``YGGDRAX_INDEX_PRECISION=int32``
-    - ``YGGDRAX_INDEX_PRECISION=int64``
+    - ``YGGDRAX_INDEX_PRECISION=int32`` (default since 2026-10)
+    - ``YGGDRAX_INDEX_PRECISION=int64`` (opt-in, index spaces past 2^31)
 
     For convenience, fall back to ``JACCPOT_INDEX_PRECISION`` so both
-    workspaces can share the same notebook/session setting.
+    workspaces can share the same notebook/session setting. Unrecognised
+    values give the default.
     """
 
     raw = os.environ.get("YGGDRAX_INDEX_PRECISION")
     if raw is None:
-        raw = os.environ.get("JACCPOT_INDEX_PRECISION", "int64")
+        raw = os.environ.get("JACCPOT_INDEX_PRECISION", "int32")
     raw_norm = str(raw).strip().lower()
-    if raw_norm in ("int32", "i32", "32"):
-        return jnp.int32
     if raw_norm in ("int64", "i64", "64"):
         return jnp.int64
-    return jnp.int64
+    return jnp.int32
 
 
 # Keep tree/index contracts consistent across yggdrax artifacts.
