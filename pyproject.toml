@@ -45,8 +45,12 @@ dev = [
   # type-check reproducible across machines. Runtime installs still allow the
   # broader `jax>=0.8` range declared above. Bump these together and regenerate
   # .basedpyright/baseline.json when moving to a newer jax.
-  "jax==0.8.3",
-  "jaxlib==0.8.3",
+  #
+  # 0.8.3 -> 0.11.2 (2026-10-05), with jaccpot's floor: the regenerated baseline
+  # holds 143 entries, 109 fewer, because the 0.11.2 stubs type more of jax. 0.11.x
+  # requires Python >= 3.12, so the dev toolchain (and CI) no longer runs on 3.11.
+  "jax==0.11.2",
+  "jaxlib==0.11.2",
   "basedpyright==1.39.9",
 ]
 docs = [
