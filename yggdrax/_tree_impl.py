@@ -9,7 +9,7 @@ import math
 import os
 from collections import deque
 from functools import partial
-from typing import Any, NamedTuple, Optional, Union, cast
+from typing import Any, Callable, NamedTuple, Optional, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -369,6 +369,37 @@ def _lcp_codes_only(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """
     xor = jnp.bitwise_xor(a, b)
     return jnp.where(xor == jnp.uint64(0), as_index(64), _clz_u64(xor))
+
+
+def _unroll_step_searches() -> bool:
+    """Whether :func:`_descending_step_search` unrolls (every backend but CPU)."""
+    return jax.default_backend() != "cpu"
+
+
+def _descending_step_search(
+    body: Callable[[jax.Array, jax.Array], jax.Array],
+    init: jax.Array,
+    num_bits: int,
+) -> jax.Array:
+    """
+    Apply ``carry = body(step, carry)`` for ``step = 2**(num_bits - 1), ..., 1``.
+
+    On GPU the steps are unrolled so XLA fuses the search into one kernel. On
+    CPU they run in a ``fori_loop``: JAX 0.11.2's XLA:CPU hands the unrolled
+    chain to LLVM's loop vectorizer, which does not finish compiling it. The
+    steps are the same integers in both forms, so the result is identical.
+    """
+    if not _unroll_step_searches():
+
+        def loop_body(i: jax.Array, carry: jax.Array) -> jax.Array:
+            shift = as_index(num_bits - 1) - jnp.asarray(i, dtype=INDEX_DTYPE)
+            return body(jnp.left_shift(as_index(1), shift), carry)
+
+        return lax.fori_loop(0, num_bits, loop_body, init)
+    carry = init
+    for k in range(num_bits - 1, -1, -1):
+        carry = body(as_index(1 << k), carry)
+    return carry
 
 
 # ---------------------------------------------
@@ -1387,16 +1418,17 @@ def _build_tree_from_leaf_partitions(
 
     delta_min = _delta_vec(indices, indices - d)
 
-    span = jnp.zeros_like(indices)
     max_k = 31
-    for k in range(max_k - 1, -1, -1):
-        step = as_index(1 << k)
+
+    def _span_step(step: jax.Array, span: jax.Array) -> jax.Array:
         candidate = indices + (span + step) * d
         delta_candidate = _delta_vec(indices, candidate)
         cond = (
             (candidate >= 0) & (candidate < num_leaves) & (delta_candidate > delta_min)
         )
-        span = jnp.where(cond, span + step, span)
+        return jnp.where(cond, span + step, span)
+
+    span = _descending_step_search(_span_step, jnp.zeros_like(indices), max_k)
 
     end_idx = indices + span * d
     first = jnp.minimum(indices, end_idx)
@@ -1410,14 +1442,14 @@ def _build_tree_from_leaf_partitions(
     last_code = leaf_codes[last]
     common_prefix = _lcp_codes_only(first_code, last_code)
 
-    split = first
-    for k in range(max_k - 1, -1, -1):
-        step = as_index(1 << k)
+    def _split_step(step: jax.Array, split: jax.Array) -> jax.Array:
         mid = split + step
         safe_mid = jnp.where(mid < last, mid, last)
         cmp = _lcp_codes_only(first_code, leaf_codes[safe_mid])
         cond = (mid < last) & (cmp > common_prefix)
-        split = jnp.where(cond, mid, split)
+        return jnp.where(cond, mid, split)
+
+    split = _descending_step_search(_split_step, first, max_k)
 
     left_is_leaf = split == first
     right_is_leaf = split + as_index(1) == last

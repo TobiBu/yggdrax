@@ -17,13 +17,13 @@ adds padding hygiene and the coarse-moment gather.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from .._tree_impl import build_tree
+from .._tree_impl import RadixTree, build_tree
 from ..geometry import compute_tree_geometry
 from ..tree_moments import compute_tree_mass_moments
 from .partition import equalize_domain, global_bounds, sfc_partition
@@ -38,6 +38,10 @@ from .sharding import AXIS_NAME
 # and exposes the same contract (the heap KD-tree used by the KNN kernels does
 # not, and is not used here).
 DISTRIBUTED_TREE_TYPES: tuple[str, ...] = ("radix", "octree", "kdtree")
+
+# What the radix builders return with ``return_reordered=True`` and
+# ``return_workspace=False``: (tree, positions_sorted, masses_sorted, inverse).
+_ReorderedRadixBuild = tuple[RadixTree, Array, Array, Array]
 
 
 def _validate_distributed_tree_type(tree_type: str) -> None:
@@ -76,16 +80,19 @@ def _build_local_tree(
         from ..octree import augment_radix_topology_with_octree
         from ..tree import _ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS, _build_octree_result
 
-        topo, pos_sorted, mass_sorted, _inv = _build_octree_result(
-            positions,
-            masses,
-            build_mode="adaptive",
-            bounds=bounds,
-            return_reordered=True,
-            workspace=None,
-            return_workspace=False,
-            leaf_size=leaf_size,
-            **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
+        topo, pos_sorted, mass_sorted, _inv = cast(
+            _ReorderedRadixBuild,
+            _build_octree_result(
+                positions,
+                masses,
+                build_mode="adaptive",
+                bounds=bounds,
+                return_reordered=True,
+                workspace=None,
+                return_workspace=False,
+                leaf_size=leaf_size,
+                **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
+            ),
         )
         return augment_radix_topology_with_octree(topo), pos_sorted, mass_sorted
 
@@ -97,8 +104,11 @@ def _build_local_tree(
         pidx = jnp.asarray(topo.particle_indices, dtype=INDEX_DTYPE)
         return topo, positions[pidx], masses[pidx]
 
-    tree, pos_sorted, mass_sorted, _inv = build_tree(
-        positions, masses, bounds, return_reordered=True, leaf_size=leaf_size
+    tree, pos_sorted, mass_sorted, _inv = cast(
+        _ReorderedRadixBuild,
+        build_tree(
+            positions, masses, bounds, return_reordered=True, leaf_size=leaf_size
+        ),
     )
     return tree, pos_sorted, mass_sorted
 
