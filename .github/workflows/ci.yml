@@ -8,6 +8,9 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    # a passing job takes 26-37 min; without a limit a compile that never
+    # finishes holds the runner for GitHub's 6 h maximum
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
