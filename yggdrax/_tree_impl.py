@@ -85,6 +85,10 @@ class RadixTreeWorkspace(NamedTuple):
 Bounds = tuple[Float[Array, "3"], Float[Array, "3"]]
 
 MAX_TREE_LEVELS = 64
+#: Pointer-doubling rounds of the node depths: reaches depth 2**8, past
+#: MAX_TREE_LEVELS (the bound before was ``bit_length(total_nodes) + 1``, 22
+#: rounds at 1.76M nodes).
+_DEPTH_ROUNDS_CAP = 8
 _MAX_MORTON_LEVEL = 21  # 21 * 3 = 63 bits of Morton depth
 
 
@@ -1557,33 +1561,51 @@ def _build_tree_from_leaf_partitions(
         parent_safe,
     )
 
-    def _depth_body(_, state):
-        sc, d = state
-        new_d = d + d[sc]
-        new_sc = sc[sc]
-        return new_sc, new_d
-
     # Pointer doubling reaches every node's root in ceil(log2(depth)) rounds,
     # and stays at that fixed point thereafter (sc[sc] == sc), so a bounded
-    # loop of that many rounds is exact for any well-formed tree.  Using a
-    # fixed bound instead of a change-driven while_loop also guarantees
-    # termination if a degenerate build produced a malformed (e.g. cyclic)
-    # parent array, rather than spinning forever.
-    n_depth_rounds = max(1, int(total_nodes).bit_length() + 1)
-    _, node_level = lax.fori_loop(
-        0, n_depth_rounds, _depth_body, (init_shortcut, init_dist)
-    )
+    # number of rounds is exact for any well-formed tree.  A fixed bound
+    # instead of a change-driven while_loop also guarantees termination if a
+    # degenerate build produced a malformed (e.g. cyclic) parent array.  The
+    # level tables below hold MAX_TREE_LEVELS levels, so depths past
+    # _DEPTH_ROUNDS_CAP's reach (2**8 = 256) cannot be represented anyway.
+    # Unrolled on GPU: XLA fuses each round into one kernel; as a fori_loop
+    # every round also copied both carried arrays (22 rounds at 1.76M nodes).
+    # On CPU the rounds stay a loop (_descending_step_search's reason).
+    n_depth_rounds = max(1, min(int(total_nodes).bit_length() + 1, _DEPTH_ROUNDS_CAP))
+
+    def _depth_round(_: Any, state: tuple[jax.Array, jax.Array]) -> tuple:
+        sc, d = state
+        return sc[sc], d + d[sc]
+
+    if _unroll_step_searches():
+        shortcut, node_level = init_shortcut, init_dist
+        for _ in range(n_depth_rounds):
+            shortcut, node_level = _depth_round(None, (shortcut, node_level))
+    else:
+        # the same rounds as a loop on CPU (see _descending_step_search)
+        _, node_level = lax.fori_loop(
+            0, n_depth_rounds, _depth_round, (init_shortcut, init_dist)
+        )
 
     max_level = jnp.max(node_level)
     num_levels = max_level + as_index(1)
 
-    level_counts = jnp.zeros((MAX_TREE_LEVELS,), dtype=INDEX_DTYPE)
-    level_counts = level_counts.at[node_level].add(as_index(1))
-
-    level_offsets = jnp.zeros((MAX_TREE_LEVELS + 1,), dtype=INDEX_DTYPE)
-    level_offsets = level_offsets.at[1:].set(jnp.cumsum(level_counts))
-
-    nodes_by_level = jnp.argsort(node_level, stable=True)
+    # The stable sort of the levels gives nodes_by_level (jnp.argsort's result,
+    # same index dtype) AND the sorted levels, whose run starts are the level
+    # offsets: no histogram (a scatter-add of every node into 64 bins, all
+    # contending for the same few counters: 1.0 ms at 1.76M nodes on an A100).
+    idx_dtype = jax.eval_shape(jnp.argsort, node_level).dtype
+    sorted_level, nodes_by_level = lax.sort(
+        (node_level, lax.broadcasted_iota(idx_dtype, node_level.shape, 0)),
+        num_keys=1,
+        is_stable=True,
+    )
+    level_offsets = jnp.searchsorted(
+        sorted_level,
+        jnp.arange(MAX_TREE_LEVELS + 1, dtype=sorted_level.dtype),
+        side="left",
+        method="scan_unrolled" if _unroll_step_searches() else "scan",
+    ).astype(INDEX_DTYPE)
 
     num_levels = jnp.clip(
         num_levels,
