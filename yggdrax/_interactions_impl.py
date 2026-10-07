@@ -6514,6 +6514,7 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
         "near_cap",
         "mac_type",
         "wavefront_ladder",
+        "separation_floor",
     ),
 )
 def dual_tree_walk_mutual(
@@ -6533,6 +6534,7 @@ def dual_tree_walk_mutual(
     seed_b: Optional[Array] = None,
     seed_count: Optional[Array] = None,
     wavefront_ladder: Optional[bool] = None,
+    separation_floor: float = 0.0,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6613,6 +6615,13 @@ def dual_tree_walk_mutual(
         ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
         the same pairs in the same order -- and differ only in per-round cost
         and compile time. Static.
+    separation_floor:
+        Accept a pair only if also ``|c_b - c_a| >= r_a + r_b + separation_floor``:
+        with exact radii no particle of one node of an accepted pair is closer than
+        the floor to a particle of the other. A far field computed with the
+        unsoftened expansion stays out of a softening kernel's reach this way.
+        ``0`` (default) adds no test, so the lists are the walk's without it.
+        Static.
 
     Returns
     -------
@@ -6737,6 +6746,11 @@ def dual_tree_walk_mutual(
                     valid_pairs=live,
                     different_nodes=~same,
                 )
+            if float(separation_floor) > 0.0:
+                reach = radius_a + radius_b + jnp.asarray(
+                    separation_floor, dtype=dist_sq.dtype
+                )
+                accept = accept & (reach * reach <= dist_sq)
             both_leaf = a_leaf & b_leaf
             is_near = live & (~accept) & both_leaf & (~same)
             refine = live & (~accept) & (~both_leaf)
