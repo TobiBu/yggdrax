@@ -1057,7 +1057,6 @@ def _build_mac_extents(
     num_internal: int,
     mac_type: str,
     dehnen_radius_scale: float,
-    separation_floor: float = 0.0,
 ) -> tuple[Array, Array]:
     """Per-node MAC extent proxies (box or sphere) for a radix-style tree.
 
@@ -6816,8 +6815,10 @@ def dual_tree_walk_mutual(
                     different_nodes=~same,
                 )
             if float(separation_floor) > 0.0:
-                reach = radius_a + radius_b + jnp.asarray(
-                    separation_floor, dtype=dist_sq.dtype
+                reach = (
+                    radius_a
+                    + radius_b
+                    + jnp.asarray(separation_floor, dtype=dist_sq.dtype)
                 )
                 accept = accept & (reach * reach <= dist_sq)
             both_leaf = a_leaf & b_leaf
