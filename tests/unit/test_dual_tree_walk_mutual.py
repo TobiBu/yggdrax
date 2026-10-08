@@ -67,7 +67,7 @@ def _mutual_inputs(topology, geometry, mac_type, scale=1.0, idx=None):
     return left, right, centers, jnp.asarray(extents, centers.dtype), root, num_internal
 
 
-def _dual_sets(topology, geometry, theta, mac_type, scale=1.0):
+def _dual_sets(topology, geometry, theta, mac_type, scale=1.0, separation_floor=0.0):
     config = DualTreeTraversalConfig(
         max_pair_queue=1 << 16,
         process_block=64,
@@ -81,6 +81,7 @@ def _dual_sets(topology, geometry, theta, mac_type, scale=1.0):
         traversal_config=config,
         mac_type=mac_type,
         dehnen_radius_scale=scale,
+        separation_floor=separation_floor,
         return_result=True,
     )
     assert not (
@@ -203,6 +204,116 @@ def test_strict_default_differs_from_the_dual_walk_at_most_on_equality():
     for a, b in far ^ far_ref:
         d2 = float(np.sum((c[a] - c[b]) ** 2))
         assert np.isclose((e[a] + e[b]) ** 2, theta_sq * d2, rtol=1e-6), (a, b)
+
+
+def _leaves_below(left, right, num_internal):
+    """Leaf count under every node (leaves are the nodes past ``num_internal``).
+
+    A radix tree's child may carry a smaller index than its parent, so this
+    walks a post-order from the root instead of trusting index order.
+    """
+    left, right = np.asarray(left), np.asarray(right)
+    count = np.zeros(left.shape[0], np.int64)
+    count[num_internal:] = 1
+    children = set(left[:num_internal].tolist()) | set(right[:num_internal].tolist())
+    root = next(i for i in range(num_internal) if i not in children)
+    stack, seen = [root], set()
+    while stack:
+        node = stack[-1]
+        if node >= num_internal:
+            stack.pop()
+        elif node in seen:
+            stack.pop()
+            count[node] = count[left[node]] + count[right[node]]
+        else:
+            seen.add(node)
+            stack += [int(left[node]), int(right[node])]
+    return count
+
+
+@pytest.mark.parametrize("floor", [4.0, 6.0])
+def test_separation_floor_keeps_far_pairs_apart_and_coverage_exact(floor):
+    """Every accepted pair's gap is at least the floor; the leaf pairs stay covered once."""
+    topology, geometry = _tree(seed=13)
+    left, right, centers, extents, root, num_internal = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
+    kw = dict(max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17)
+    bare = dual_tree_walk_mutual(
+        left, right, centers, extents, 0.5, root, mac_type="dehnen", **kw
+    )
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        mac_type="dehnen",
+        separation_floor=floor,
+        **kw,
+    )
+    assert not (
+        bool(res.queue_overflow) or bool(res.far_overflow) or bool(res.near_overflow)
+    )
+    far, near = _mutual_sets(res)
+    far_bare, near_bare = _mutual_sets(bare)
+    # the floor bites at this size (otherwise the test would prove nothing): a
+    # gap at theta 0.5 is already >= r_a + r_b, ~1.5 for these leaves
+    assert far != far_bare and len(near) > len(near_bare)
+    c, e = np.asarray(centers), np.asarray(extents)
+    for a, b in far:
+        gap = np.sqrt(np.sum((c[a] - c[b]) ** 2)) - e[a] - e[b]
+        assert gap >= floor * (1 - 1e-12), (a, b, gap)
+    # every unordered pair of distinct leaves is covered exactly once
+    below = _leaves_below(left, right, num_internal)
+    num_leaves = left.shape[0] - num_internal
+    for f, n in ((far_bare, near_bare), (far, near)):
+        covered = sum(int(below[a]) * int(below[b]) for a, b in f | n)
+        assert covered == num_leaves * (num_leaves - 1) // 2
+    # a zero floor is the walk without the test
+    zero = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        mac_type="dehnen",
+        separation_floor=0.0,
+        **kw,
+    )
+    assert _mutual_sets(zero) == (far_bare, near_bare)
+
+
+@pytest.mark.parametrize("mac_type", ["bh", "dehnen"])
+def test_separation_floor_dual_walk_matches_the_mutual_walk(mac_type):
+    """The floor lives in the shared MAC test: the dual walk honours it like the mutual walk."""
+    topology, geometry = _tree(seed=13)
+    floor = 5.0
+    far_ref, near_ref, _, _ = _dual_sets(
+        topology, geometry, 0.5, mac_type, separation_floor=floor
+    )
+    far_bare, _, _, _ = _dual_sets(topology, geometry, 0.5, mac_type)
+    assert far_ref != far_bare, "the floor must bite at this size"
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, mac_type
+    )
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type=mac_type,
+        separation_floor=floor,
+    )
+    far, near = _mutual_sets(res)
+    assert far == far_ref and near == near_ref
 
 
 def test_traces_under_jit_and_reports_peak_and_rounds():

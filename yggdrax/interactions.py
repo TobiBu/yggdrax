@@ -51,6 +51,7 @@ def build_well_separated_interactions(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> NodeInteractionList:
     """Construct only the far-field interaction list from a dual-tree walk.
 
@@ -83,6 +84,11 @@ def build_well_separated_interactions(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -104,6 +110,7 @@ def build_well_separated_interactions(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
 
 
@@ -121,6 +128,7 @@ def build_compact_far_pairs(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> CompactTaggedFarPairs:
     """Construct exact-length tagged far pairs from the dual-tree walk.
 
@@ -153,6 +161,11 @@ def build_compact_far_pairs(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -174,6 +187,7 @@ def build_compact_far_pairs(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
 
 
@@ -192,6 +206,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     timing_callback: Callable[..., object] | None = None,
     compact_far_pair_capacity: int | None = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
@@ -228,6 +243,11 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
     timing_callback
         Optional callable invoked with per-stage timing diagnostics.
     compact_far_pair_capacity
@@ -255,6 +275,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         timing_callback=timing_callback,
         compact_far_pair_capacity=compact_far_pair_capacity,
     )
@@ -275,6 +296,7 @@ def build_leaf_neighbor_lists(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> NodeNeighborList:
     """Construct only the near-field neighbor list from a dual-tree walk.
 
@@ -310,6 +332,11 @@ def build_leaf_neighbor_lists(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -332,6 +359,7 @@ def build_leaf_neighbor_lists(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
 
 
@@ -347,6 +375,7 @@ def build_interactions_and_neighbors(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     pair_policy: PairPolicy | None = None,
     policy_state: object = None,
     *,
@@ -401,6 +430,11 @@ def build_interactions_and_neighbors(
         ``"dehnen"``, or ``"engblom"``.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
     pair_policy
         Optional JAX-traceable callable overriding the built-in MAC decision.
     policy_state
@@ -439,6 +473,7 @@ def build_interactions_and_neighbors(
         retry_logger=retry_logger,
         mac_type=mac_type,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         pair_policy=pair_policy,
         policy_state=policy_state,
         return_result=return_result,
@@ -460,6 +495,7 @@ def build_interactions_and_neighbors_split(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     pair_policy: PairPolicy | None = None,
     policy_state: object = None,
 ) -> tuple:
@@ -493,6 +529,11 @@ def build_interactions_and_neighbors_split(
         MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
     pair_policy
         Optional JAX-traceable callable overriding the built-in MAC.
     policy_state
@@ -518,6 +559,7 @@ def build_interactions_and_neighbors_split(
         retry_logger=retry_logger,
         mac_type=mac_type,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         pair_policy=pair_policy,
         policy_state=policy_state,
     )
@@ -537,6 +579,7 @@ def build_octree_native_far_pairs(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> CompactTaggedOctreeFarPairs:
     """Construct exact-length far-field pairs in explicit octree node space.
 
@@ -569,6 +612,11 @@ def build_octree_native_far_pairs(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -590,6 +638,7 @@ def build_octree_native_far_pairs(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
 
 
@@ -608,6 +657,7 @@ def build_octree_native_neighbor_lists(
     traversal_config: DualTreeTraversalConfig | None = None,
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> OctreeNativeNeighborList:
     """Construct exact-length near neighbors in explicit octree leaf space.
 
@@ -643,6 +693,11 @@ def build_octree_native_neighbor_lists(
         Optional callable invoked on each capacity-driven retry.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -665,6 +720,7 @@ def build_octree_native_neighbor_lists(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
 
 
