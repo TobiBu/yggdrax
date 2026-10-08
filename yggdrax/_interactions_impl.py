@@ -16,7 +16,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
-from typing import List, Literal, NamedTuple, Optional, Union
+from typing import Any, List, Literal, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -6583,6 +6583,7 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
         "mac_type",
         "wavefront_ladder",
         "separation_floor",
+        "pair_accept",
     ),
 )
 def dual_tree_walk_mutual(
@@ -6603,6 +6604,8 @@ def dual_tree_walk_mutual(
     seed_count: Optional[Array] = None,
     wavefront_ladder: Optional[bool] = None,
     separation_floor: float = 0.0,
+    pair_accept: Optional[Callable[..., Array]] = None,
+    pair_accept_data: Any = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6690,6 +6693,21 @@ def dual_tree_walk_mutual(
         unsoftened expansion stays out of a softening kernel's reach this way.
         ``0`` (default) adds no test, so the lists are the walk's without it.
         Static.
+    pair_accept:
+        Optional acceptance test that REPLACES the opening-angle rule (``theta`` and
+        ``mac_type`` are then unused): called once per round as
+        ``pair_accept(pair_accept_data, a, b, dist_sq, radius_a, radius_b)`` on the
+        round's node pairs, it returns a boolean mask, and a pair is accepted where
+        the mask holds, it is live and ``a != b``. The separation floor still
+        applies on top; a rejected pair is a near pair (two leaves) or refined,
+        exactly as under the geometric rule. This is how an error-controlled
+        criterion (Dehnen 2014 eq 16a) runs in this walk without the walk knowing
+        about multipoles: the caller's per-node data rides in ``pair_accept_data``.
+        The test must be symmetric in ``a`` and ``b``, since every pair is visited
+        in one orientation only. Static (a hashable callable).
+    pair_accept_data:
+        Pytree of arrays handed to ``pair_accept`` as its first argument, traced.
+        ``None`` (default) when there is no ``pair_accept``.
 
     Returns
     -------
@@ -6801,7 +6819,18 @@ def dual_tree_walk_mutual(
             same = jnp.asarray(sa == sb)
             delta = centers[sb] - centers[sa]
             dist_sq = jnp.sum(delta * delta, axis=-1)
-            if mac_type is None:
+            if pair_accept is not None:
+                accept = (
+                    live
+                    & (~same)
+                    & jnp.asarray(
+                        pair_accept(
+                            pair_accept_data, sa, sb, dist_sq, radius_a, radius_b
+                        ),
+                        dtype=bool,
+                    )
+                )
+            elif mac_type is None:
                 radius_sum = radius_a + radius_b
                 accept = live & (~same) & (theta_sq * dist_sq > radius_sum * radius_sum)
             else:

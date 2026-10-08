@@ -512,3 +512,124 @@ def test_env_switch_sets_the_ladder_default(monkeypatch):
         assert out.returncode == 0, out.stderr
         assert out.stdout.strip() == expect, (value, out.stdout)
     del importlib, monkeypatch
+
+
+def _geometric_accept(data, a, b, dist_sq, radius_a, radius_b):
+    """The non-strict opening-angle rule, written as a ``pair_accept`` callable."""
+    del a, b
+    rsum = radius_a + radius_b
+    return rsum * rsum <= data["theta_sq"] * dist_sq
+
+
+def _weighted_accept(data, a, b, dist_sq, radius_a, radius_b):
+    """A symmetric node-dependent rule: geometric AND a per-node weight budget."""
+    rsum = radius_a + radius_b
+    geometric = rsum * rsum <= data["theta_sq"] * dist_sq
+    return geometric & (data["weight"][a] + data["weight"][b] < data["cap"])
+
+
+def _walk_kw():
+    return dict(max_pair_queue=1 << 16, far_cap=1 << 17, near_cap=1 << 17)
+
+
+def test_pair_accept_replaces_the_opening_angle_rule():
+    """A ``pair_accept`` that IS the geometric rule gives the geometric lists, whatever ``theta``."""
+    topology, geometry = _tree(seed=21)
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
+    ref = dual_tree_walk_mutual(
+        left, right, centers, extents, 0.5, root, mac_type="dehnen", **_walk_kw()
+    )
+    data = {"theta_sq": jnp.asarray(0.25, centers.dtype)}
+    # theta and mac_type are unused once pair_accept is given
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.01,
+        root,
+        mac_type="bh",
+        pair_accept=_geometric_accept,
+        pair_accept_data=data,
+        **_walk_kw(),
+    )
+    assert not (
+        bool(res.queue_overflow) or bool(res.far_overflow) or bool(res.near_overflow)
+    )
+    assert _mutual_sets(res) == _mutual_sets(ref)
+    assert int(res.rounds) == int(ref.rounds)
+
+
+def test_pair_accept_never_accepting_leaves_every_leaf_pair_near():
+    topology, geometry = _tree(n=600, seed=22)
+    left, right, centers, extents, root, num_internal = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        pair_accept=lambda data, a, b, d2, ra, rb: jnp.zeros_like(d2, dtype=bool),
+        **_walk_kw(),
+    )
+    far, near = _mutual_sets(res)
+    num_leaves = left.shape[0] - num_internal
+    assert far == set()
+    assert len(near) == num_leaves * (num_leaves - 1) // 2
+
+
+def test_pair_accept_data_is_traced_and_node_ids_reach_the_test():
+    """Node-dependent rule under an outer jit: coverage stays exact, the rule holds on
+    every far pair, and new data changes the lists without a new trace."""
+    topology, geometry = _tree(seed=23)
+    left, right, centers, extents, root, num_internal = _mutual_inputs(
+        topology, geometry, "dehnen"
+    )
+    weight = jnp.asarray(
+        np.random.default_rng(0).uniform(0.0, 1.0, left.shape[0]), centers.dtype
+    )
+    traces = []
+
+    @jax.jit
+    def run(data):
+        traces.append(1)
+        return dual_tree_walk_mutual(
+            left,
+            right,
+            centers,
+            extents,
+            0.5,
+            root,
+            pair_accept=_weighted_accept,
+            pair_accept_data=data,
+            **_walk_kw(),
+        )
+
+    below = _leaves_below(left, right, num_internal)
+    num_leaves = left.shape[0] - num_internal
+    lists = []
+    for cap in (0.8, 1.4):
+        data = {
+            "theta_sq": jnp.asarray(0.25, centers.dtype),
+            "weight": weight,
+            "cap": jnp.asarray(cap, centers.dtype),
+        }
+        res = run(data)
+        assert not (
+            bool(res.queue_overflow)
+            or bool(res.far_overflow)
+            or bool(res.near_overflow)
+        )
+        far, near = _mutual_sets(res)
+        w = np.asarray(weight)
+        assert all(w[a] + w[b] < cap for a, b in far)
+        covered = sum(int(below[a]) * int(below[b]) for a, b in far | near)
+        assert covered == num_leaves * (num_leaves - 1) // 2
+        lists.append((far, near))
+    assert lists[0] != lists[1], "the cap must change the lists"
+    assert len(traces) == 1, "new data must not retrace"
