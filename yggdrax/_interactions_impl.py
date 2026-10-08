@@ -416,6 +416,7 @@ def _compute_mac_ok(
     extent_source: Array,
     valid_pairs: Array,
     different_nodes: Array,
+    separation_floor: float = 0.0,
 ) -> Array:
     """Return per-pair acceptance decisions for the configured MAC.
 
@@ -429,6 +430,10 @@ def _compute_mac_ok(
         extent_source: Effective extent/radius of source node.
         valid_pairs: Boolean mask for valid pairs.
         different_nodes: Boolean mask for target != source.
+        separation_floor: Static. With a positive value a pair is also refused
+            unless ``extent_target + extent_source + separation_floor <= d``: no
+            particle of one node is then closer than the floor to the other node
+            (exact radii). ``0`` adds no test, so the decision is unchanged.
 
     Returns:
         Boolean array matching ``dist_sq`` shape.
@@ -436,6 +441,13 @@ def _compute_mac_ok(
 
     # Common validity guards.
     valid = valid_pairs & different_nodes & (dist_sq > 0.0)
+    if float(separation_floor) > 0.0:
+        reach = (
+            extent_target
+            + extent_source
+            + jnp.asarray(separation_floor, dtype=dist_sq.dtype)
+        )
+        valid = valid & (reach * reach <= dist_sq)
 
     if mac_type == "bh":
         # Symmetric opening angle: (r_t + r_s)^2 <= theta^2 * d^2
@@ -1045,6 +1057,7 @@ def _build_mac_extents(
     num_internal: int,
     mac_type: str,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
 ) -> tuple[Array, Array]:
     """Per-node MAC extent proxies (box or sphere) for a radix-style tree.
 
@@ -1172,6 +1185,7 @@ def _raise_if_true(flag, message: str) -> None:
         "max_neighbors_per_leaf",
         "max_pair_queue",
         "mac_type",
+        "separation_floor",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -1187,6 +1201,7 @@ def _dual_tree_walk_impl(
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
     max_pair_queue: int,
@@ -1443,6 +1458,7 @@ def _dual_tree_walk_impl(
             extent_source=extent_mac_source,
             valid_pairs=valid_pairs_bool,
             different_nodes=different_nodes,
+            separation_floor=separation_floor,
         )
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
@@ -1962,6 +1978,7 @@ def _dual_tree_walk_impl(
         "max_neighbors_per_leaf",
         "max_pair_queue",
         "mac_type",
+        "separation_floor",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -1979,6 +1996,7 @@ def _dual_tree_walk_octree_impl(
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
     max_pair_queue: int,
@@ -2223,6 +2241,7 @@ def _dual_tree_walk_octree_impl(
             extent_source=extent_mac_source,
             valid_pairs=valid_pairs_bool,
             different_nodes=different_nodes,
+            separation_floor=separation_floor,
         )
 
         target_leaf = valid_pairs_bool & near_leaf_mask[safe_targets]
@@ -2652,6 +2671,7 @@ def _dual_tree_walk_octree_impl(
     jax.jit,
     static_argnames=(
         "mac_type",
+        "separation_floor",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -2668,6 +2688,7 @@ def _dual_tree_walk_count_impl(
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     collect_far: bool = True,
     collect_near: bool = True,
     process_block: int = _DEFAULT_PAIR_BATCH,
@@ -2800,6 +2821,7 @@ def _dual_tree_walk_count_impl(
             extent_source=extent_mac_source,
             valid_pairs=valid_pairs_bool,
             different_nodes=different_nodes,
+            separation_floor=separation_floor,
         )
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
@@ -2994,6 +3016,7 @@ def _dual_tree_walk_count_impl(
     jax.jit,
     static_argnames=(
         "mac_type",
+        "separation_floor",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -3015,6 +3038,7 @@ def _dual_tree_walk_compact_fill_impl(
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     max_pair_queue: int,
     total_far_pairs: int,
     total_near_pairs: int,
@@ -3231,6 +3255,7 @@ def _dual_tree_walk_compact_fill_impl(
             extent_source=extent_mac_source,
             valid_pairs=valid_pairs_bool,
             different_nodes=different_nodes,
+            separation_floor=separation_floor,
         )
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
@@ -3903,6 +3928,7 @@ def _run_dual_tree_walk_raw(
     collect_far: bool,
     collect_near: bool,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     _dispatch_mode: str = "auto",
@@ -3964,6 +3990,7 @@ def _run_dual_tree_walk_raw(
             collect_far=collect_far,
             collect_near=collect_near,
             dehnen_radius_scale=dehnen_scale_val,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
             near_node_space=near_node_space,
@@ -4157,6 +4184,7 @@ def _run_dual_tree_walk_raw(
             pair_policy=pair_policy,
             policy_state=policy_state,
             dehnen_radius_scale=dehnen_scale_val,
+            separation_floor=separation_floor,
             collect_far=collect_far,
             collect_near=collect_near,
             process_block=count_process_block,
@@ -4328,6 +4356,7 @@ def _run_dual_tree_walk_raw(
                 pair_policy=pair_policy,
                 policy_state=policy_state,
                 dehnen_radius_scale=dehnen_scale_val,
+                separation_floor=separation_floor,
                 max_pair_queue=int(queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -4409,6 +4438,7 @@ def _run_dual_tree_walk_raw(
                     pair_policy=pair_policy,
                     policy_state=policy_state,
                     dehnen_radius_scale=dehnen_scale_val,
+                    separation_floor=separation_floor,
                     max_interactions_per_node=interaction_capacity,
                     max_neighbors_per_leaf=neighbor_capacity,
                     max_pair_queue=queue_capacity,
@@ -4550,6 +4580,7 @@ def _run_octree_walk_raw(
     collect_far: bool,
     collect_near: bool,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
     near_node_space: str = "compat",
@@ -4575,6 +4606,7 @@ def _run_octree_walk_raw(
             collect_far=collect_far,
             collect_near=collect_near,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
             near_node_space=near_node_space,
@@ -4609,6 +4641,7 @@ def _run_octree_walk_raw(
             collect_far=collect_far,
             collect_near=collect_near,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
             near_node_space=near_node_space,
@@ -4624,6 +4657,7 @@ def _run_octree_walk_raw(
         pair_policy=pair_policy,
         policy_state=policy_state,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         max_interactions_per_node=interaction_capacity,
         max_neighbors_per_leaf=neighbor_capacity,
         max_pair_queue=queue_capacity,
@@ -4671,6 +4705,7 @@ def _run_legacy_dual_tree_walk_raw(
     collect_far: bool,
     collect_near: bool,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
     near_node_space: str = "compat",
@@ -4692,6 +4727,7 @@ def _run_legacy_dual_tree_walk_raw(
         collect_far=collect_far,
         collect_near=collect_near,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         process_block=process_block,
         retry_logger=retry_logger,
         _dispatch_mode="legacy",
@@ -4732,6 +4768,7 @@ def _run_far_only_compact_with_bounded_count_pass(
     policy_state: object,
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
 ) -> CompactTaggedFarPairs:
@@ -4813,6 +4850,7 @@ def _run_far_only_compact_with_bounded_count_pass(
             pair_policy=pair_policy,
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
+            separation_floor=separation_floor,
             collect_far=True,
             collect_near=False,
             process_block=int(count_process_block),
@@ -4898,6 +4936,7 @@ def _run_far_only_compact_with_bounded_count_pass(
                 pair_policy=pair_policy,
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
+                separation_floor=separation_floor,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=0,
@@ -4928,6 +4967,7 @@ def _run_near_only_compact_with_bounded_count_pass(
     policy_state: object,
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
 ) -> NodeNeighborList:
@@ -5005,6 +5045,7 @@ def _run_near_only_compact_with_bounded_count_pass(
             pair_policy=pair_policy,
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
+            separation_floor=separation_floor,
             collect_far=False,
             collect_near=True,
             process_block=int(count_process_block),
@@ -5086,6 +5127,7 @@ def _run_near_only_compact_with_bounded_count_pass(
                 pair_policy=pair_policy,
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
+                separation_floor=separation_floor,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=0,
                 total_near_pairs=int(total_near_pairs),
@@ -5116,6 +5158,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
     policy_state: object,
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
+    separation_floor: float = 0.0,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
     timing_callback: Optional[Callable[[str, float], None]] = None,
@@ -5218,6 +5261,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             pair_policy=pair_policy,
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
+            separation_floor=separation_floor,
             collect_far=True,
             collect_near=True,
             process_block=int(count_process_block),
@@ -5265,6 +5309,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                 pair_policy=pair_policy,
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
+                separation_floor=separation_floor,
                 max_pair_queue=int(queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -5313,6 +5358,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             pair_policy=pair_policy,
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
+            separation_floor=separation_floor,
             collect_far=True,
             collect_near=True,
             process_block=int(count_process_block),
@@ -5382,6 +5428,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                 pair_policy=pair_policy,
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
+                separation_floor=separation_floor,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -5662,6 +5709,7 @@ def build_octree_native_far_pairs(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> CompactTaggedOctreeFarPairs:
     """Construct exact-length far pairs directly in explicit octree node space."""
     del geometry, retry_logger
@@ -5702,6 +5750,7 @@ def build_octree_native_far_pairs(
         pair_policy=pair_policy,
         policy_state=policy_state,
         dehnen_radius_scale=float(dehnen_radius_scale),
+        separation_floor=separation_floor,
         max_interactions_per_node=int(resolved_cfg.max_interactions_per_node),
         max_neighbors_per_leaf=int(resolved_cfg.max_neighbors_per_leaf),
         max_pair_queue=max(4, int(resolved_cfg.max_pair_queue)),
@@ -5744,6 +5793,7 @@ def build_octree_native_neighbor_lists(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> OctreeNativeNeighborList:
     """Construct exact-length near neighbors directly in explicit octree leaf space."""
     del geometry, retry_logger
@@ -5786,6 +5836,7 @@ def build_octree_native_neighbor_lists(
         pair_policy=pair_policy,
         policy_state=policy_state,
         dehnen_radius_scale=float(dehnen_radius_scale),
+        separation_floor=separation_floor,
         max_interactions_per_node=int(resolved_cfg.max_interactions_per_node),
         max_neighbors_per_leaf=int(resolved_cfg.max_neighbors_per_leaf),
         max_pair_queue=max(4, int(resolved_cfg.max_pair_queue)),
@@ -5827,6 +5878,7 @@ def build_well_separated_interactions(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> NodeInteractionList:
     """Construct multipole-to-local interaction lists using a MAC walk.
 
@@ -5850,6 +5902,7 @@ def build_well_separated_interactions(
         collect_far=True,
         collect_near=False,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -5871,6 +5924,7 @@ def build_compact_far_pairs(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> CompactTaggedFarPairs:
     """Construct exact-length far pairs directly from the generic dual-tree walk."""
 
@@ -5886,6 +5940,7 @@ def build_compact_far_pairs(
             policy_state=policy_state,
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -5904,6 +5959,7 @@ def build_compact_far_pairs(
         collect_far=True,
         collect_near=False,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -5926,6 +5982,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     timing_callback: Optional[Callable[[str, float], None]] = None,
     compact_far_pair_capacity: Optional[int] = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
@@ -5948,6 +6005,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             policy_state=policy_state,
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
             timing_callback=timing_callback,
@@ -5968,6 +6026,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             collect_far=True,
             collect_near=True,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -5989,6 +6048,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
     neighbors = build_leaf_neighbor_lists(
         tree,
@@ -6004,6 +6064,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
     return far_pairs, neighbors
 
@@ -6024,6 +6085,7 @@ def build_leaf_neighbor_lists(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> NodeNeighborList:
     """Construct near-field adjacency for leaf nodes via a MAC walk."""
 
@@ -6044,6 +6106,7 @@ def build_leaf_neighbor_lists(
             policy_state=policy_state,
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
+            separation_floor=separation_floor,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -6062,6 +6125,7 @@ def build_leaf_neighbor_lists(
         collect_far=False,
         collect_near=True,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -6081,6 +6145,7 @@ def build_interactions_and_neighbors_split(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
 ) -> tuple[NodeInteractionList, NodeNeighborList]:
@@ -6104,6 +6169,7 @@ def build_interactions_and_neighbors_split(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
     neighbors = build_leaf_neighbor_lists(
         tree,
@@ -6119,6 +6185,7 @@ def build_interactions_and_neighbors_split(
         traversal_config=traversal_config,
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
     )
     return interactions, neighbors
 
@@ -6136,6 +6203,7 @@ def build_interactions_and_neighbors(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     *,
@@ -6197,6 +6265,7 @@ def build_interactions_and_neighbors(
         collect_far=True,
         collect_near=True,
         dehnen_radius_scale=dehnen_radius_scale,
+        separation_floor=separation_floor,
         process_block=process_block,
         retry_logger=retry_logger,
     )

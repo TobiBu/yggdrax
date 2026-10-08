@@ -177,6 +177,7 @@ def dual_tree_walk_cross_impl(
     *,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
     max_pair_queue: int,
@@ -404,6 +405,7 @@ def dual_tree_walk_cross_impl(
             extent_source=es,
             valid_pairs=vb,
             different_nodes=vb,  # disjoint trees: always "different"
+            separation_floor=separation_floor,
         )
 
         t_int = vb & (wf_t < t_internal_v)
@@ -681,6 +683,7 @@ dual_tree_walk_cross = partial(
         "max_neighbors_per_leaf",
         "max_pair_queue",
         "mac_type",
+        "separation_floor",
         "collect_far",
         "collect_near",
         # A Python callable, so it must be static: traced, it would be flattened to

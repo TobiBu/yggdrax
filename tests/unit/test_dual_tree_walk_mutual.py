@@ -67,7 +67,7 @@ def _mutual_inputs(topology, geometry, mac_type, scale=1.0, idx=None):
     return left, right, centers, jnp.asarray(extents, centers.dtype), root, num_internal
 
 
-def _dual_sets(topology, geometry, theta, mac_type, scale=1.0):
+def _dual_sets(topology, geometry, theta, mac_type, scale=1.0, separation_floor=0.0):
     config = DualTreeTraversalConfig(
         max_pair_queue=1 << 16,
         process_block=64,
@@ -81,6 +81,7 @@ def _dual_sets(topology, geometry, theta, mac_type, scale=1.0):
         traversal_config=config,
         mac_type=mac_type,
         dehnen_radius_scale=scale,
+        separation_floor=separation_floor,
         return_result=True,
     )
     assert not (
@@ -283,6 +284,36 @@ def test_separation_floor_keeps_far_pairs_apart_and_coverage_exact(floor):
         **kw,
     )
     assert _mutual_sets(zero) == (far_bare, near_bare)
+
+
+@pytest.mark.parametrize("mac_type", ["bh", "dehnen"])
+def test_separation_floor_dual_walk_matches_the_mutual_walk(mac_type):
+    """The floor lives in the shared MAC test: the dual walk honours it like the mutual walk."""
+    topology, geometry = _tree(seed=13)
+    floor = 5.0
+    far_ref, near_ref, _, _ = _dual_sets(
+        topology, geometry, 0.5, mac_type, separation_floor=floor
+    )
+    far_bare, _, _, _ = _dual_sets(topology, geometry, 0.5, mac_type)
+    assert far_ref != far_bare, "the floor must bite at this size"
+    left, right, centers, extents, root, _ = _mutual_inputs(
+        topology, geometry, mac_type
+    )
+    res = dual_tree_walk_mutual(
+        left,
+        right,
+        centers,
+        extents,
+        0.5,
+        root,
+        max_pair_queue=1 << 16,
+        far_cap=1 << 17,
+        near_cap=1 << 17,
+        mac_type=mac_type,
+        separation_floor=floor,
+    )
+    far, near = _mutual_sets(res)
+    assert far == far_ref and near == near_ref
 
 
 def test_traces_under_jit_and_reports_peak_and_rounds():
