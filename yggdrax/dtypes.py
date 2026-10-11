@@ -39,15 +39,7 @@ def as_index(x: ArrayLike) -> jax.Array:
     return jnp.asarray(x, dtype=INDEX_DTYPE)
 
 
-def complex_dtype_for_real(real_dtype: DTypeLike) -> DTypeLike:
-    """Return complex dtype paired with a real floating dtype."""
-    dtype = jnp.asarray(0, dtype=real_dtype).dtype
-    if dtype == jnp.float64:
-        return jnp.complex128
-    return jnp.complex64
-
-
-__all__ = ["INDEX_DTYPE", "as_index", "complex_dtype_for_real"]
+__all__ = ["INDEX_DTYPE", "as_index"]
 
 
 def is_traced(value: object) -> bool:

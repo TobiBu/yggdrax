@@ -72,7 +72,3 @@ Contracts and types
 .. automodule:: yggdrax.types
    :members:
    :undoc-members:
-
-.. automodule:: yggdrax.policies
-   :members:
-   :undoc-members:
