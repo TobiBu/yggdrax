@@ -162,15 +162,6 @@ def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(x == 0, as_index(64), n)
 
 
-def _lcp_codes_only(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-    """
-    Leading common prefix length for two uint64 Morton codes
-    (no index tie-break). Returns int32 in [0, 64].
-    """
-    xor = jnp.bitwise_xor(a, b)
-    return jnp.where(xor == jnp.uint64(0), as_index(64), _clz_u64(xor))
-
-
 def _unroll_step_searches() -> bool:
     """Whether :func:`_descending_step_search` unrolls (every backend but CPU)."""
     return jax.default_backend() != "cpu"
@@ -1093,14 +1084,20 @@ def _build_tree_from_leaf_partitions(
     end_particle = leaf_ends_exclusive[last] - as_index(1)
     node_ranges_internal = jnp.stack([start_particle, end_particle], axis=1)
 
-    first_code = leaf_codes[first]
-    last_code = leaf_codes[last]
-    common_prefix = _lcp_codes_only(first_code, last_code)
+    # The split search must order leaves the way the range search above does:
+    # by code, and by leaf index where codes tie (Karras 2012's augmented delta).
+    # A codes-only prefix cannot split a range whose leaves all share one code
+    # (more than ``leaf_size`` particles in one Morton cell -- duplicates, or
+    # padding rows copied from a real particle). Every candidate then compares
+    # equal to the range's own prefix, the split collapses onto ``first``, and the
+    # rest of the range is orphaned: the build returned a forest. Where the range's
+    # first and last codes differ, both forms give the same split.
+    common_prefix = _delta_vec(first, last)
 
     def _split_step(step: jax.Array, split: jax.Array) -> jax.Array:
         mid = split + step
         safe_mid = jnp.where(mid < last, mid, last)
-        cmp = _lcp_codes_only(first_code, leaf_codes[safe_mid])
+        cmp = _delta_vec(first, safe_mid)
         cond = (mid < last) & (cmp > common_prefix)
         return jnp.where(cond, mid, split)
 

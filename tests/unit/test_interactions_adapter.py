@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from yggdrax import (
     CompactTaggedFarPairs,
@@ -24,6 +25,7 @@ from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConf
 from yggdrax.interactions import (
     build_compact_far_pairs,
     build_interactions_and_neighbors_split,
+    build_well_separated_interactions,
 )
 
 _TEST_N = 16
@@ -297,16 +299,44 @@ def test_dual_tree_walk_serves_every_tree_type():
         assert int(jnp.min(neighbors.counts)) >= 1, tree_type
 
 
-def test_octree_near_lists_agree_across_builders():
-    """Every near-list builder serves an octree with the joint walk's pairs.
+def _far_pairs(interactions) -> set[tuple[int, int]]:
+    """Return a far list (either container) as a set of ``(target, source)`` pairs."""
 
-    The near-only builders with explicit capacities used to route an octree to a
-    native octree walk that left most near rows empty; it was removed in the
-    2026-10 cleanup (Y1) and every builder now runs the binary walk.
+    if isinstance(interactions, CompactTaggedFarPairs):
+        total = int(interactions.far_pair_count)
+    else:
+        total = int(jnp.sum(interactions.counts))
+    return set(
+        zip(
+            interactions.targets[:total].tolist(),
+            interactions.sources[:total].tolist(),
+        )
+    )
+
+
+@pytest.mark.parametrize("tree_type", ["octree", "kdtree"])
+def test_walk_builders_agree_with_the_joint_walk(tree_type):
+    """Every builder serves the tree with the joint far + near walk's pairs.
+
+    Two ways they used to differ, both under explicit capacities:
+
+    * octree: the near-only builders routed to a native octree walk that left most
+      near rows empty; removed in the 2026-10 cleanup (Y1), every builder now runs
+      the binary walk;
+    * kd-tree with the Dehnen MAC: the kd default ``dehnen_radius_scale`` (1.2) was
+      applied by the joint walk only, so the bounded count-pass routes walked at
+      1.0 -- 1,710 near pairs against 2,408 at this size (fixed 2026-10).
     """
 
-    tree, geometry = _walk_problem("octree")
-    _, joint = build_interactions_and_neighbors(
+    tree, geometry = _walk_problem(tree_type)
+    joint_far, joint = build_interactions_and_neighbors(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_WALK_CFG,
+    )
+    far_only = build_well_separated_interactions(
         tree,
         geometry,
         theta=0.6,
@@ -327,7 +357,7 @@ def test_octree_near_lists_agree_across_builders():
         mac_type="dehnen",
         traversal_config=_WALK_CFG,
     )
-    _, compact = build_compact_far_pairs_and_leaf_neighbor_lists(
+    compact_far, compact = build_compact_far_pairs_and_leaf_neighbor_lists(
         tree,
         geometry,
         theta=0.6,
@@ -341,3 +371,7 @@ def test_octree_near_lists_agree_across_builders():
     assert _near_pairs(near_only) == joint_pairs
     assert _near_pairs(split) == joint_pairs
     assert _near_pairs(compact) == joint_pairs
+    joint_far_pairs = _far_pairs(joint_far)
+    assert joint_far_pairs, "the walk accepted no far pair; the far check is vacuous"
+    assert _far_pairs(far_only) == joint_far_pairs
+    assert _far_pairs(compact_far) == joint_far_pairs
