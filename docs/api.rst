@@ -47,10 +47,6 @@ Moments
    :members:
    :undoc-members:
 
-.. automodule:: yggdrax.multipole_utils
-   :members:
-   :undoc-members:
-
 Morton ordering and primitives
 -------------------------------
 

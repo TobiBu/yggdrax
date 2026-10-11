@@ -59,7 +59,6 @@ jobs:
             yggdrax/geometry.py \
             yggdrax/interactions.py \
             yggdrax/morton.py \
-            yggdrax/multipole_utils.py \
             yggdrax/policies.py \
             yggdrax/traversal.py \
             yggdrax/tree.py \
