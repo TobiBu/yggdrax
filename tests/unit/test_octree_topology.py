@@ -18,7 +18,7 @@ _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
 )
 
 
-def test_fixed_depth_octree_populates_eight_root_children():
+def test_octree_populates_eight_root_children():
     positions = jnp.array(
         [
             [0.25, 0.25, 0.25],
@@ -37,22 +37,29 @@ def test_fixed_depth_octree_populates_eight_root_children():
         positions,
         masses,
         tree_type="octree",
-        build_mode="fixed_depth",
         bounds=(
             jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32),
             jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
         ),
         return_reordered=True,
-        target_leaf_particles=1,
-        max_depth=1,
-        refine_local=False,
+        leaf_size=1,
     )
 
+    # One particle per octant, one particle per leaf: the eight leaves are the
+    # root's eight children. (Before the 2026-10 cleanup, Y2, this was built
+    # fixed-depth at depth 1, so the children sat at octree depth 1; adaptive
+    # leaves resolve to the tightest cell holding their particles instead.)
     assert tree.tree_type == "octree"
     assert tree.oct_num_nodes == 9
     assert int(tree.oct_child_counts[0]) == 8
     assert jnp.all(tree.oct_children[0] >= 0)
-    assert jnp.all(tree.oct_node_depths[tree.oct_children[0]] == 1)
+    assert jnp.all(tree.oct_parent[tree.oct_children[0]] == 0)
+    assert int(tree.oct_node_depths[0]) == 0
+    assert jnp.all(tree.oct_node_depths[tree.oct_children[0]] >= 1)
+    # Each child lies in a different octant of the root (the top 3 of the 63
+    # Morton bits).
+    octants = tree.oct_node_codes[tree.oct_children[0]] >> jnp.uint64(60)
+    assert jnp.array_equal(jnp.sort(octants), jnp.arange(8, dtype=octants.dtype))
     assert jnp.array_equal(
         tree.oct_leaf_nodes[: tree.oct_num_leaf_nodes],
         tree.oct_children[0],

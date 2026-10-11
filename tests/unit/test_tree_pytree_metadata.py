@@ -21,8 +21,8 @@ and it read as flaky there because one tree reused holds the same array object o
 both sides and the identity check hides it.
 
 ``leaf_size=None`` needs nothing -- ``None`` is pytree structure, not a leaf --
-which is why the fixed-depth paths were never affected. They are parametrised in
-anyway: the assertion is "static", and ``None`` is static.
+which is why the fixed-depth paths were never affected. They were parametrised
+in until fixed-depth builds were removed in the 2026-10 cleanup (Y2).
 """
 
 import jax
@@ -60,8 +60,7 @@ def _topology_of(built):
     return getattr(obj, "topology", obj)
 
 
-# Every entry point that can produce a tree with a non-``None`` leaf size, plus
-# the fixed-depth ones for completeness. Keyed by name so a failure names the
+# Every entry point that can produce a tree. Keyed by name so a failure names the
 # builder rather than an index.
 _BUILDERS = {
     "build_tree": lambda p, m: tree_api.build_tree(
@@ -79,32 +78,14 @@ _BUILDERS = {
     "build_static_radix_tree": lambda p, m: tree_api.build_static_radix_tree(
         p, m, leaf_size=8, return_reordered=True
     ),
-    "build_fixed_depth_tree": lambda p, m: tree_api.build_fixed_depth_tree(
-        p, m, return_reordered=True
-    ),
-    "build_fixed_depth_tree_jit": lambda p, m: tree_api.build_fixed_depth_tree_jit(
-        p, m, return_reordered=True
-    ),
-    "build_fixed_depth_octree": lambda p, m: tree_api.build_fixed_depth_octree(
-        p, m, return_reordered=True
-    ),
-    "build_fixed_depth_octree_jit": (
-        lambda p, m: tree_api.build_fixed_depth_octree_jit(p, m, return_reordered=True)
-    ),
     "RadixTree.adaptive": lambda p, m: RadixTree.from_particles(
         p, m, build_mode="adaptive", leaf_size=8
-    ),
-    "RadixTree.fixed_depth": lambda p, m: RadixTree.from_particles(
-        p, m, build_mode="fixed_depth", leaf_size=8
     ),
     "RadixTree.static_radix": lambda p, m: RadixTree.from_particles(
         p, m, build_mode="static_radix", leaf_size=8
     ),
     "OctreeTree.adaptive": lambda p, m: OctreeTree.from_particles(
         p, m, build_mode="adaptive", leaf_size=8
-    ),
-    "OctreeTree.fixed_depth": lambda p, m: OctreeTree.from_particles(
-        p, m, build_mode="fixed_depth", leaf_size=8
     ),
     "KDParticleTree.adaptive": lambda p, m: KDParticleTree.from_particles(
         p, m, leaf_size=8

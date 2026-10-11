@@ -16,7 +16,7 @@ can consume both the proven traversal buffers and octree-style child tables.
 ## Features
 
 - Morton encode/decode and stable Morton sorting for 3D points
-- LBVH and fixed-depth radix tree construction
+- LBVH (adaptive) and static-shape radix tree construction
 - Explicit octree metadata derived from Morton/radix topology
 - Tree geometry extraction (bounds, centers, extents, radii)
 - Dual-tree far-field and near-field interaction builders
@@ -73,7 +73,7 @@ interactions, neighbors = build_interactions_and_neighbors(
 ```
 
 `build_tree(...)` continues to expose the radix/LBVH backend directly. The
-octree wrappers (`build_octree(...)`, `build_fixed_depth_octree(...)`) preserve
+octree wrappers (`build_octree(...)`, `build_octree_jit(...)`) preserve
 the same compatibility fields while additionally exposing explicit octree
 buffers such as `oct_children`, `oct_node_depths`, and `radix_node_to_oct`.
 
@@ -149,14 +149,20 @@ repeated builds and traversals:
 
 - `TreeBuildConfig`: adaptive radix-tree settings (`leaf_size`,
   `return_reordered`, reusable workspace handling)
-- `FixedDepthTreeBuildConfig`: fixed-depth tree settings, including local
-  Morton refinement controls
 - `DualTreeTraversalConfig`: traversal queue, block size, interaction capacity,
   and neighbor capacity
 
-When a `config=...` object is passed to `build_tree(...)` or
-`build_fixed_depth_tree(...)`, or their octree counterparts, it takes precedence over the equivalent
-individual keyword arguments.
+When a `config=...` object is passed to `build_tree(...)` or `build_octree(...)`
+(or their `_jit` variants), it takes precedence over the equivalent individual
+keyword arguments.
+
+Fixed-depth builds (`build_mode="fixed_depth"`, `build_fixed_depth_tree(...)`,
+`build_fixed_depth_octree(...)`, their `_jit` variants and
+`FixedDepthTreeBuildConfig`) were removed in the 2026-10 cleanup (Y2);
+`build_mode="fixed_depth"` now raises a `ValueError`. The fixed-depth keywords of
+`Tree.from_particles(...)` (`target_leaf_particles`, `max_depth`, `refine_local`,
+`max_refine_levels`, `aspect_threshold`, `min_refined_leaf_particles`) are still
+accepted, and ignored, because jaccpot passes them.
 
 Conformance tests:
 

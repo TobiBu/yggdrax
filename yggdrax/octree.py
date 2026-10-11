@@ -495,7 +495,7 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
     static_leaf_size = getattr(topology, "leaf_size", None)
     if static_leaf_size is None:
         # Nothing to put back. `None` is pytree *structure* rather than a leaf,
-        # so a fixed-depth topology crosses the boundary with it intact.
+        # so a topology without a static leaf size crosses the boundary intact.
         return augmented
     return augmented._replace(leaf_size=static_leaf_size)
 

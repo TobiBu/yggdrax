@@ -70,7 +70,7 @@ def _build_local_tree(
         # Local imports: avoid importing the public tree module (which pulls in
         # the kdtree/octree backends) at package import time.
         from ..octree import augment_radix_topology_with_octree
-        from ..tree import _ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS, _build_octree_result
+        from ..tree import _build_octree_result
 
         topo, pos_sorted, mass_sorted, _inv = cast(
             _ReorderedRadixBuild,
@@ -83,7 +83,6 @@ def _build_local_tree(
                 workspace=None,
                 return_workspace=False,
                 leaf_size=leaf_size,
-                **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
             ),
         )
         return augment_radix_topology_with_octree(topo), pos_sorted, mass_sorted

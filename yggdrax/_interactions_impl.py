@@ -431,7 +431,7 @@ def _auto_pair_queue_candidates(
     that can spawn refinements) and progressively double until we reach the
     conservative default derived from ``DEFAULT_PAIR_QUEUE_MULTIPLIER``.  This
     avoids compiling the large walker with multi-million entry stacks unless it
-    is truly necessary (common for deep fixed-depth trees), substantially
+    is truly necessary (common for deep trees), substantially
     reducing both compile and run time.
     """
 
