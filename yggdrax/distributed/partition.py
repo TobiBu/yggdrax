@@ -7,15 +7,14 @@ Morton-sorts its shard locally, a small set of samples is gathered to choose
 ``ndev-1`` splitters, and particles are routed to their owning device with the
 ragged all-to-all from :mod:`yggdrax.distributed.comm`.
 
-Two balancing modes:
-
-* the sample sort alone gives contiguous, *approximately* balanced domains and
-  can *snap* domain boundaries to coarse Morton cells (``align_level``) so a
-  top-level tree node never straddles two GPUs (jztree's
-  ``adjust_domain_for_nodesize``);
-* ``equalize`` adds an exact rank-based rebalance pass (each device gets
-  ``floor``/``ceil`` of ``N/ndev`` particles) at the cost of breaking cell
-  alignment.
+The sample sort gives contiguous, *approximately* balanced domains and can
+*snap* domain boundaries to coarse Morton cells (``align_level``), so a top-level
+tree node never straddles two GPUs (jztree's ``adjust_domain_for_nodesize``).
+:func:`sfc_partition` decomposes a shard; :func:`sfc_repartition`
+re-partitions an already padded one, checking every receiver's capacity first. The exact rank-based rebalance
+(``equalize_domain``), the ``sfc_decompose`` wrapper with its ``ShardedDomain``
+result, and the cadence helpers ``repartition_due`` / ``maybe_repartition`` had
+no caller and were removed in the 2026-10 cleanup (Y3).
 
 Everything runs inside ``jax.shard_map`` over the mesh axis and keeps static
 buffer shapes (padded to ``output_capacity``) with a dynamic valid ``count``.
@@ -23,7 +22,6 @@ buffer shapes (padded to ``output_capacity``) with a dynamic valid ``count``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, NamedTuple, Optional, cast
 
 import jax
@@ -31,28 +29,13 @@ import jax.numpy as jnp
 from jaxtyping import Array
 
 from ..morton import morton_encode_impl
-from .comm import _COUNT_DTYPE, _exclusive_cumsum, ragged_all_to_all_exchange
+from .comm import _COUNT_DTYPE, ragged_all_to_all_exchange
 from .sharding import AXIS_NAME
 
 # Padding sentinel for Morton codes: sorts padding rows to the tail so the
 # valid (leading ``count``) rows stay contiguous after a re-sort. Built as a
 # uint64 scalar so it never gets parsed as a (overflowing) weak int64.
 _CODE_SENTINEL = jnp.uint64((1 << 64) - 1)
-
-
-@dataclass
-class ShardedDomain:
-    """Global (host-side) view of a decomposed particle set.
-
-    Leaves are the concatenation of every device's padded shard:
-    ``positions``/``masses``/``codes`` have leading dim ``ndev * capacity``;
-    ``counts[g]`` is the number of valid leading rows in device ``g``'s shard.
-    """
-
-    positions: Array
-    masses: Array
-    codes: Array
-    counts: Array
 
 
 def global_bounds(
@@ -492,272 +475,9 @@ def sfc_repartition(
     )
 
 
-def equalize_domain(
-    positions,
-    masses,
-    codes,
-    count,
-    ndev: int,
-    *,
-    output_capacity: int,
-    axis_name: str = AXIS_NAME,
-):
-    """Exact rank-based rebalance: each device gets floor/ceil of ``N/ndev``.
-
-    Assumes the input is the output of :func:`sfc_partition` (globally
-    Morton-ordered across devices in device order). Preserves ordering and
-    contiguity while equalising counts.
-    """
-
-    counts = jax.lax.all_gather(
-        count.astype(_COUNT_DTYPE), axis_name, tiled=False
-    )  # [ndev]
-    me = jax.lax.axis_index(axis_name)
-    total = jnp.sum(counts)
-    global_offset = _exclusive_cumsum(counts)[me]
-
-    cap = codes.shape[0]
-    j = jnp.arange(cap, dtype=_COUNT_DTYPE)
-    global_rank = global_offset + j
-
-    base = total // ndev
-    rem = total - base * ndev
-    target_sizes = base + (jnp.arange(ndev, dtype=_COUNT_DTYPE) < rem).astype(
-        _COUNT_DTYPE
-    )
-    target_ends = jnp.cumsum(target_sizes)
-
-    valid = j < count
-    dest = jnp.searchsorted(target_ends, global_rank, side="right").astype(_COUNT_DTYPE)
-    dest = jnp.minimum(dest, ndev - 1)
-    dest = jnp.where(valid, dest, ndev)  # drop padding rows from routing
-    send_sizes = jnp.bincount(dest, length=ndev).astype(_COUNT_DTYPE)
-
-    pos_out, mass_out, code_out, new_count, _ = _route(
-        positions, masses, codes, send_sizes, output_capacity, axis_name
-    )
-    pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
-        pos_out, mass_out, code_out, new_count
-    )
-    return pos_out, mass_out, code_out, new_count
-
-
-def sfc_decompose(
-    mesh,
-    positions: Array,
-    masses: Array,
-    *,
-    output_capacity: int,
-    num_samples: int = 8,
-    align_level: Optional[int] = None,
-    equalize: bool = True,
-    axis_name: str = AXIS_NAME,
-) -> ShardedDomain:
-    """Decompose a global particle set into per-GPU Morton domains.
-
-    ``positions`` (``[N, 3]``) and ``masses`` (``[N]``) are sharded evenly along
-    axis 0 over the mesh (``N`` must be divisible by ``mesh.size``). Returns a
-    :class:`ShardedDomain` global view. ``equalize`` and ``align_level`` are
-    mutually-exclusive goals (rank rebalancing ignores cell edges); pass
-    ``equalize=False`` when using ``align_level``.
-    """
-
-    try:  # stable across recent JAX versions
-        from jax import shard_map
-    except ImportError:  # pragma: no cover
-        from jax.experimental.shard_map import shard_map
-    from jax.sharding import PartitionSpec as P
-
-    ndev = mesh.size
-
-    def fn(pos, mass):
-        p, m, c, cnt, _ = sfc_partition(
-            pos,
-            mass,
-            ndev,
-            output_capacity=output_capacity,
-            num_samples=num_samples,
-            align_level=align_level,
-            axis_name=axis_name,
-        )
-        if equalize:
-            p, m, c, cnt = equalize_domain(
-                p, m, c, cnt, ndev, output_capacity=output_capacity, axis_name=axis_name
-            )
-        return p, m, c, cnt[None]
-
-    p, m, c, cnt = shard_map(
-        fn,
-        mesh=mesh,
-        in_specs=(P(axis_name), P(axis_name)),
-        out_specs=(P(axis_name), P(axis_name), P(axis_name), P(axis_name)),
-    )(positions, masses)
-    return ShardedDomain(positions=p, masses=m, codes=c, counts=cnt)
-
-
 __all__ = [
     "RepartitionResult",
-    "ShardedDomain",
-    "equalize_domain",
     "global_bounds",
-    "maybe_repartition",
-    "repartition_due",
-    "sfc_decompose",
     "sfc_partition",
     "sfc_repartition",
 ]
-
-
-def repartition_due(
-    count: Array,
-    capacity: int,
-    step: Array,
-    *,
-    interval: int = 16,
-    headroom: float = 0.9,
-    axis_name: str = AXIS_NAME,
-) -> Array:
-    """Whether to re-run :func:`sfc_partition` this step -- the SAME answer everywhere.
-
-    **The verdict must be mesh-uniform, and that is the whole point of this function.**
-    ``sfc_partition`` contains collectives: two ``all_gather`` rounds and a ragged
-    all-to-all. If one device repartitions and another does not, the first blocks on a
-    collective the second never enters and the mesh DEADLOCKS. So the drift test cannot
-    be the local ``count``; it is an all-reduced maximum over every device's occupancy.
-
-    Two triggers, both uniform by construction:
-
-    * **scheduled** -- every ``interval`` steps. Particles move, so device ownership
-      goes stale, but only on the dynamical time: the fused lane re-Morton-sorts and
-      rebuilds its local tree every step anyway, so drift WITHIN a domain is absorbed
-      for free and only the assignment needs refreshing. ``step`` is replicated, so
-      this needs no reduction.
-    * **drift guard** -- any device's ``count`` passing ``headroom`` of ``capacity``.
-      ``capacity`` is a compile-time constant that every shape depends on, so a count
-      reaching it is not a slowdown but an overflow.
-
-    Parameters
-    ----------
-    count:
-        This device's live particle count.
-    capacity:
-        The static shard capacity. Static.
-    step:
-        Step index, replicated across the mesh.
-    interval:
-        Scheduled cadence in steps. Static.
-    headroom:
-        Fraction of ``capacity`` above which the guard fires, regardless of schedule.
-    axis_name:
-        Mesh axis; must match the enclosing ``shard_map``.
-
-    Returns
-    -------
-    Array
-        Scalar bool, **identical on every device**.
-    """
-    frac = jnp.asarray(count, jnp.float32) / jnp.float32(max(int(capacity), 1))
-    worst = jax.lax.pmax(frac, axis_name)
-    scheduled = (jnp.asarray(step).astype(jnp.int32) % jnp.int32(int(interval))) == 0
-    return jnp.logical_or(scheduled, worst > jnp.float32(headroom))
-
-
-def maybe_repartition(
-    positions: Array,
-    masses: Array,
-    count: Array,
-    should: Array,
-    ndev: int,
-    *,
-    output_capacity: int,
-    bounds: Optional[tuple[Array, Array]] = None,
-    num_samples: int = 8,
-    axis_name: str = AXIS_NAME,
-    payload: Optional[Array] = None,
-):
-    """Repartition under ``should``, with both branches the same shapes.
-
-    The branches must agree in shape AND in manual-axis variance, and the second is
-    the one that bites. ``sfc_partition`` ends in collectives, and under the NATIVE
-    ``ragged_all_to_all`` JAX infers its result as axis-INVARIANT, while the identity
-    branch passes through a sharded input and is ``{V:gpus}`` varying -- so the
-    ``cond`` is rejected for "manual axis types do not match" even though every shape
-    and dtype agrees. Both branches are therefore pushed to varying with
-    :func:`jax.lax.pcast`.
-
-    **This does not reproduce on forced CPU devices**, because
-    :func:`~yggdrax.distributed.comm.resolve_ragged_method` picks the ``buf``
-    all-gather fallback there and ``native`` on GPU, and the two infer variance
-    differently. Testing distributed code on forced CPU devices does not cover the
-    GPU tracing path.
-
-    ``should`` must come from :func:`repartition_due`, or from something else that is
-    mesh-uniform. A locally-computed predicate deadlocks.
-
-    Parameters
-    ----------
-    positions, masses, count:
-        The current padded shard and its live count.
-    should:
-        Mesh-uniform verdict.
-    ndev, output_capacity, bounds, num_samples, axis_name, payload:
-        As :func:`sfc_partition`.
-
-    Returns
-    -------
-    tuple
-        ``(positions, masses, codes, count, payload)``, repartitioned or not.
-    """
-    if bounds is None:
-        bounds = global_bounds(positions, axis_name=axis_name)
-
-    def _to_varying(x):
-        """Make ``x`` axis-varying, whichever it already is.
-
-        ``pcast`` converts invariant -> varying and RAISES on an input that is
-        already varying, and the variance is not exposed as an attribute to test.
-        Which case applies depends on the backend -- the native
-        ``ragged_all_to_all`` leaves `sfc_partition`'s result invariant, the ``buf``
-        fallback leaves it varying -- so the branch is decided by trying it. This is
-        trace time; nothing is attempted at runtime.
-        """
-        if not hasattr(x, "shape"):
-            return x
-        try:
-            return jax.lax.pcast(x, axis_name, to="varying")
-        except (ValueError, TypeError):
-            return x
-
-    def _varying(tree):
-        return jax.tree.map(_to_varying, tree)
-
-    def _do(_):
-        return _varying(
-            sfc_partition(
-                positions,
-                masses,
-                ndev,
-                output_capacity=output_capacity,
-                bounds=bounds,
-                num_samples=num_samples,
-                align_level=None,
-                axis_name=axis_name,
-                payload=payload,
-                count=count,
-            )
-        )
-
-    def _keep(_):
-        codes = morton_encode_impl(positions, bounds)
-        valid = jnp.arange(codes.shape[0]) < count
-        return _varying(
-            (
-                positions,
-                masses,
-                jnp.where(valid, codes, _CODE_SENTINEL),
-                count,
-                payload,
-            )
-        )
-
-    return jax.lax.cond(jnp.asarray(should), _do, _keep, operand=None)

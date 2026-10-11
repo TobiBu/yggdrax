@@ -16,8 +16,9 @@ import numpy as np
 
 from yggdrax._tree_impl import build_tree
 from yggdrax.bounds import infer_bounds
-from yggdrax.distributed import dual_tree_walk_cross
 from yggdrax.geometry import compute_tree_geometry
+
+from ._walk import dual_tree_walk_cross
 
 _LEAF = 8
 _THETA = 0.5

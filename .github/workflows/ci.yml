@@ -138,57 +138,29 @@ jobs:
         run: python -m pytest --collect-only -q -o addopts="" tests
 
   distributed-tier:
-    # The only job with more than one device, so the only one that runs the 42 tests in
-    # tests/distributed that need a mesh.
-    #
-    # WHAT WAS AND WAS NOT ALREADY COVERED. `lint-and-test` above runs bare `pytest` on
-    # a single default CPU device, and 24 of the tier's 66 tests pass there -- the ones
-    # built on synthetic trees rather than a mesh: `test_cross_pair_ownership`,
-    # `test_cross_walk`, `test_cross_walk_mutual` and three of
-    # `test_local_tree_backends`. That is worth stating precisely, because it includes
-    # the cross-pair ownership rule and the leaf-pair acceptance partition -- the two
-    # properties whose violations caused real force errors downstream in jaccpot. Those
-    # were never a device-coverage gap; the tests simply did not exist yet, and once
-    # written they run in ordinary CI.
-    #
-    # The 42 that skipped are everything with a mesh in it: `test_comm` (the ragged
-    # all-to-all), `test_partition`, `test_local_tree`, `test_classify`, `test_let`,
-    # `test_import` (the halo import), `test_reverse_halo`, `test_frontier_payload` and
-    # the octree/kdtree halves of `test_local_tree_backends`. So every collective and
-    # both exchanges went untested on every run, while CI stayed green -- and
-    # `pyproject.toml` omits `yggdrax/distributed/*` from the coverage gate, so that
-    # reported nothing either. pytest exits 0 on a run that skips 42 tests, which is
-    # why the guard below is a step and not a comment.
+    # The only job with more than one device, so the only one that runs the tests in
+    # tests/distributed that need a mesh. `lint-and-test` above runs bare `pytest`
+    # on one CPU device: there these files skip, and the device-independent ones
+    # (the cross walks, export walks, receiver lists, summaries, the local-tree
+    # backends) pass. Those are deliberately NOT repeated here.
     #
     # `--xla_force_host_platform_device_count=4` fakes four CPU devices. NOT a
     # substitute for real multi-GPU -- NCCL is not exercised on host-platform devices --
     # but it is what makes the collectives run at all.
     #
-    # SHARDED BY FILE, because the tier is ~2 h serially and xdist barely helps: `-n 4`
-    # measured 1:18:34 against a serial run that was still going at 71% when a 90 min
-    # cap killed it. It is compile-bound in a way that does not parallelise, with single
-    # items costing 700-1300 s -- `test_local_tree_backends[octree]` alone is 1292 s of
-    # call plus ~2400 s of fixture setup, and `test_let`'s module fixture is ~1240 s.
-    # The shards below split that cost. The alternative -- one job with a 2 h timeout
-    # -- is a timeout so wide it would stop detecting a hang, which is the same argument
-    # against absorbing new tests by widening a cap.
+    # Until the 2026-10 cleanup (Y3) this tier took 25-52 min per shard. The long poles
+    # were the mesh drivers' fixtures (`test_let`'s ~1240 s, the octree
+    # `test_local_tree_backends` ~1292 s plus ~2400 s of setup), and the drivers had no
+    # caller outside the tests. Y3 removed them and added the four files that needed a
+    # mesh but were in no shard, so CI had never run them: `test_halo_payload`,
+    # `test_import_cells`, `test_partition_payload` and `test_sfc_repartition` (jaccpot
+    # calls `sfc_repartition`). Measured per file on a loaded workstation, 4 fake
+    # devices (2026-10-11), in seconds:
     #
-    # Measured wall time per shard, all run CONCURRENTLY on one workstation so these are
-    # upper bounds rather than best cases (a CI runner gives each shard a machine, but a
-    # slower one):
-    #
-    #     exchanges   23 tests   25:22
-    #     let + import (as one)  13 tests   52:04   <- split, hence the two shards
-    #     backends     9 tests   44:19
-    #
-    # `backends` is the long pole and it is almost entirely the octree parametrisation
-    # (1292 s of call plus ~2400 s of fixture setup). If that path is not one the shipped
-    # distributed API actually uses, deselecting it would roughly halve this job's
-    # critical path -- worth deciding deliberately rather than by default.
-    #
-    # The three device-independent files are deliberately NOT repeated here -- they
-    # already run in `lint-and-test` on every Python version, and re-running them under
-    # a mesh exercises no different path.
+    #     exchanges   comm 14, reverse_halo 21, partition 83, partition_payload 8,
+    #                 sfc_repartition 8, import_cells 5, classify 124,
+    #                 coarse_tree_extents 25                          ~290 s
+    #     let         import 149, frontier_payload 187, halo_payload 292   ~630 s
     strategy:
       fail-fast: false
       matrix:
@@ -198,18 +170,16 @@ jobs:
               tests/distributed/test_comm.py
               tests/distributed/test_reverse_halo.py
               tests/distributed/test_partition.py
-              tests/distributed/test_local_tree.py
+              tests/distributed/test_partition_payload.py
+              tests/distributed/test_sfc_repartition.py
+              tests/distributed/test_import_cells.py
               tests/distributed/test_classify.py
-          - shard: let
-            paths: >-
-              tests/distributed/test_let.py
               tests/distributed/test_coarse_tree_extents.py
-          - shard: import
+          - shard: let
             paths: >-
               tests/distributed/test_import.py
               tests/distributed/test_frontier_payload.py
-          - shard: backends
-            paths: tests/distributed/test_local_tree_backends.py
+              tests/distributed/test_halo_payload.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75

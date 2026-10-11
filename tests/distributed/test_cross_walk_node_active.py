@@ -265,38 +265,6 @@ def test_all_active_mask_is_identical_to_no_mask():
         ), field
 
 
-def test_the_jitted_wrapper_takes_the_masks_too():
-    """`dual_tree_walk_cross` is the entry point jaccpot imports, not the impl.
-
-    Threading a parameter through the impl alone has left it unreachable from the
-    public name before in this codebase, and a test that calls the impl directly
-    does not notice.
-    """
-    from yggdrax.distributed import dual_tree_walk_cross
-
-    t, s = _padded_pair()
-    res = dual_tree_walk_cross(
-        t[0],
-        t[1],
-        s[0],
-        s[1],
-        _THETA,
-        mac_type=_MAC,
-        max_interactions_per_node=512,
-        max_neighbors_per_leaf=512,
-        max_pair_queue=1 << 14,
-        target_node_active=_active(t[0]),
-        source_node_active=_active(s[0]),
-    )
-    assert not (
-        bool(res.queue_overflow) or bool(res.far_overflow) or bool(res.near_overflow)
-    )
-    t_dead = set(np.flatnonzero(~np.asarray(_active(t[0]))).tolist())
-    far, near = _pairs(res, t[0])
-    assert far and near
-    assert not any(a in t_dead for a, _ in far | near)
-
-
 def test_mask_shape_is_checked():
     # Unlike ``policy_state``, these are shape-checked: a mask built over the wrong
     # tree raises instead of gathering the wrong node.

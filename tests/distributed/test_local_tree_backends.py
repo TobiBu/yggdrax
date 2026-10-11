@@ -1,9 +1,12 @@
-"""Multi-GPU distributed tree build + cross-walk across backends.
+"""Distributed local tree build + cross-walk across backends.
 
-`distributed_tree_moments` / the LET drivers gained a `tree_type` selector
-(``radix``, ``octree``, ``kdtree``). The build correctness anchor is
-backend-independent: the union of the per-domain coarse moments must reproduce
-the *global* total mass and centre of mass a single-device build would give.
+``_build_local_tree`` dispatches a domain's local build to ``radix``, ``octree``
+or ``kdtree``. The build correctness anchor is backend-independent: the root
+moment of a domain's local tree must be the domain's total mass and centre of
+mass. That was checked through the mesh drivers ``distributed_tree_moments`` and
+``build_distributed_coarse_tree`` until the 2026-10 cleanup (Y3) removed them
+(no caller outside the tests); it is now checked on the build itself, on one
+device.
 
 For ``kdtree`` the distributed path uses the leaf-only bucket build
 (:func:`yggdrax.kdtree.build_leaf_kdtree`), which stores all points in leaves and
@@ -11,8 +14,7 @@ so satisfies the same topology contract as radix/octree -- unlike the heap
 KD-tree used by the KNN kernels. The cross-walk test asserts the actual thing
 that was previously broken for KD: a complete, disjoint source partition.
 
-    XLA_FLAGS=--xla_force_host_platform_device_count=4 JAX_PLATFORMS=cpu \
-        pytest tests/distributed/test_local_tree_backends.py -o addopts="" -q
+    JAX_PLATFORMS=cpu pytest tests/distributed/test_local_tree_backends.py -o addopts="" -q
 """
 
 import jax.numpy as jnp
@@ -20,29 +22,17 @@ import numpy as np
 import pytest
 
 from yggdrax.bounds import infer_bounds
-from yggdrax.distributed import (
-    build_distributed_coarse_tree,
-    device_count,
-    distributed_tree_moments,
-    dual_tree_walk_cross,
-    make_mesh,
-)
 from yggdrax.distributed.local_tree import (
     DISTRIBUTED_TREE_TYPES,
     _build_local_tree,
     _validate_distributed_tree_type,
 )
 from yggdrax.geometry import compute_tree_geometry
+from yggdrax.tree_moments import compute_tree_mass_moments
 
-_NDEV = min(4, device_count())
+from ._walk import dual_tree_walk_cross
+
 _LEAF = 8
-_PER_DEV = 16
-_N = _PER_DEV * _NDEV
-_CAP = 4 * _PER_DEV
-
-needs_devices = pytest.mark.skipif(
-    device_count() < 2, reason="distributed tree build needs >= 2 devices"
-)
 
 
 # ---- validation (no devices needed) ----
@@ -55,73 +45,26 @@ def test_unknown_tree_type_rejected():
         _validate_distributed_tree_type("bogus")
 
 
-# ---- distributed build reconstruction: radix baseline + octree + kdtree ----
-@pytest.fixture(scope="module")
-def built():
-    """Run distributed_tree_moments once per backend; reuse across assertions."""
-    mesh = make_mesh(_NDEV)
+# ---- local build reconstruction: every backend ----
+@pytest.mark.parametrize("tree_type", DISTRIBUTED_TREE_TYPES)
+def test_local_build_root_moment_is_the_domain_total(tree_type):
+    """The root (located by parent link) carries the domain's mass and COM."""
     rng = np.random.default_rng(10)
-    pts = rng.uniform(-1.0, 1.0, size=(_N, 3)).astype(np.float32)
-    mass = rng.uniform(0.5, 2.0, size=(_N,)).astype(np.float32)
-    out = {}
-    for tt in ("octree", "kdtree"):
-        out[tt] = distributed_tree_moments(
-            mesh,
-            jnp.asarray(pts),
-            jnp.asarray(mass),
-            leaf_size=_LEAF,
-            output_capacity=_CAP,
-            equalize=True,
-            tree_type=tt,
-        )
-    return pts, mass, out
-
-
-@needs_devices
-@pytest.mark.parametrize("tree_type", ["octree", "kdtree"])
-def test_domain_moments_reconstruct_global(built, tree_type):
-    pts, mass, out = built
-    res = out[tree_type]
-    domain_mass = np.asarray(res.domain_mass)
-    domain_com = np.asarray(res.domain_com)
-    counts = np.asarray(res.counts)
-
-    assert int(counts.sum()) == _N
-    np.testing.assert_allclose(domain_mass.sum(), mass.sum(), rtol=1e-4)
-    global_com = (mass[:, None] * pts).sum(0) / mass.sum()
-    recon_com = (domain_mass[:, None] * domain_com).sum(0) / domain_mass.sum()
-    np.testing.assert_allclose(recon_com, global_com, rtol=1e-3, atol=1e-4)
-
-
-@needs_devices
-@pytest.mark.parametrize("tree_type", ["octree", "kdtree"])
-def test_shared_top_tree_replicated(built, tree_type):
-    _, _, out = built
-    res = out[tree_type]
-    top_mass = np.asarray(res.top_mass).reshape(_NDEV, _NDEV)
-    domain_mass = np.asarray(res.domain_mass)
-    for g in range(_NDEV):
-        np.testing.assert_allclose(top_mass[g], top_mass[0], rtol=1e-5)
-    np.testing.assert_allclose(top_mass[0], domain_mass, rtol=1e-5)
-
-
-@needs_devices
-@pytest.mark.parametrize("tree_type", ["octree", "kdtree"])
-def test_coarse_tree_root_is_global(built, tree_type):
-    """build_distributed_coarse_tree: coarse root mass == global (any local backend)."""
-    pts, mass, _ = built
-    mesh = make_mesh(_NDEV)
-    metrics = build_distributed_coarse_tree(
-        mesh,
-        jnp.asarray(pts),
-        jnp.asarray(mass),
-        leaf_size=_LEAF,
-        output_capacity=_CAP,
-        equalize=True,
-        tree_type=tree_type,
+    pts = rng.uniform(-1.0, 1.0, size=(64, 3)).astype(np.float32)
+    mass = rng.uniform(0.5, 2.0, size=(64,)).astype(np.float32)
+    pos = jnp.asarray(pts)
+    tree, pos_sorted, mass_sorted = _build_local_tree(
+        pos, jnp.asarray(mass), infer_bounds(pos), tree_type=tree_type, leaf_size=_LEAF
     )
     np.testing.assert_allclose(
-        np.asarray(metrics.coarse_root_mass), mass.sum(), rtol=1e-3
+        np.sort(np.asarray(mass_sorted)), np.sort(mass), rtol=0, atol=0
+    )
+    moments = compute_tree_mass_moments(tree, pos_sorted, mass_sorted)
+    root = int(np.argmin(np.asarray(tree.parent)))
+    np.testing.assert_allclose(float(moments.mass[root]), float(mass.sum()), rtol=1e-5)
+    global_com = (mass[:, None] * pts).sum(0) / mass.sum()
+    np.testing.assert_allclose(
+        np.asarray(moments.center_of_mass[root]), global_com, rtol=1e-4, atol=1e-5
     )
 
 
