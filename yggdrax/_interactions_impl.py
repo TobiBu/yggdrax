@@ -3060,6 +3060,51 @@ def _result_to_neighbors(
     )
 
 
+def _resolve_dehnen_radius_scale(
+    tree: object, mac_type: MACType, dehnen_radius_scale: float
+) -> float:
+    """The Dehnen radius scale a walk over ``tree`` uses.
+
+    A kd-tree's Dehnen MAC defaults to :data:`_DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE`
+    when the caller leaves the scale at ``1.0``. Every walk route has to apply it
+    the same way: until 2026-10 only the joint walk did, so the bounded count-pass
+    routes (``build_leaf_neighbor_lists``, ``build_well_separated_interactions`` and
+    ``build_compact_far_pairs_and_leaf_neighbor_lists`` with a traversal config)
+    walked a kd-tree at ``1.0`` -- 1,710 near pairs against the joint walk's 2,408
+    at N = 512, leaf 8.
+
+    Parameters
+    ----------
+    tree
+        The walk's topology (already unwrapped from a public tree container).
+    mac_type
+        The acceptance criterion.
+    dehnen_radius_scale
+        The caller's scale.
+
+    Returns
+    -------
+    float
+        The scale to walk with.
+
+    Raises
+    ------
+    ValueError
+        If the scale is not positive.
+    """
+    scale = float(dehnen_radius_scale)
+    is_kdtree_topology = (
+        hasattr(tree, "split_dim")
+        and hasattr(tree, "points")
+        and hasattr(tree, "leaf_size")
+    )
+    if mac_type == "dehnen" and is_kdtree_topology and abs(scale - 1.0) <= 1e-12:
+        scale = _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE
+    if scale <= 0.0:
+        raise ValueError("dehnen_radius_scale must be > 0")
+    return scale
+
+
 def _run_dual_tree_walk_raw(
     tree: object,
     geometry: TreeGeometry,
@@ -3084,20 +3129,7 @@ def _run_dual_tree_walk_raw(
     tree = tree.topology if hasattr(tree, "topology") else tree
 
     theta_val = float(theta)
-    dehnen_scale_val = float(dehnen_radius_scale)
-    is_kdtree_topology = (
-        hasattr(tree, "split_dim")
-        and hasattr(tree, "points")
-        and hasattr(tree, "leaf_size")
-    )
-    if (
-        mac_type == "dehnen"
-        and is_kdtree_topology
-        and abs(dehnen_scale_val - 1.0) <= 1e-12
-    ):
-        dehnen_scale_val = _DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE
-    if dehnen_scale_val <= 0.0:
-        raise ValueError("dehnen_radius_scale must be > 0")
+    dehnen_scale_val = _resolve_dehnen_radius_scale(tree, mac_type, dehnen_radius_scale)
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     nodes_by_level = get_nodes_by_level(tree)
@@ -3715,6 +3747,9 @@ def _run_far_only_compact_with_bounded_count_pass(
 ) -> CompactTaggedFarPairs:
     """Build compact far pairs with a bounded count pass under explicit caps."""
 
+    dehnen_radius_scale = _resolve_dehnen_radius_scale(
+        tree, mac_type, dehnen_radius_scale
+    )
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     queue_max = max(4, int(traversal_config.max_pair_queue))
@@ -3914,6 +3949,9 @@ def _run_near_only_compact_with_bounded_count_pass(
 ) -> NodeNeighborList:
     """Build compact neighbor lists with a bounded count pass under explicit caps."""
 
+    dehnen_radius_scale = _resolve_dehnen_radius_scale(
+        tree, mac_type, dehnen_radius_scale
+    )
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     num_leaves = max(1, total_nodes - num_internal)
@@ -4107,6 +4145,9 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Build compact far pairs and near neighbors from one shared count pass."""
 
+    dehnen_radius_scale = _resolve_dehnen_radius_scale(
+        tree, mac_type, dehnen_radius_scale
+    )
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     num_leaves = max(1, total_nodes - num_internal)
