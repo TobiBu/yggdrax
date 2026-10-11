@@ -28,10 +28,6 @@ from jaxtyping import Array, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index
 from .geometry import TreeGeometry
-from .grouped_interactions import (
-    GroupedInteractionBuffers,
-    build_grouped_interactions_from_pairs,
-)
 from .tree import (
     get_leaf_nodes,
     get_level_offsets,
@@ -4822,36 +4818,15 @@ def build_interactions_and_neighbors(
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
-    return_grouped: bool = False,
 ) -> Union[
     tuple[Optional[NodeInteractionList], NodeNeighborList],
     tuple[Optional[NodeInteractionList], NodeNeighborList, DualTreeWalkResult],
     tuple[Optional[NodeInteractionList], NodeNeighborList, CompactTaggedFarPairs],
-    tuple[Optional[NodeInteractionList], NodeNeighborList, GroupedInteractionBuffers],
-    tuple[
-        Optional[NodeInteractionList],
-        NodeNeighborList,
-        DualTreeWalkResult,
-        GroupedInteractionBuffers,
-    ],
     tuple[
         Optional[NodeInteractionList],
         NodeNeighborList,
         DualTreeWalkResult,
         CompactTaggedFarPairs,
-    ],
-    tuple[
-        Optional[NodeInteractionList],
-        NodeNeighborList,
-        CompactTaggedFarPairs,
-        GroupedInteractionBuffers,
-    ],
-    tuple[
-        Optional[NodeInteractionList],
-        NodeNeighborList,
-        DualTreeWalkResult,
-        CompactTaggedFarPairs,
-        GroupedInteractionBuffers,
     ],
 ]:
     """Return both far-field interactions and near-field neighbour lists.
@@ -4882,41 +4857,19 @@ def build_interactions_and_neighbors(
         retry_logger=retry_logger,
     )
 
-    if return_grouped and not return_interactions:
-        raise ValueError("grouped interaction return requires return_interactions=True")
     interactions = _result_to_interactions(raw, tree) if return_interactions else None
     neighbors = _result_to_neighbors(raw, tree)
-    grouped = None
-    if return_grouped:
-        far_total = int(raw.far_pair_count)
-        grouped = build_grouped_interactions_from_pairs(
-            tree,
-            geometry,
-            raw.interaction_sources[:far_total],
-            raw.interaction_targets[:far_total],
-            level_offsets=(
-                interactions.level_offsets if interactions is not None else None
-            ),
-        )
 
     result = _raw_to_result(raw) if return_result else None
     compact_far_pairs = (
         _raw_to_compact_far_pairs(raw) if return_compact_far_pairs else None
     )
-    if return_result and return_compact_far_pairs and return_grouped:
-        return interactions, neighbors, result, compact_far_pairs, grouped
     if return_result and return_compact_far_pairs:
         return interactions, neighbors, result, compact_far_pairs
-    if return_result and return_grouped:
-        return interactions, neighbors, result, grouped
     if return_result:
         return interactions, neighbors, result
-    if return_compact_far_pairs and return_grouped:
-        return interactions, neighbors, compact_far_pairs, grouped
     if return_compact_far_pairs:
         return interactions, neighbors, compact_far_pairs
-    if return_grouped:
-        return interactions, neighbors, grouped
     return interactions, neighbors
 
 

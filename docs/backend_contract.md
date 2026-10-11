@@ -35,7 +35,7 @@ Required only when `use_morton_geometry=True`:
 
 ### `TreeLevelIndexProtocol` (optional, derivable)
 
-Used by level-major and interaction grouping paths. If absent, yggdrax derives
+Used to order far-field interaction lists by level. If absent, yggdrax derives
 these from `parent`:
 
 - `node_level`

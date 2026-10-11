@@ -40,14 +40,6 @@ Interactions and traversal
    :members:
    :undoc-members:
 
-.. automodule:: yggdrax.dense_interactions
-   :members:
-   :undoc-members:
-
-.. automodule:: yggdrax.grouped_interactions
-   :members:
-   :undoc-members:
-
 Moments
 -------
 

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Callable
 
-from jaxtyping import Array
-
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
@@ -380,7 +378,6 @@ def build_interactions_and_neighbors(
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
-    return_grouped: bool = False,
 ) -> tuple:
     """Construct both far-field interactions and near-field neighbors.
 
@@ -445,8 +442,6 @@ def build_interactions_and_neighbors(
     return_interactions
         If ``True`` (default), include the sparse :class:`NodeInteractionList`
         in the result.
-    return_grouped
-        If ``True``, also return displacement-grouped interaction buffers.
 
     Returns
     -------
@@ -455,7 +450,7 @@ def build_interactions_and_neighbors(
         :class:`NodeInteractionList` and ``neighbors`` is a
         :class:`NodeNeighborList`. Additional elements are appended, in
         declaration order, for each enabled ``return_*`` flag
-        (``return_compact_far_pairs``, ``return_grouped``, ``return_result``).
+        (``return_result``, then ``return_compact_far_pairs``).
     """
 
     return _call_with_topology(
@@ -477,7 +472,6 @@ def build_interactions_and_neighbors(
         return_result=return_result,
         return_compact_far_pairs=return_compact_far_pairs,
         return_interactions=return_interactions,
-        return_grouped=return_grouped,
     )
 
 
@@ -563,50 +557,6 @@ def build_interactions_and_neighbors_split(
     )
 
 
-def build_grouped_interactions_from_pairs(
-    tree: object,
-    geometry: TreeGeometry,
-    interaction_sources: Array,
-    interaction_targets: Array,
-    *,
-    level_offsets: Array | None = None,
-):
-    """Group far-field pairs into displacement classes for class-major M2L.
-
-    Thin wrapper over
-    :func:`yggdrax.grouped_interactions.build_grouped_interactions_from_pairs`
-    that first resolves ``tree`` to its topology payload.
-
-    Parameters
-    ----------
-    tree
-        Tree container or topology exposing level-order metadata.
-    geometry
-        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
-    interaction_sources
-        Far-pair source node indices, shape ``(num_pairs,)``.
-    interaction_targets
-        Far-pair target node indices, shape ``(num_pairs,)``.
-    level_offsets
-        Optional precomputed level offsets passed through for diagnostics;
-        derived from ``tree`` when omitted.
-
-    Returns
-    -------
-    GroupedInteractionBuffers
-        Class keys, per-class displacements, and CSR-style class offsets/ids.
-    """
-
-    return _call_with_topology(
-        _interactions_impl.build_grouped_interactions_from_pairs,
-        tree,
-        geometry,
-        interaction_sources,
-        interaction_targets,
-        level_offsets=level_offsets,
-    )
-
-
 def diagnose_leaf_neighbor_growth(
     tree: object,
     geometry: TreeGeometry,
@@ -670,7 +620,6 @@ __all__ = [
     "dual_tree_walk_mutual",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_leaf_neighbor_lists",
-    "build_grouped_interactions_from_pairs",
     "build_well_separated_interactions",
     "diagnose_leaf_neighbor_growth",
     "interactions_for_node",

@@ -439,23 +439,7 @@
                 "code": "reportReturnType",
                 "range": {
                     "startColumn": 15,
-                    "endColumn": 74,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 15,
                     "endColumn": 65,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 55,
                     "lineCount": 1
                 }
             },
@@ -471,23 +455,7 @@
                 "code": "reportReturnType",
                 "range": {
                     "startColumn": 15,
-                    "endColumn": 66,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 15,
                     "endColumn": 57,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 47,
                     "lineCount": 1
                 }
             }
@@ -730,24 +698,6 @@
                 "range": {
                     "startColumn": 41,
                     "endColumn": 50,
-                    "lineCount": 1
-                }
-            }
-        ],
-        "./yggdrax/grouped_interactions.py": [
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 48,
-                    "endColumn": 58,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 48,
-                    "endColumn": 58,
                     "lineCount": 1
                 }
             }

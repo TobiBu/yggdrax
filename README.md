@@ -20,7 +20,6 @@ can consume both the proven traversal buffers and octree-style child tables.
 - Explicit octree metadata derived from Morton/radix topology
 - Tree geometry extraction (bounds, centers, extents, radii)
 - Dual-tree far-field and near-field interaction builders
-- Dense and grouped interaction buffer transforms for batched kernels
 - Prepared artifact utilities for downstream solver integrations
 
 ## Installation
@@ -213,7 +212,6 @@ python -m sphinx -b html docs docs/_build/html
 - `yggdrax/protocols.py`: backend capability protocols
 - `yggdrax/geometry.py`, `yggdrax/_geometry_impl.py`: geometry wrappers and implementations
 - `yggdrax/interactions.py`, `yggdrax/_interactions_impl.py`: traversal and interaction generation
-- `yggdrax/dense_interactions.py`, `yggdrax/grouped_interactions.py`: interaction layout utilities
 - `tests/unit`: unit test suite for API and implementation behavior
 - `examples`: runnable examples and notebooks
 

@@ -55,10 +55,8 @@ jobs:
           pydoclint \
             yggdrax/__init__.py \
             yggdrax/bounds.py \
-            yggdrax/dense_interactions.py \
             yggdrax/dtypes.py \
             yggdrax/geometry.py \
-            yggdrax/grouped_interactions.py \
             yggdrax/interactions.py \
             yggdrax/morton.py \
             yggdrax/multipole_utils.py \

@@ -7,12 +7,7 @@ _jax_config.update("jax_enable_x64", True)
 
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
-from .geometry import (
-    LevelMajorTreeGeometry,
-    TreeGeometry,
-    compute_tree_geometry,
-    geometry_to_level_major,
-)
+from .geometry import TreeGeometry, compute_tree_geometry
 from .interactions import (
     CompactTaggedFarPairs,
     DualTreeRetryEvent,
@@ -114,7 +109,6 @@ __all__ = [
     "CompactTaggedFarPairs",
     "FixedDepthTreeBuildConfig",
     "INDEX_DTYPE",
-    "LevelMajorTreeGeometry",
     "NodeInteractionList",
     "NodeNeighborList",
     "PairPolicy",
@@ -170,7 +164,6 @@ __all__ = [
     "missing_leaf_topology_fields",
     "missing_morton_topology_fields",
     "compute_tree_geometry",
-    "geometry_to_level_major",
     "get_common_prefix_length",
     "infer_bounds",
     "morton_decode",
