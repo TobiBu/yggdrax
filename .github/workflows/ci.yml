@@ -5,6 +5,11 @@ on:
     branches: [main, master]
   pull_request:
 
+# A new push to a PR cancels that PR's run still in progress; runs on main finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -69,8 +74,16 @@ jobs:
         # The gate enforces "no new type errors" over the committed baseline.
         run: basedpyright yggdrax
 
-      - name: Unit tests with coverage
+      # The full suite, with the coverage gate, runs once (3.13). 3.12 runs the
+      # unit tests only, without coverage: it is there to catch an interpreter
+      # incompatibility, not to repeat every test.
+      - name: Tests with coverage
+        if: matrix.python-version == '3.13'
         run: pytest
+
+      - name: Unit tests
+        if: matrix.python-version != '3.13'
+        run: pytest tests/unit --no-cov
 
       - name: Tree backend smoke script
         run: python examples/kdtree_jaccpot_smoke.py --n-points 512 --leaf-size 16 --seed 0
@@ -81,10 +94,48 @@ jobs:
           python -m sphinx -b html docs docs/_build/html
 
       - name: Upload coverage XML artifact
+        if: matrix.python-version == '3.13'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-xml-py${{ matrix.python-version }}
           path: coverage.xml
+
+  jaccpot-compat:
+    # jaccpot installs yggdrax from main, so a removal it still imports used to
+    # break jaccpot's CI only after it had landed here. This collects jaccpot
+    # main's test suite against THIS yggdrax: jaccpot's conftest aborts collection
+    # when a yggdrax name its library imports is missing, and collecting imports
+    # every test module. It runs no jaccpot test, and it cannot see a keyword
+    # argument jaccpot passes that yggdrax dropped.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JAX_PLATFORMS: cpu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Checkout jaccpot main
+        uses: actions/checkout@v4
+        with:
+          repository: TobiBu/jaccpot
+          ref: main
+          path: jaccpot
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install this yggdrax, then jaccpot over it
+        # yggdrax first: jaccpot's `yggdrax>=0.0.1,<0.1.0` is then already met by
+        # this checkout, so pip keeps it rather than fetching another.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install -e "./jaccpot[dev]"
+          python -c "import yggdrax, jaccpot; print(yggdrax.__file__); print(jaccpot.__file__)"
+      - name: Collect jaccpot's tests against this yggdrax
+        working-directory: jaccpot
+        run: python -m pytest --collect-only -q -o addopts="" tests
 
   distributed-tier:
     # The only job with more than one device, so the only one that runs the 42 tests in
