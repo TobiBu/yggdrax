@@ -379,7 +379,7 @@ def dual_tree_walk_cross_impl(
         # the union has to be narrowed somewhere; doing it at the source keeps every
         # consumer's signature honest instead of widening them to a type they cannot
         # actually accept. `typing.cast` is the codebase's existing idiom for this (see
-        # `tree.py` and `octree_uvwx.py`).
+        # `tree.py`).
         st_t = cast(Array, jnp.where(valid, wf_t, as_index(0)))
         st_s = cast(Array, jnp.where(valid, wf_s, as_index(0)))
 

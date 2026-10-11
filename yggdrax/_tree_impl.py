@@ -880,7 +880,7 @@ def build_static_cells_tree(
     # so this three-argument call is an `Array` at runtime but a union to the checker,
     # and `leaf_codes_override` below is annotated `Optional[Array]`. Narrow at the
     # source rather than widening the parameter to a type it cannot accept (the
-    # codebase's existing idiom; see `cross_walk.py`, `tree.py`, `octree_uvwx.py`).
+    # codebase's existing idiom; see `cross_walk.py`, `tree.py`).
     leaf_codes = cast(Array, jnp.where(live, sorted_codes[safe_start], sentinel))
     out = _build_tree_from_leaf_partitions(
         positions,
@@ -901,7 +901,7 @@ def build_static_cells_tree(
     # a bare RadixTree is itself a NamedTuple: test for the container first.
     # Annotated `list[Any]` because the list is genuinely heterogeneous -- a
     # `RadixTree` followed by plain arrays -- which pyright would otherwise pin to
-    # `list[RadixTree]` from the first element (as in `octree_uvwx.py`).
+    # `list[RadixTree]` from the first element.
     outputs: list[Any] = [out] if isinstance(out, RadixTree) else list(out)
     if return_overflow:
         outputs.append(part.overflow)
