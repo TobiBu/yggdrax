@@ -40,22 +40,10 @@ Interactions and traversal
    :members:
    :undoc-members:
 
-.. automodule:: yggdrax.dense_interactions
-   :members:
-   :undoc-members:
-
-.. automodule:: yggdrax.grouped_interactions
-   :members:
-   :undoc-members:
-
 Moments
 -------
 
 .. automodule:: yggdrax.tree_moments
-   :members:
-   :undoc-members:
-
-.. automodule:: yggdrax.multipole_utils
    :members:
    :undoc-members:
 
@@ -82,9 +70,5 @@ Contracts and types
    :undoc-members:
 
 .. automodule:: yggdrax.types
-   :members:
-   :undoc-members:
-
-.. automodule:: yggdrax.policies
    :members:
    :undoc-members:

@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from typing import Callable
 
-from jaxtyping import Array
-
 from . import _interactions_impl
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
     CompactTaggedFarPairs,
-    CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
@@ -18,7 +15,6 @@ from ._interactions_impl import (
     MutualWalkResult,
     NodeInteractionList,
     NodeNeighborList,
-    OctreeNativeNeighborList,
     PairPolicy,
     _compute_effective_extents,
     _compute_leaf_effective_extents,
@@ -382,7 +378,6 @@ def build_interactions_and_neighbors(
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
-    return_grouped: bool = False,
 ) -> tuple:
     """Construct both far-field interactions and near-field neighbors.
 
@@ -447,8 +442,6 @@ def build_interactions_and_neighbors(
     return_interactions
         If ``True`` (default), include the sparse :class:`NodeInteractionList`
         in the result.
-    return_grouped
-        If ``True``, also return displacement-grouped interaction buffers.
 
     Returns
     -------
@@ -457,7 +450,7 @@ def build_interactions_and_neighbors(
         :class:`NodeInteractionList` and ``neighbors`` is a
         :class:`NodeNeighborList`. Additional elements are appended, in
         declaration order, for each enabled ``return_*`` flag
-        (``return_compact_far_pairs``, ``return_grouped``, ``return_result``).
+        (``return_result``, then ``return_compact_far_pairs``).
     """
 
     return _call_with_topology(
@@ -479,7 +472,6 @@ def build_interactions_and_neighbors(
         return_result=return_result,
         return_compact_far_pairs=return_compact_far_pairs,
         return_interactions=return_interactions,
-        return_grouped=return_grouped,
     )
 
 
@@ -565,209 +557,6 @@ def build_interactions_and_neighbors_split(
     )
 
 
-def build_octree_native_far_pairs(
-    tree: object,
-    geometry: TreeGeometry,
-    theta: float = 0.5,
-    max_interactions_per_node: int | None = None,
-    mac_type: MACType = "bh",
-    *,
-    pair_policy: PairPolicy | None = None,
-    policy_state: object = None,
-    max_pair_queue: int | None = None,
-    process_block: int | None = None,
-    traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
-    dehnen_radius_scale: float = 1.0,
-    separation_floor: float = 0.0,
-) -> CompactTaggedOctreeFarPairs:
-    """Construct exact-length far-field pairs in explicit octree node space.
-
-    Like :func:`build_compact_far_pairs` but emits pairs indexed in the explicit
-    octree cell space (requires an octree-augmented ``tree``).
-
-    Parameters
-    ----------
-    tree
-        Octree-augmented tree exposing the explicit ``oct_*`` buffers.
-    geometry
-        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
-    theta
-        Opening-angle parameter of the multipole acceptance criterion.
-    max_interactions_per_node
-        Per-node far-interaction capacity; auto-sized when ``None``.
-    mac_type
-        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
-    pair_policy
-        Optional JAX-traceable callable overriding the built-in MAC.
-    policy_state
-        Opaque state threaded to ``pair_policy``.
-    max_pair_queue
-        Traversal wavefront capacity; auto-sized when ``None``.
-    process_block
-        Pairs processed per traversal iteration; auto-sized when ``None``.
-    traversal_config
-        Bundled traversal settings; overrides the individual arguments.
-    retry_logger
-        Optional callable invoked on each capacity-driven retry.
-    dehnen_radius_scale
-        Effective-radius scale applied for the Dehnen MAC.
-    separation_floor
-        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
-        extents); ``0`` (default) adds no test. A softening kernel with compact
-        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
-        unsoftened far field exact.
-
-    Returns
-    -------
-    CompactTaggedOctreeFarPairs
-        Exact-length far pairs in octree node space.
-    """
-
-    return _call_with_topology(
-        _interactions_impl.build_octree_native_far_pairs,
-        tree,
-        geometry,
-        theta=theta,
-        max_interactions_per_node=max_interactions_per_node,
-        mac_type=mac_type,
-        pair_policy=pair_policy,
-        policy_state=policy_state,
-        max_pair_queue=max_pair_queue,
-        process_block=process_block,
-        traversal_config=traversal_config,
-        retry_logger=retry_logger,
-        dehnen_radius_scale=dehnen_radius_scale,
-        separation_floor=separation_floor,
-    )
-
-
-def build_octree_native_neighbor_lists(
-    tree: object,
-    geometry: TreeGeometry,
-    theta: float = 0.5,
-    max_neighbors_per_leaf: int = _interactions_impl._DEFAULT_MAX_NEIGHBORS,
-    max_interactions_per_node: int | None = None,
-    mac_type: MACType = "bh",
-    *,
-    pair_policy: PairPolicy | None = None,
-    policy_state: object = None,
-    max_pair_queue: int | None = None,
-    process_block: int | None = None,
-    traversal_config: DualTreeTraversalConfig | None = None,
-    retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
-    dehnen_radius_scale: float = 1.0,
-    separation_floor: float = 0.0,
-) -> OctreeNativeNeighborList:
-    """Construct exact-length near neighbors in explicit octree leaf space.
-
-    Like :func:`build_leaf_neighbor_lists` but emits neighbor pairs indexed in
-    the explicit octree leaf space (requires an octree-augmented ``tree``).
-
-    Parameters
-    ----------
-    tree
-        Octree-augmented tree exposing the explicit ``oct_*`` buffers.
-    geometry
-        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
-    theta
-        Opening-angle parameter of the multipole acceptance criterion.
-    max_neighbors_per_leaf
-        Per-leaf near-neighbor capacity.
-    max_interactions_per_node
-        Per-node far-interaction capacity used during the walk; auto-sized when
-        ``None``.
-    mac_type
-        MAC variant: ``"bh"``, ``"dehnen"``, or ``"engblom"``.
-    pair_policy
-        Optional JAX-traceable callable overriding the built-in MAC.
-    policy_state
-        Opaque state threaded to ``pair_policy``.
-    max_pair_queue
-        Traversal wavefront capacity; auto-sized when ``None``.
-    process_block
-        Pairs processed per traversal iteration; auto-sized when ``None``.
-    traversal_config
-        Bundled traversal settings; overrides the individual arguments.
-    retry_logger
-        Optional callable invoked on each capacity-driven retry.
-    dehnen_radius_scale
-        Effective-radius scale applied for the Dehnen MAC.
-    separation_floor
-        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
-        extents); ``0`` (default) adds no test. A softening kernel with compact
-        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
-        unsoftened far field exact.
-
-    Returns
-    -------
-    OctreeNativeNeighborList
-        Exact-length near neighbors in octree leaf space.
-    """
-
-    return _call_with_topology(
-        _interactions_impl.build_octree_native_neighbor_lists,
-        tree,
-        geometry,
-        theta=theta,
-        max_neighbors_per_leaf=max_neighbors_per_leaf,
-        max_interactions_per_node=max_interactions_per_node,
-        mac_type=mac_type,
-        pair_policy=pair_policy,
-        policy_state=policy_state,
-        max_pair_queue=max_pair_queue,
-        process_block=process_block,
-        traversal_config=traversal_config,
-        retry_logger=retry_logger,
-        dehnen_radius_scale=dehnen_radius_scale,
-        separation_floor=separation_floor,
-    )
-
-
-def build_grouped_interactions_from_pairs(
-    tree: object,
-    geometry: TreeGeometry,
-    interaction_sources: Array,
-    interaction_targets: Array,
-    *,
-    level_offsets: Array | None = None,
-):
-    """Group far-field pairs into displacement classes for class-major M2L.
-
-    Thin wrapper over
-    :func:`yggdrax.grouped_interactions.build_grouped_interactions_from_pairs`
-    that first resolves ``tree`` to its topology payload.
-
-    Parameters
-    ----------
-    tree
-        Tree container or topology exposing level-order metadata.
-    geometry
-        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
-    interaction_sources
-        Far-pair source node indices, shape ``(num_pairs,)``.
-    interaction_targets
-        Far-pair target node indices, shape ``(num_pairs,)``.
-    level_offsets
-        Optional precomputed level offsets passed through for diagnostics;
-        derived from ``tree`` when omitted.
-
-    Returns
-    -------
-    GroupedInteractionBuffers
-        Class keys, per-class displacements, and CSR-style class offsets/ids.
-    """
-
-    return _call_with_topology(
-        _interactions_impl.build_grouped_interactions_from_pairs,
-        tree,
-        geometry,
-        interaction_sources,
-        interaction_targets,
-        level_offsets=level_offsets,
-    )
-
-
 def diagnose_leaf_neighbor_growth(
     tree: object,
     geometry: TreeGeometry,
@@ -823,8 +612,6 @@ __all__ = [
     "DualTreeWalkResult",
     "MutualWalkResult",
     "CompactTaggedFarPairs",
-    "CompactTaggedOctreeFarPairs",
-    "OctreeNativeNeighborList",
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",
@@ -832,10 +619,7 @@ __all__ = [
     "build_compact_far_pairs",
     "dual_tree_walk_mutual",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
-    "build_octree_native_far_pairs",
-    "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
-    "build_grouped_interactions_from_pairs",
     "build_well_separated_interactions",
     "diagnose_leaf_neighbor_growth",
     "interactions_for_node",

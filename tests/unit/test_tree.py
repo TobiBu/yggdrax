@@ -9,10 +9,6 @@ from yggdrax.geometry import compute_tree_geometry
 from yggdrax.tree import (
     MAX_TREE_LEVELS,
     RadixTreeWorkspace,
-    build_fixed_depth_octree,
-    build_fixed_depth_octree_jit,
-    build_fixed_depth_tree,
-    build_fixed_depth_tree_jit,
     build_octree,
     build_octree_jit,
     build_static_radix_tree,
@@ -401,71 +397,6 @@ def test_leaf_size_larger_than_particle_count():
     assert int(end) == positions.shape[0] - 1
 
 
-def test_fixed_depth_tree_uniform_leaf_levels():
-    rng_positions = jnp.linspace(-1.0, 1.0, 64)
-    grid = jnp.meshgrid(rng_positions, rng_positions, rng_positions)
-    positions = jnp.stack(grid, axis=-1).reshape(-1, 3)
-    masses = jnp.ones((positions.shape[0],))
-
-    bounds = (
-        jnp.array([-1.5, -1.5, -1.5]),
-        jnp.array([1.5, 1.5, 1.5]),
-    )
-
-    target = 32
-    tree = build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=target,
-        refine_local=False,
-    )
-
-    num_internal = tree.num_internal_nodes
-    total_nodes = tree.parent.shape[0]
-    num_leaves = total_nodes - num_internal
-
-    depth_vals = tree.leaf_depths
-    assert int(jnp.min(depth_vals)) == int(jnp.max(depth_vals))
-    depth = int(depth_vals[0])
-    expected_leaves = 1 << (3 * depth)
-
-    assert num_leaves > 0
-    assert num_internal == num_leaves - 1
-    assert num_leaves == expected_leaves
-
-
-def test_fixed_depth_tree_depth_scales_with_target():
-    positions = jnp.array(
-        [[float(i), 0.0, 0.0] for i in range(128)],
-        dtype=jnp.float32,
-    )
-    masses = jnp.ones((positions.shape[0],))
-    bounds = (
-        jnp.array([-10.0, -1.0, -1.0]),
-        jnp.array([10.0, 1.0, 1.0]),
-    )
-
-    tree_loose = build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=64,
-    )
-    tree_tight = build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=8,
-    )
-
-    max_loose = _max_leaf_count(tree_loose)
-    max_tight = _max_leaf_count(tree_tight)
-
-    assert tree_tight.num_internal_nodes >= tree_loose.num_internal_nodes
-    assert max_tight <= max_loose
-
-
 def _assert_valid_forest(tree):
     """Assert the parent pointers describe a single-rooted acyclic tree.
 
@@ -496,15 +427,36 @@ def _assert_valid_forest(tree):
             node = int(parent[node])
 
 
-def test_fixed_depth_tree_degenerate_tied_codes_is_valid():
-    """Out-of-bounds points that clip to identical Morton codes must still
-    yield a valid (acyclic) tree rather than a cyclic parent array.
+_TIED_CODES_LBVH_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "known bug, found in the 2026-10 cleanup (Y2), not fixed there: when more "
+        "than leaf_size particles share one Morton code, the adaptive LBVH emits "
+        "orphaned subtrees (several parent == -1 nodes; leaves unreachable from "
+        "the root). _split_step compares codes without the index tie-break that "
+        "_delta_vec applies."
+    ),
+)
 
-    Regression test: 128 collinear particles, most of which fall outside the
-    supplied bounds and clip to the same boundary cell, share identical Morton
-    codes.  The fixed-depth builder previously emitted a malformed topology
-    whose ``node_level`` field, once materialized, exceeded ``MAX_TREE_LEVELS``
-    (indicating a cycle in the parent pointers).
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        pytest.param(build_static_radix_tree, id="build_static_radix_tree"),
+        pytest.param(build_tree, id="build_tree", marks=_TIED_CODES_LBVH_XFAIL),
+        pytest.param(build_octree, id="build_octree", marks=_TIED_CODES_LBVH_XFAIL),
+    ],
+)
+def test_tree_builders_degenerate_tied_codes_are_valid(builder):
+    """Out-of-bounds points that clip to identical Morton codes must still
+    yield a valid (acyclic, single-rooted) tree.
+
+    128 collinear particles, most of which fall outside the supplied bounds and
+    clip to the same boundary cell, share identical Morton codes. This was a
+    regression test for the fixed-depth builder's local refinement, which emitted
+    a cyclic parent array on this input; fixed-depth builds were removed in the
+    2026-10 cleanup (Y2), and the same invariants are now held against the
+    builders that remain.
     """
 
     positions = jnp.array(
@@ -519,41 +471,26 @@ def test_fixed_depth_tree_degenerate_tied_codes_is_valid():
         jnp.array([10.0, 1.0, 1.0]),
     )
 
-    # Exercise both the local-refinement path (default) and the plain path,
-    # since the tied-code layout stresses the refinement re-partitioning.
-    for refine_local in (True, False):
-        tree = build_fixed_depth_tree(
-            positions,
-            masses,
-            bounds,
-            target_leaf_particles=8,
-            refine_local=refine_local,
-        )
+    tree = builder(positions, masses, bounds, leaf_size=8)
 
-        node_level = np.asarray(jax.device_get(jax.block_until_ready(tree.node_level)))
-        num_levels = int(tree.num_levels)
+    node_level = np.asarray(jax.device_get(jax.block_until_ready(tree.node_level)))
+    num_levels = int(tree.num_levels)
 
-        assert node_level.min() >= 0
-        # A valid tree's deepest node sits at level ``num_levels - 1`` and, in
-        # particular, must never exceed the level cap (a cycle would blow this
-        # far past ``MAX_TREE_LEVELS``).
-        assert int(node_level.max()) <= num_levels, (
-            f"node_level max {int(node_level.max())} exceeds num_levels "
-            f"{num_levels} (refine_local={refine_local})"
-        )
-        assert int(node_level.max()) < MAX_TREE_LEVELS, (
-            f"node_level max {int(node_level.max())} >= MAX_TREE_LEVELS "
-            f"{MAX_TREE_LEVELS} (refine_local={refine_local})"
-        )
+    assert node_level.min() >= 0
+    # A valid tree's deepest node sits at level ``num_levels - 1`` and, in
+    # particular, must never exceed the level cap (a cycle would blow this far
+    # past ``MAX_TREE_LEVELS``).
+    assert int(node_level.max()) <= num_levels
+    assert int(node_level.max()) < MAX_TREE_LEVELS
 
-        _assert_valid_forest(tree)
+    _assert_valid_forest(tree)
 
-        # Every particle must still be covered exactly once by the leaves.
-        num_internal = tree.num_internal_nodes
-        leaf_ranges = np.asarray(jax.device_get(tree.node_ranges))[num_internal:]
-        counts = leaf_ranges[:, 1] - leaf_ranges[:, 0] + 1
-        counts = counts[counts > 0]
-        assert int(counts.sum()) == positions.shape[0]
+    # Every particle must still be covered exactly once by the leaves.
+    num_internal = tree.num_internal_nodes
+    leaf_ranges = np.asarray(jax.device_get(tree.node_ranges))[num_internal:]
+    counts = leaf_ranges[:, 1] - leaf_ranges[:, 0] + 1
+    counts = counts[counts > 0]
+    assert int(counts.sum()) == positions.shape[0]
 
 
 def test_static_radix_tree_uses_fixed_count_buckets():
@@ -683,64 +620,6 @@ def test_static_radix_rejects_workspace():
         )
 
 
-def test_fixed_depth_morton_geometry_contains_particles():
-    coords = jnp.linspace(-0.75, 0.75, 4)
-    grid = jnp.meshgrid(coords, coords, coords)
-    positions = jnp.stack(grid, axis=-1).reshape(-1, 3)
-    masses = jnp.ones((positions.shape[0],))
-
-    bounds = (
-        jnp.array([-1.0, -1.0, -1.0]),
-        jnp.array([1.0, 1.0, 1.0]),
-    )
-
-    tree, positions_sorted, *_ = build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=8,
-        return_reordered=True,
-        refine_local=False,
-    )
-
-    depth_vals = tree.leaf_depths
-    assert int(jnp.min(depth_vals)) == int(jnp.max(depth_vals))
-    depth = int(depth_vals[0])
-    expected_leaves = 1 << (3 * depth)
-    num_internal = int(tree.num_internal_nodes)
-    num_leaves = int(tree.parent.shape[0]) - num_internal
-    assert num_leaves == expected_leaves
-
-    geometry = compute_tree_geometry(tree, positions_sorted)
-    leaf_ranges = np.asarray(tree.node_ranges[num_internal:])
-    centers = np.asarray(geometry.center[num_internal:])
-    half_extent = np.asarray(geometry.half_extent[num_internal:])
-    positions_np = np.asarray(positions_sorted)
-    eps = 1e-9
-
-    for idx, (start, end) in enumerate(leaf_ranges):
-        start_i = int(start)
-        end_i = int(end)
-        if end_i < start_i:
-            continue
-        pts = positions_np[start_i : end_i + 1]
-        if pts.size == 0:
-            continue
-        cell_min = centers[idx] - half_extent[idx]
-        cell_max = centers[idx] + half_extent[idx]
-        assert np.all(pts >= cell_min - eps)
-        assert np.all(pts <= cell_max + eps)
-
-    domain_half_extent = 0.5 * (bounds[1] - bounds[0])
-    root_extent = geometry.max_extent[0]
-    assert jnp.allclose(
-        root_extent,
-        jnp.max(domain_half_extent),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-
-
 def test_workspace_reuse_roundtrip():
     positions = jnp.array(
         [
@@ -856,54 +735,6 @@ def test_build_tree_jit_matches_eager():
     assert jnp.array_equal(inv_eager, inv_jit)
 
 
-def test_fixed_depth_tree_jit_matches_eager():
-    positions = jnp.array(
-        [
-            [0.1, -0.2, 0.3],
-            [0.4, 0.5, -0.6],
-            [-0.7, 0.8, 0.9],
-            [-0.4, -0.3, 0.2],
-        ]
-    )
-    masses = jnp.array([1.0, 2.0, 3.0, 4.0])
-
-    bounds = (
-        jnp.array([-1.0, -1.0, -1.0]),
-        jnp.array([1.0, 1.0, 1.0]),
-    )
-
-    eager = build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=2,
-        return_reordered=True,
-        refine_local=False,
-    )
-    jitted = build_fixed_depth_tree_jit(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=2,
-        return_reordered=True,
-        refine_local=False,
-    )
-
-    assert isinstance(eager, tuple) and isinstance(jitted, tuple)
-    assert len(eager) == len(jitted) == 4
-
-    tree_eager, pos_eager, mass_eager, inv_eager = eager
-    tree_jit, pos_jit, mass_jit, inv_jit = jitted
-
-    assert jnp.array_equal(tree_eager.parent, tree_jit.parent)
-    assert jnp.array_equal(tree_eager.left_child, tree_jit.left_child)
-    assert jnp.array_equal(tree_eager.right_child, tree_jit.right_child)
-    assert jnp.array_equal(tree_eager.node_ranges, tree_jit.node_ranges)
-    assert jnp.array_equal(pos_eager, pos_jit)
-    assert jnp.array_equal(mass_eager, mass_jit)
-    assert jnp.array_equal(inv_eager, inv_jit)
-
-
 def test_build_octree_jit_matches_eager():
     positions = jnp.array(
         [
@@ -933,58 +764,6 @@ def test_build_octree_jit_matches_eager():
         bounds,
         return_reordered=True,
         leaf_size=DEFAULT_TEST_LEAF_SIZE,
-    )
-
-    assert isinstance(jitted, tuple) and isinstance(eager, tuple)
-    assert len(eager) == len(jitted) == 4
-
-    tree_eager, pos_eager, mass_eager, inv_eager = eager
-    tree_jit, pos_jit, mass_jit, inv_jit = jitted
-
-    assert tree_eager.tree_type == tree_jit.tree_type == "octree"
-    assert jnp.array_equal(tree_eager.parent, tree_jit.parent)
-    assert jnp.array_equal(tree_eager.node_ranges, tree_jit.node_ranges)
-    assert jnp.array_equal(tree_eager.oct_children, tree_jit.oct_children)
-    assert jnp.array_equal(tree_eager.oct_parent, tree_jit.oct_parent)
-    assert jnp.array_equal(tree_eager.oct_leaf_mask, tree_jit.oct_leaf_mask)
-    assert jnp.array_equal(tree_eager.oct_leaf_nodes, tree_jit.oct_leaf_nodes)
-    assert jnp.array_equal(tree_eager.radix_leaf_to_oct, tree_jit.radix_leaf_to_oct)
-    assert jnp.array_equal(pos_eager, pos_jit)
-    assert jnp.array_equal(mass_eager, mass_jit)
-    assert jnp.array_equal(inv_eager, inv_jit)
-
-
-def test_build_fixed_depth_octree_jit_matches_eager():
-    positions = jnp.array(
-        [
-            [0.1, -0.2, 0.3],
-            [0.4, 0.5, -0.6],
-            [-0.7, 0.8, 0.9],
-            [-0.4, -0.3, 0.2],
-        ]
-    )
-    masses = jnp.array([1.0, 2.0, 3.0, 4.0])
-
-    bounds = (
-        jnp.array([-1.0, -1.0, -1.0]),
-        jnp.array([1.0, 1.0, 1.0]),
-    )
-
-    eager = build_fixed_depth_octree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=2,
-        return_reordered=True,
-        refine_local=False,
-    )
-    jitted = build_fixed_depth_octree_jit(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=2,
-        return_reordered=True,
-        refine_local=False,
     )
 
     assert isinstance(jitted, tuple) and isinstance(eager, tuple)

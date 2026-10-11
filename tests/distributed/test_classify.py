@@ -18,7 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from yggdrax.distributed import classify_against_remote, device_count, make_mesh
+from yggdrax.distributed import device_count, make_mesh
+
+from ._let_drivers import classify_against_remote
 
 pytestmark = pytest.mark.skipif(
     device_count() < 2, reason="remote classification needs >= 2 devices"
@@ -44,7 +46,6 @@ def metrics():
         leaf_size=_LEAF,
         output_capacity=_CAP,
         theta=0.5,
-        equalize=True,
     )
     return pts, mass, m
 

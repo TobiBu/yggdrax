@@ -15,7 +15,7 @@ The pipeline is:
         -> tree build                      (tree: radix | octree | kdtree)
         -> per-node geometry               (geometry)
         -> dual-tree walk                  (interactions: far / M2L + near / P2P)
-        -> interaction / neighbor lists    (dense_interactions, grouped_interactions)
+        -> interaction / neighbor lists    (NodeInteractionList, CompactTaggedFarPairs, NodeNeighborList)
 ```
 
 ## Installation

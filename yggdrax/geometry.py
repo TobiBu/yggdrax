@@ -10,7 +10,6 @@ from . import _geometry_impl
 from .tree import resolve_tree_topology
 
 TreeGeometry = _geometry_impl.TreeGeometry
-LevelMajorTreeGeometry = _geometry_impl.LevelMajorTreeGeometry
 _MAX_MORTON_LEVEL = _geometry_impl._MAX_MORTON_LEVEL
 
 
@@ -75,37 +74,8 @@ def compute_tree_geometry(
     )
 
 
-@jaxtyped(typechecker=beartype)
-def geometry_to_level_major(
-    tree: object,
-    geometry: TreeGeometry,
-) -> LevelMajorTreeGeometry:
-    """Convert per-node geometry to padded level-major buffers.
-
-    Regroups the flat per-node geometry into ``(num_levels, max_nodes_per_level)``
-    padded arrays, so batched kernels can process one tree level at a time.
-
-    Parameters
-    ----------
-    tree
-        Tree container or topology exposing level-order metadata.
-    geometry
-        Per-node geometry from :func:`compute_tree_geometry` for ``tree``.
-
-    Returns
-    -------
-    LevelMajorTreeGeometry
-        Level-major padded geometry buffers and per-level node counts.
-    """
-
-    topology = resolve_tree_topology(tree)
-    return _geometry_impl.geometry_to_level_major(topology, geometry)
-
-
 __all__ = [
-    "LevelMajorTreeGeometry",
     "TreeGeometry",
     "_MAX_MORTON_LEVEL",
     "compute_tree_geometry",
-    "geometry_to_level_major",
 ]

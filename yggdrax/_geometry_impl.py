@@ -18,13 +18,7 @@ from jaxtyping import Array, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index
 from .morton import _compact3_u64
-from .tree import (
-    get_level_offsets,
-    get_node_levels,
-    get_nodes_by_level,
-    get_num_levels,
-    require_morton_topology,
-)
+from .tree import require_morton_topology
 
 
 class TreeGeometry(NamedTuple):
@@ -34,17 +28,6 @@ class TreeGeometry(NamedTuple):
     half_extent: Array
     radius: Array
     max_extent: Array
-
-
-class LevelMajorTreeGeometry(NamedTuple):
-    """Tree geometry reshaped into dense level-major buffers."""
-
-    centers: Array
-    half_extents: Array
-    radii: Array
-    max_extents: Array
-    level_counts: Array
-    node_indices: Array
 
 
 def _validate_inputs(tree: object, positions_sorted: Array) -> None:
@@ -343,96 +326,7 @@ def compute_tree_geometry(
     return TreeGeometry(centers, half_extents, radii, max_extents)
 
 
-@jaxtyped(typechecker=beartype)
-def geometry_to_level_major(
-    tree: object,
-    geometry: TreeGeometry,
-) -> LevelMajorTreeGeometry:
-    """Materialise padded, level-major views of node geometry."""
-
-    node_levels = get_node_levels(tree)
-    num_levels = get_num_levels(tree, node_levels=node_levels)
-    if num_levels <= 0:
-        raise ValueError("tree must contain at least one populated level")
-
-    level_offsets = get_level_offsets(tree, node_levels=node_levels)
-    level_counts_full = level_offsets[1:] - level_offsets[:-1]
-    level_counts = level_counts_full[:num_levels]
-    max_nodes = int(jnp.max(jnp.maximum(level_counts, 1)))
-
-    def _make_buffer(template, fill_value=0):
-        shape = (num_levels, max_nodes) + template.shape[1:]
-        return jnp.full(shape, fill_value, dtype=template.dtype)
-
-    centers_buf = _make_buffer(geometry.center)
-    extents_buf = _make_buffer(geometry.half_extent)
-    radii_buf = _make_buffer(geometry.radius)
-    max_extents_buf = _make_buffer(geometry.max_extent)
-    node_idx_buf = jnp.full((num_levels, max_nodes), -1, dtype=INDEX_DTYPE)
-
-    nodes_by_level = get_nodes_by_level(tree, node_levels=node_levels)
-
-    total_nodes = geometry.center.shape[0]
-    node_indices = jnp.asarray(nodes_by_level, dtype=INDEX_DTYPE)
-
-    def body(level_idx, state):
-        centers_arr, extents_arr, radii_arr, max_extents_arr, idx_arr = state
-        count = level_counts[level_idx]
-        start = level_offsets[level_idx]
-        slots = jnp.arange(max_nodes, dtype=INDEX_DTYPE)
-        valid = slots < count
-        node_positions = start + slots
-        safe_pos = jnp.where(valid, node_positions, as_index(0))
-        level_nodes = jnp.where(
-            valid,
-            node_indices[safe_pos],
-            as_index(-1),
-        )
-
-        safe_nodes = jnp.clip(level_nodes, min=0, max=total_nodes - 1)
-        centers_values = geometry.center[safe_nodes]
-        extents_values = geometry.half_extent[safe_nodes]
-        radii_values = geometry.radius[safe_nodes]
-        max_extents_values = geometry.max_extent[safe_nodes]
-
-        centers_values = jnp.where(valid[:, None], centers_values, 0.0)
-        extents_values = jnp.where(valid[:, None], extents_values, 0.0)
-        radii_values = jnp.where(valid, radii_values, 0.0)
-        max_extents_values = jnp.where(valid, max_extents_values, 0.0)
-
-        centers_arr = centers_arr.at[level_idx].set(centers_values)
-        extents_arr = extents_arr.at[level_idx].set(extents_values)
-        radii_arr = radii_arr.at[level_idx].set(radii_values)
-        max_extents_arr = max_extents_arr.at[level_idx].set(max_extents_values)
-        idx_arr = idx_arr.at[level_idx].set(level_nodes)
-        return centers_arr, extents_arr, radii_arr, max_extents_arr, idx_arr
-
-    (
-        centers_buf,
-        extents_buf,
-        radii_buf,
-        max_extents_buf,
-        node_idx_buf,
-    ) = lax.fori_loop(
-        0,
-        num_levels,
-        body,
-        (centers_buf, extents_buf, radii_buf, max_extents_buf, node_idx_buf),
-    )
-
-    return LevelMajorTreeGeometry(
-        centers=centers_buf,
-        half_extents=extents_buf,
-        radii=radii_buf,
-        max_extents=max_extents_buf,
-        level_counts=level_counts,
-        node_indices=node_idx_buf,
-    )
-
-
 __all__ = [
-    "LevelMajorTreeGeometry",
     "TreeGeometry",
     "compute_tree_geometry",
-    "geometry_to_level_major",
 ]
