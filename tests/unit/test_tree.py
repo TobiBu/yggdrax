@@ -427,24 +427,12 @@ def _assert_valid_forest(tree):
             node = int(parent[node])
 
 
-_TIED_CODES_LBVH_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "known bug, found in the 2026-10 cleanup (Y2), not fixed there: when more "
-        "than leaf_size particles share one Morton code, the adaptive LBVH emits "
-        "orphaned subtrees (several parent == -1 nodes; leaves unreachable from "
-        "the root). _split_step compares codes without the index tie-break that "
-        "_delta_vec applies."
-    ),
-)
-
-
 @pytest.mark.parametrize(
     "builder",
     [
         pytest.param(build_static_radix_tree, id="build_static_radix_tree"),
-        pytest.param(build_tree, id="build_tree", marks=_TIED_CODES_LBVH_XFAIL),
-        pytest.param(build_octree, id="build_octree", marks=_TIED_CODES_LBVH_XFAIL),
+        pytest.param(build_tree, id="build_tree"),
+        pytest.param(build_octree, id="build_octree"),
     ],
 )
 def test_tree_builders_degenerate_tied_codes_are_valid(builder):
@@ -456,7 +444,9 @@ def test_tree_builders_degenerate_tied_codes_are_valid(builder):
     regression test for the fixed-depth builder's local refinement, which emitted
     a cyclic parent array on this input; fixed-depth builds were removed in the
     2026-10 cleanup (Y2), and the same invariants are now held against the
-    builders that remain.
+    builders that remain. The adaptive LBVH failed them until 2026-10: its split
+    search compared codes without the index tie-break, so a range of tied leaves
+    collapsed onto its first leaf and the build returned a forest.
     """
 
     positions = jnp.array(
@@ -491,6 +481,59 @@ def test_tree_builders_degenerate_tied_codes_are_valid(builder):
     counts = leaf_ranges[:, 1] - leaf_ranges[:, 0] + 1
     counts = counts[counts > 0]
     assert int(counts.sum()) == positions.shape[0]
+
+
+def _leaves_reachable_from_root(tree) -> int:
+    """Leaves reached by following child pointers down from the root."""
+    parent = np.asarray(jax.device_get(tree.parent))
+    left = np.asarray(jax.device_get(tree.left_child))
+    right = np.asarray(jax.device_get(tree.right_child))
+    num_internal = int(tree.num_internal_nodes)
+    stack, seen = [int(np.argmin(parent))], set()
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node < num_internal:
+            stack += [int(left[node]), int(right[node])]
+    return sum(1 for node in seen if node >= num_internal)
+
+
+@pytest.mark.parametrize("duplicates", [28, 64])
+@pytest.mark.parametrize(
+    "builder",
+    [
+        pytest.param(build_static_radix_tree, id="build_static_radix_tree"),
+        pytest.param(build_tree, id="build_tree"),
+        pytest.param(build_octree, id="build_octree"),
+    ],
+)
+def test_duplicate_positions_leave_no_leaf_unreachable(builder, duplicates):
+    """More than ``leaf_size`` copies of one point must stay inside one tree.
+
+    This is the shape of a padded shard: ``distributed.sanitize_padding`` copies
+    the first real position into every padding row. Before 2026-10 the adaptive
+    builds returned a forest here -- 28 copies among 128 points orphaned one of 16
+    leaves, 64 copies five -- and a walk from the root never reached them, so their
+    particles received no force and exerted none.
+    """
+    rng = np.random.default_rng(0)
+    points = rng.uniform(-1.0, 1.0, size=(128, 3))
+    points[128 - duplicates :] = points[0]
+    positions = jnp.asarray(points)
+    masses = jnp.ones((positions.shape[0],))
+    bounds = (jnp.full((3,), -1.0), jnp.full((3,), 1.0))
+
+    tree = builder(positions, masses, bounds, leaf_size=8)
+
+    _assert_valid_forest(tree)
+    num_internal = int(tree.num_internal_nodes)
+    num_leaves = int(np.asarray(tree.parent).shape[0]) - num_internal
+    assert _leaves_reachable_from_root(tree) == num_leaves
+    root = int(np.argmin(np.asarray(tree.parent)))
+    root_range = np.asarray(jax.device_get(tree.node_ranges))[root]
+    assert tuple(int(v) for v in root_range) == (0, positions.shape[0] - 1)
 
 
 def test_static_radix_tree_uses_fixed_count_buckets():
