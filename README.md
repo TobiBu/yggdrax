@@ -116,8 +116,10 @@ your downstream solver.
 
 - For FMM-style runs (e.g. jaccpot), `mac_type="dehnen"` is the recommended
   path for apples-to-apples parity checks.
-- Octree builds currently share the radix traversal core, so interaction-count
-  parity between `radix` and `octree` should hold for the same build settings.
+- Octree builds share the radix traversal core in every walk builder, so
+  interaction-count parity between `radix` and `octree` should hold for the same
+  build settings. (The octree-native walk, the `build_octree_native_*` builders
+  and the `octree_uvwx` execution views were removed in the 2026-10 cleanup, Y1.)
 - KD-tree traversal uses a calibrated default effective radius scale for
   Dehnen MAC (`dehnen_radius_scale=1.2`) to match near-field/far-field split
   behavior more closely with radix trees.

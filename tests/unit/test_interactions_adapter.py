@@ -21,7 +21,10 @@ from yggdrax import (
     infer_bounds,
 )
 from yggdrax.interactions import DualTreeTraversalConfig as ExpanseTraversalConfig
-from yggdrax.interactions import build_compact_far_pairs
+from yggdrax.interactions import (
+    build_compact_far_pairs,
+    build_interactions_and_neighbors_split,
+)
 
 _TEST_N = 16
 _TEST_TRAVERSAL_CFG = DualTreeTraversalConfig(
@@ -239,93 +242,102 @@ def test_dual_tree_queue_cache_is_bounded():
     )
 
 
-def test_dual_tree_dispatch_is_octree_specific(monkeypatch):
-    positions, masses = _sample_problem(n=_TEST_N)
+def _near_pairs(neighbors: NodeNeighborList) -> set[tuple[int, int]]:
+    """Return the near list as a set of ``(leaf, neighbour)`` node pairs."""
 
-    dispatch_calls: list[str] = []
-    original_octree = _interactions_impl._run_octree_walk_raw
-    original_legacy = _interactions_impl._run_legacy_dual_tree_walk_raw
-
-    def _record_octree(*args, **kwargs):
-        dispatch_calls.append("octree")
-        return original_octree(*args, **kwargs)
-
-    def _record_legacy(*args, **kwargs):
-        dispatch_calls.append("legacy")
-        return original_legacy(*args, **kwargs)
-
-    monkeypatch.setattr(_interactions_impl, "_run_octree_walk_raw", _record_octree)
-    monkeypatch.setattr(
-        _interactions_impl,
-        "_run_legacy_dual_tree_walk_raw",
-        _record_legacy,
+    leaf_rows = jnp.repeat(neighbors.leaf_indices, neighbors.counts)
+    total = int(neighbors.offsets[-1])
+    return set(
+        zip(
+            leaf_rows[:total].tolist(),
+            neighbors.neighbors[:total].tolist(),
+        )
     )
 
-    for tree_type, expected_calls in (
-        ("radix", ["legacy"]),
-        ("octree", ["octree", "legacy"]),
-        ("kdtree", ["legacy"]),
-    ):
-        dispatch_calls.clear()
-        tree = Tree.from_particles(
-            positions,
-            masses,
-            bounds=infer_bounds(positions),
-            leaf_size=16,
-            return_reordered=True,
-            tree_type=tree_type,
-        )
-        geometry = compute_tree_geometry(tree, tree.positions_sorted)
+
+def _walk_problem(tree_type: str):
+    # 64 leaves: enough for the walk to accept far pairs as well as near ones.
+    positions, masses = _sample_problem(n=512)
+    tree = Tree.from_particles(
+        positions,
+        masses,
+        bounds=infer_bounds(positions),
+        leaf_size=8,
+        return_reordered=True,
+        tree_type=tree_type,
+    )
+    return tree, compute_tree_geometry(tree, tree.positions_sorted)
+
+
+_WALK_CFG = DualTreeTraversalConfig(
+    max_pair_queue=4096,
+    process_block=32,
+    max_interactions_per_node=256,
+    max_neighbors_per_leaf=256,
+)
+
+
+def test_dual_tree_walk_serves_every_tree_type():
+    """The joint far + near walk serves radix, octree and kd-tree topologies."""
+
+    for tree_type in ("radix", "octree", "kdtree"):
+        tree, geometry = _walk_problem(tree_type)
         interactions, neighbors = build_interactions_and_neighbors(
             tree,
             geometry,
             theta=0.6,
             mac_type="dehnen",
-            traversal_config=_TEST_TRAVERSAL_CFG,
+            traversal_config=_WALK_CFG,
         )
 
         assert isinstance(interactions, NodeInteractionList)
         assert isinstance(neighbors, NodeNeighborList)
-        assert dispatch_calls == expected_calls
+        assert int(interactions.sources.shape[0]) > 0, tree_type
+        # At this density every leaf has near neighbours.
+        assert int(jnp.min(neighbors.counts)) >= 1, tree_type
 
 
-def test_octree_leaf_neighbor_lists_use_native_dispatch(monkeypatch):
-    positions, masses = _sample_problem(n=_TEST_N)
-    dispatch_calls: list[str] = []
-    original_octree = _interactions_impl._run_octree_walk_raw
-    original_legacy = _interactions_impl._run_legacy_dual_tree_walk_raw
+def test_octree_near_lists_agree_across_builders():
+    """Every near-list builder serves an octree with the joint walk's pairs.
 
-    def _record_octree(*args, **kwargs):
-        dispatch_calls.append("octree")
-        return original_octree(*args, **kwargs)
+    The near-only builders with explicit capacities used to route an octree to a
+    native octree walk that left most near rows empty; it was removed in the
+    2026-10 cleanup (Y1) and every builder now runs the binary walk.
+    """
 
-    def _record_legacy(*args, **kwargs):
-        dispatch_calls.append("legacy")
-        return original_legacy(*args, **kwargs)
-
-    monkeypatch.setattr(_interactions_impl, "_run_octree_walk_raw", _record_octree)
-    monkeypatch.setattr(
-        _interactions_impl,
-        "_run_legacy_dual_tree_walk_raw",
-        _record_legacy,
-    )
-
-    tree = Tree.from_particles(
-        positions,
-        masses,
-        bounds=infer_bounds(positions),
-        leaf_size=16,
-        return_reordered=True,
-        tree_type="octree",
-    )
-    geometry = compute_tree_geometry(tree, tree.positions_sorted)
-    neighbors = build_leaf_neighbor_lists(
+    tree, geometry = _walk_problem("octree")
+    _, joint = build_interactions_and_neighbors(
         tree,
         geometry,
         theta=0.6,
         mac_type="dehnen",
-        traversal_config=_TEST_TRAVERSAL_CFG,
+        traversal_config=_WALK_CFG,
+    )
+    near_only = build_leaf_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_WALK_CFG,
+    )
+    _, split = build_interactions_and_neighbors_split(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_WALK_CFG,
+    )
+    _, compact = build_compact_far_pairs_and_leaf_neighbor_lists(
+        tree,
+        geometry,
+        theta=0.6,
+        mac_type="dehnen",
+        traversal_config=_WALK_CFG,
     )
 
-    assert isinstance(neighbors, NodeNeighborList)
-    assert dispatch_calls == ["octree"]
+    assert isinstance(near_only, NodeNeighborList)
+    assert int(jnp.min(joint.counts)) >= 1
+    joint_pairs = _near_pairs(joint)
+    assert _near_pairs(near_only) == joint_pairs
+    assert _near_pairs(split) == joint_pairs
+    assert _near_pairs(compact) == joint_pairs
