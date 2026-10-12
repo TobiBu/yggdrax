@@ -36,7 +36,7 @@ import jax.numpy as jnp
 from jax import core as jax_core
 from jaxtyping import Array
 
-from ..dtypes import INDEX_DTYPE, as_index
+from ..dtypes import INDEX_DTYPE, as_index, require_x64
 from ..geometry import compute_tree_geometry
 from ..tree import Tree
 from ..tree_moments import compute_tree_mass_moments
@@ -47,7 +47,7 @@ from .sharding import AXIS_NAME
 # importer verify provenance (which domain/index a halo particle came from).
 _GID_STRIDE = 1 << 40
 #: Global ids are int64 whatever ``INDEX_DTYPE`` is: ``domain * 2**40`` needs the
-#: width (x64 is on wherever yggdrax is imported).
+#: width, hence ``jax_enable_x64`` (``import_near_halo`` checks it).
 _GID_DTYPE = jnp.int64
 
 
@@ -409,6 +409,7 @@ def import_near_halo(
     *leaf* -- a multipole, an extent -- belongs on the frontier instead.
     """
 
+    require_x64("int64 global particle ids")
     me = jax.lax.axis_index(axis_name)
     n_remote = rct.tag_domain.shape[0]
     cnr = jnp.asarray(rct.tree.node_ranges, dtype=INDEX_DTYPE)

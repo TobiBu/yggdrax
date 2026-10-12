@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .tree import require_fmm_core_topology, resolve_tree_topology
 
 
@@ -66,8 +66,8 @@ def _accumulation_dtype(dtype: Any) -> Any:
     -- twenty times the width of a core leaf. The error grows with N. Measured on the
     fused jaccpot lane (clipped Plummer, 3.2e7, one A100): the MAC radii about those
     centres inflated the near list from 35.8M to 515.9M directed pairs and the force
-    from 200 to 774 ms. With x64 on (yggdrax enables it at import) the prefixes are
-    accumulated in float64.
+    from 200 to 774 ms. The prefixes are therefore accumulated in float64, which
+    needs ``jax_enable_x64`` (it used to fall back to ``dtype`` quietly without it).
 
     Parameters
     ----------
@@ -77,10 +77,11 @@ def _accumulation_dtype(dtype: Any) -> Any:
     Returns
     -------
     Any
-        ``float64`` when x64 is enabled and ``dtype`` is floating, else ``dtype``.
+        ``float64`` when ``dtype`` is floating, else ``dtype``. For a floating
+        ``dtype`` with x64 off, :func:`~yggdrax.dtypes.require_x64` raises.
     """
-    wide = jax.dtypes.canonicalize_dtype(jnp.float64)
-    if wide == jnp.float64 and jnp.issubdtype(dtype, jnp.floating):
+    if jnp.issubdtype(dtype, jnp.floating):
+        require_x64("float64 prefix sums of the node mass moments")
         return jnp.float64
     return dtype
 

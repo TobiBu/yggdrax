@@ -26,7 +26,7 @@ from jax import core as jax_core
 from jax import lax
 from jaxtyping import Array, jaxtyped
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .geometry import TreeGeometry
 from .tree import (
     get_leaf_nodes,
@@ -3124,6 +3124,7 @@ def _run_dual_tree_walk_raw(
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> _DualTreeWalkRawOutputs:
+    require_x64("int64 pair-count totals")
     # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
     tree = tree.topology if hasattr(tree, "topology") else tree
@@ -3747,6 +3748,7 @@ def _run_far_only_compact_with_bounded_count_pass(
 ) -> CompactTaggedFarPairs:
     """Build compact far pairs with a bounded count pass under explicit caps."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
@@ -3949,6 +3951,7 @@ def _run_near_only_compact_with_bounded_count_pass(
 ) -> NodeNeighborList:
     """Build compact neighbor lists with a bounded count pass under explicit caps."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
@@ -4145,6 +4148,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Build compact far pairs and near neighbors from one shared count pass."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )

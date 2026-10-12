@@ -16,7 +16,7 @@ from beartype import beartype
 from jax import lax
 from jaxtyping import Array, Float, jaxtyped
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 
 
 class RadixTree(NamedTuple):
@@ -126,6 +126,7 @@ def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     Implemented with a fixed sequence of shifts and conditional adds to
     avoid Python control flow. Works on CPU/GPU/TPU without custom calls.
     """
+    require_x64("63-bit Morton codes")
     x = x.astype(jnp.uint64)
     n = as_index(0)
 
@@ -402,6 +403,7 @@ def _static_radix_node_ranges_from_leaf_ranges(
 ) -> Union[np.ndarray, Array]:
     """Recompute node ranges for an existing static radix bucket topology."""
 
+    require_x64("63-bit Morton codes")
     num_leaves = int(leaf_starts_np.shape[0])
     num_internal = int(template.left_child.shape[0])
     total_nodes = int(num_internal + num_leaves)
@@ -524,6 +526,7 @@ def build_static_cells_tree(
     ValueError
         If ``leaf_size`` or ``leaf_capacity`` is not positive.
     """
+    require_x64("63-bit Morton codes")
     from ._cell_partition import adaptive_cell_leaf_partition
     from .morton import morton_encode  # local import to avoid circulars
 
@@ -942,6 +945,7 @@ def _build_tree_from_leaf_partitions(
     leaf_codes_override: Optional[Array] = None,
     leaf_depths_override: Optional[Array] = None,
 ):
+    require_x64("63-bit Morton codes")
     n = positions.shape[0]
     num_leaves = int(leaf_starts.shape[0])
 
