@@ -20,6 +20,7 @@ from typing import Any, List, Literal, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from beartype import beartype
 from beartype.typing import Callable
 from jax import core as jax_core
@@ -50,9 +51,12 @@ _COUNT_PASS_FILL_INTERACTION_CAP = 4096
 
 # Module-level helper constants and functions used by the traversal refiners.
 # These are defined at module scope so they are picklable/visible to JAX's
-# tracer during jitting of nested traversal functions.
-_FILLER_PAIR = jnp.asarray([-1, -1], dtype=INDEX_DTYPE)
-_EMPTY_REFINEMENT_PAIRS = jnp.tile(_FILLER_PAIR[None, :], (_MAX_REFINEMENT_PAIRS, 1))
+# tracer during jitting of nested traversal functions. numpy, not jnp: a jax array
+# here started the JAX backend when yggdrax was imported, which is too early for
+# jax.distributed.initialize() and XLA flags set afterwards. In the traced helpers
+# below they are the same INDEX_DTYPE constants.
+_FILLER_PAIR = np.asarray([-1, -1], dtype=INDEX_DTYPE)
+_EMPTY_REFINEMENT_PAIRS = np.tile(_FILLER_PAIR[None, :], (_MAX_REFINEMENT_PAIRS, 1))
 
 
 def _count_sorted_pair(a: Array, b: Array) -> Array:
