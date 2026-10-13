@@ -36,11 +36,35 @@ Install with development tools:
 pip install -e ".[dev]"
 ```
 
+## Requirement: `jax_enable_x64`
+
+yggdrax needs JAX's 64-bit mode. Its Morton codes are 63-bit `uint64`, and a few
+pair counts, global ids and centre-of-mass prefix sums are 64-bit. Turn it on at the
+top of your program, before creating any arrays:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)  # or set JAX_ENABLE_X64=1
+```
+
+yggdrax does not do this for you. Until 2026-10 it switched the flag on at import,
+which changed the default dtypes of the whole process. The functions that need 64-bit
+types now raise a `RuntimeError` naming the flag if it is off. Without the check, JAX
+would narrow the codes to 32 bits and the trees would be wrong without any error.
+
+x64 makes 64-bit types available; it does not make yggdrax compute in float64. The
+dtype of your inputs sets the working precision, so float32 positions stay float32.
+Arrays you create without a dtype do become 64-bit under x64, so pass `dtype=` where
+the width matters.
+
 ## Quick Start
 
 ```python
 import jax
 import jax.numpy as jnp
+
+jax.config.update("jax_enable_x64", True)  # yggdrax needs it, see above
 
 from yggdrax import (
     DualTreeTraversalConfig,

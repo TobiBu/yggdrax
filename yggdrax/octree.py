@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .dtypes import INDEX_DTYPE, is_traced
+from .dtypes import INDEX_DTYPE, is_traced, require_x64
 
 _MORTON_BITS = 63
 _MAX_MORTON_LEVEL = 21
@@ -86,6 +86,7 @@ def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
     ensuring keys at different depths never overlap.  This is used to
     enable O(n log n) parent lookup via :func:`jnp.searchsorted`.
     """
+    require_x64("63-bit Morton codes")
     depths_u64 = jnp.asarray(
         jnp.maximum(0, depths), dtype=jnp.uint64
     )  # clamp negative sentinel values (e.g. -1 padding) before uint64 cast
@@ -98,6 +99,7 @@ def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 
 
 def _prefix_code(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     depths_i32 = jnp.asarray(depths, dtype=INDEX_DTYPE)
     shifts = jnp.maximum(0, _MORTON_BITS - 3 * depths_i32).astype(jnp.uint64)
@@ -106,6 +108,7 @@ def _prefix_code(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 
 
 def _octant_at_depth(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     depths_i32 = jnp.asarray(depths, dtype=INDEX_DTYPE)
     shifts = jnp.maximum(0, _MORTON_BITS - 3 * depths_i32).astype(jnp.uint64)
@@ -116,6 +119,7 @@ def _octant_at_depth(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 def _common_depth_from_codes(
     first_codes: jnp.ndarray, last_codes: jnp.ndarray
 ) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     xor = jnp.bitwise_xor(
         jnp.asarray(first_codes, dtype=jnp.uint64),
         jnp.asarray(last_codes, dtype=jnp.uint64),
@@ -130,6 +134,7 @@ def _common_depth_from_codes(
 
 
 def _resolved_leaf_cells(topology: object) -> tuple[jnp.ndarray, jnp.ndarray]:
+    require_x64("63-bit Morton codes")
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     # Derive num_internal from the static shape (total_nodes = 2*num_leaves - 1).
     num_internal = (node_ranges.shape[0] - 1) // 2
@@ -187,6 +192,7 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     most 2N-1 unique entries.
     """
 
+    require_x64("63-bit Morton codes")
     leaf_starts = jnp.asarray(leaf_starts, dtype=INDEX_DTYPE)
     leaf_ends_exclusive = jnp.asarray(leaf_ends_exclusive, dtype=INDEX_DTYPE)
     leaf_codes = jnp.asarray(leaf_codes, dtype=jnp.uint64)
@@ -402,6 +408,7 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
         ``radix_node_to_oct`` / ``radix_leaf_to_oct`` mappings.
     """
 
+    require_x64("63-bit Morton codes")
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
     num_nodes = int(node_ranges.shape[0])

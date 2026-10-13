@@ -16,7 +16,7 @@ from jax import core as jax_core
 from jax import lax
 from jaxtyping import Array, jaxtyped
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .morton import _compact3_u64
 from .tree import require_morton_topology
 
@@ -118,6 +118,7 @@ _MAX_MORTON_LEVEL = 21
 
 
 def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
+    require_x64("63-bit Morton codes")
     require_morton_topology(tree)
 
     bounds_min = jnp.asarray(tree.bounds_min)

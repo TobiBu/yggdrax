@@ -26,8 +26,10 @@ from typing import Any, NamedTuple, Optional, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array
 
+from ..dtypes import require_x64
 from ..morton import morton_encode_impl
 from .comm import _COUNT_DTYPE, ragged_all_to_all_exchange
 from .sharding import AXIS_NAME
@@ -35,7 +37,8 @@ from .sharding import AXIS_NAME
 # Padding sentinel for Morton codes: sorts padding rows to the tail so the
 # valid (leading ``count``) rows stay contiguous after a re-sort. Built as a
 # uint64 scalar so it never gets parsed as a (overflowing) weak int64.
-_CODE_SENTINEL = jnp.uint64((1 << 64) - 1)
+# A numpy scalar: jnp.uint64 at import raised when x64 was off (see morton.py).
+_CODE_SENTINEL = np.uint64((1 << 64) - 1)
 
 
 def global_bounds(
@@ -59,6 +62,7 @@ def global_bounds(
 def _align_pivots(pivots: Array, align_level: Optional[int]) -> Array:
     """Snap splitter codes down to a level-``align_level`` Morton cell edge."""
 
+    require_x64("63-bit Morton codes")
     if align_level is None:
         return pivots
     shift = max(0, 63 - 3 * int(align_level))
@@ -171,6 +175,7 @@ def _resort_by_code(positions, masses, codes, count, payload=None):
     went where.
     """
 
+    require_x64("63-bit Morton codes")
     order = jnp.argsort(codes)
     positions = positions[order]
     masses = masses[order]
@@ -223,7 +228,7 @@ def _route(
         send_sizes,
         output_capacity=output_capacity,
         axis_name=axis_name,
-        fill_value=_CODE_SENTINEL,
+        fill_value=jnp.uint64(_CODE_SENTINEL),
     )
     count = jnp.sum(recv_sizes).astype(_COUNT_DTYPE)
     if payload is None:

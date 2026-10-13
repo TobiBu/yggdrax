@@ -20,13 +20,14 @@ from typing import Any, List, Literal, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from beartype import beartype
 from beartype.typing import Callable
 from jax import core as jax_core
 from jax import lax
 from jaxtyping import Array, jaxtyped
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .geometry import TreeGeometry
 from .tree import (
     get_leaf_nodes,
@@ -50,9 +51,12 @@ _COUNT_PASS_FILL_INTERACTION_CAP = 4096
 
 # Module-level helper constants and functions used by the traversal refiners.
 # These are defined at module scope so they are picklable/visible to JAX's
-# tracer during jitting of nested traversal functions.
-_FILLER_PAIR = jnp.asarray([-1, -1], dtype=INDEX_DTYPE)
-_EMPTY_REFINEMENT_PAIRS = jnp.tile(_FILLER_PAIR[None, :], (_MAX_REFINEMENT_PAIRS, 1))
+# tracer during jitting of nested traversal functions. numpy, not jnp: a jax array
+# here started the JAX backend when yggdrax was imported, which is too early for
+# jax.distributed.initialize() and XLA flags set afterwards. In the traced helpers
+# below they are the same INDEX_DTYPE constants.
+_FILLER_PAIR = np.asarray([-1, -1], dtype=INDEX_DTYPE)
+_EMPTY_REFINEMENT_PAIRS = np.tile(_FILLER_PAIR[None, :], (_MAX_REFINEMENT_PAIRS, 1))
 
 
 def _count_sorted_pair(a: Array, b: Array) -> Array:
@@ -3124,6 +3128,7 @@ def _run_dual_tree_walk_raw(
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> _DualTreeWalkRawOutputs:
+    require_x64("int64 pair-count totals")
     # Public APIs may pass the wrapper ``yggdrax.tree.RadixTree``.
     # Jitted kernels require the underlying topology pytree.
     tree = tree.topology if hasattr(tree, "topology") else tree
@@ -3747,6 +3752,7 @@ def _run_far_only_compact_with_bounded_count_pass(
 ) -> CompactTaggedFarPairs:
     """Build compact far pairs with a bounded count pass under explicit caps."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
@@ -3949,6 +3955,7 @@ def _run_near_only_compact_with_bounded_count_pass(
 ) -> NodeNeighborList:
     """Build compact neighbor lists with a bounded count pass under explicit caps."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
@@ -4145,6 +4152,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
     """Build compact far pairs and near neighbors from one shared count pass."""
 
+    require_x64("int64 pair-count totals")
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )

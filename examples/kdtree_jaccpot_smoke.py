@@ -22,6 +22,9 @@ from yggdrax import (
     missing_fmm_core_topology_fields,
 )
 
+# yggdrax needs 64-bit types (README) and no longer turns them on at import.
+jax.config.update("jax_enable_x64", True)
+
 
 def _add_jaccpot_repo_to_path() -> None:
     """Allow imports from a sibling local jaccpot checkout."""

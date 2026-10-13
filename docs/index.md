@@ -25,10 +25,21 @@ pip install -e ".[dev]"      # library + quality tooling
 pip install -e ".[docs]"     # to build this documentation
 ```
 
+## Requirement: `jax_enable_x64`
+
+yggdrax needs JAX's 64-bit mode: Morton codes are 63-bit `uint64`, and some pair
+counts, global ids and centre-of-mass prefix sums are 64-bit. Enable it at the top of
+your program, before creating arrays, with `jax.config.update("jax_enable_x64", True)`
+or `JAX_ENABLE_X64=1`. yggdrax does not switch it on itself, and the functions that
+need it raise a `RuntimeError` when it is off. x64 does not make the computation
+float64: the dtype of your inputs sets the working precision.
+
 ## Quick start
 
 ```python
 import jax
+
+jax.config.update("jax_enable_x64", True)
 
 from yggdrax import (
     DualTreeTraversalConfig,

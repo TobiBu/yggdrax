@@ -1,9 +1,10 @@
-"""Yggdrax: tree generation, geometry, traversal, and interaction APIs."""
+"""Yggdrax: tree generation, geometry, traversal, and interaction APIs.
 
-from jax import config as _jax_config
-
-# Morton codes rely on uint64 bit arithmetic.
-_jax_config.update("jax_enable_x64", True)
+yggdrax needs ``jax_enable_x64=True``: Morton codes are 63-bit ``uint64``, and a few
+counts and prefix sums are 64-bit. It does not switch the flag on for you. Enable it
+before creating arrays, with ``jax.config.update("jax_enable_x64", True)`` or
+``JAX_ENABLE_X64=1``; the functions that need it raise if it is off.
+"""
 
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index

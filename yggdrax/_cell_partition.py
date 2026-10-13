@@ -39,7 +39,7 @@ import numpy as np
 from jax import lax
 from jaxtyping import Array
 
-from .dtypes import INDEX_DTYPE
+from .dtypes import INDEX_DTYPE, require_x64
 
 __all__ = [
     "CellLeafPartition",
@@ -136,6 +136,7 @@ def adaptive_cell_leaf_partition(
         If ``leaf_size`` or ``capacity`` is not positive, or ``max_level`` or
         ``min_level`` is out of range.
     """
+    require_x64("63-bit Morton codes")
     if int(leaf_size) < 1:
         raise ValueError("leaf_size must be >= 1")
     if int(capacity) < 1:

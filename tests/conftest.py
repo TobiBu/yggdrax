@@ -15,6 +15,17 @@ if os.environ.get("YGGDRAX_TEST_KEEP_LOOP_VECTORIZER", "0") != "1" and (
         + " --xla_backend_extra_options=-vectorize-loops=false"
     ).strip()
 
+import jax  # noqa: E402  (importing jax does not start a backend; XLA_FLAGS is set)
+
+# yggdrax needs jax_enable_x64 and no longer switches it on at import (README). The
+# suite turns it on here, before any test module creates an array. An explicit
+# JAX_ENABLE_X64=0 leaves it off: that is how the x64-off guard sweep runs.
+jax.config.update(
+    "jax_enable_x64",
+    os.environ.get("JAX_ENABLE_X64", "1").strip().lower()
+    not in ("0", "false", "off", "no", "n", "f"),
+)
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
