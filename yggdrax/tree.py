@@ -1743,6 +1743,7 @@ def rebuild_static_radix_tree_from_template(
     return_overflow: bool = False,
     num_valid: Optional[Array] = None,
     cell_min_level: int = 0,
+    return_num_leaves: bool = False,
 ):
     """Refresh particles using an existing static-radix data structure.
 
@@ -1750,6 +1751,10 @@ def rebuild_static_radix_tree_from_template(
     template's leaf capacity and width (see
     :func:`yggdrax._tree_impl.build_static_cells_tree`); ``return_overflow``
     then appends the partition's overflow flag to the returned tuple.
+
+    ``return_num_leaves`` (cells only) appends the partition's live leaf count
+    after it: the exact count the positions need, also past an overflow, so a
+    caller whose capacity overflowed can size the next one from it.
 
     ``num_valid`` is the live row count of a capacity-padded shard (the
     distributed lane); ``None`` treats every row as live. Cells only.
@@ -1777,10 +1782,15 @@ def rebuild_static_radix_tree_from_template(
         return_overflow=return_overflow,
         num_valid=num_valid,
         cell_min_level=int(cell_min_level),
+        return_num_leaves=return_num_leaves,
     )
-    overflow = None
-    if return_overflow:
-        *core, overflow = result
+    # the partition's scalars ride at the end (overflow, then the leaf count):
+    # split them off so the tree and reordered arrays are wrapped as before
+    extras: list[Any] = []
+    num_extras = int(bool(return_overflow)) + int(bool(return_num_leaves))
+    if num_extras:
+        core = list(result[:-num_extras])
+        extras = list(result[-num_extras:])
         result = tuple(core) if len(core) > 1 else core[0]
     wrapped = _wrap_radix_public_result(
         result=result,
@@ -1788,9 +1798,9 @@ def rebuild_static_radix_tree_from_template(
         return_reordered=return_reordered,
         return_workspace=False,
     )
-    if return_overflow:
+    if extras:
         items = list(wrapped) if isinstance(wrapped, tuple) else [wrapped]
-        return (*items, overflow)
+        return (*items, *extras)
     return wrapped
 
 
