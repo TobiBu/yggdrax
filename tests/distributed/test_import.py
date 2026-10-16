@@ -17,7 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from yggdrax.distributed import device_count, distributed_let_import, make_mesh
+from yggdrax.distributed import device_count, make_mesh
+
+from ._let_drivers import distributed_let_import
 
 pytestmark = pytest.mark.skipif(
     device_count() < 2, reason="halo import needs >= 2 devices"
@@ -43,7 +45,6 @@ def metrics():
         leaf_size=_LEAF,
         output_capacity=_CAP,
         theta=0.5,
-        equalize=True,
     )
     return pts, mass, m
 

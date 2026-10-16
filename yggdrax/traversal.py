@@ -32,6 +32,7 @@ def build_prepared_tree_artifacts(
     mac_type: MACType = "bh",
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
 ) -> PreparedTreeArtifacts:
     """Build a tree, geometry, and interactions in one call.
 
@@ -63,6 +64,11 @@ def build_prepared_tree_artifacts(
         used when omitted for KD-trees.
     dehnen_radius_scale
         Effective-radius scale applied for the Dehnen MAC.
+    separation_floor
+        Minimum gap ``|c_b - c_a| - r_a - r_b`` of an accepted pair (the MAC
+        extents); ``0`` (default) adds no test. A softening kernel with compact
+        support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
+        unsoftened far field exact.
 
     Returns
     -------
@@ -110,6 +116,7 @@ def build_prepared_tree_artifacts(
         traversal_config=traversal_cfg,
         mac_type=mac_type,
         dehnen_radius_scale=float(dehnen_radius_scale),
+        separation_floor=separation_floor,
         return_result=True,
     )
     traversal_result = (

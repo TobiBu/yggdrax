@@ -1,34 +1,26 @@
-"""Yggdrax: tree generation, geometry, traversal, and interaction APIs."""
+"""Yggdrax: tree generation, geometry, traversal, and interaction APIs.
 
-from jax import config as _jax_config
-
-# Morton codes rely on uint64 bit arithmetic.
-_jax_config.update("jax_enable_x64", True)
+yggdrax needs ``jax_enable_x64=True``: Morton codes are 63-bit ``uint64``, and a few
+counts and prefix sums are 64-bit. It does not switch the flag on for you. Enable it
+before creating arrays, with ``jax.config.update("jax_enable_x64", True)`` or
+``JAX_ENABLE_X64=1``; the functions that need it raise if it is off.
+"""
 
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
-from .geometry import (
-    LevelMajorTreeGeometry,
-    TreeGeometry,
-    compute_tree_geometry,
-    geometry_to_level_major,
-)
+from .geometry import TreeGeometry, compute_tree_geometry
 from .interactions import (
     CompactTaggedFarPairs,
-    CompactTaggedOctreeFarPairs,
     DualTreeRetryEvent,
     DualTreeTraversalConfig,
     DualTreeWalkResult,
     MACType,
     NodeInteractionList,
     NodeNeighborList,
-    OctreeNativeNeighborList,
     PairPolicy,
     build_compact_far_pairs_and_leaf_neighbor_lists,
     build_interactions_and_neighbors,
     build_leaf_neighbor_lists,
-    build_octree_native_far_pairs,
-    build_octree_native_neighbor_lists,
 )
 from .kdtree import (
     KDTree,
@@ -48,15 +40,6 @@ from .octree import (
     OctreeTopology,
     build_explicit_octree_metadata,
 )
-from .octree_uvwx import (
-    OctreeUVLists,
-    UniformOctreeExecutionView,
-    build_adaptive_octree_execution_view_device,
-    build_sparse_uniform_octree_execution_view_device,
-    build_uniform_octree_execution_view,
-    build_uniform_octree_execution_view_device,
-    build_uniform_octree_uv,
-)
 from .protocols import (
     MortonLeafBoundsProtocol,
     TopologyContainerProtocol,
@@ -70,7 +53,6 @@ from .tree import (
     FMM_TOPOLOGY_REQUIRED_FIELDS,
     MAX_TREE_LEVELS,
     MORTON_TOPOLOGY_REQUIRED_FIELDS,
-    FixedDepthTreeBuildConfig,
     KDParticleTree,
     OctreeTree,
     RadixTree,
@@ -82,10 +64,6 @@ from .tree import (
     TreeBuildRequest,
     TreeType,
     available_tree_types,
-    build_fixed_depth_octree,
-    build_fixed_depth_octree_jit,
-    build_fixed_depth_tree,
-    build_fixed_depth_tree_jit,
     build_octree,
     build_octree_jit,
     build_static_radix_tree,
@@ -125,11 +103,7 @@ __all__ = [
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
     "CompactTaggedFarPairs",
-    "CompactTaggedOctreeFarPairs",
-    "OctreeNativeNeighborList",
-    "FixedDepthTreeBuildConfig",
     "INDEX_DTYPE",
-    "LevelMajorTreeGeometry",
     "NodeInteractionList",
     "NodeNeighborList",
     "PairPolicy",
@@ -139,8 +113,6 @@ __all__ = [
     "KDParticleTree",
     "OctreeTree",
     "OctreeTopology",
-    "OctreeUVLists",
-    "UniformOctreeExecutionView",
     "RadixTree",
     "RadixTreeWorkspace",
     "Tree",
@@ -158,16 +130,10 @@ __all__ = [
     "build_kdtree",
     "count_neighbors",
     "query_neighbors",
-    "build_fixed_depth_tree",
-    "build_fixed_depth_octree",
-    "build_fixed_depth_octree_jit",
-    "build_fixed_depth_tree_jit",
     "available_tree_types",
     "build_static_radix_tree",
     "build_interactions_and_neighbors",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
-    "build_octree_native_far_pairs",
-    "build_octree_native_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_prepared_tree_artifacts",
     "build_tree",
@@ -189,17 +155,11 @@ __all__ = [
     "missing_leaf_topology_fields",
     "missing_morton_topology_fields",
     "compute_tree_geometry",
-    "geometry_to_level_major",
     "get_common_prefix_length",
     "infer_bounds",
     "morton_decode",
     "morton_encode",
     "build_explicit_octree_metadata",
-    "build_adaptive_octree_execution_view_device",
-    "build_sparse_uniform_octree_execution_view_device",
-    "build_uniform_octree_execution_view",
-    "build_uniform_octree_execution_view_device",
-    "build_uniform_octree_uv",
     "resolve_tree_topology",
     "require_fmm_core_topology",
     "require_fmm_topology",

@@ -57,9 +57,9 @@ From the latest `--durations=25` run:
 1. `tests/unit/test_octree_topology.py::test_octree_matches_radix_interaction_counts` — `18.47s`
 2. `tests/unit/test_backend_conformance.py::test_backend_conformance[radix]` — `13.63s`
 3. `tests/unit/test_interactions_backend_parity.py::test_build_interactions_and_neighbors_contract_holds_for_backends[radix-8]` — `13.16s`
-4. `tests/unit/test_dense_interactions.py::test_dense_sources_match_sparse_lists` setup — `13.11s`
+4. `tests/unit/test_dense_interactions.py::test_dense_sources_match_sparse_lists` setup — `13.11s` (removed with `dense_interactions` in the 2026-10 cleanup, Y2)
 5. `tests/unit/test_backend_conformance.py::test_backend_conformance[octree]` — `12.25s`
-6. `tests/unit/test_tree.py::test_build_fixed_depth_octree_jit_matches_eager` — `11.31s`
+6. `tests/unit/test_tree.py::test_build_fixed_depth_octree_jit_matches_eager` — `11.31s` (removed with fixed-depth builds in the 2026-10 cleanup, Y2)
 7. `tests/unit/test_interactions_backend_parity.py::test_build_interactions_and_neighbors_contract_holds_for_backends[kdtree-16]` — `11.29s`
 8. `tests/unit/test_two_pass_builder.py::test_count_pass_uses_compact_fill_path` — `11.25s`
 
@@ -77,7 +77,7 @@ The suite is no longer dominated by easy Python-side waste. The remaining large 
 If we continue runtime work, the highest-value next steps are:
 
 1. Revisit overlap between backend conformance and backend parity tests.
-2. Reduce or share setup in the remaining dense interaction tests.
+2. ~~Reduce or share setup in the remaining dense interaction tests.~~ Moot: `dense_interactions` and its tests were removed in the 2026-10 cleanup (Y2).
 3. Inspect slow traversal-policy tests for smaller static configs or reusable fixtures.
 4. Decide whether the slowest JIT parity tests should remain in the default local suite or move behind a `slow` marker while staying in CI.
 

@@ -20,6 +20,9 @@ from yggdrax import (
     compute_tree_geometry,
 )
 
+# yggdrax needs 64-bit types (README) and no longer turns them on at import.
+jax.config.update("jax_enable_x64", True)
+
 
 def _add_jaccpot_repo_to_path() -> None:
     here = pathlib.Path(__file__).resolve()

@@ -220,3 +220,88 @@ def test_num_valid_is_traceable_and_default_is_unchanged():
     )
     for field in omitted._fields:
         assert jnp.array_equal(getattr(omitted, field), getattr(explicit, field))
+
+
+@pytest.mark.parametrize("min_level", [0, 4, 8])
+def test_min_level_device_and_numpy_agree_and_no_leaf_is_coarser(min_level):
+    """``min_level`` splits sparse cells shallower than it even when they fit."""
+    codes = _sorted_codes(6000, seed=7)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    s_np, e_np, d_np = adaptive_cell_leaf_partition_numpy(
+        codes_np, leaf_size=32, min_level=min_level
+    )
+    part = adaptive_cell_leaf_partition(
+        codes, leaf_size=32, capacity=4096, min_level=min_level
+    )
+    k = int(part.num_leaves)
+    assert not bool(part.overflow)
+    np.testing.assert_array_equal(np.asarray(part.leaf_starts)[:k], s_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_ends)[:k], e_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_depths)[:k], d_np)
+    assert d_np.min() >= min_level
+    assert s_np[0] == 0 and e_np[-1] == codes_np.shape[0]
+    assert np.all(e_np[:-1] == s_np[1:]), "leaves tile the particles"
+    assert np.all(e_np - s_np <= 32)
+
+
+def test_min_level_zero_is_the_unconstrained_partition():
+    """CONTROL: the default must be bit-identical to omitting the argument, and a
+    positive level must actually change a Plummer partition (its outskirt leaves
+    are coarse), or the test above checks nothing."""
+    codes = _sorted_codes(6000, seed=7)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    a = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32)
+    b = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32, min_level=0)
+    for x, y in zip(a, b):
+        np.testing.assert_array_equal(x, y)
+    assert a[2].min() < 4, "vacuous: no coarse leaf to split"
+    c = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=32, min_level=4)
+    assert len(c[0]) > len(a[0])
+
+
+def test_min_level_out_of_range_is_refused():
+    codes = _sorted_codes(100)
+    with pytest.raises(ValueError, match="min_level"):
+        adaptive_cell_leaf_partition(codes, leaf_size=8, capacity=64, min_level=-1)
+    with pytest.raises(ValueError, match="min_level"):
+        adaptive_cell_leaf_partition(
+            codes, leaf_size=8, capacity=64, max_level=10, min_level=11
+        )
+
+
+@pytest.mark.parametrize(
+    "n, leaf_size, min_level, max_level, duplicates",
+    [
+        (3000, 1, 0, MORTON_LEVELS, 0),
+        (3000, 7, 3, MORTON_LEVELS, 40),
+        (5000, 64, 8, MORTON_LEVELS, 0),
+        (500, 64, 0, 12, 0),
+        (40, 64, 0, MORTON_LEVELS, 0),  # fewer particles than one window
+        (2000, 16, 5, 5, 0),  # min_level == max_level: everything at max_level
+    ],
+)
+def test_window_depths_equal_the_level_loop(
+    n, leaf_size, min_level, max_level, duplicates
+):
+    """The device depth (one sliding window) is the numpy level loop's, bit for bit.
+
+    Dense centres, sparse outskirts, coincident runs longer than a leaf, a
+    max_level cut, fewer particles than a window, min_level == max_level.
+    """
+    codes = _sorted_codes(n, seed=n + leaf_size, duplicates=duplicates)
+    codes_np = np.asarray(codes).astype(np.uint64)
+    s_np, e_np, d_np = adaptive_cell_leaf_partition_numpy(
+        codes_np, leaf_size=leaf_size, min_level=min_level, max_level=max_level
+    )
+    part = adaptive_cell_leaf_partition(
+        codes,
+        leaf_size=leaf_size,
+        capacity=int(s_np.size) + 5,
+        min_level=min_level,
+        max_level=max_level,
+    )
+    k = int(part.num_leaves)
+    assert k == s_np.size and not bool(part.overflow)
+    np.testing.assert_array_equal(np.asarray(part.leaf_starts)[:k], s_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_ends)[:k], e_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_depths)[:k], d_np)

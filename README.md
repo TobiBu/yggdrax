@@ -16,11 +16,10 @@ can consume both the proven traversal buffers and octree-style child tables.
 ## Features
 
 - Morton encode/decode and stable Morton sorting for 3D points
-- LBVH and fixed-depth radix tree construction
+- LBVH (adaptive) and static-shape radix tree construction
 - Explicit octree metadata derived from Morton/radix topology
 - Tree geometry extraction (bounds, centers, extents, radii)
 - Dual-tree far-field and near-field interaction builders
-- Dense and grouped interaction buffer transforms for batched kernels
 - Prepared artifact utilities for downstream solver integrations
 
 ## Installation
@@ -37,11 +36,35 @@ Install with development tools:
 pip install -e ".[dev]"
 ```
 
+## Requirement: `jax_enable_x64`
+
+yggdrax needs JAX's 64-bit mode. Its Morton codes are 63-bit `uint64`, and a few
+pair counts, global ids and centre-of-mass prefix sums are 64-bit. Turn it on at the
+top of your program, before creating any arrays:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)  # or set JAX_ENABLE_X64=1
+```
+
+yggdrax does not do this for you. Until 2026-10 it switched the flag on at import,
+which changed the default dtypes of the whole process. The functions that need 64-bit
+types now raise a `RuntimeError` naming the flag if it is off. Without the check, JAX
+would narrow the codes to 32 bits and the trees would be wrong without any error.
+
+x64 makes 64-bit types available; it does not make yggdrax compute in float64. The
+dtype of your inputs sets the working precision, so float32 positions stay float32.
+Arrays you create without a dtype do become 64-bit under x64, so pass `dtype=` where
+the width matters.
+
 ## Quick Start
 
 ```python
 import jax
 import jax.numpy as jnp
+
+jax.config.update("jax_enable_x64", True)  # yggdrax needs it, see above
 
 from yggdrax import (
     DualTreeTraversalConfig,
@@ -74,7 +97,7 @@ interactions, neighbors = build_interactions_and_neighbors(
 ```
 
 `build_tree(...)` continues to expose the radix/LBVH backend directly. The
-octree wrappers (`build_octree(...)`, `build_fixed_depth_octree(...)`) preserve
+octree wrappers (`build_octree(...)`, `build_octree_jit(...)`) preserve
 the same compatibility fields while additionally exposing explicit octree
 buffers such as `oct_children`, `oct_node_depths`, and `radix_node_to_oct`.
 
@@ -116,8 +139,10 @@ your downstream solver.
 
 - For FMM-style runs (e.g. jaccpot), `mac_type="dehnen"` is the recommended
   path for apples-to-apples parity checks.
-- Octree builds currently share the radix traversal core, so interaction-count
-  parity between `radix` and `octree` should hold for the same build settings.
+- Octree builds share the radix traversal core in every walk builder, so
+  interaction-count parity between `radix` and `octree` should hold for the same
+  build settings. (The octree-native walk, the `build_octree_native_*` builders
+  and the `octree_uvwx` execution views were removed in the 2026-10 cleanup, Y1.)
 - KD-tree traversal uses a calibrated default effective radius scale for
   Dehnen MAC (`dehnen_radius_scale=1.2`) to match near-field/far-field split
   behavior more closely with radix trees.
@@ -148,14 +173,20 @@ repeated builds and traversals:
 
 - `TreeBuildConfig`: adaptive radix-tree settings (`leaf_size`,
   `return_reordered`, reusable workspace handling)
-- `FixedDepthTreeBuildConfig`: fixed-depth tree settings, including local
-  Morton refinement controls
 - `DualTreeTraversalConfig`: traversal queue, block size, interaction capacity,
   and neighbor capacity
 
-When a `config=...` object is passed to `build_tree(...)` or
-`build_fixed_depth_tree(...)`, or their octree counterparts, it takes precedence over the equivalent
-individual keyword arguments.
+When a `config=...` object is passed to `build_tree(...)` or `build_octree(...)`
+(or their `_jit` variants), it takes precedence over the equivalent individual
+keyword arguments.
+
+Fixed-depth builds (`build_mode="fixed_depth"`, `build_fixed_depth_tree(...)`,
+`build_fixed_depth_octree(...)`, their `_jit` variants and
+`FixedDepthTreeBuildConfig`) were removed in the 2026-10 cleanup (Y2);
+`build_mode="fixed_depth"` now raises a `ValueError`. The fixed-depth keywords of
+`Tree.from_particles(...)` (`target_leaf_particles`, `max_depth`, `refine_local`,
+`max_refine_levels`, `aspect_threshold`, `min_refined_leaf_particles`) are still
+accepted, and ignored, because jaccpot passes them.
 
 Conformance tests:
 
@@ -211,7 +242,6 @@ python -m sphinx -b html docs docs/_build/html
 - `yggdrax/protocols.py`: backend capability protocols
 - `yggdrax/geometry.py`, `yggdrax/_geometry_impl.py`: geometry wrappers and implementations
 - `yggdrax/interactions.py`, `yggdrax/_interactions_impl.py`: traversal and interaction generation
-- `yggdrax/dense_interactions.py`, `yggdrax/grouped_interactions.py`: interaction layout utilities
 - `tests/unit`: unit test suite for API and implementation behavior
 - `examples`: runnable examples and notebooks
 

@@ -63,23 +63,53 @@ def test_tree_from_particles_builds_adaptive_radix_tree():
     assert tree.inverse_permutation is not None
 
 
-def test_tree_from_particles_builds_fixed_depth_tree():
+@pytest.mark.parametrize("tree_type", ["radix", "octree"])
+def test_tree_from_particles_fixed_depth_raises_removal_error(tree_type: str):
     positions, masses = _sample_problem(n=64)
-    tree = Tree.from_particles(
+    with pytest.raises(
+        ValueError, match=r"fixed_depth.*removed.*\(Y2\).*'adaptive'.*'static_radix'"
+    ):
+        Tree.from_particles(
+            positions,
+            masses,
+            tree_type=tree_type,
+            build_mode="fixed_depth",
+            target_leaf_particles=16,
+            return_reordered=True,
+        )
+
+
+@pytest.mark.parametrize("tree_type", ["radix", "octree", "kdtree"])
+def test_fixed_depth_keywords_are_accepted_and_ignored(tree_type: str):
+    """jaccpot passes the fixed-depth keywords on every non-LBVH build.
+
+    They were accepted and used only by fixed-depth builds, which went in the
+    2026-10 cleanup (Y2). They must stay accepted, and change nothing.
+    """
+
+    positions, masses = _sample_problem(n=64)
+    plain = Tree.from_particles(
+        positions, masses, tree_type=tree_type, leaf_size=8, return_reordered=True
+    )
+    with_keywords = Tree.from_particles(
         positions,
         masses,
-        tree_type="radix",
-        build_mode="fixed_depth",
-        target_leaf_particles=16,
+        tree_type=tree_type,
+        leaf_size=8,
         return_reordered=True,
+        target_leaf_particles=3,
+        max_depth=2,
+        refine_local=False,
+        max_refine_levels=7,
+        aspect_threshold=1.5,
+        min_refined_leaf_particles=9,
     )
 
-    assert tree.tree_type == "radix"
-    assert tree.build_mode == "fixed_depth"
-    assert tree.num_particles == 64
-    assert tree.positions_sorted is not None
-    assert tree.masses_sorted is not None
-    assert tree.inverse_permutation is not None
+    assert jax.tree.structure(plain) == jax.tree.structure(with_keywords)
+    for left, right in zip(
+        jax.tree.leaves(plain), jax.tree.leaves(with_keywords), strict=True
+    ):
+        assert jnp.array_equal(left, right, equal_nan=True)
 
 
 def test_tree_from_particles_builds_octree():

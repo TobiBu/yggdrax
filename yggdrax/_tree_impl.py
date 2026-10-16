@@ -5,11 +5,9 @@ The radix tree is built from sorted Morton codes and represents the
 hierarchical octree structure implicitly through the Morton code ordering.
 """
 
-import math
 import os
-from collections import deque
 from functools import partial
-from typing import Any, NamedTuple, Optional, Union, cast
+from typing import Any, Callable, NamedTuple, Optional, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +16,7 @@ from beartype import beartype
 from jax import lax
 from jaxtyping import Array, Float, jaxtyped
 
-from .dtypes import INDEX_DTYPE, as_index
+from .dtypes import INDEX_DTYPE, as_index, require_x64
 
 
 class RadixTree(NamedTuple):
@@ -85,7 +83,10 @@ class RadixTreeWorkspace(NamedTuple):
 Bounds = tuple[Float[Array, "3"], Float[Array, "3"]]
 
 MAX_TREE_LEVELS = 64
-_MAX_MORTON_LEVEL = 21  # 21 * 3 = 63 bits of Morton depth
+#: Pointer-doubling rounds of the node depths: reaches depth 2**8, past
+#: MAX_TREE_LEVELS (the bound before was ``bit_length(total_nodes) + 1``, 22
+#: rounds at 1.76M nodes).
+_DEPTH_ROUNDS_CAP = 8
 
 
 # ---------------------------------------------
@@ -93,205 +94,29 @@ _MAX_MORTON_LEVEL = 21  # 21 * 3 = 63 bits of Morton depth
 # ---------------------------------------------
 
 
-def _refine_leaf_partitions_by_aspect(
-    pos_sorted_np: np.ndarray,
-    sorted_codes_np: np.ndarray,
-    leaf_starts_np: np.ndarray,
-    leaf_ends_np: np.ndarray,
-    leaf_codes_np: np.ndarray,
-    leaf_depths_np: np.ndarray,
-    current_depth: int,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_leaf_particles: int = 2,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Refine Morton leaf partitions locally where aspect ratio is high."""
+def _morton_sort(codes: Array) -> tuple[Array, Array]:
+    """Stable sort by Morton code: ``(permutation, sorted codes)`` from ONE sort.
 
-    new_starts: list[int] = []
-    new_ends: list[int] = []
-    new_codes: list[np.uint64] = []
-    new_depths: list[int] = []
+    ``jnp.argsort(codes, stable=True)`` sorts ``(codes, iota)`` with the iota at
+    the default integer width (int64 under x64) and returns only the permutation,
+    after which the caller gathered the codes a second time. Sorting the pair
+    ``(codes, INDEX_DTYPE iota)`` with ``is_stable`` gives the same permutation
+    (ties break by input order) and the sorted codes together.
 
-    queue = deque[tuple[int, int, np.uint64, int]]()
-    for i in range(leaf_starts_np.shape[0]):
-        queue.append(
-            (
-                int(leaf_starts_np[i]),
-                int(leaf_ends_np[i]),
-                np.uint64(leaf_codes_np[i]),
-                int(leaf_depths_np[i]),
-            )
-        )
+    Parameters
+    ----------
+    codes
+        ``(n,)`` Morton codes.
 
-    eps = 1e-12
-    while queue:
-        s, e, base_code, depth_level = queue.popleft()
-        if e <= s:
-            # Preserve empty leaves so Morton layout remains stable.
-            new_starts.append(s)
-            new_ends.append(e)
-            new_codes.append(base_code)
-            new_depths.append(depth_level)
-            continue
-
-        pts = pos_sorted_np[s:e]
-        mins = pts.min(axis=0)
-        maxs = pts.max(axis=0)
-        extents = maxs - mins
-        min_axis = float(max(extents.min(), eps))
-        max_axis = float(extents.max())
-        aspect = max_axis / min_axis if min_axis > 0 else float("inf")
-
-        exceeded_levels = (depth_level - current_depth) >= max_refine_levels
-        if aspect <= aspect_threshold or exceeded_levels:
-            new_starts.append(s)
-            new_ends.append(e)
-            new_codes.append(base_code)
-            new_depths.append(depth_level)
-            continue
-
-        entry_shift = max(0, 64 - depth_level * 3)
-        child_depth = depth_level + 1
-        child_shift = entry_shift - 3
-        if child_shift < 0:
-            new_starts.append(s)
-            new_ends.append(e)
-            new_codes.append(base_code)
-            new_depths.append(depth_level)
-            continue
-
-        sub_ids = (
-            (sorted_codes_np[s:e] >> np.uint64(child_shift)) & np.uint64(0x7)
-        ).astype(np.int64)
-        counts = np.bincount(sub_ids, minlength=8)
-        if int(np.count_nonzero(counts)) <= 1:
-            new_starts.append(s)
-            new_ends.append(e)
-            new_codes.append(base_code)
-            new_depths.append(depth_level)
-            continue
-
-        offset = s
-        for sub in range(8):
-            cnt = int(counts[sub])
-            if cnt == 0:
-                continue
-            child_s = offset
-            child_e = offset + cnt
-            child_code = np.uint64(
-                base_code | (np.uint64(sub) << np.uint64(child_shift))
-            )
-            if cnt <= min_leaf_particles:
-                new_starts.append(child_s)
-                new_ends.append(child_e)
-                new_codes.append(child_code)
-                new_depths.append(child_depth)
-            else:
-                queue.append((child_s, child_e, child_code, child_depth))
-            offset = child_e
-
-    if len(new_starts) == 0:
-        return leaf_starts_np, leaf_ends_np, leaf_codes_np, leaf_depths_np
-
-    starts_arr = np.asarray(new_starts, dtype=np.int64)
-    ends_arr = np.asarray(new_ends, dtype=np.int64)
-    codes_arr = np.asarray(new_codes, dtype=np.uint64)
-    depths_arr = np.asarray(new_depths, dtype=np.int64)
-
-    # Order leaves by particle ``start`` and break ties by Morton ``code``.
-    #
-    # The LBVH builder requires the per-leaf code sequence to be monotonically
-    # non-decreasing in Morton-sort order; a non-monotonic sequence drives the
-    # Karras split/parent assignment into an inconsistent state and produces a
-    # malformed (cyclic) parent array.  Empty buckets are intentionally
-    # preserved here (see above) so the Morton layout stays stable, but they
-    # carry a *synthetic* cell code and share a particle ``start`` with their
-    # neighbours.  Sorting on ``start`` alone (with an unstable sort, and no
-    # code tie-break) can therefore interleave those zero-width buckets in an
-    # order that scrambles the codes -- which is exactly what happens when many
-    # particles share identical codes (e.g. out-of-bounds points clipped to the
-    # same boundary cell) and almost every bucket is empty.
-    #
-    # Using ``code`` as the tie-break restores monotonicity: for this Morton
-    # partition a lower code always implies a lower-or-equal ``start`` (bucket
-    # order matches code order and ``start`` is a running particle count), so
-    # ordering by ``(start, code)`` yields both a contiguous ``[0, n)``
-    # partition and a non-decreasing code sequence.  ``np.lexsort`` sorts by its
-    # last key first, so ``start`` is the primary key and ``code`` the tie-break.
-    order = np.lexsort((codes_arr, starts_arr))
-    return (
-        starts_arr[order],
-        ends_arr[order],
-        codes_arr[order],
-        depths_arr[order],
-    )
-
-
-def _maybe_refine_fixed_depth_leaf_partitions(
-    *,
-    positions: Array,
-    sorted_indices: Array,
-    sorted_codes: Array,
-    leaf_starts: Array,
-    leaf_ends: Array,
-    leaf_codes: Array,
-    leaf_depths: Array,
-    resolved_depth: int,
-    refine_local: bool,
-    max_refine_levels: int,
-    aspect_threshold: float,
-    min_refined_leaf_particles: int,
-) -> tuple[Array, Array, Array, Array]:
-    """Run host-side local refinement only when eager execution allows it.
-
-    The eager path fetches all required arrays with a single ``device_get`` so
-    the refinement helper does not trigger multiple host/device synchronizations.
-    Traced/JIT execution returns the original JAX partitions unchanged.
+    Returns
+    -------
+    tuple[Array, Array]
+        ``(sorted_indices, sorted_codes)``: ``codes[sorted_indices] ==
+        sorted_codes``, the indices in ``INDEX_DTYPE``.
     """
-
-    if not refine_local or isinstance(positions, jax.core.Tracer):
-        return leaf_starts, leaf_ends, leaf_codes, leaf_depths
-
-    try:
-        (
-            pos_sorted_np,
-            sorted_codes_np,
-            leaf_starts_np,
-            leaf_ends_np,
-            leaf_codes_np,
-            (leaf_depths_np),
-        ) = jax.device_get(
-            (
-                positions[sorted_indices],
-                sorted_codes,
-                leaf_starts,
-                leaf_ends,
-                leaf_codes,
-                leaf_depths,
-            )
-        )
-        refined = _refine_leaf_partitions_by_aspect(
-            pos_sorted_np,
-            np.asarray(sorted_codes_np, dtype=np.uint64),
-            np.asarray(leaf_starts_np, dtype=np.int64),
-            np.asarray(leaf_ends_np, dtype=np.int64),
-            np.asarray(leaf_codes_np, dtype=np.uint64),
-            np.asarray(leaf_depths_np, dtype=np.int64),
-            resolved_depth,
-            max_refine_levels=max_refine_levels,
-            aspect_threshold=aspect_threshold,
-            min_leaf_particles=min_refined_leaf_particles,
-        )
-    except (TypeError, ValueError):
-        return leaf_starts, leaf_ends, leaf_codes, leaf_depths
-
-    refined_starts_np, refined_ends_np, refined_codes_np, refined_depths_np = refined
-    return (
-        jnp.asarray(refined_starts_np, dtype=INDEX_DTYPE),
-        jnp.asarray(refined_ends_np, dtype=INDEX_DTYPE),
-        jnp.asarray(refined_codes_np, dtype=jnp.uint64),
-        jnp.asarray(refined_depths_np, dtype=INDEX_DTYPE),
-    )
+    iota = lax.broadcasted_iota(INDEX_DTYPE, codes.shape, 0)
+    sorted_codes, sorted_indices = lax.sort((codes, iota), num_keys=1, is_stable=True)
+    return sorted_indices, sorted_codes
 
 
 def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
@@ -301,6 +126,7 @@ def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     Implemented with a fixed sequence of shifts and conditional adds to
     avoid Python control flow. Works on CPU/GPU/TPU without custom calls.
     """
+    require_x64("63-bit Morton codes")
     x = x.astype(jnp.uint64)
     n = as_index(0)
 
@@ -337,13 +163,35 @@ def _clz_u64(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(x == 0, as_index(64), n)
 
 
-def _lcp_codes_only(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+def _unroll_step_searches() -> bool:
+    """Whether :func:`_descending_step_search` unrolls (every backend but CPU)."""
+    return jax.default_backend() != "cpu"
+
+
+def _descending_step_search(
+    body: Callable[[jax.Array, jax.Array], jax.Array],
+    init: jax.Array,
+    num_bits: int,
+) -> jax.Array:
     """
-    Leading common prefix length for two uint64 Morton codes
-    (no index tie-break). Returns int32 in [0, 64].
+    Apply ``carry = body(step, carry)`` for ``step = 2**(num_bits - 1), ..., 1``.
+
+    On GPU the steps are unrolled so XLA fuses the search into one kernel. On
+    CPU they run in a ``fori_loop``: JAX 0.11.2's XLA:CPU hands the unrolled
+    chain to LLVM's loop vectorizer, which does not finish compiling it. The
+    steps are the same integers in both forms, so the result is identical.
     """
-    xor = jnp.bitwise_xor(a, b)
-    return jnp.where(xor == jnp.uint64(0), as_index(64), _clz_u64(xor))
+    if not _unroll_step_searches():
+
+        def loop_body(i: jax.Array, carry: jax.Array) -> jax.Array:
+            shift = as_index(num_bits - 1) - jnp.asarray(i, dtype=INDEX_DTYPE)
+            return body(jnp.left_shift(as_index(1), shift), carry)
+
+        return lax.fori_loop(0, num_bits, loop_body, init)
+    carry = init
+    for k in range(num_bits - 1, -1, -1):
+        carry = body(as_index(1 << k), carry)
+    return carry
 
 
 # ---------------------------------------------
@@ -398,8 +246,7 @@ def build_tree(
     morton_codes = morton_encode(positions, bounds)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     # Determine leaf groups in Morton order
     leaf_starts = jnp.arange(0, n, leaf_size, dtype=INDEX_DTYPE)
@@ -417,105 +264,6 @@ def build_tree(
         return_reordered=return_reordered,
         workspace=workspace,
         return_workspace=return_workspace,
-    )
-
-
-@jaxtyped(typechecker=beartype)
-def build_fixed_depth_tree(
-    positions: Array,
-    masses: Array,
-    bounds: Bounds,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    # Local Morton refinement options
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-):
-    """Build a tree whose leaves all share the same Morton depth.
-
-    When local refinement kicks in, the helper will not split leaves below
-    ``min_refined_leaf_particles`` particles so that near-field pairs remain
-    anchored to reproducible leaf extents.
-    """
-
-    from .morton import morton_encode  # local import to avoid circulars
-
-    n = positions.shape[0]
-    if n < 1:
-        raise ValueError("Need at least one particle")
-
-    if target_leaf_particles < 1:
-        raise ValueError("target_leaf_particles must be >= 1")
-
-    morton_codes = morton_encode(positions, bounds)
-    # Stable sort by Morton code (ties break by input order == original index),
-    # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
-
-    max_allowed_depth = min(MAX_TREE_LEVELS - 1, _MAX_MORTON_LEVEL)
-    if max_depth is not None:
-        max_allowed_depth = min(max_allowed_depth, int(max_depth))
-
-    resolved_depth = _resolve_fixed_depth_level(
-        n,
-        target_leaf_particles,
-        max_allowed_depth=max_allowed_depth,
-    )
-
-    (
-        leaf_starts,
-        leaf_ends,
-        leaf_codes,
-        leaf_depths,
-    ) = _fixed_depth_leaf_partitions(
-        sorted_codes,
-        resolved_depth,
-        n,
-    )
-
-    # Post-process leaf partitions to avoid pathological aspect ratios by
-    # locally refining Morton buckets where leaves are highly elongated.
-    # Host/device conversion is only attempted in eager mode, and eager
-    # refinement pulls all required arrays back in a single device_get call.
-    leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
-        _maybe_refine_fixed_depth_leaf_partitions(
-            positions=positions,
-            sorted_indices=sorted_indices,
-            sorted_codes=sorted_codes,
-            leaf_starts=leaf_starts,
-            leaf_ends=leaf_ends,
-            leaf_codes=leaf_codes,
-            leaf_depths=leaf_depths,
-            resolved_depth=resolved_depth,
-            refine_local=refine_local,
-            max_refine_levels=max_refine_levels,
-            aspect_threshold=aspect_threshold,
-            min_refined_leaf_particles=min_refined_leaf_particles,
-        )
-    )
-
-    return _build_tree_from_leaf_partitions(
-        positions,
-        masses,
-        sorted_indices,
-        sorted_codes,
-        leaf_starts,
-        leaf_ends,
-        bounds,
-        leaf_size=None,
-        use_morton_geometry=True,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-        leaf_codes_override=leaf_codes,
-        leaf_depths_override=leaf_depths,
     )
 
 
@@ -655,6 +403,7 @@ def _static_radix_node_ranges_from_leaf_ranges(
 ) -> Union[np.ndarray, Array]:
     """Recompute node ranges for an existing static radix bucket topology."""
 
+    require_x64("63-bit Morton codes")
     num_leaves = int(leaf_starts_np.shape[0])
     num_internal = int(template.left_child.shape[0])
     total_nodes = int(num_internal + num_leaves)
@@ -714,6 +463,7 @@ def build_static_cells_tree(
     return_reordered: bool = False,
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
+    min_level: int = 0,
 ):
     """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
 
@@ -761,6 +511,10 @@ def build_static_cells_tree(
         ``num_valid`` -- both halves are needed, see
         :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`. The dead
         rows end up in no leaf, so nothing downstream gathers them.
+    min_level
+        No leaf coarser than this Morton level (see
+        :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`). ``0``:
+        unconstrained.
 
     Returns
     -------
@@ -772,6 +526,7 @@ def build_static_cells_tree(
     ValueError
         If ``leaf_size`` or ``leaf_capacity`` is not positive.
     """
+    require_x64("63-bit Morton codes")
     from ._cell_partition import adaptive_cell_leaf_partition
     from .morton import morton_encode  # local import to avoid circulars
 
@@ -799,13 +554,13 @@ def build_static_cells_tree(
                 jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64),
             ),
         )
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
     part = adaptive_cell_leaf_partition(
         sorted_codes,
         leaf_size=int(leaf_size),
         capacity=int(leaf_capacity),
         num_valid=num_valid,
+        min_level=int(min_level),
     )
     live = part.leaf_starts < as_index(int(n))
     safe_start = jnp.minimum(part.leaf_starts, as_index(max(int(n) - 1, 0)))
@@ -817,7 +572,7 @@ def build_static_cells_tree(
     # so this three-argument call is an `Array` at runtime but a union to the checker,
     # and `leaf_codes_override` below is annotated `Optional[Array]`. Narrow at the
     # source rather than widening the parameter to a type it cannot accept (the
-    # codebase's existing idiom; see `cross_walk.py`, `tree.py`, `octree_uvwx.py`).
+    # codebase's existing idiom; see `cross_walk.py`, `tree.py`).
     leaf_codes = cast(Array, jnp.where(live, sorted_codes[safe_start], sentinel))
     out = _build_tree_from_leaf_partitions(
         positions,
@@ -828,7 +583,6 @@ def build_static_cells_tree(
         part.leaf_ends,
         bounds,
         leaf_size=int(leaf_size),
-        use_morton_geometry=False,
         return_reordered=bool(return_reordered),
         workspace=None,
         return_workspace=False,
@@ -838,7 +592,7 @@ def build_static_cells_tree(
     # a bare RadixTree is itself a NamedTuple: test for the container first.
     # Annotated `list[Any]` because the list is genuinely heterogeneous -- a
     # `RadixTree` followed by plain arrays -- which pyright would otherwise pin to
-    # `list[RadixTree]` from the first element (as in `octree_uvwx.py`).
+    # `list[RadixTree]` from the first element.
     outputs: list[Any] = [out] if isinstance(out, RadixTree) else list(out)
     if return_overflow:
         outputs.append(part.overflow)
@@ -856,6 +610,7 @@ def build_static_radix_tree(
     leaf_partition: str = "buckets",
     leaf_capacity: Optional[int] = None,
     num_valid: Array | int | None = None,
+    cell_min_level: int = 0,
 ):
     """Build a fixed-shape radix tree from equal-size Morton-order buckets.
 
@@ -891,6 +646,7 @@ def build_static_radix_tree(
             leaf_capacity=int(leaf_capacity),
             return_reordered=bool(return_reordered),
             num_valid=num_valid,
+            min_level=int(cell_min_level),
         )
     if num_valid is not None:
         raise ValueError("num_valid is only supported for leaf_partition='cells'")
@@ -904,8 +660,7 @@ def build_static_radix_tree(
     morton_codes = morton_encode(positions, bounds)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(int(n), int(leaf_size))
     (
@@ -996,6 +751,7 @@ def rebuild_static_radix_tree_from_template(
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
+    cell_min_level: int = 0,
 ):
     """Refresh particles against a fixed-shape static radix bucket topology.
 
@@ -1051,13 +807,13 @@ def rebuild_static_radix_tree_from_template(
             return_reordered=bool(return_reordered),
             return_overflow=bool(return_overflow),
             num_valid=num_valid,
+            min_level=int(cell_min_level),
         )
 
     morton_codes = morton_encode(positions, bounds_resolved)
     # Stable sort by Morton code (ties break by input order == original index),
     # identical to lexsort((orig_idx, codes)) with one fewer sort key.
-    sorted_indices = jnp.argsort(morton_codes, stable=True)
-    sorted_codes = morton_codes[sorted_indices]
+    sorted_indices, sorted_codes = _morton_sort(morton_codes)
 
     leaf_starts_np, leaf_ends_np = _static_radix_leaf_partitions(
         int(n),
@@ -1118,7 +874,10 @@ def inverse_permutation(sorted_indices: Array) -> Array:
     """
     n = sorted_indices.shape[0]
     inv = jnp.empty((n,), dtype=INDEX_DTYPE)
-    return inv.at[sorted_indices].set(jnp.arange(n, dtype=INDEX_DTYPE))
+    # a permutation: every index once, so the scatter needs no atomics
+    return inv.at[sorted_indices].set(
+        jnp.arange(n, dtype=INDEX_DTYPE), unique_indices=True
+    )
 
 
 @jaxtyped(typechecker=beartype)
@@ -1170,53 +929,6 @@ def build_tree_jit(
     )
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "return_reordered",
-        "target_leaf_particles",
-        "return_workspace",
-        "max_depth",
-        "refine_local",
-        "max_refine_levels",
-        "aspect_threshold",
-        "min_refined_leaf_particles",
-    ),
-)
-@jaxtyped(typechecker=beartype)
-def build_fixed_depth_tree_jit(
-    positions: Array,
-    masses: Array,
-    bounds: Bounds,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-):
-    """JIT-compiled wrapper for :func:`build_fixed_depth_tree`."""
-
-    return build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds,
-        target_leaf_particles=target_leaf_particles,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-        max_depth=max_depth,
-        refine_local=refine_local,
-        max_refine_levels=max_refine_levels,
-        aspect_threshold=aspect_threshold,
-        min_refined_leaf_particles=min_refined_leaf_particles,
-    )
-
-
 def _build_tree_from_leaf_partitions(
     positions: Array,
     masses: Array,
@@ -1227,13 +939,13 @@ def _build_tree_from_leaf_partitions(
     bounds: Bounds,
     *,
     leaf_size: int | None = None,
-    use_morton_geometry: bool = False,
     return_reordered: bool,
     workspace: Optional[RadixTreeWorkspace],
     return_workspace: bool,
     leaf_codes_override: Optional[Array] = None,
     leaf_depths_override: Optional[Array] = None,
 ):
+    require_x64("63-bit Morton codes")
     n = positions.shape[0]
     num_leaves = int(leaf_starts.shape[0])
 
@@ -1253,7 +965,9 @@ def _build_tree_from_leaf_partitions(
 
     bounds_min = jnp.asarray(bounds[0], dtype=positions.dtype)
     bounds_max = jnp.asarray(bounds[1], dtype=positions.dtype)
-    morton_geometry_flag = jnp.asarray(use_morton_geometry, dtype=jnp.bool_)
+    # No builder derives node boxes from Morton cells since fixed-depth builds
+    # went (2026-10 cleanup, Y2): geometry comes from the particle ranges.
+    morton_geometry_flag = jnp.asarray(False, dtype=jnp.bool_)
 
     if return_reordered:
         pos_sorted = positions[sorted_indices]
@@ -1354,16 +1068,17 @@ def _build_tree_from_leaf_partitions(
 
     delta_min = _delta_vec(indices, indices - d)
 
-    span = jnp.zeros_like(indices)
     max_k = 31
-    for k in range(max_k - 1, -1, -1):
-        step = as_index(1 << k)
+
+    def _span_step(step: jax.Array, span: jax.Array) -> jax.Array:
         candidate = indices + (span + step) * d
         delta_candidate = _delta_vec(indices, candidate)
         cond = (
             (candidate >= 0) & (candidate < num_leaves) & (delta_candidate > delta_min)
         )
-        span = jnp.where(cond, span + step, span)
+        return jnp.where(cond, span + step, span)
+
+    span = _descending_step_search(_span_step, jnp.zeros_like(indices), max_k)
 
     end_idx = indices + span * d
     first = jnp.minimum(indices, end_idx)
@@ -1373,18 +1088,24 @@ def _build_tree_from_leaf_partitions(
     end_particle = leaf_ends_exclusive[last] - as_index(1)
     node_ranges_internal = jnp.stack([start_particle, end_particle], axis=1)
 
-    first_code = leaf_codes[first]
-    last_code = leaf_codes[last]
-    common_prefix = _lcp_codes_only(first_code, last_code)
+    # The split search must order leaves the way the range search above does:
+    # by code, and by leaf index where codes tie (Karras 2012's augmented delta).
+    # A codes-only prefix cannot split a range whose leaves all share one code
+    # (more than ``leaf_size`` particles in one Morton cell -- duplicates, or
+    # padding rows copied from a real particle). Every candidate then compares
+    # equal to the range's own prefix, the split collapses onto ``first``, and the
+    # rest of the range is orphaned: the build returned a forest. Where the range's
+    # first and last codes differ, both forms give the same split.
+    common_prefix = _delta_vec(first, last)
 
-    split = first
-    for k in range(max_k - 1, -1, -1):
-        step = as_index(1 << k)
+    def _split_step(step: jax.Array, split: jax.Array) -> jax.Array:
         mid = split + step
         safe_mid = jnp.where(mid < last, mid, last)
-        cmp = _lcp_codes_only(first_code, leaf_codes[safe_mid])
+        cmp = _delta_vec(first, safe_mid)
         cond = (mid < last) & (cmp > common_prefix)
-        split = jnp.where(cond, mid, split)
+        return jnp.where(cond, mid, split)
+
+    split = _descending_step_search(_split_step, first, max_k)
 
     left_is_leaf = split == first
     right_is_leaf = split + as_index(1) == last
@@ -1492,33 +1213,51 @@ def _build_tree_from_leaf_partitions(
         parent_safe,
     )
 
-    def _depth_body(_, state):
-        sc, d = state
-        new_d = d + d[sc]
-        new_sc = sc[sc]
-        return new_sc, new_d
-
     # Pointer doubling reaches every node's root in ceil(log2(depth)) rounds,
     # and stays at that fixed point thereafter (sc[sc] == sc), so a bounded
-    # loop of that many rounds is exact for any well-formed tree.  Using a
-    # fixed bound instead of a change-driven while_loop also guarantees
-    # termination if a degenerate build produced a malformed (e.g. cyclic)
-    # parent array, rather than spinning forever.
-    n_depth_rounds = max(1, int(total_nodes).bit_length() + 1)
-    _, node_level = lax.fori_loop(
-        0, n_depth_rounds, _depth_body, (init_shortcut, init_dist)
-    )
+    # number of rounds is exact for any well-formed tree.  A fixed bound
+    # instead of a change-driven while_loop also guarantees termination if a
+    # degenerate build produced a malformed (e.g. cyclic) parent array.  The
+    # level tables below hold MAX_TREE_LEVELS levels, so depths past
+    # _DEPTH_ROUNDS_CAP's reach (2**8 = 256) cannot be represented anyway.
+    # Unrolled on GPU: XLA fuses each round into one kernel; as a fori_loop
+    # every round also copied both carried arrays (22 rounds at 1.76M nodes).
+    # On CPU the rounds stay a loop (_descending_step_search's reason).
+    n_depth_rounds = max(1, min(int(total_nodes).bit_length() + 1, _DEPTH_ROUNDS_CAP))
+
+    def _depth_round(_: Any, state: tuple[jax.Array, jax.Array]) -> tuple:
+        sc, d = state
+        return sc[sc], d + d[sc]
+
+    if _unroll_step_searches():
+        shortcut, node_level = init_shortcut, init_dist
+        for _ in range(n_depth_rounds):
+            shortcut, node_level = _depth_round(None, (shortcut, node_level))
+    else:
+        # the same rounds as a loop on CPU (see _descending_step_search)
+        _, node_level = lax.fori_loop(
+            0, n_depth_rounds, _depth_round, (init_shortcut, init_dist)
+        )
 
     max_level = jnp.max(node_level)
     num_levels = max_level + as_index(1)
 
-    level_counts = jnp.zeros((MAX_TREE_LEVELS,), dtype=INDEX_DTYPE)
-    level_counts = level_counts.at[node_level].add(as_index(1))
-
-    level_offsets = jnp.zeros((MAX_TREE_LEVELS + 1,), dtype=INDEX_DTYPE)
-    level_offsets = level_offsets.at[1:].set(jnp.cumsum(level_counts))
-
-    nodes_by_level = jnp.argsort(node_level, stable=True)
+    # The stable sort of the levels gives nodes_by_level (jnp.argsort's result,
+    # same index dtype) AND the sorted levels, whose run starts are the level
+    # offsets: no histogram (a scatter-add of every node into 64 bins, all
+    # contending for the same few counters: 1.0 ms at 1.76M nodes on an A100).
+    idx_dtype = jax.eval_shape(jnp.argsort, node_level).dtype
+    sorted_level, nodes_by_level = lax.sort(
+        (node_level, lax.broadcasted_iota(idx_dtype, node_level.shape, 0)),
+        num_keys=1,
+        is_stable=True,
+    )
+    level_offsets = jnp.searchsorted(
+        sorted_level,
+        jnp.arange(MAX_TREE_LEVELS + 1, dtype=sorted_level.dtype),
+        side="left",
+        method="scan_unrolled" if _unroll_step_searches() else "scan",
+    ).astype(INDEX_DTYPE)
 
     num_levels = jnp.clip(
         num_levels,
@@ -1566,52 +1305,6 @@ def _build_tree_from_leaf_partitions(
     return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
 
-def _resolve_fixed_depth_level(
-    num_particles: int,
-    target_leaf_particles: int,
-    *,
-    max_allowed_depth: int,
-) -> int:
-    target = max(1, int(target_leaf_particles))
-    if num_particles <= target:
-        return 0
-
-    target_leaves = math.ceil(num_particles / target)
-    depth = math.ceil(math.log(target_leaves, 8))
-    return int(min(depth, max_allowed_depth))
-
-
-def _fixed_depth_leaf_partitions(
-    sorted_codes: Array,
-    depth: int,
-    num_particles: int,
-) -> tuple[Array, Array, Array, Array]:
-    depth = max(0, int(depth))
-    if depth == 0:
-        starts = jnp.asarray([0], dtype=INDEX_DTYPE)
-        ends = jnp.asarray([num_particles], dtype=INDEX_DTYPE)
-        codes = jnp.asarray([0], dtype=jnp.uint64)
-        depths = jnp.asarray([0], dtype=INDEX_DTYPE)
-        return starts, ends, codes, depths
-
-    # Morton codes use 63 meaningful bits (21 per axis). Subtracting from 64
-    # would drop an extra bit and halve the number of buckets, so subtract
-    # from 63 instead.
-    shift = max(0, 63 - depth * 3)
-    leaf_ids = jnp.right_shift(sorted_codes, jnp.uint64(shift))
-    leaf_ids = leaf_ids.astype(INDEX_DTYPE)
-    num_leaves = int(1 << (3 * depth))
-
-    counts = jnp.bincount(leaf_ids, length=num_leaves)
-    counts = counts.astype(INDEX_DTYPE)
-    leaf_starts = jnp.cumsum(counts, dtype=INDEX_DTYPE) - counts
-    leaf_ends = leaf_starts + counts
-
-    codes = jnp.arange(num_leaves, dtype=jnp.uint64) << jnp.uint64(shift)
-    depths = jnp.full((num_leaves,), depth, dtype=INDEX_DTYPE)
-    return leaf_starts, leaf_ends, codes, depths
-
-
 __all__ = [
     "Bounds",
     "RadixTree",
@@ -1619,8 +1312,6 @@ __all__ = [
     "build_tree",
     "build_tree_jit",
     "build_static_radix_tree",
-    "build_fixed_depth_tree",
-    "build_fixed_depth_tree_jit",
     "inverse_permutation",
     "rebuild_static_radix_tree_from_template",
     "reorder_particles_by_indices",

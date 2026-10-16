@@ -82,7 +82,8 @@ hints unless pinned via a {class}`yggdrax.DualTreeTraversalConfig`.
 A single dual-tree walk yields two products:
 
 - **far-field (M2L)** — {class}`yggdrax.NodeInteractionList` (sparse) or
-  exact-length compact far pairs; densified for batched kernels by
-  `dense_interactions` / `grouped_interactions`.
+  exact-length compact far pairs ({class}`yggdrax.CompactTaggedFarPairs`). The
+  dense level-major and displacement-grouped layouts built from these were
+  removed in the 2026-10 cleanup (Y2); no consumer used them.
 - **near-field (P2P)** — {class}`yggdrax.NodeNeighborList` of leaf-leaf
   neighbor pairs.

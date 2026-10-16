@@ -1,6 +1,7 @@
 """Tests for Morton code utilities."""
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from yggdrax.morton import get_common_prefix_length, morton_decode, morton_encode
@@ -87,3 +88,22 @@ def test_common_prefix_length():
     code2 = jnp.uint64((1 << 63))
     common = get_common_prefix_length(code1, code2)
     assert common == 0
+
+
+def test_morton_sort_is_the_stable_argsort_and_its_gather():
+    """One key-value sort: argsort(stable)'s permutation and the gathered codes."""
+    from yggdrax._tree_impl import _morton_sort, inverse_permutation
+
+    rng = np.random.default_rng(5)
+    # many ties (the stable tie-break by input order is what is pinned) and codes
+    # above 2^32 (the sort must compare all 64 bits)
+    codes = rng.integers(0, 50, size=4096).astype(np.uint64) << np.uint64(37)
+    codes += rng.integers(0, 3, size=4096).astype(np.uint64)
+    codes = jnp.asarray(codes)
+    idx, sorted_codes = _morton_sort(codes)
+    ref = jnp.argsort(codes, stable=True)
+    assert np.array_equal(np.asarray(idx), np.asarray(ref))
+    assert np.array_equal(np.asarray(sorted_codes), np.asarray(codes[ref]))
+    assert len(np.unique(np.asarray(codes))) < codes.shape[0] // 10  # ties exist
+    inv = np.asarray(inverse_permutation(idx))
+    assert np.array_equal(inv[np.asarray(idx)], np.arange(codes.shape[0]))

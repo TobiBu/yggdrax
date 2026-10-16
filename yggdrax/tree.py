@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Any, Callable, Literal, Optional, TypedDict, cast
+from typing import Any, Callable, Literal, Optional, cast
 
 import jax
 import jax.numpy as jnp
@@ -42,40 +42,21 @@ class TreeBuildConfig:
     return_workspace: bool = False
 
 
-@dataclass(frozen=True)
-class FixedDepthTreeBuildConfig:
-    """Resolved options for fixed-depth tree construction.
-
-    Attributes:
-        target_leaf_particles: Target occupancy used to resolve Morton depth.
-        return_reordered: Whether to return Morton-sorted particle arrays.
-        workspace: Optional reusable radix workspace.
-        return_workspace: Whether to return the workspace alongside the tree.
-        max_depth: Optional upper bound on Morton depth.
-        refine_local: Whether to locally refine elongated Morton buckets.
-        max_refine_levels: Maximum extra local refinement depth.
-        aspect_threshold: Axis-aligned aspect ratio threshold for refinement.
-        min_refined_leaf_particles: Smallest locally refined leaf occupancy.
-    """
-
-    target_leaf_particles: int = 32
-    return_reordered: bool = False
-    workspace: Optional[RadixTreeWorkspace] = None
-    return_workspace: bool = False
-    max_depth: Optional[int] = None
-    refine_local: bool = True
-    max_refine_levels: int = 2
-    aspect_threshold: float = 8.0
-    min_refined_leaf_particles: int = 2
-
-
 TreeType = Literal["radix", "octree", "kdtree"]
-TreeBuildMode = Literal["adaptive", "fixed_depth", "static_radix"]
+TreeBuildMode = Literal["adaptive", "static_radix"]
 
 _VALID_BUILD_MODES: tuple[TreeBuildMode, ...] = (
     "adaptive",
-    "fixed_depth",
     "static_radix",
+)
+
+# Fixed-depth (uniform Morton depth + host-side aspect refinement) builds were
+# removed in the 2026-10 cleanup (Y2). Their keywords stay accepted, and ignored,
+# on the public builders because jaccpot still passes them on every build.
+_FIXED_DEPTH_REMOVED_MESSAGE = (
+    "build_mode='fixed_depth' was removed in the 2026-10 cleanup (Y2). Use "
+    "build_mode='adaptive' (LBVH leaves of at most leaf_size particles) or "
+    "'static_radix' (fixed-shape buckets; radix trees only)."
 )
 
 
@@ -95,9 +76,12 @@ def _normalize_build_mode(build_mode: str) -> TreeBuildMode:
     Raises
     ------
     ValueError
-        If ``build_mode`` is not one of the supported modes.
+        If ``build_mode`` is ``"fixed_depth"`` (removed) or not one of the
+        supported modes.
     """
 
+    if build_mode == "fixed_depth":
+        raise ValueError(_FIXED_DEPTH_REMOVED_MESSAGE)
     if build_mode not in _VALID_BUILD_MODES:
         supported = ", ".join(f"'{name}'" for name in _VALID_BUILD_MODES)
         raise ValueError(
@@ -112,6 +96,12 @@ class TreeBuildRequest:
 
     Registered builders receive a fully normalized request so wrapper code can
     share one dispatch path across radix and backend-provided tree families.
+
+    The fields ``target_leaf_particles``, ``max_depth``, ``refine_local``,
+    ``max_refine_levels``, ``aspect_threshold`` and ``min_refined_leaf_particles``
+    are accepted and ignored: fixed-depth builds were removed in the 2026-10
+    cleanup (Y2); jaccpot still passes them. The built-in builders never read
+    them.
     """
 
     positions: Array
@@ -154,31 +144,6 @@ MORTON_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
 FMM_TOPOLOGY_REQUIRED_FIELDS: tuple[str, ...] = (
     FMM_CORE_REQUIRED_FIELDS + MORTON_TOPOLOGY_REQUIRED_FIELDS
 )
-
-
-class _AdaptiveOctreeRefinement(TypedDict):
-    """Keyword arguments controlling adaptive-octree local refinement."""
-
-    target_leaf_particles: int
-    max_depth: Optional[int]
-    refine_local: bool
-    max_refine_levels: int
-    aspect_threshold: float
-    min_refined_leaf_particles: int
-
-
-# Local-refinement defaults for the adaptive octree build path. Defined once so
-# the JIT (``build_octree_jit``) and eager (``build_octree``) entry points share
-# a single source of truth and cannot silently drift apart. Typed as a
-# ``TypedDict`` so unpacking it at each call site stays type-checked per field.
-_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS: _AdaptiveOctreeRefinement = {
-    "target_leaf_particles": 32,
-    "max_depth": None,
-    "refine_local": True,
-    "max_refine_levels": 2,
-    "aspect_threshold": 8.0,
-    "min_refined_leaf_particles": 2,
-}
 
 
 @dataclass(frozen=True)
@@ -278,8 +243,9 @@ class Tree:
             Backend identifier: ``"radix"``, ``"octree"``, ``"kdtree"``, or any
             registered type.
         build_mode
-            Construction mode: ``"adaptive"``, ``"fixed_depth"``, or
-            ``"static_radix"``.
+            Construction mode: ``"adaptive"`` or ``"static_radix"`` (radix only).
+            ``"fixed_depth"`` was removed in the 2026-10 cleanup (Y2); the radix
+            and octree builders raise ``ValueError`` for it.
         bounds
             Optional ``(min_corner, max_corner)`` box; inferred when omitted.
         return_reordered
@@ -292,17 +258,18 @@ class Tree:
         leaf_size
             Maximum particles per leaf (adaptive/static modes).
         target_leaf_particles
-            Target per-leaf occupancy (fixed-depth mode).
+            Accepted and ignored: fixed-depth builds were removed in the 2026-10
+            cleanup (Y2); jaccpot still passes it.
         max_depth
-            Optional hard cap on the fixed-depth Morton depth.
+            Accepted and ignored (fixed-depth only; removed in Y2).
         refine_local
-            Whether to locally refine elongated buckets (fixed-depth mode).
+            Accepted and ignored (fixed-depth only; removed in Y2).
         max_refine_levels
-            Maximum additional local refinement depth.
+            Accepted and ignored (fixed-depth only; removed in Y2).
         aspect_threshold
-            Axis aspect-ratio above which a bucket is refined.
+            Accepted and ignored (fixed-depth only; removed in Y2).
         min_refined_leaf_particles
-            Smallest occupancy a locally refined leaf may have.
+            Accepted and ignored (fixed-depth only; removed in Y2).
 
         Returns
         -------
@@ -312,7 +279,9 @@ class Tree:
         Raises
         ------
         ValueError
-            If ``tree_type`` is not registered.
+            If ``tree_type`` is not registered. The registered builder raises its
+            own ``ValueError`` for an unsupported ``build_mode``, including the
+            removed ``"fixed_depth"``.
         """
 
         request = TreeBuildRequest(
@@ -352,7 +321,7 @@ class _ResolvedTreeBuildOptions:
 
 def _resolve_tree_build_options(
     *,
-    config: Optional[TreeBuildConfig | FixedDepthTreeBuildConfig],
+    config: Optional[TreeBuildConfig],
     return_reordered: bool,
     workspace: Optional[RadixTreeWorkspace],
     return_workspace: bool,
@@ -382,12 +351,6 @@ def _build_octree_result(
     workspace: Optional[RadixTreeWorkspace],
     return_workspace: bool,
     leaf_size: int,
-    target_leaf_particles: int,
-    max_depth: Optional[int],
-    refine_local: bool,
-    max_refine_levels: int,
-    aspect_threshold: float,
-    min_refined_leaf_particles: int,
 ):
     """Build octree topology through its own Morton partition pipeline."""
 
@@ -422,63 +385,8 @@ def _build_octree_result(
             return_workspace=return_workspace,
         )
 
-    if build_mode == "fixed_depth":
-        if target_leaf_particles < 1:
-            raise ValueError("target_leaf_particles must be >= 1")
-        max_allowed_depth = min(
-            _tree_impl.MAX_TREE_LEVELS - 1,
-            _tree_impl._MAX_MORTON_LEVEL,
-        )
-        if max_depth is not None:
-            max_allowed_depth = min(max_allowed_depth, int(max_depth))
-        resolved_depth = _tree_impl._resolve_fixed_depth_level(
-            num_particles,
-            target_leaf_particles,
-            max_allowed_depth=max_allowed_depth,
-        )
-        leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
-            _tree_impl._fixed_depth_leaf_partitions(
-                sorted_codes,
-                resolved_depth,
-                num_particles,
-            )
-        )
-        leaf_starts, leaf_ends, leaf_codes, leaf_depths = (
-            _tree_impl._maybe_refine_fixed_depth_leaf_partitions(
-                positions=positions,
-                sorted_indices=sorted_indices,
-                sorted_codes=sorted_codes,
-                leaf_starts=leaf_starts,
-                leaf_ends=leaf_ends,
-                leaf_codes=leaf_codes,
-                leaf_depths=leaf_depths,
-                resolved_depth=resolved_depth,
-                refine_local=refine_local,
-                max_refine_levels=max_refine_levels,
-                aspect_threshold=aspect_threshold,
-                min_refined_leaf_particles=min_refined_leaf_particles,
-            )
-        )
-        return _tree_impl._build_tree_from_leaf_partitions(
-            positions,
-            masses,
-            sorted_indices,
-            sorted_codes,
-            leaf_starts,
-            leaf_ends,
-            bounds_resolved,
-            leaf_size=None,
-            use_morton_geometry=True,
-            return_reordered=return_reordered,
-            workspace=workspace,
-            return_workspace=return_workspace,
-            leaf_codes_override=leaf_codes,
-            leaf_depths_override=leaf_depths,
-        )
-
     raise ValueError(
-        "Unsupported build_mode "
-        f"'{build_mode}'. Supported: ('adaptive', 'fixed_depth')"
+        f"Unsupported build_mode '{build_mode}' for octree. Supported: ('adaptive',)"
     )
 
 
@@ -512,8 +420,9 @@ def _with_static_leaf_size(result: Any, leaf_size: Optional[int]) -> Any:
     identity check hides it. It cost jaccpot a red CI shard (TobiBu/jaccpot#330).
 
     ``leaf_size=None`` needs nothing: ``None`` is pytree *structure*, not a leaf,
-    so it survives the jit boundary unchanged. That is why the two fixed-depth
-    paths, which pass ``None``, were never affected.
+    so it survives the jit boundary unchanged. That is why the fixed-depth paths
+    (removed in the 2026-10 cleanup, Y2), which passed ``None``, were never
+    affected.
 
     Parameters
     ----------
@@ -564,7 +473,6 @@ def _build_octree_jit_traced_result(
         workspace=workspace,
         return_workspace=return_workspace,
         leaf_size=leaf_size,
-        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
 
 
@@ -619,54 +527,6 @@ def _build_octree_jit_result(
             return_workspace=return_workspace,
         ),
         int(leaf_size),
-    )
-
-
-@partial(
-    jax.jit,
-    static_argnames=(
-        "return_reordered",
-        "target_leaf_particles",
-        "return_workspace",
-        "max_depth",
-        "refine_local",
-        "max_refine_levels",
-        "aspect_threshold",
-        "min_refined_leaf_particles",
-    ),
-)
-def _build_fixed_depth_octree_jit_result(
-    positions: Array,
-    masses: Array,
-    bounds: tuple[Array, Array],
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-):
-    """JIT-compiled fixed-depth octree builder using Morton leaf partitions."""
-
-    return _build_octree_result(
-        positions,
-        masses,
-        build_mode="fixed_depth",
-        bounds=bounds,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-        leaf_size=8,
-        target_leaf_particles=target_leaf_particles,
-        max_depth=max_depth,
-        refine_local=refine_local,
-        max_refine_levels=max_refine_levels,
-        aspect_threshold=aspect_threshold,
-        min_refined_leaf_particles=min_refined_leaf_particles,
     )
 
 
@@ -735,8 +595,25 @@ class RadixTree(Tree):
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
     ) -> "RadixTree":
-        """Build a radix tree from particles using a selected build mode."""
+        """Build a radix tree from particles using a selected build mode.
 
+        ``build_mode`` is ``"adaptive"`` (LBVH) or ``"static_radix"``;
+        ``"fixed_depth"`` raises ``ValueError``. ``target_leaf_particles``,
+        ``max_depth``, ``refine_local``, ``max_refine_levels``,
+        ``aspect_threshold`` and ``min_refined_leaf_particles`` are accepted and
+        ignored: fixed-depth builds were removed in the 2026-10 cleanup (Y2);
+        jaccpot still passes them.
+        """
+
+        del (
+            target_leaf_particles,
+            max_depth,
+            refine_local,
+            max_refine_levels,
+            aspect_threshold,
+            min_refined_leaf_particles,
+        )
+        build_mode = _normalize_build_mode(build_mode)
         bounds_resolved = infer_bounds(positions) if bounds is None else bounds
         if build_mode == "adaptive":
             use_fast_adaptive_path = workspace is None and not return_workspace
@@ -755,22 +632,7 @@ class RadixTree(Tree):
                     workspace=workspace,
                     return_workspace=return_workspace,
                 )
-        elif build_mode == "fixed_depth":
-            result = _tree_impl.build_fixed_depth_tree(
-                positions,
-                masses,
-                bounds_resolved,
-                target_leaf_particles=target_leaf_particles,
-                return_reordered=return_reordered,
-                workspace=workspace,
-                return_workspace=return_workspace,
-                max_depth=max_depth,
-                refine_local=refine_local,
-                max_refine_levels=max_refine_levels,
-                aspect_threshold=aspect_threshold,
-                min_refined_leaf_particles=min_refined_leaf_particles,
-            )
-        elif build_mode == "static_radix":
+        else:  # "static_radix"
             if workspace is not None:
                 raise ValueError(
                     "workspace is not supported for build_mode='static_radix'. "
@@ -784,12 +646,6 @@ class RadixTree(Tree):
                 leaf_size=leaf_size,
                 return_reordered=return_reordered,
                 return_workspace=return_workspace,
-            )
-        else:
-            raise ValueError(
-                "Unsupported build_mode "
-                f"'{build_mode}'. Supported: "
-                "('adaptive', 'fixed_depth', 'static_radix')"
             )
 
         return cls._from_build_result(
@@ -879,8 +735,24 @@ class OctreeTree(RadixTree):
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
     ) -> "OctreeTree":
-        """Build an octree from particles using the octree-specific build path."""
+        """Build an octree from particles using the octree-specific build path.
 
+        ``build_mode`` must be ``"adaptive"``; ``"fixed_depth"`` raises
+        ``ValueError``. ``target_leaf_particles``, ``max_depth``,
+        ``refine_local``, ``max_refine_levels``, ``aspect_threshold`` and
+        ``min_refined_leaf_particles`` are accepted and ignored: fixed-depth
+        builds were removed in the 2026-10 cleanup (Y2); jaccpot still passes
+        them.
+        """
+
+        del (
+            target_leaf_particles,
+            max_depth,
+            refine_local,
+            max_refine_levels,
+            aspect_threshold,
+            min_refined_leaf_particles,
+        )
         build_mode = _normalize_build_mode(build_mode)
         # The adaptive build is slow only because it is dispatched op by op.
         # Profiled at N = 1e5 on an A100 it is 4213 apply_primitive calls and
@@ -890,11 +762,6 @@ class OctreeTree(RadixTree):
         # (n, leaf_size), so one compilation is reused across rebuilds. Same
         # trick, and the same reason, as the SVGD sampler's jitted
         # compute_tree_geometry.
-        #
-        # Only the adaptive mode: the fixed-depth build calls the host-side
-        # aspect refinement, which silently does nothing when positions are
-        # traced, so jitting it would quietly build a different tree. The
-        # adaptive branch touches none of the refinement arguments.
         if (
             build_mode == "adaptive"
             and workspace is None
@@ -918,12 +785,6 @@ class OctreeTree(RadixTree):
                 workspace=workspace,
                 return_workspace=return_workspace,
                 leaf_size=leaf_size,
-                target_leaf_particles=target_leaf_particles,
-                max_depth=max_depth,
-                refine_local=refine_local,
-                max_refine_levels=max_refine_levels,
-                aspect_threshold=aspect_threshold,
-                min_refined_leaf_particles=min_refined_leaf_particles,
             )
         return cls._from_build_result(
             result=result,
@@ -1010,6 +871,15 @@ class KDParticleTree(Tree):
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
     ) -> "KDParticleTree":
+        """Build a leaf KD-tree from particles (``build_mode="adaptive"`` only).
+
+        ``bounds``, ``workspace`` and ``return_workspace`` do not apply to the
+        KD-tree. ``target_leaf_particles``, ``max_depth``, ``refine_local``,
+        ``max_refine_levels``, ``aspect_threshold`` and
+        ``min_refined_leaf_particles`` are accepted and ignored: fixed-depth
+        builds were removed in the 2026-10 cleanup (Y2); jaccpot still passes
+        them.
+        """
         del (
             bounds,
             workspace,
@@ -1150,12 +1020,6 @@ def _build_radix_tree_from_request(request: TreeBuildRequest) -> Tree:
         workspace=request.workspace,
         return_workspace=request.return_workspace,
         leaf_size=request.leaf_size,
-        target_leaf_particles=request.target_leaf_particles,
-        max_depth=request.max_depth,
-        refine_local=request.refine_local,
-        max_refine_levels=request.max_refine_levels,
-        aspect_threshold=request.aspect_threshold,
-        min_refined_leaf_particles=request.min_refined_leaf_particles,
     )
 
 
@@ -1169,12 +1033,6 @@ def _build_octree_from_request(request: TreeBuildRequest) -> Tree:
         workspace=request.workspace,
         return_workspace=request.return_workspace,
         leaf_size=request.leaf_size,
-        target_leaf_particles=request.target_leaf_particles,
-        max_depth=request.max_depth,
-        refine_local=request.refine_local,
-        max_refine_levels=request.max_refine_levels,
-        aspect_threshold=request.aspect_threshold,
-        min_refined_leaf_particles=request.min_refined_leaf_particles,
     )
 
 
@@ -1727,7 +1585,6 @@ def build_octree(
         workspace=resolved.workspace,
         return_workspace=resolved.return_workspace,
         leaf_size=config.leaf_size if config is not None else leaf_size,
-        **_ADAPTIVE_OCTREE_REFINEMENT_DEFAULTS,
     )
     return _wrap_octree_public_result(
         result=result,
@@ -1818,107 +1675,6 @@ def build_octree_jit(
 
 
 @jaxtyped(typechecker=beartype)
-def build_fixed_depth_tree(
-    positions: Array,
-    masses: Array,
-    bounds: Optional[tuple[Array, Array]] = None,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-    config: Optional[FixedDepthTreeBuildConfig] = None,
-):
-    """Build a fixed-depth Morton tree, inferring bounds when not provided.
-
-    Resolves a uniform Morton depth from ``target_leaf_particles`` and, when
-    ``refine_local`` is set, locally refines elongated leaf buckets by axis
-    aspect ratio.
-
-    Parameters
-    ----------
-    positions
-        Particle positions of shape ``(n, 3)``.
-    masses
-        Particle masses of shape ``(n,)``.
-    bounds
-        Optional ``(min_corner, max_corner)`` box; inferred when omitted.
-    target_leaf_particles
-        Target per-leaf occupancy used to resolve the Morton depth.
-    return_reordered
-        If ``True``, also return the reordered particle buffers.
-    workspace
-        Optional reusable :class:`RadixTreeWorkspace`.
-    return_workspace
-        If ``True``, also return the workspace.
-    max_depth
-        Optional hard cap on the Morton depth.
-    refine_local
-        Whether to locally refine elongated Morton buckets.
-    max_refine_levels
-        Maximum additional local refinement depth.
-    aspect_threshold
-        Axis aspect-ratio above which a bucket is refined.
-    min_refined_leaf_particles
-        Smallest occupancy a locally refined leaf may have.
-    config
-        Optional :class:`FixedDepthTreeBuildConfig` overriding the individual
-        keyword arguments.
-
-    Returns
-    -------
-    RadixTree or tuple
-        The tree, or a tuple additionally containing the reordered buffers
-        and/or workspace when the corresponding flags are set.
-    """
-
-    resolved = _resolve_tree_build_options(
-        config=config,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-    )
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_fixed_depth_tree(
-        positions,
-        masses,
-        bounds_resolved,
-        target_leaf_particles=(
-            config.target_leaf_particles
-            if config is not None
-            else target_leaf_particles
-        ),
-        return_reordered=resolved.return_reordered,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
-        max_depth=config.max_depth if config is not None else max_depth,
-        refine_local=config.refine_local if config is not None else refine_local,
-        max_refine_levels=(
-            config.max_refine_levels if config is not None else max_refine_levels
-        ),
-        aspect_threshold=(
-            config.aspect_threshold if config is not None else aspect_threshold
-        ),
-        min_refined_leaf_particles=(
-            config.min_refined_leaf_particles
-            if config is not None
-            else min_refined_leaf_particles
-        ),
-    )
-    return _wrap_radix_public_result(
-        result=result,
-        build_mode="fixed_depth",
-        return_reordered=resolved.return_reordered,
-        return_workspace=resolved.return_workspace,
-    )
-
-
-@jaxtyped(typechecker=beartype)
 def build_static_radix_tree(
     positions: Array,
     masses: Array,
@@ -1986,6 +1742,7 @@ def rebuild_static_radix_tree_from_template(
     leaf_partition: str = "buckets",
     return_overflow: bool = False,
     num_valid: Optional[Array] = None,
+    cell_min_level: int = 0,
 ):
     """Refresh particles using an existing static-radix data structure.
 
@@ -1996,6 +1753,9 @@ def rebuild_static_radix_tree_from_template(
 
     ``num_valid`` is the live row count of a capacity-padded shard (the
     distributed lane); ``None`` treats every row as live. Cells only.
+
+    ``cell_min_level``: no cell leaf coarser than this Morton level (see
+    :func:`yggdrax._cell_partition.adaptive_cell_leaf_partition`). Cells only.
     """
 
     if isinstance(template, RadixTree):
@@ -2016,6 +1776,7 @@ def rebuild_static_radix_tree_from_template(
         leaf_partition=leaf_partition,
         return_overflow=return_overflow,
         num_valid=num_valid,
+        cell_min_level=int(cell_min_level),
     )
     overflow = None
     if return_overflow:
@@ -2031,187 +1792,6 @@ def rebuild_static_radix_tree_from_template(
         items = list(wrapped) if isinstance(wrapped, tuple) else [wrapped]
         return (*items, overflow)
     return wrapped
-
-
-@jaxtyped(typechecker=beartype)
-def build_fixed_depth_octree(
-    positions: Array,
-    masses: Array,
-    bounds: Optional[tuple[Array, Array]] = None,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-    config: Optional[FixedDepthTreeBuildConfig] = None,
-):
-    """Build a fixed-depth octree through the octree-specific build path."""
-
-    resolved = _resolve_tree_build_options(
-        config=config,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-    )
-    result = _build_octree_result(
-        positions,
-        masses,
-        build_mode="fixed_depth",
-        bounds=bounds,
-        return_reordered=resolved.return_reordered,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
-        leaf_size=8,
-        target_leaf_particles=(
-            config.target_leaf_particles
-            if config is not None
-            else target_leaf_particles
-        ),
-        max_depth=config.max_depth if config is not None else max_depth,
-        refine_local=config.refine_local if config is not None else refine_local,
-        max_refine_levels=(
-            config.max_refine_levels if config is not None else max_refine_levels
-        ),
-        aspect_threshold=(
-            config.aspect_threshold if config is not None else aspect_threshold
-        ),
-        min_refined_leaf_particles=(
-            config.min_refined_leaf_particles
-            if config is not None
-            else min_refined_leaf_particles
-        ),
-    )
-    return _wrap_octree_public_result(
-        result=result,
-        build_mode="fixed_depth",
-        return_reordered=resolved.return_reordered,
-        return_workspace=resolved.return_workspace,
-    )
-
-
-@jaxtyped(typechecker=beartype)
-def build_fixed_depth_tree_jit(
-    positions: Array,
-    masses: Array,
-    bounds: Optional[tuple[Array, Array]] = None,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-    config: Optional[FixedDepthTreeBuildConfig] = None,
-):
-    """JIT build for a fixed-depth tree, inferring bounds when not provided."""
-
-    resolved = _resolve_tree_build_options(
-        config=config,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-    )
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _tree_impl.build_fixed_depth_tree_jit(
-        positions,
-        masses,
-        bounds_resolved,
-        target_leaf_particles=(
-            config.target_leaf_particles
-            if config is not None
-            else target_leaf_particles
-        ),
-        return_reordered=resolved.return_reordered,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
-        max_depth=config.max_depth if config is not None else max_depth,
-        refine_local=config.refine_local if config is not None else refine_local,
-        max_refine_levels=(
-            config.max_refine_levels if config is not None else max_refine_levels
-        ),
-        aspect_threshold=(
-            config.aspect_threshold if config is not None else aspect_threshold
-        ),
-        min_refined_leaf_particles=(
-            config.min_refined_leaf_particles
-            if config is not None
-            else min_refined_leaf_particles
-        ),
-    )
-    return _wrap_radix_public_result(
-        result=result,
-        build_mode="fixed_depth",
-        return_reordered=resolved.return_reordered,
-        return_workspace=resolved.return_workspace,
-    )
-
-
-@jaxtyped(typechecker=beartype)
-def build_fixed_depth_octree_jit(
-    positions: Array,
-    masses: Array,
-    bounds: Optional[tuple[Array, Array]] = None,
-    *,
-    target_leaf_particles: int = 32,
-    return_reordered: bool = False,
-    workspace: Optional[RadixTreeWorkspace] = None,
-    return_workspace: bool = False,
-    max_depth: Optional[int] = None,
-    refine_local: bool = True,
-    max_refine_levels: int = 2,
-    aspect_threshold: float = 8.0,
-    min_refined_leaf_particles: int = 2,
-    config: Optional[FixedDepthTreeBuildConfig] = None,
-):
-    """JIT build for a fixed-depth octree through the octree-native path."""
-
-    resolved = _resolve_tree_build_options(
-        config=config,
-        return_reordered=return_reordered,
-        workspace=workspace,
-        return_workspace=return_workspace,
-    )
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
-    result = _build_fixed_depth_octree_jit_result(
-        positions,
-        masses,
-        bounds_resolved,
-        target_leaf_particles=(
-            config.target_leaf_particles
-            if config is not None
-            else target_leaf_particles
-        ),
-        return_reordered=resolved.return_reordered,
-        workspace=resolved.workspace,
-        return_workspace=resolved.return_workspace,
-        max_depth=config.max_depth if config is not None else max_depth,
-        refine_local=config.refine_local if config is not None else refine_local,
-        max_refine_levels=(
-            config.max_refine_levels if config is not None else max_refine_levels
-        ),
-        aspect_threshold=(
-            config.aspect_threshold if config is not None else aspect_threshold
-        ),
-        min_refined_leaf_particles=(
-            config.min_refined_leaf_particles
-            if config is not None
-            else min_refined_leaf_particles
-        ),
-    )
-    return _wrap_octree_public_result(
-        result=result,
-        build_mode="fixed_depth",
-        return_reordered=resolved.return_reordered,
-        return_workspace=resolved.return_workspace,
-    )
 
 
 __all__ = [
@@ -2230,12 +1810,7 @@ __all__ = [
     "KDParticleTree",
     "RadixTreeWorkspace",
     "TreeBuildConfig",
-    "FixedDepthTreeBuildConfig",
     "build_static_radix_tree",
-    "build_fixed_depth_tree",
-    "build_fixed_depth_octree",
-    "build_fixed_depth_tree_jit",
-    "build_fixed_depth_octree_jit",
     "build_octree",
     "build_octree_jit",
     "build_tree",

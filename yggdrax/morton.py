@@ -4,22 +4,29 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from beartype import beartype
 from jaxtyping import Array, Float, jaxtyped
 
+from .dtypes import require_x64
+
 U64 = jnp.uint64
 
-MASK_21 = U64(0x1FFFFF)
-M1 = U64(0x1F00000000FFFF)
-M2 = U64(0x1F0000FF0000FF)
-M3 = U64(0x100F00F00F00F00F)
-M4 = U64(0x10C30C30C30C30C3)
-M5 = U64(0x1249249249249249)
+# numpy scalars, not jax arrays: a jnp.uint64 constant here raised at import when x64
+# was off (the masks do not fit 32 bits). Combined with a uint64 array they are the
+# same uint64 constants.
+MASK_21 = np.uint64(0x1FFFFF)
+M1 = np.uint64(0x1F00000000FFFF)
+M2 = np.uint64(0x1F0000FF0000FF)
+M3 = np.uint64(0x100F00F00F00F00F)
+M4 = np.uint64(0x10C30C30C30C30C3)
+M5 = np.uint64(0x1249249249249249)
 
 Bounds = tuple[Float[Array, "3"], Float[Array, "3"]]
 
 
 def _spread3_u64(x_u64: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     x = jnp.bitwise_and(x_u64, MASK_21)
     x = (x | (x << U64(32))) & M1
     x = (x | (x << U64(16))) & M2
@@ -30,6 +37,7 @@ def _spread3_u64(x_u64: jnp.ndarray) -> jnp.ndarray:
 
 
 def _compact3_u64(x: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     x = jnp.bitwise_and(x, M5)
     x = (x | (x >> U64(2))) & M4
     x = (x | (x >> U64(4))) & M3
@@ -65,6 +73,7 @@ def morton_encode_impl(
         ``uint64`` Morton codes of shape ``(n,)``.
     """
 
+    require_x64("63-bit Morton codes")
     min_c, max_c = bounds
     norm = (positions - min_c) / (max_c - min_c)
     norm = jnp.clip(norm, min=0.0, max=jnp.nextafter(1.0, 0.0))
@@ -104,6 +113,7 @@ def morton_decode(
         Decoded positions of shape ``(n, 3)``.
     """
 
+    require_x64("63-bit Morton codes")
     min_c, max_c = bounds
     x = _compact3_u64(codes)
     y = _compact3_u64(codes >> U64(1))

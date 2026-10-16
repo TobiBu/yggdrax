@@ -8,8 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .dtypes import INDEX_DTYPE, is_traced
-from .morton import _compact3_u64
+from .dtypes import INDEX_DTYPE, is_traced, require_x64
 
 _MORTON_BITS = 63
 _MAX_MORTON_LEVEL = 21
@@ -33,42 +32,6 @@ class ExplicitOctreeMetadata(NamedTuple):
     oct_leaf_nodes: jnp.ndarray
     radix_node_to_oct: jnp.ndarray
     radix_leaf_to_oct: jnp.ndarray
-
-
-class ExplicitOctreeBoxGeometry(NamedTuple):
-    """Axis-aligned box geometry for explicit octree cells."""
-
-    centers: jnp.ndarray
-    half_extents: jnp.ndarray
-    radii: jnp.ndarray
-    max_extents: jnp.ndarray
-
-
-class ExplicitOctreeTraversalView(NamedTuple):
-    """Source-owned octree traversal/geometry package for native consumers."""
-
-    valid_mask: jnp.ndarray
-    parent: jnp.ndarray
-    children: jnp.ndarray
-    child_counts: jnp.ndarray
-    node_codes: jnp.ndarray
-    node_depths: jnp.ndarray
-    node_ranges: jnp.ndarray
-    nodes_by_level: jnp.ndarray
-    level_offsets: jnp.ndarray
-    num_levels: jnp.ndarray
-    leaf_mask: jnp.ndarray
-    leaf_nodes: jnp.ndarray
-    radix_node_to_oct: jnp.ndarray
-    radix_leaf_to_oct: jnp.ndarray
-    oct_to_radix_node: jnp.ndarray
-    oct_to_radix_leaf: jnp.ndarray
-    num_valid_nodes: jnp.ndarray
-    num_leaf_nodes: jnp.ndarray
-    box_centers: jnp.ndarray
-    box_half_extents: jnp.ndarray
-    box_radii: jnp.ndarray
-    box_max_extents: jnp.ndarray
 
 
 class OctreeTopology(NamedTuple):
@@ -123,6 +86,7 @@ def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
     ensuring keys at different depths never overlap.  This is used to
     enable O(n log n) parent lookup via :func:`jnp.searchsorted`.
     """
+    require_x64("63-bit Morton codes")
     depths_u64 = jnp.asarray(
         jnp.maximum(0, depths), dtype=jnp.uint64
     )  # clamp negative sentinel values (e.g. -1 padding) before uint64 cast
@@ -135,6 +99,7 @@ def _oct_address(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 
 
 def _prefix_code(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     depths_i32 = jnp.asarray(depths, dtype=INDEX_DTYPE)
     shifts = jnp.maximum(0, _MORTON_BITS - 3 * depths_i32).astype(jnp.uint64)
@@ -143,6 +108,7 @@ def _prefix_code(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 
 
 def _octant_at_depth(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     codes_u64 = jnp.asarray(codes, dtype=jnp.uint64)
     depths_i32 = jnp.asarray(depths, dtype=INDEX_DTYPE)
     shifts = jnp.maximum(0, _MORTON_BITS - 3 * depths_i32).astype(jnp.uint64)
@@ -153,6 +119,7 @@ def _octant_at_depth(codes: jnp.ndarray, depths: jnp.ndarray) -> jnp.ndarray:
 def _common_depth_from_codes(
     first_codes: jnp.ndarray, last_codes: jnp.ndarray
 ) -> jnp.ndarray:
+    require_x64("63-bit Morton codes")
     xor = jnp.bitwise_xor(
         jnp.asarray(first_codes, dtype=jnp.uint64),
         jnp.asarray(last_codes, dtype=jnp.uint64),
@@ -167,6 +134,7 @@ def _common_depth_from_codes(
 
 
 def _resolved_leaf_cells(topology: object) -> tuple[jnp.ndarray, jnp.ndarray]:
+    require_x64("63-bit Morton codes")
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     # Derive num_internal from the static shape (total_nodes = 2*num_leaves - 1).
     num_internal = (node_ranges.shape[0] - 1) // 2
@@ -224,6 +192,7 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     most 2N-1 unique entries.
     """
 
+    require_x64("63-bit Morton codes")
     leaf_starts = jnp.asarray(leaf_starts, dtype=INDEX_DTYPE)
     leaf_ends_exclusive = jnp.asarray(leaf_ends_exclusive, dtype=INDEX_DTYPE)
     leaf_codes = jnp.asarray(leaf_codes, dtype=jnp.uint64)
@@ -420,63 +389,6 @@ def build_explicit_octree_metadata_from_leaf_partitions(
     )
 
 
-def compute_explicit_octree_box_geometry(
-    *,
-    valid_mask: jnp.ndarray,
-    node_codes: jnp.ndarray,
-    node_depths: jnp.ndarray,
-    bounds_min: jnp.ndarray,
-    bounds_max: jnp.ndarray,
-) -> ExplicitOctreeBoxGeometry:
-    """Compute explicit octree box geometry directly from code/depth pairs."""
-
-    bounds_min = jnp.asarray(bounds_min)
-    bounds_max = jnp.asarray(bounds_max)
-    domain = bounds_max - bounds_min
-    depth_clamped = jnp.clip(
-        jnp.asarray(node_depths, dtype=INDEX_DTYPE),
-        jnp.asarray(0, dtype=INDEX_DTYPE),
-        jnp.asarray(_MAX_MORTON_LEVEL, dtype=INDEX_DTYPE),
-    )
-    shift = jnp.asarray(_MAX_MORTON_LEVEL, dtype=jnp.uint64) - depth_clamped.astype(
-        jnp.uint64
-    )
-    node_codes = jnp.asarray(node_codes, dtype=jnp.uint64)
-    x_coords = _compact3_u64(node_codes)
-    y_coords = _compact3_u64(node_codes >> jnp.uint64(1))
-    z_coords = _compact3_u64(node_codes >> jnp.uint64(2))
-
-    x_idx = x_coords >> shift
-    y_idx = y_coords >> shift
-    z_idx = z_coords >> shift
-    indices = jnp.stack([x_idx, y_idx, z_idx], axis=1).astype(bounds_min.dtype)
-
-    counts = jnp.left_shift(
-        jnp.ones_like(depth_clamped, dtype=jnp.uint64),
-        depth_clamped.astype(jnp.uint64),
-    )
-    counts = jnp.maximum(counts, jnp.uint64(1)).astype(bounds_min.dtype)
-    cell_sizes = domain[None, :] / counts[:, None]
-    mins = bounds_min[None, :] + cell_sizes * indices
-    maxs = mins + cell_sizes
-    centers = 0.5 * (mins + maxs)
-    half_extents = 0.5 * (maxs - mins)
-    radii = jnp.linalg.norm(half_extents, axis=1)
-    max_extents = jnp.max(half_extents, axis=1)
-
-    valid_mask = jnp.asarray(valid_mask, dtype=jnp.bool_)
-    centers = jnp.where(valid_mask[:, None], centers, 0.0)
-    half_extents = jnp.where(valid_mask[:, None], half_extents, 0.0)
-    radii = jnp.where(valid_mask, radii, 0.0)
-    max_extents = jnp.where(valid_mask, max_extents, 0.0)
-    return ExplicitOctreeBoxGeometry(
-        centers=centers,
-        half_extents=half_extents,
-        radii=radii,
-        max_extents=max_extents,
-    )
-
-
 def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
     """Derive explicit octree cells and map the radix nodes onto them.
 
@@ -496,6 +408,7 @@ def build_explicit_octree_metadata(topology: object) -> ExplicitOctreeMetadata:
         ``radix_node_to_oct`` / ``radix_leaf_to_oct`` mappings.
     """
 
+    require_x64("63-bit Morton codes")
     node_ranges = jnp.asarray(getattr(topology, "node_ranges"), dtype=INDEX_DTYPE)
     morton_codes = jnp.asarray(getattr(topology, "morton_codes"), dtype=jnp.uint64)
     num_nodes = int(node_ranges.shape[0])
@@ -589,7 +502,7 @@ def augment_radix_topology_with_octree(topology: object) -> OctreeTopology:
     static_leaf_size = getattr(topology, "leaf_size", None)
     if static_leaf_size is None:
         # Nothing to put back. `None` is pytree *structure* rather than a leaf,
-        # so a fixed-depth topology crosses the boundary with it intact.
+        # so a topology without a static leaf size crosses the boundary intact.
         return augmented
     return augmented._replace(leaf_size=static_leaf_size)
 
@@ -618,150 +531,9 @@ _jit_augment_radix_topology_with_octree = jax.jit(
 )
 
 
-def build_explicit_octree_traversal_view(
-    topology: object,
-) -> ExplicitOctreeTraversalView:
-    """Package explicit octree structure, mappings, and box geometry.
-
-    Convenience view that bundles the octree cell tables, the radix<->octree
-    mappings, and per-cell box geometry for downstream octree-native traversal.
-
-    Parameters
-    ----------
-    topology
-        Octree-augmented topology (see :func:`augment_radix_topology_with_octree`)
-        exposing the ``oct_*`` fields.
-
-    Returns
-    -------
-    ExplicitOctreeTraversalView
-        Bundled octree structure, mappings, and box geometry.
-
-    Raises
-    ------
-    ValueError
-        If ``topology`` is missing any required ``oct_*`` field.
-    """
-
-    required = (
-        "oct_valid_mask",
-        "oct_parent",
-        "oct_children",
-        "oct_child_counts",
-        "oct_node_codes",
-        "oct_node_depths",
-        "oct_node_ranges",
-        "oct_nodes_by_level",
-        "oct_level_offsets",
-        "oct_num_levels",
-        "oct_leaf_mask",
-        "oct_leaf_nodes",
-        "radix_node_to_oct",
-        "radix_leaf_to_oct",
-        "bounds_min",
-        "bounds_max",
-    )
-    missing = tuple(name for name in required if not hasattr(topology, name))
-    if missing:
-        missing_txt = ", ".join(missing)
-        raise ValueError(
-            f"topology is missing explicit octree traversal fields: {missing_txt}"
-        )
-
-    valid_mask = jnp.asarray(getattr(topology, "oct_valid_mask"), dtype=jnp.bool_)
-    parent = jnp.asarray(getattr(topology, "oct_parent"), dtype=INDEX_DTYPE)
-    children = jnp.asarray(getattr(topology, "oct_children"), dtype=INDEX_DTYPE)
-    child_counts = jnp.asarray(getattr(topology, "oct_child_counts"), dtype=INDEX_DTYPE)
-    node_codes = jnp.asarray(getattr(topology, "oct_node_codes"), dtype=jnp.uint64)
-    node_depths = jnp.asarray(getattr(topology, "oct_node_depths"), dtype=INDEX_DTYPE)
-    node_ranges = jnp.asarray(getattr(topology, "oct_node_ranges"), dtype=INDEX_DTYPE)
-    nodes_by_level = jnp.asarray(
-        getattr(topology, "oct_nodes_by_level"), dtype=INDEX_DTYPE
-    )
-    level_offsets = jnp.asarray(
-        getattr(topology, "oct_level_offsets"), dtype=INDEX_DTYPE
-    )
-    num_levels = jnp.asarray(getattr(topology, "oct_num_levels"), dtype=INDEX_DTYPE)
-    leaf_mask = jnp.asarray(getattr(topology, "oct_leaf_mask"), dtype=jnp.bool_)
-    leaf_nodes = jnp.asarray(getattr(topology, "oct_leaf_nodes"), dtype=INDEX_DTYPE)
-    radix_node_to_oct = jnp.asarray(
-        getattr(topology, "radix_node_to_oct"), dtype=INDEX_DTYPE
-    )
-    radix_leaf_to_oct = jnp.asarray(
-        getattr(topology, "radix_leaf_to_oct"), dtype=INDEX_DTYPE
-    )
-
-    full_oct_nodes = valid_mask.shape[0]
-    radix_nodes = radix_node_to_oct.shape[0]
-    radix_node_ids = jnp.arange(radix_nodes, dtype=INDEX_DTYPE)
-    node_fill = jnp.asarray(radix_nodes, dtype=INDEX_DTYPE)
-    oct_to_radix_node = jnp.full((full_oct_nodes,), node_fill, dtype=INDEX_DTYPE)
-    oct_to_radix_node = oct_to_radix_node.at[radix_node_to_oct].min(radix_node_ids)
-    oct_to_radix_node = jnp.where(
-        valid_mask & (oct_to_radix_node < node_fill),
-        oct_to_radix_node,
-        jnp.asarray(-1, dtype=INDEX_DTYPE),
-    )
-
-    num_internal = int(jnp.asarray(getattr(topology, "left_child")).shape[0])
-    radix_leaf_nodes = jnp.arange(
-        num_internal,
-        num_internal + radix_leaf_to_oct.shape[0],
-        dtype=INDEX_DTYPE,
-    )
-    leaf_fill = jnp.asarray(
-        num_internal + radix_leaf_to_oct.shape[0], dtype=INDEX_DTYPE
-    )
-    oct_to_radix_leaf = jnp.full((full_oct_nodes,), leaf_fill, dtype=INDEX_DTYPE)
-    oct_to_radix_leaf = oct_to_radix_leaf.at[radix_leaf_to_oct].min(radix_leaf_nodes)
-    oct_to_radix_leaf = jnp.where(
-        leaf_mask & (oct_to_radix_leaf < leaf_fill),
-        oct_to_radix_leaf,
-        jnp.asarray(-1, dtype=INDEX_DTYPE),
-    )
-
-    num_valid_nodes = jnp.sum(valid_mask.astype(INDEX_DTYPE))
-    num_leaf_nodes = jnp.sum(leaf_mask.astype(INDEX_DTYPE))
-    box_geometry = compute_explicit_octree_box_geometry(
-        valid_mask=valid_mask,
-        node_codes=node_codes,
-        node_depths=node_depths,
-        bounds_min=jnp.asarray(getattr(topology, "bounds_min")),
-        bounds_max=jnp.asarray(getattr(topology, "bounds_max")),
-    )
-    return ExplicitOctreeTraversalView(
-        valid_mask=valid_mask,
-        parent=parent,
-        children=children,
-        child_counts=child_counts,
-        node_codes=node_codes,
-        node_depths=node_depths,
-        node_ranges=node_ranges,
-        nodes_by_level=nodes_by_level,
-        level_offsets=level_offsets,
-        num_levels=num_levels,
-        leaf_mask=leaf_mask,
-        leaf_nodes=leaf_nodes,
-        radix_node_to_oct=radix_node_to_oct,
-        radix_leaf_to_oct=radix_leaf_to_oct,
-        oct_to_radix_node=oct_to_radix_node,
-        oct_to_radix_leaf=oct_to_radix_leaf,
-        num_valid_nodes=num_valid_nodes,
-        num_leaf_nodes=num_leaf_nodes,
-        box_centers=box_geometry.centers,
-        box_half_extents=box_geometry.half_extents,
-        box_radii=box_geometry.radii,
-        box_max_extents=box_geometry.max_extents,
-    )
-
-
 __all__ = [
-    "ExplicitOctreeBoxGeometry",
     "ExplicitOctreeMetadata",
-    "ExplicitOctreeTraversalView",
     "OctreeTopology",
     "augment_radix_topology_with_octree",
-    "build_explicit_octree_traversal_view",
-    "compute_explicit_octree_box_geometry",
     "build_explicit_octree_metadata",
 ]

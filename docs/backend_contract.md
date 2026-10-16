@@ -25,7 +25,10 @@ Required for geometry from particle ranges:
 
 ### `MortonLeafBoundsProtocol` (optional geometry mode)
 
-Required only when `use_morton_geometry=True`:
+Required only when `use_morton_geometry=True`. No yggdrax builder sets the flag
+since fixed-depth builds were removed in the 2026-10 cleanup (Y2); a backend that
+knows each leaf's Morton cell may, and `compute_tree_geometry` then derives leaf
+boxes from the cells:
 
 - `use_morton_geometry`
 - `bounds_min`
@@ -35,7 +38,7 @@ Required only when `use_morton_geometry=True`:
 
 ### `TreeLevelIndexProtocol` (optional, derivable)
 
-Used by level-major and interaction grouping paths. If absent, yggdrax derives
+Used to order far-field interaction lists by level. If absent, yggdrax derives
 these from `parent`:
 
 - `node_level`

@@ -16,8 +16,7 @@ dynamic count, exactly like jztree's padded ``Pos`` container.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+import os
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +44,63 @@ _COUNT_DTYPE = jnp.int32
 #: error on a 17.8M-particle disc across 4 GPUs while angular momentum, energy and
 #: every overflow flag stayed healthy.
 RAGGED_NATIVE_FIXED_JAX = (0, 9, 1)
+
+#: XLA flag that selects the NCCL send/recv ragged fallback when ``false``.
+_ONE_SHOT_FLAG = "xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel"
+#: XLA flag the NCCL fallback cannot run with. Its default is ``true`` from jax
+#: :data:`_BARRIER_DEFAULT_ON_JAX` on (XLA 91888df6), ``false`` before.
+_BARRIER_FLAG = "xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl"
+_BARRIER_DEFAULT_ON_JAX = (0, 11)
+
+
+def _xla_flag_values(xla_flags: str) -> dict[str, str]:
+    """The ``--name=value`` tokens of ``XLA_FLAGS``; a later one wins, as in XLA."""
+    values: dict[str, str] = {}
+    for token in xla_flags.split():
+        if token.startswith("--"):
+            name, _, value = token[2:].partition("=")
+            values[name] = value.lower() if value else "true"
+    return values
+
+
+def ragged_native_flag_hazard(xla_flags: str | None = None) -> str | None:
+    """Say why ``XLA_FLAGS`` breaks the native ``ragged_all_to_all``, else ``None``.
+
+    The NCCL send/recv fallback (``one_shot_kernel=false``) is broken while
+    ``use_barrier_with_nccl`` is on. From about 512 rows of 56 float32 per message up,
+    the first call returns only each device's block to itself (every cross-device row
+    keeps ``fill_value``), and the second call never returns, with both GPUs spinning.
+    Measured 2026-10-12 on 2x A100-PCIE with pure JAX (jaccpot
+    ``bench/repro_jax_ragged_all_to_all_nccl_fallback.py``): broken on jax 0.11.2 at
+    its default and on 0.10.2 with the flag set explicitly; clean on both with it off.
+    jax 0.11 turned the flag on by default, so the one-flag NCCL setting that was safe
+    on 0.10 hangs on 0.11.
+
+    Parameters
+    ----------
+    xla_flags:
+        The flag string to check; ``None`` reads ``XLA_FLAGS``. XLA reads its flags
+        once, when the backend starts, so a later change is not what XLA runs with.
+
+    Returns
+    -------
+    str or None
+        The reason, ready for an error message, or ``None`` when the flags are safe.
+    """
+    if xla_flags is None:
+        xla_flags = os.environ.get("XLA_FLAGS", "")
+    values = _xla_flag_values(xla_flags)
+    if values.get(_ONE_SHOT_FLAG, "true") not in ("false", "0"):
+        return None
+    default = "true" if _jax_version_tuple() >= _BARRIER_DEFAULT_ON_JAX else "false"
+    if values.get(_BARRIER_FLAG, default) in ("false", "0"):
+        return None
+    return (
+        f"XLA_FLAGS selects the NCCL ragged_all_to_all (--{_ONE_SHOT_FLAG}=false) "
+        f"with --{_BARRIER_FLAG} on (its default from jax 0.11). That combination "
+        "delivers no cross-device rows and deadlocks on the next call. Add "
+        f"--{_BARRIER_FLAG}=false, or drop the one-shot flag for XLA's default kernel."
+    )
 
 
 def _jax_version_tuple() -> tuple[int, ...]:
@@ -82,45 +138,10 @@ def resolve_ragged_method(method: str = "auto") -> str:
     return "native" if _jax_version_tuple() >= RAGGED_NATIVE_FIXED_JAX else "buf"
 
 
-@jax.tree_util.register_dataclass
-@dataclass
-class ShardedArray:
-    """A padded per-device array plus its valid-row count.
-
-    ``data`` has a static leading capacity; only the first ``count`` rows are
-    valid. Carrying ``count`` as a traced scalar (rather than reshaping) keeps
-    the container ``jit``/``shard_map`` friendly under transient load imbalance,
-    the same trick jztree uses to avoid reshuffling mid-algorithm.
-    """
-
-    data: Array
-    count: Array  # scalar int, number of valid leading rows in ``data``
-
-    @property
-    def capacity(self) -> int:
-        return int(self.data.shape[0])
-
-
 def _exclusive_cumsum(x: Array, axis: int = 0) -> Array:
     """Exclusive prefix sum (``out[i] = sum(x[:i])``) along ``axis``."""
 
     return jnp.cumsum(x, axis=axis) - x
-
-
-def exchange_sizes(send_sizes: Array, *, axis_name: str = AXIS_NAME) -> Array:
-    """Transpose the per-device send-size matrix into receive sizes.
-
-    ``send_sizes[i]`` is how many rows this device sends to device ``i``. The
-    returned ``recv_sizes[s]`` is how many rows this device receives from
-    device ``s``. Implemented by gathering every device's row of the
-    communication matrix (tiny: ``ndev x ndev``) and reading off our column.
-    """
-
-    full = jax.lax.all_gather(
-        send_sizes.astype(_COUNT_DTYPE), axis_name, tiled=False
-    )  # full[s, i] = rows device s sends to device i
-    me = jax.lax.axis_index(axis_name)
-    return full[:, me]
 
 
 def _ragged_native(
@@ -219,6 +240,8 @@ def ragged_all_to_all_exchange(
         and buf otherwise. Below that version the native collective silently returns
         ``fill_value`` once its buffers move (donation is enough) -- see the constant
         for the measurement. Do not select ``"native"`` there except to reproduce it.
+        On GPU, a native exchange raises ``RuntimeError`` when ``XLA_FLAGS`` selects the
+        NCCL fallback in a way that deadlocks; see :func:`ragged_native_flag_hazard`.
 
     Returns
     -------
@@ -234,6 +257,10 @@ def ragged_all_to_all_exchange(
     me = jax.lax.axis_index(axis_name)
 
     method = resolve_ragged_method(method)
+    if method == "native" and jax.default_backend() == "gpu":
+        hazard = ragged_native_flag_hazard()
+        if hazard is not None:
+            raise RuntimeError(hazard)
     impl = _ragged_native if method == "native" else _ragged_through_buf
     output = impl(operand, send_sizes, full, me, output_capacity, axis_name, fill_value)
 
@@ -242,81 +269,7 @@ def ragged_all_to_all_exchange(
     return output, recv_sizes, recv_offsets
 
 
-def all_to_all_dense(
-    operand: Array,
-    send_counts: Array,
-    *,
-    axis_name: str = AXIS_NAME,
-) -> tuple[Array, Array]:
-    """Fixed-capacity all-to-all fallback (higher bandwidth, always correct).
-
-    ``operand`` has shape ``[ndev, capacity, *feat]``: block ``i`` (of which the
-    first ``send_counts[i]`` rows are valid) is destined for device ``i``. This
-    is the buffer-based fallback jztree keeps for platforms/shapes where the
-    ragged primitive is undesirable; it is also a useful cross-check in tests.
-
-    Returns ``(received, recv_counts)`` where ``received[s]`` is the block from
-    device ``s`` and ``recv_counts[s]`` its valid-row count.
-    """
-
-    received = jax.lax.all_to_all(
-        operand, axis_name, split_axis=0, concat_axis=0, tiled=True
-    )
-    recv_counts = jax.lax.all_to_all(
-        send_counts.astype(_COUNT_DTYPE), axis_name, 0, 0, tiled=True
-    )
-    return received, recv_counts
-
-
-def exchange_pytree(
-    tree,
-    send_sizes: Array,
-    *,
-    output_capacity: int,
-    axis_name: str = AXIS_NAME,
-    n_local: Optional[int] = None,
-):
-    """Ragged-exchange every leaf of ``tree`` whose leading dim is per-particle.
-
-    Leaves whose leading dimension equals ``n_local`` (the padded local particle
-    capacity) are treated as per-particle and exchanged with a shared routing
-    (same ``send_sizes`` and offsets for all of them). Other leaves are passed
-    through unchanged -- matching jztree's rule that only leaves whose leading
-    dim == N are communicated.
-
-    Returns ``(new_tree, recv_sizes, recv_offsets)``.
-    """
-
-    leaves, treedef = jax.tree_util.tree_flatten(tree)
-    if n_local is None:
-        # Infer from the first array-like leaf.
-        n_local = int(leaves[0].shape[0])
-
-    recv_sizes = None
-    recv_offsets = None
-    new_leaves = []
-    for leaf in leaves:
-        arr = jnp.asarray(leaf)
-        if arr.ndim >= 1 and arr.shape[0] == n_local:
-            out, rs, ro = ragged_all_to_all_exchange(
-                arr,
-                send_sizes,
-                output_capacity=output_capacity,
-                axis_name=axis_name,
-            )
-            new_leaves.append(out)
-            recv_sizes = rs
-            recv_offsets = ro
-        else:
-            new_leaves.append(leaf)
-
-    return jax.tree_util.tree_unflatten(treedef, new_leaves), recv_sizes, recv_offsets
-
-
 __all__ = [
-    "ShardedArray",
-    "exchange_sizes",
     "ragged_all_to_all_exchange",
-    "all_to_all_dense",
-    "exchange_pytree",
+    "ragged_native_flag_hazard",
 ]

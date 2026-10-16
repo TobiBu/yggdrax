@@ -25,7 +25,6 @@ interaction/neighbour consumers work unchanged -- with the understanding that
 
 from __future__ import annotations
 
-from functools import partial
 from typing import NamedTuple, Optional, cast
 
 import jax
@@ -177,6 +176,7 @@ def dual_tree_walk_cross_impl(
     *,
     mac_type: MACType = "bh",
     dehnen_radius_scale: float = 1.0,
+    separation_floor: float = 0.0,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
     max_pair_queue: int,
@@ -189,8 +189,12 @@ def dual_tree_walk_cross_impl(
 ) -> DualTreeWalkResult:
     """Dual walk of target-tree nodes against source-tree nodes (un-jitted impl).
 
-    Call this raw form inside another transform (e.g. ``shard_map``); use the
-    jitted :func:`dual_tree_walk_cross` wrapper standalone.
+    Call this raw form inside another transform (e.g. ``shard_map``). To call it
+    standalone, ``jax.jit`` it with the capacities, ``mac_type``, the two
+    ``collect_*`` flags, ``separation_floor`` and ``pair_policy`` static (a
+    traced ``pair_policy`` would flatten to nothing and silently fall back to the
+    geometric MAC). The jitted wrapper ``dual_tree_walk_cross`` had no caller and
+    was removed in the 2026-10 cleanup (Y3).
 
     Far list is keyed by target node (``target_node <- source_node``); near list
     is keyed by target leaf (``target_leaf <- source_leaf``). Fixed-capacity,
@@ -375,7 +379,7 @@ def dual_tree_walk_cross_impl(
         # the union has to be narrowed somewhere; doing it at the source keeps every
         # consumer's signature honest instead of widening them to a type they cannot
         # actually accept. `typing.cast` is the codebase's existing idiom for this (see
-        # `tree.py` and `octree_uvwx.py`).
+        # `tree.py`).
         st_t = cast(Array, jnp.where(valid, wf_t, as_index(0)))
         st_s = cast(Array, jnp.where(valid, wf_s, as_index(0)))
 
@@ -404,6 +408,7 @@ def dual_tree_walk_cross_impl(
             extent_source=es,
             valid_pairs=vb,
             different_nodes=vb,  # disjoint trees: always "different"
+            separation_floor=separation_floor,
         )
 
         t_int = vb & (wf_t < t_internal_v)
@@ -672,23 +677,6 @@ def dual_tree_walk_cross_impl(
         near_decisions=n_near,
         refine_decisions=n_refine,
     )
-
-
-dual_tree_walk_cross = partial(
-    jax.jit,
-    static_argnames=(
-        "max_interactions_per_node",
-        "max_neighbors_per_leaf",
-        "max_pair_queue",
-        "mac_type",
-        "collect_far",
-        "collect_near",
-        # A Python callable, so it must be static: traced, it would be flattened to
-        # nothing and the walk would silently fall back to the geometric MAC.
-        # ``policy_state`` stays traced -- it is arrays.
-        "pair_policy",
-    ),
-)(dual_tree_walk_cross_impl)
 
 
 # ---------------------------------------------------------------------------
@@ -1237,7 +1225,6 @@ __all__ = [
     "single_owner_domain",
     "cross_pair_is_owned",
     "cross_pair_owner",
-    "dual_tree_walk_cross",
     "dual_tree_walk_cross_impl",
     "dual_tree_walk_cross_mutual",
 ]
