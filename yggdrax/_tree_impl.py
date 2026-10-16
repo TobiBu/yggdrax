@@ -464,6 +464,7 @@ def build_static_cells_tree(
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
     min_level: int = 0,
+    return_num_leaves: bool = False,
 ):
     """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
 
@@ -515,11 +516,17 @@ def build_static_cells_tree(
         No leaf coarser than this Morton level (see
         :func:`~yggdrax._cell_partition.adaptive_cell_leaf_partition`). ``0``:
         unconstrained.
+    return_num_leaves
+        Also return the partition's live leaf count (a traced integer scalar):
+        the exact number of cell leaves the positions need, counted BEFORE the
+        cut to ``leaf_capacity`` -- so past an overflow it is the capacity a
+        rebuild would have needed, which a caller re-plans from.
 
     Returns
     -------
     RadixTree or tuple
-        ``tree`` [, ``positions_sorted, masses_sorted, inverse``] [, ``overflow``].
+        ``tree`` [, ``positions_sorted, masses_sorted, inverse``] [, ``overflow``]
+        [, ``num_leaves``].
 
     Raises
     ------
@@ -596,6 +603,8 @@ def build_static_cells_tree(
     outputs: list[Any] = [out] if isinstance(out, RadixTree) else list(out)
     if return_overflow:
         outputs.append(part.overflow)
+    if return_num_leaves:
+        outputs.append(part.num_leaves)
     return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
 
@@ -752,6 +761,7 @@ def rebuild_static_radix_tree_from_template(
     return_overflow: bool = False,
     num_valid: Array | int | None = None,
     cell_min_level: int = 0,
+    return_num_leaves: bool = False,
 ):
     """Refresh particles against a fixed-shape static radix bucket topology.
 
@@ -759,8 +769,10 @@ def rebuild_static_radix_tree_from_template(
     capacity = its leaf count, ``leaf_size`` = its leaf width, bounds): the
     cell leaves and the radix structure over them are rebuilt from the new
     positions on device (:func:`build_static_cells_tree`). ``return_overflow``
-    then appends the partition's overflow flag; for buckets it is refused
-    (their leaf count is a function of ``n`` and ``leaf_size`` alone).
+    then appends the partition's overflow flag and ``return_num_leaves`` its
+    live leaf count (exact even past an overflow: what a re-planned capacity
+    must hold); for buckets both are refused (their leaf count is a function of
+    ``n`` and ``leaf_size`` alone).
     """
 
     from .morton import morton_encode  # local import to avoid circulars
@@ -773,6 +785,10 @@ def rebuild_static_radix_tree_from_template(
     if return_overflow and leaf_partition != "cells":
         raise ValueError(
             "return_overflow is only meaningful for leaf_partition='cells'"
+        )
+    if return_num_leaves and leaf_partition != "cells":
+        raise ValueError(
+            "return_num_leaves is only meaningful for leaf_partition='cells'"
         )
     if num_valid is not None and leaf_partition != "cells":
         # Buckets cut the sorted particles into fixed runs of leaf_size, so a
@@ -808,6 +824,7 @@ def rebuild_static_radix_tree_from_template(
             return_overflow=bool(return_overflow),
             num_valid=num_valid,
             min_level=int(cell_min_level),
+            return_num_leaves=bool(return_num_leaves),
         )
 
     morton_codes = morton_encode(positions, bounds_resolved)
