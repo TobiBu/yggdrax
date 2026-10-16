@@ -189,10 +189,11 @@ gate rerun corrfunc_scaling "$OUT/corrfunc/scaling.json" --base "$BASE" \
 
 # -- 5. series C of the rebuild scale-up, exactly as its JSON records it ----------------------
 # The flags are the file's own fields (fixed_budget, target/lr modes and
-# reference N, sweep.num_particles_requested, sweep.seeds); the memory fraction
-# is its metadata.xla_memory_env, which sets where the sweep runs out of memory.
+# reference N, sweep.num_particles_requested, sweep.seeds); the allocator
+# settings are its metadata.xla_memory_env, and the fraction sets where the
+# sweep runs out of memory.
 step "differentiability/nn_rebuild_scaling_step_scaled.json (series C)"
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 bench --smoke-sweep \
+XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 bench --smoke-sweep \
   "$OUT/differentiability/nn_rebuild_scaling_step_scaled.json" -- \
   "$PY" bench/differentiability/nn_rebuild.py \
   --sweep-n 256 1024 4096 16384 65536 131072 262144 524288 1048576 2097152 \
