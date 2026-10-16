@@ -6,8 +6,11 @@ Times the two stages of the estimator separately over a sweep of catalog size:
 * ``accumulate`` -- the differentiable soft-count reduction over that topology;
 * ``value_and_grad`` -- forward + reverse of the accumulation.
 
-A brute-force :math:`O(N^2)` soft count is timed for the small sizes as a
-context baseline (it is quadratic and only feasible for small N).
+The exact :math:`O(N^2)` soft count is timed up to ``--brute-force-max-n`` as
+the baseline: ``brute_force_soft_pair_counts_device``, jitted and warmed like
+the estimator. (The host-loop reference this bench used to time, cold, measured
+the loop as well as the pairs -- 594 ms at N = 1e3 on an A100.) Where both
+exist, each record also carries the estimator's error against it.
 
 Results -> ``results/corrfunc/scaling.json``.
 
@@ -84,8 +87,6 @@ def main() -> None:
 
     select_free_gpu(args.gpu_select, tag="corrfunc-scaling")
 
-    import time
-
     import jax
     import jax.numpy as jnp
 
@@ -95,7 +96,9 @@ def main() -> None:
     jax.config.update("jax_enable_x64", True)
 
     from yggdrax import DualTreeTraversalConfig
-    from yggdrax.applications.corrfunc.baselines import brute_force_soft_pair_counts
+    from yggdrax.applications.corrfunc.baselines import (
+        brute_force_soft_pair_counts_device,
+    )
     from yggdrax.applications.corrfunc.binning import make_log_edges
     from yggdrax.applications.corrfunc.estimator import (
         build_pair_topology,
@@ -168,9 +171,18 @@ def main() -> None:
             "device_memory": device_memory_stats(),
         }
         if n <= args.brute_force_max_n:
-            t0 = time.perf_counter()
-            brute_force_soft_pair_counts(pos, edges, sharp)
-            entry["brute_force_s"] = time.perf_counter() - t0
+            brute = jax.jit(
+                lambda p: brute_force_soft_pair_counts_device(p, edges, sharp)
+            )
+            bf_t = time_callable(lambda: brute(pos), warmup=args.warmup, runs=args.runs)
+            entry["brute_force"] = bf_t.as_dict()
+            entry["brute_force_s"] = bf_t.min_s
+            ref = brute(pos)
+            est = accumulate(pos)
+            # The validation bench's metric, so the two JSONs read the same way.
+            entry["max_per_bin_rel_error_vs_brute_force"] = float(
+                jnp.max(jnp.abs(est - ref) / jnp.maximum(ref, 1.0))
+            )
         print(
             f"n={n:>8d} build={build_s * 1e3:8.1f} ms "
             f"acc={acc_t.min_s * 1e3:8.2f} ms vgrad={vg_t.min_s * 1e3:8.2f} ms"
@@ -198,6 +210,8 @@ def main() -> None:
             "leaf_size": args.leaf_size,
             "backend": args.backend,
             "dtype": args.dtype,
+            "brute_force_max_n": args.brute_force_max_n,
+            "brute_force": "brute_force_soft_pair_counts_device, jitted and warmed",
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,

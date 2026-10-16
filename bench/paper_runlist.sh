@@ -181,9 +181,11 @@ bench --smoke "$OUT/differentiability/autodiff_overhead.json" -- "$PY" \
 # timings only: no accuracy field to gate
 
 # -- 4. pair counts ---------------------------------------------------------------------
+# The brute force is the device one (jitted, warmed), so it is timed to 1e5 rather
+# than the 2e4 the host loop could reach; 1e6 would take minutes per call.
 step "corrfunc/scaling.json"
 bench --smoke "$OUT/corrfunc/scaling.json" -- "$PY" bench/corrfunc/scaling.py \
-  --sizes 1000 10000 20000 100000 1000000 --brute-force-max-n 20000
+  --sizes 1000 10000 20000 100000 1000000 --brute-force-max-n 100000
 gate rerun corrfunc_scaling "$OUT/corrfunc/scaling.json" --base "$BASE" \
   --path results/corrfunc/scaling.json
 
@@ -219,13 +221,14 @@ gate rerun bandwidth "$OUT/svgd/bandwidth_learning.json" --base "$BASE" \
 # -- 7. pair-count error vs cost at N = 1e5 (new data; validation.json stays) ----------------
 # --num-bins, --r-min, --r-max, --sharpness, --leaf-size, --backend and --seed
 # are validation.json's params, so its N = 1e4 points and these are comparable.
-# Above --brute-force-max-n the reference is the theta = 0 estimator (near
-# field exact), not brute force; the record's "baseline" field says so.
+# --brute-force-max-n 100000 makes the reference the exact brute force at 1e5
+# too (the device form of validation.json's host reference, equal to ~1e-13),
+# so theta = 0 is measured against it rather than serving as the reference.
 step "corrfunc/validation_n1e5.json"
 bench --smoke "$OUT/corrfunc/validation_n1e5.json" -- "$PY" \
   bench/corrfunc/validate_vs_baseline.py --sizes 100000 \
   --thetas 0 0.2 0.3 0.4 0.5 0.6 0.9 --num-bins 10 --r-min 0.01 --r-max 0.5 \
-  --sharpness 150 --leaf-size 32 --backend radix --seed 0
+  --sharpness 150 --leaf-size 32 --backend radix --seed 0 --brute-force-max-n 100000
 
 # -- Gate 2's machine half: one jax, one device, one commit, x64 on ------------------------
 step "Gate 2: every JSON from this run on one machine"

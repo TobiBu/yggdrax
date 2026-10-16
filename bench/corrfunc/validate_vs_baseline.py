@@ -48,10 +48,10 @@ def _parse_args() -> argparse.Namespace:
         "--brute-force-max-n",
         type=int,
         default=20000,
-        help="Above this N the exact O(N^2) brute-force baseline is infeasible "
-        "(it materialises the full upper-triangle soft-weight tensor and OOMs); "
-        "the theta=0 estimator (near field exact) is used as the reference "
-        "instead, so the estimator itself is still exercised at large N.",
+        help="Above this N the theta=0 estimator (near field exact) is the "
+        "reference instead of the exact O(N^2) brute force. The brute force is "
+        "brute_force_soft_pair_counts_device, which holds one bounded block at "
+        "a time, so the cap is a cost choice, not a memory one.",
     )
     p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
@@ -76,7 +76,9 @@ def main() -> None:
     jax.config.update("jax_enable_x64", True)
 
     from yggdrax import DualTreeTraversalConfig
-    from yggdrax.applications.corrfunc.baselines import brute_force_soft_pair_counts
+    from yggdrax.applications.corrfunc.baselines import (
+        brute_force_soft_pair_counts_device,
+    )
     from yggdrax.applications.corrfunc.binning import make_log_edges
     from yggdrax.applications.corrfunc.estimator import (
         build_pair_topology,
@@ -117,12 +119,15 @@ def main() -> None:
                 pos, topo, edges, args.sharpness
             )
 
-        # Reference: the exact O(N^2) brute force where feasible; otherwise the
+        # Reference: the exact O(N^2) brute force -- the device form of the host
+        # reference, equal to it to ~1e-13 -- up to --brute-force-max-n; above, the
         # theta=0 estimator, whose near field is exact (no far pairs accepted),
-        # which still isolates the far-field monopole error at looser theta while
-        # avoiding the brute force's quadratic memory blow-up.
+        # which still isolates the far-field monopole error at looser theta at a
+        # fraction of the brute force's quadratic cost.
         if n <= args.brute_force_max_n:
-            reference = brute_force_soft_pair_counts(pos, edges, args.sharpness)
+            reference = jax.jit(
+                lambda p: brute_force_soft_pair_counts_device(p, edges, args.sharpness)
+            )(pos)
             baseline = "brute_force"
         else:
             theta_ref = min(args.thetas)
@@ -177,6 +182,8 @@ def main() -> None:
             "leaf_size": args.leaf_size,
             "backend": args.backend,
             "seed": args.seed,
+            "brute_force_max_n": args.brute_force_max_n,
+            "brute_force": "brute_force_soft_pair_counts_device",
         },
         "bin_edges": [float(x) for x in edges],
         "metadata": run_metadata(),
