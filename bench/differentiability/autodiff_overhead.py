@@ -77,6 +77,10 @@ def main() -> None:
     import jax
     import jax.numpy as jnp
 
+    # yggdrax needs x64 and no longer switches it on at import (#97). The
+    # points below stay float32, as they were when the import switched it on.
+    jax.config.update("jax_enable_x64", True)
+
     from yggdrax import build_kdtree, query_neighbors
 
     k = args.k

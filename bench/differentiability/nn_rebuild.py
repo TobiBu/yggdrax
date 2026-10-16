@@ -1450,6 +1450,12 @@ def main() -> None:
 
     select_free_gpu(args.gpu_select, tag="nn_rebuild")
 
+    import jax
+
+    # yggdrax needs x64 and no longer switches it on at import (#97); every mode
+    # below creates its arrays after this line.
+    jax.config.update("jax_enable_x64", True)
+
     if check_mode:
         _run_gradient_check(args)
         return

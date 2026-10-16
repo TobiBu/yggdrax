@@ -55,8 +55,9 @@ def _parse_args() -> argparse.Namespace:
         choices=("float32", "float64"),
         default="float64",
         help=(
-            "Working precision. 'float64' enables jax_enable_x64 (this bench's "
-            "historical default); 'float32' leaves it off."
+            "Working precision, set by the input dtype alone. jax_enable_x64 is "
+            "on either way, because yggdrax needs it; 'float32' inputs keep the "
+            "computation in float32."
         ),
     )
     p.add_argument("--runs", type=int, default=5)
@@ -86,8 +87,10 @@ def main() -> None:
     import jax
     import jax.numpy as jnp
 
-    use_x64 = args.dtype == "float64"
-    jax.config.update("jax_enable_x64", use_x64)
+    # yggdrax needs x64 and no longer switches it on at import (#97), so it is on
+    # for both dtypes. That is also what every committed float32 run measured:
+    # this line used to switch it off, and the yggdrax import switched it back on.
+    jax.config.update("jax_enable_x64", True)
 
     from yggdrax import DualTreeTraversalConfig
     from yggdrax.applications.corrfunc.baselines import brute_force_soft_pair_counts
@@ -111,7 +114,7 @@ def main() -> None:
         max_interactions_per_node=1 << 13,
         max_neighbors_per_leaf=1 << 13,
     )
-    dtype = jnp.float64 if use_x64 else jnp.float32
+    dtype = jnp.float64 if args.dtype == "float64" else jnp.float32
     edges = make_log_edges(args.r_min, args.r_max, args.num_bins).astype(dtype)
     sharp = args.sharpness
 
