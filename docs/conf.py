@@ -49,6 +49,9 @@ intersphinx_mapping = {
 intersphinx_disabled_reftypes = ["*"]
 
 myst_enable_extensions = ["deflist", "colon_fence"]
+# GitHub-style slugs for h1/h2, so `page.md#section` links resolve both here and
+# when the Markdown is read on GitHub.
+myst_heading_anchors = 2
 
 html_theme = "furo"
 html_title = "Yggdrax"

@@ -25,9 +25,10 @@ of them. Contract details are in [](backend_contract.md).
 ## Morton ordering
 
 Particles are mapped to 21-bit-per-axis Z-order (Morton) codes on `uint64`
-(x64 is enabled at import for this reason). Sorting by Morton code makes spatial
-neighbors contiguous in memory, which is what lets the radix builder and the
-prefix-sum moment queries be efficient.
+(yggdrax therefore requires `jax_enable_x64`; see
+[Requirement: `jax_enable_x64`](index.md#requirement-jax_enable_x64)). Sorting by
+Morton code makes spatial neighbors contiguous in memory, which is what lets the
+radix builder and the prefix-sum moment queries be efficient.
 
 ## Multipole Acceptance Criterion (MAC)
 
