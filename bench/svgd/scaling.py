@@ -107,12 +107,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--accumulate",
         choices=("scatter", "segment", "pallas", "auto"),
-        default="scatter",
+        default="auto",
         help=(
-            "How the near field is summed. 'scatter' is the differentiation-safe "
-            "default; 'segment' replaces the contended atomicAdd with a segmented "
-            "reduction (fast forward in float32, slower reverse); 'pallas' is the "
-            "fused kernel with its hand-written VJP, so neither pass scatters."
+            "How the near field is summed. 'auto' (default) is what svgd_phi and "
+            "run_tree_svgd pass, so the bench times what a user gets: the fused "
+            "kernel where prefer_fused_nearfield says so, else 'segment' in "
+            "float32 and 'scatter' in float64. 'scatter' is "
+            "svgd_phi_from_topology's own default; 'segment' replaces the "
+            "contended atomicAdd with a segmented reduction (fast forward in "
+            "float32, slower reverse); 'pallas' is the fused kernel with its "
+            "hand-written VJP, so neither pass scatters. Each record names the "
+            "path that ran as 'accumulate_resolved'."
         ),
     )
     p.add_argument("--runs", type=int, default=5)
@@ -154,6 +159,7 @@ def main() -> None:
 
     from yggdrax import DualTreeTraversalConfig
     from yggdrax.applications.svgd.exact import exact_phi
+    from yggdrax.applications.svgd.pallas_nearfield import prefer_fused_nearfield
     from yggdrax.applications.svgd.sampler import (
         assemble_svgd_topology,
         build_svgd_traversal,
@@ -237,10 +243,20 @@ def main() -> None:
             lambda: vg(p, scores, h, topo), warmup=args.warmup, runs=args.runs
         )
 
+        # The lane "auto" resolves to, by svgd_phi_from_topology's own rule, so
+        # the JSON says which kernel produced each time.
+        resolved = how
+        if how == "auto":
+            if prefer_fused_nearfield(topo.leaf_slots.shape[0]):
+                resolved = "pallas"
+            else:
+                resolved = "segment" if p.dtype.itemsize <= 4 else "scatter"
+
         entry = {
             "n": n,
             "dim": dim,
             "accumulate": args.accumulate,
+            "accumulate_resolved": resolved,
             "build_s": build_s,
             "build_device": walk_t.as_dict(),
             "build_host": assemble_t.as_dict(),
@@ -298,6 +314,9 @@ def main() -> None:
             "leaf_size": args.leaf_size,
             "backend": backend,
             "dtype": args.dtype,
+            "accumulate": args.accumulate,
+            "exact_max_n": args.exact_max_n,
+            "exact_block": args.exact_block,
             "cutoff_bandwidths": args.cutoff_bandwidths,
             "density": args.density,
             "sigma": args.sigma,
