@@ -6,6 +6,10 @@ The soft-binned brute force is the key control: comparing it against the
 tree-accelerated soft estimator isolates the *tree/MAC approximation* error
 from the *soft-binning* error.
 
+Those two are host loops, written to be obviously right rather than fast.
+:func:`brute_force_soft_pair_counts_device` computes the same soft sum as one
+jittable device program, and is the baseline to *time* the estimator against.
+
 Thin wrappers around ``Corrfunc`` and ``TreeCorr`` are also provided for
 external cross-checks. They import lazily and raise an informative error if the
 package is absent, so they are exercised only where those libraries are
@@ -15,6 +19,7 @@ the local test suite self-contained.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
@@ -23,6 +28,11 @@ from yggdrax.applications.corrfunc.binning import (
     hard_bin_weights,
     soft_bin_weights,
 )
+
+#: Entries of the ``(block, n, nbins + 1)`` sigmoid tensor one block of
+#: :func:`brute_force_soft_pair_counts_device` may hold by default: 2**25, which
+#: is 256 MiB in float64.
+_DEVICE_BLOCK_ELEMENTS = 1 << 25
 
 
 def brute_force_pair_counts(
@@ -103,6 +113,76 @@ def brute_force_soft_pair_counts(
         w = np.asarray(soft_bin_weights(r_keep, edges, sharpness, log=log))
         counts += w.sum(axis=0)
     return jnp.asarray(counts)
+
+
+def brute_force_soft_pair_counts_device(
+    positions: Float[Array, "n d"],
+    edges: Float[Array, " nbins+1"],
+    sharpness: float,
+    *,
+    log: bool = True,
+    block_size: int | None = None,
+) -> Float[Array, " nbins"]:
+    """Exact soft-binned counts of unordered pairs as one device program, :math:`O(N^2)`.
+
+    The same sum as :func:`brute_force_soft_pair_counts` -- every pair ``i < j``
+    weighted by :func:`soft_bin_weights` -- written in JAX instead of as a host
+    loop, so it can be jitted, warmed and timed like the estimator. That
+    function stays the validation reference; this one is the baseline. The host
+    loop runs eagerly and moves every row block between host and device, so
+    timing it measures the loop as well as the pairs: on an A100 at N = 1e3 it
+    took 594 ms where the estimator took 0.6 ms.
+
+    Targets are taken ``block_size`` rows at a time by :func:`jax.lax.map`, and
+    each block is reduced to ``(nbins,)`` before the next, so the largest live
+    intermediate is one ``(block_size, n, nbins + 1)`` sigmoid tensor.
+    Separations come from coordinate differences rather than the
+    ``|x|^2 - 2 x.y + |y|^2`` expansion, which would cancel catastrophically for
+    close pairs in float32. The block body is rematerialised under
+    :func:`jax.checkpoint`, so reverse mode stays within the same memory.
+
+    Args:
+        positions: Particle coordinates, shape ``(n, d)``.
+        edges: Radial bin edges, shape ``(nbins + 1,)``.
+        sharpness: Soft-window sharpness (must match the estimator).
+        log: Bin in ``log`` separation (must match the estimator).
+        block_size: Target rows per block. ``None`` picks the largest block
+            whose sigmoid tensor holds at most 2**25 entries.
+
+    Returns:
+        Per-bin soft count of unordered pairs, in the dtype of ``positions``.
+    """
+    positions = jnp.asarray(positions)
+    n, dim = positions.shape
+    nbins = int(edges.shape[0]) - 1
+    if block_size is None:
+        block_size = _DEVICE_BLOCK_ELEMENTS // max(1, n * (nbins + 1))
+    block = max(1, min(int(block_size), n))
+    num_blocks = -(-n // block)
+    pad = num_blocks * block - n
+    padded = (
+        positions
+        if pad == 0
+        else jnp.concatenate([positions, jnp.zeros((pad, dim), positions.dtype)])
+    )
+    # Padded rows get indices >= n, so ``row < col`` rejects every one of them.
+    rows = jnp.arange(num_blocks * block).reshape(num_blocks, block)
+    cols = jnp.arange(n)
+
+    @jax.checkpoint
+    def _block(args: tuple[Array, Array]) -> Array:
+        """Soft counts of the pairs one block of targets heads, ``(nbins,)``."""
+        x_t, row = args
+        diff = x_t[:, None, :] - positions[None, :, :]
+        keep = row[:, None] < cols[None, :]
+        # A rejected pair (the diagonal among them) is given separation 1 before
+        # the square root, so neither the window nor its gradient sees r = 0.
+        r = jnp.sqrt(jnp.where(keep, jnp.sum(diff * diff, axis=-1), 1.0))
+        w = soft_bin_weights(r, edges, sharpness, log=log)
+        return jnp.sum(jnp.where(keep[..., None], w, 0.0), axis=(0, 1))
+
+    per_block = jax.lax.map(_block, (padded.reshape(num_blocks, block, dim), rows))
+    return jnp.sum(per_block, axis=0)
 
 
 def corrfunc_pair_counts(
