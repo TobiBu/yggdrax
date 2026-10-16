@@ -158,11 +158,19 @@ def test_an_empty_source_list_leaves_only_the_self_term():
 
 
 def test_the_twin_is_chunk_invariant():
-    """Chunking is a memory knob, not a numerical one."""
+    """Chunking is a memory knob, not a numerical one.
+
+    It changes only the order in which each target's pair terms are added. On
+    CPU that order is the same for every chunk size and the results agree bit
+    for bit. On a GPU the segment sum scatters atomically and they differ by an
+    ULP: 1.13e-16 on an A100 in float64, which is also the largest spread that
+    500 random reorderings of each target's sources produce on CPU. The bound is
+    the one this file already uses for sums that differ only in order.
+    """
     case = tuple(jnp.asarray(a) for a in _random_case(seed=5))
     whole = nearfield_stein_jax(*case, 0.7)
     for chunk in (1, 3, 7):
-        assert _rel(nearfield_stein_jax(*case, 0.7, chunk_pairs=chunk), whole) == 0.0
+        assert _rel(nearfield_stein_jax(*case, 0.7, chunk_pairs=chunk), whole) < 1e-13
 
 
 @pytest.mark.parametrize("tile", [1, 2, 4, 8])
