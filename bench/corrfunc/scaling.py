@@ -34,6 +34,8 @@ if str(_REPO_ROOT) not in sys.path:
 from bench.differentiability._common import (
     device_memory_stats,
     dump_json,
+    is_out_of_memory,
+    out_of_memory_stop,
     run_metadata,
     select_free_gpu,
     time_callable,
@@ -118,8 +120,8 @@ def main() -> None:
     edges = make_log_edges(args.r_min, args.r_max, args.num_bins).astype(dtype)
     sharp = args.sharpness
 
-    records = []
-    for n in args.sizes:
+    def _measure(n: int) -> dict:
+        """Measure one size; raises if it does not fit in memory."""
         key = jax.random.PRNGKey(args.seed)
         pos = jax.random.uniform(key, (n, 3), dtype=dtype)
 
@@ -169,11 +171,22 @@ def main() -> None:
             t0 = time.perf_counter()
             brute_force_soft_pair_counts(pos, edges, sharp)
             entry["brute_force_s"] = time.perf_counter() - t0
-        records.append(entry)
         print(
             f"n={n:>8d} build={build_s * 1e3:8.1f} ms "
             f"acc={acc_t.min_s * 1e3:8.2f} ms vgrad={vg_t.min_s * 1e3:8.2f} ms"
         )
+        return entry
+
+    records = []
+    stopped_early = None
+    for n in args.sizes:
+        try:
+            records.append(_measure(n))
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                raise
+            stopped_early = out_of_memory_stop(n, exc)
+            break
 
     payload = {
         "benchmark": "corrfunc_scaling",
@@ -190,6 +203,7 @@ def main() -> None:
             "seed": args.seed,
         },
         "metadata": run_metadata(),
+        "sweep": {"stopped_early": stopped_early},
         "records": records,
     }
     dump_json(payload, args.output)

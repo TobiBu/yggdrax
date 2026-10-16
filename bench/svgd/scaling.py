@@ -42,6 +42,8 @@ if str(_REPO_ROOT) not in sys.path:
 from bench.differentiability._common import (
     device_memory_stats,
     dump_json,
+    is_out_of_memory,
+    out_of_memory_stop,
     run_metadata,
     select_free_gpu,
     time_callable,
@@ -180,8 +182,9 @@ def main() -> None:
         backend = "radix" if dim <= 3 else "leaf_kdtree"
 
     n_ref = min(args.sizes)
-    records = []
-    for n in args.sizes:
+
+    def _measure(n: int) -> dict:
+        """Measure one size; raises if it does not fit in memory."""
         key = jax.random.PRNGKey(args.seed)
         # Fixed density means the cloud's volume grows with N, so its scale goes
         # like N^(1/dim); fixed cloud holds it and lets the density grow.
@@ -292,7 +295,6 @@ def main() -> None:
             entry["exact"] = exact_t.as_dict()
             entry["exact_s"] = exact_t.min_s
             entry["speedup_vs_exact"] = exact_t.min_s / phi_t.min_s
-        records.append(entry)
         msg = (
             f"n={n:>8d} build={build_s * 1e3:8.1f} ms "
             f"(dev={walk_t.min_s * 1e3:7.1f} host={assemble_t.min_s * 1e3:7.1f}) "
@@ -304,6 +306,18 @@ def main() -> None:
         if "exact_s" in entry:
             msg += f" exact={entry['exact_s'] * 1e3:8.2f} ms"
         print(msg)
+        return entry
+
+    records = []
+    stopped_early = None
+    for n in args.sizes:
+        try:
+            records.append(_measure(n))
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                raise
+            stopped_early = out_of_memory_stop(n, exc)
+            break
 
     payload = {
         "benchmark": "svgd_scaling",
@@ -325,6 +339,7 @@ def main() -> None:
             "seed": args.seed,
         },
         "metadata": run_metadata(),
+        "sweep": {"stopped_early": stopped_early},
         "records": records,
     }
     dump_json(payload, args.output)

@@ -30,6 +30,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from bench.differentiability._common import (
     dump_json,
+    is_out_of_memory,
+    out_of_memory_stop,
     run_metadata,
     select_free_gpu,
     time_callable,
@@ -100,8 +102,8 @@ def main() -> None:
     fwd = jax.jit(loss)
     fwd_bwd = jax.jit(jax.value_and_grad(loss))
 
-    records = []
-    for n in args.sizes:
+    def _measure(n: int) -> dict:
+        """Measure one size; raises if it does not fit in memory."""
         key = jax.random.PRNGKey(args.seed)
         points = jax.random.uniform(
             key, (n, 3), minval=-1.0, maxval=1.0, dtype=jnp.float32
@@ -114,19 +116,27 @@ def main() -> None:
             lambda: fwd_bwd(points), warmup=args.warmup, runs=args.runs
         )
         ratio = bwd_timing.min_s / fwd_timing.min_s
-
-        records.append(
-            {
-                "n": n,
-                "forward": fwd_timing.as_dict(),
-                "forward_backward": bwd_timing.as_dict(),
-                "overhead_ratio": ratio,
-            }
-        )
         print(
             f"n={n:>9d}  fwd={fwd_timing.min_s * 1e3:8.2f} ms  "
             f"fwd+bwd={bwd_timing.min_s * 1e3:8.2f} ms  ratio={ratio:5.2f}x"
         )
+        return {
+            "n": n,
+            "forward": fwd_timing.as_dict(),
+            "forward_backward": bwd_timing.as_dict(),
+            "overhead_ratio": ratio,
+        }
+
+    records = []
+    stopped_early = None
+    for n in args.sizes:
+        try:
+            records.append(_measure(n))
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                raise
+            stopped_early = out_of_memory_stop(n, exc)
+            break
 
     payload = {
         "benchmark": "autodiff_overhead",
@@ -140,6 +150,7 @@ def main() -> None:
             "seed": args.seed,
         },
         "metadata": run_metadata(),
+        "sweep": {"stopped_early": stopped_early},
         "records": records,
     }
     dump_json(payload, args.output)

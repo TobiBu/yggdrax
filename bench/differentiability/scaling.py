@@ -31,6 +31,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from bench.differentiability._common import (
     dump_json,
+    is_out_of_memory,
+    out_of_memory_stop,
     run_metadata,
     select_free_gpu,
     time_callable,
@@ -115,8 +117,8 @@ def main() -> None:
         mass = jax.random.uniform(km, (n,), minval=0.5, maxval=1.5, dtype=jnp.float32)
         return pos, mass
 
-    records = []
-    for n in args.sizes:
+    def _measure(n: int) -> dict:
+        """Measure one size; raises if it does not fit in memory."""
         pos, mass = make_problem(n, args.seed)
         pos_np = np.asarray(pos)
         entry: dict = {"n": n, "backends": {}}
@@ -163,8 +165,18 @@ def main() -> None:
 
         if not args.no_scipy:
             entry["scipy_ckdtree"] = _scipy_baseline(pos_np, args.leaf_size, args.runs)
+        return entry
 
-        records.append(entry)
+    records = []
+    stopped_early = None
+    for n in args.sizes:
+        try:
+            records.append(_measure(n))
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                raise
+            stopped_early = out_of_memory_stop(n, exc)
+            break
 
     payload = {
         "benchmark": "scaling",
@@ -178,6 +190,7 @@ def main() -> None:
             "seed": args.seed,
         },
         "metadata": run_metadata(),
+        "sweep": {"stopped_early": stopped_early},
         "records": records,
     }
     dump_json(payload, args.output)

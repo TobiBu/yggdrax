@@ -38,6 +38,55 @@ def select_free_gpu(mode: str = "free", *, tag: str = "bench") -> None:
     autocvd(num_gpus=1, least_used=(mode == "least-used"))
 
 
+_OUT_OF_MEMORY_MARKERS = (
+    "RESOURCE_EXHAUSTED",
+    "Out of memory",
+    "out of memory",
+    "CUDA_ERROR_OUT_OF_MEMORY",
+)
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    """Whether ``exc`` is a device or host allocation failure.
+
+    A size sweep keeps the sizes it finished when a larger one does not fit,
+    and records the failure instead of losing the whole JSON. Anything else is
+    a bug and should still crash the bench.
+
+    Args:
+        exc: The exception raised while measuring one size.
+
+    Returns:
+        ``True`` for an allocation failure.
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in _OUT_OF_MEMORY_MARKERS)
+
+
+def out_of_memory_stop(n: int, exc: BaseException) -> dict[str, Any]:
+    """Return a ``sweep.stopped_early`` record for a size that did not fit.
+
+    Same shape as ``nn_rebuild.py``'s scale-up sweep, so every bench reports a
+    truncated sweep the same way. The size is named, never dropped silently.
+
+    Args:
+        n: The size that failed.
+        exc: The allocation failure.
+
+    Returns:
+        The record, ready for the payload's ``sweep.stopped_early``.
+    """
+    record = {
+        "reason": "out_of_memory",
+        "at_n": n,
+        "detail": f"{type(exc).__name__}: {str(exc)[:400]}",
+    }
+    print(f"[bench] stopped early at n={n}: {record['detail']}")
+    return record
+
+
 def device_memory_stats(device_index: int = 0) -> dict[str, int] | None:
     """Return the backend's memory counters for one device, or ``None``.
 

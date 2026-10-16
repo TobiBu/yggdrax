@@ -24,7 +24,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from bench.differentiability._common import dump_json, run_metadata, select_free_gpu
+from bench.differentiability._common import (
+    dump_json,
+    is_out_of_memory,
+    out_of_memory_stop,
+    run_metadata,
+    select_free_gpu,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -90,8 +96,8 @@ def main() -> None:
     )
     edges = make_log_edges(args.r_min, args.r_max, args.num_bins)
 
-    records = []
-    for n in args.sizes:
+    def _measure(n: int) -> list[dict]:
+        """Validate one size across theta; raises if it does not fit in memory."""
         key = jax.random.PRNGKey(args.seed)
         pos = jax.random.uniform(key, (n, 3), dtype=jnp.float64)
 
@@ -123,6 +129,7 @@ def main() -> None:
             reference = ests[theta_ref]
             baseline = f"tree_theta{theta_ref:g}_nearfield_exact"
 
+        recs = []
         for theta in args.thetas:
             est = ests[theta]
             topo = topos[theta]
@@ -139,12 +146,24 @@ def main() -> None:
                 "estimator_counts": [float(x) for x in est],
                 "baseline_counts": [float(x) for x in reference],
             }
-            records.append(rec)
+            recs.append(rec)
             print(
                 f"n={n:>7d} theta={theta:4.2f} far={rec['num_far_pairs']:6d} "
                 f"max_relerr={rec['max_per_bin_rel_error']:.3e} "
                 f"[ref={baseline}]"
             )
+        return recs
+
+    records = []
+    stopped_early = None
+    for n in args.sizes:
+        try:
+            records.extend(_measure(n))
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                raise
+            stopped_early = out_of_memory_stop(n, exc)
+            break
 
     payload = {
         "benchmark": "corrfunc_validation",
@@ -161,6 +180,7 @@ def main() -> None:
         },
         "bin_edges": [float(x) for x in edges],
         "metadata": run_metadata(),
+        "sweep": {"stopped_early": stopped_early},
         "records": records,
     }
     dump_json(payload, args.output)
