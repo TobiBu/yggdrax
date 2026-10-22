@@ -287,3 +287,10 @@ built with `--system-site-packages` can load an *older* `jax_plugins.xla_cuda12`
 than `pip list` reports (check `jax_plugins.xla_cuda12.__file__`); and any
 multi-device result taken on an affected JAX is unverified unless a step *after the
 first* was compared with a direct sum.
+
+The native collective does no bounds check: handed sizes that overflow its buffers,
+it writes past the receive buffer and reads past the send buffer on the GPU.
+`ragged_all_to_all_exchange` therefore cuts every block to both buffers (on both
+paths) and still returns the *requested* `recv_sizes`, so an overflow is detected
+from them: `sum(recv_sizes) > output_capacity` on a receiver, `sum(send_sizes) > C_in`
+on a sender. Its output is then incomplete and must not be used.
