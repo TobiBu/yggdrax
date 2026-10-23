@@ -144,60 +144,102 @@ def _exclusive_cumsum(x: Array, axis: int = 0) -> Array:
     return jnp.cumsum(x, axis=axis) - x
 
 
-def _ragged_native(
-    operand, send_sizes, full, me, output_capacity, axis_name, fill_value
-):
-    """XLA ``ragged_all_to_all`` path (GPU/TPU)."""
+def _clamped_transfer(
+    full: Array, c_in: int, output_capacity: int
+) -> tuple[Array, Array, Array]:
+    """The block of every (sender, receiver) pair that stays inside both buffers.
 
-    input_offsets = _exclusive_cumsum(send_sizes)
-    recv_sizes = full[:, me]
-    # output_offsets[i] = offset into device i's output our block lands at =
-    # number of rows device i receives from sources ranked before us.
-    output_offsets = _exclusive_cumsum(full)[me]
+    Blocks sit where the TRUE sizes put them: sender ``s``'s block for ``i`` starts at
+    row ``in_off[s, i]`` of its operand and lands at row ``out_off[s, i]`` of ``i``'s
+    output, both exclusive prefix sums of ``full``. A block is cut where it would read
+    past the operand's ``c_in`` rows or write past ``output_capacity``; a block that
+    starts beyond either moves nothing. Computed from the all-gathered ``full`` alone,
+    so every device derives the identical matrix and a sender and its receiver agree
+    on every block. When every row sum of ``full`` fits ``c_in`` and every column sum
+    fits ``output_capacity`` the clamp is the identity.
 
+    Parameters
+    ----------
+    full:
+        ``[ndev, ndev]`` requested sizes, ``full[s, i]`` = rows ``s`` -> ``i``.
+    c_in:
+        Rows of every device's operand (shard_map gives each the same shape).
+    output_capacity:
+        Rows of every device's output.
+
+    Returns
+    -------
+    (moved, in_off, out_off)
+        ``[ndev, ndev]`` each: the rows actually moved, and each block's input and
+        output offset, clipped into ``[0, c_in]`` / ``[0, output_capacity]`` (only a
+        block that moves nothing is ever clipped).
+    """
+
+    in_off = _exclusive_cumsum(full, axis=1)
+    out_off = _exclusive_cumsum(full, axis=0)
+    room = jnp.minimum(c_in - in_off, output_capacity - out_off)
+    moved = jnp.clip(jnp.minimum(full, room), 0, None)
+    return (
+        moved,
+        jnp.clip(in_off, 0, c_in),
+        jnp.clip(out_off, 0, output_capacity),
+    )
+
+
+def _ragged_native(operand, full, me, output_capacity, axis_name, fill_value):
+    """XLA ``ragged_all_to_all`` path (GPU/TPU).
+
+    The op does no bounds check: handed the requested sizes of an overflowing
+    exchange it reads past the operand and writes past the peer's output on the GPU
+    (measured 2026-10-22, 2x A100, NCCL fallback). It gets the clamped blocks.
+    """
+
+    moved, in_off, out_off = _clamped_transfer(full, operand.shape[0], output_capacity)
     feat = operand.shape[1:]
     output = jnp.full((output_capacity, *feat), fill_value, dtype=operand.dtype)
+    # output_offsets[i] = row of device i's output our block lands at.
     output = jax.lax.ragged_all_to_all(
         operand,
         output,
-        input_offsets,
-        send_sizes,
-        output_offsets,
-        recv_sizes,
+        in_off[me],
+        moved[me],
+        out_off[me],
+        moved[:, me],
         axis_name=axis_name,
     )
     return output
 
 
-def _ragged_through_buf(
-    operand, send_sizes, full, me, output_capacity, axis_name, fill_value
-):
+def _ragged_through_buf(operand, full, me, output_capacity, axis_name, fill_value):
     """all_gather-based fallback for backends without ``ragged_all_to_all``.
 
     Gathers every device's send buffer (small at Phase-0 scale) and gathers the
     rows destined for this device with a vectorised index computation. Same
-    result as the native path; used on CPU (XLA:CPU lacks the ragged op) and as
-    a cross-check.
+    result as the native path, overflow included (it delivers the same clamped
+    blocks); used on CPU (XLA:CPU lacks the ragged op) and as a cross-check.
     """
 
     ndev, c_in = full.shape[0], operand.shape[0]
     feat = operand.shape[1:]
     ops = jax.lax.all_gather(operand, axis_name, tiled=False)  # [ndev, c_in, *feat]
     flat = ops.reshape((ndev * c_in, *feat))
+    moved, in_off, _ = _clamped_transfer(full, c_in, output_capacity)
 
     recv_sizes = full[:, me]
     recv_end = jnp.cumsum(recv_sizes)
-    total = recv_end[-1]
-    # per-source offset within the source's own send buffer for our column.
-    src_in_off = _exclusive_cumsum(full, axis=1)[:, me]  # [ndev]
-
     r = jnp.arange(output_capacity)
     src = jnp.searchsorted(recv_end, r, side="right")
     src = jnp.minimum(src, ndev - 1)
     within = r - (recv_end[src] - recv_sizes[src])
-    gidx = src * c_in + src_in_off[src] + within
+    # a row is real when it lies in the moved part of its block; rows past the
+    # last block (src clipped to ndev - 1) have within >= its size, so they fail too.
+    # A discarded row's index may point anywhere: the gather clamps it, never reads
+    # out of bounds, and on an exchange that fits every index is the one used before
+    # the clamp existed (in_off is clipped only for blocks that move nothing).
+    valid = within < moved[src, me]
+    gidx = src * c_in + in_off[src, me] + within
     gathered = flat[gidx]
-    valid = (r < total).reshape((output_capacity,) + (1,) * len(feat))
+    valid = valid.reshape((output_capacity,) + (1,) * len(feat))
     output = jnp.where(valid, gathered, jnp.asarray(fill_value, operand.dtype))
     return output
 
@@ -226,9 +268,9 @@ def ragged_all_to_all_exchange(
     send_sizes:
         Integer array ``[ndev]``; ``send_sizes[i]`` rows go to device ``i``.
     output_capacity:
-        Static leading dimension of the receive buffer. Must be large enough to
-        hold this device's total received rows (over-allocate with slack, per
-        the padding-based load-balancing strategy).
+        Static leading dimension of the receive buffer. Should hold this device's
+        total received rows (over-allocate with slack, per the padding-based
+        load-balancing strategy); see *Overflow* below for what happens when not.
     axis_name:
         Mesh axis the exchange runs over; must match the enclosing ``shard_map``.
     fill_value:
@@ -247,7 +289,19 @@ def ragged_all_to_all_exchange(
     -------
     (output, recv_sizes, recv_offsets)
         ``output`` shape ``[output_capacity, *feat]``; ``recv_sizes[s]`` rows
-        received from device ``s`` at ``recv_offsets[s]``.
+        received from device ``s`` at ``recv_offsets[s]``. Both follow the sizes the
+        senders REQUESTED, also on an overflow, so a caller can detect one from them.
+
+    Notes
+    -----
+    *Overflow.* The exchange never reads or writes out of bounds. A block that would
+    read past a sender's ``C_in`` rows or write past ``output_capacity`` is cut there,
+    identically on both paths: rows of a block keep their offsets, rows past the
+    sender's operand arrive as ``fill_value``, rows past ``output_capacity`` are
+    dropped. The output is then incomplete, and the call cannot tell its caller so
+    except through the sizes: treat ``sum(recv_sizes) > output_capacity`` on a
+    receiver, and ``sum(send_sizes) > C_in`` on a sender, as an overflow. An exchange
+    that fits both buffers is unaffected (the clamp is the identity).
     """
 
     send_sizes = send_sizes.astype(_COUNT_DTYPE)
@@ -262,7 +316,7 @@ def ragged_all_to_all_exchange(
         if hazard is not None:
             raise RuntimeError(hazard)
     impl = _ragged_native if method == "native" else _ragged_through_buf
-    output = impl(operand, send_sizes, full, me, output_capacity, axis_name, fill_value)
+    output = impl(operand, full, me, output_capacity, axis_name, fill_value)
 
     recv_sizes = full[:, me]
     recv_offsets = _exclusive_cumsum(recv_sizes)
