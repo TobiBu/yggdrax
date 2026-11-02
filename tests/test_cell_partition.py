@@ -43,12 +43,12 @@ def _check_partition(
     assert np.all(ends[:-1] == starts[1:]), "leaves tile the particles"
     occ = ends - starts
     assert np.all(occ >= 1)
+    assert np.all(occ <= leaf_size), "every leaf fits the leaf_size-wide tables"
     for s, e, d in zip(starts, ends, depths):
         shift = np.uint64(3 * (MORTON_LEVELS - d))
         cells = codes_np[s:e] >> shift
         assert np.all(cells == cells[0]), "a leaf lies within one cell of its depth"
         if d < max_level:
-            assert e - s <= leaf_size
             # coarsest: the parent cell holds more than leaf_size particles
             if d > 0:
                 pshift = np.uint64(3 * (MORTON_LEVELS - d + 1))
@@ -98,14 +98,56 @@ def test_overflow_is_flagged_not_silent():
 
 
 def test_coincident_particles_stop_at_the_deepest_level():
+    """A deepest-level cell over ``leaf_size`` becomes leaf_size-wide chunks.
+
+    The leaf tables downstream are ``leaf_size`` wide; one 40-particle leaf
+    there dropped particles 9-40 without a flag.
+    """
     codes = _sorted_codes(1024, seed=4, duplicates=40)
     codes_np = np.asarray(codes).astype(np.uint64)
     starts, ends, depths = adaptive_cell_leaf_partition_numpy(codes_np, leaf_size=8)
-    occ = ends - starts
-    assert occ.max() >= 40 and depths[np.argmax(occ)] == MORTON_LEVELS
+    _check_partition(codes_np, starts, ends, depths, 8)
+    values, counts = np.unique(codes_np, return_counts=True)
+    (dup_code,) = values[counts >= 40]
+    first = int(np.searchsorted(codes_np, dup_code))
+    in_cell = (starts >= first) & (starts < first + 40)
+    np.testing.assert_array_equal((ends - starts)[in_cell], [8, 8, 8, 8, 8])
+    assert np.all(depths[in_cell] == MORTON_LEVELS)
     part = adaptive_cell_leaf_partition(codes, leaf_size=8, capacity=starts.size + 4)
     k = int(part.num_leaves)
+    assert k == starts.size
     assert np.array_equal(np.asarray(part.leaf_starts)[:k], starts)
+    assert np.array_equal(np.asarray(part.leaf_ends)[:k], ends)
+    assert np.array_equal(np.asarray(part.leaf_depths)[:k], depths)
+
+
+@pytest.mark.parametrize("width", [1, 63, 64, 65, 128, 200])
+def test_a_wide_deepest_cell_splits_into_leaf_size_chunks(width):
+    """Chunks of exactly ``leaf_size`` plus a remainder, in index order."""
+    leaf_size = 64
+    codes = np.asarray(_sorted_codes(3000, seed=9)).astype(np.uint64)
+    # one cell at the deepest level holding ``width`` coincident codes
+    codes = np.sort(np.concatenate([codes, np.full(width, codes[1500], np.uint64)]))
+    s_np, e_np, d_np = adaptive_cell_leaf_partition_numpy(codes, leaf_size=leaf_size)
+    _check_partition(codes, s_np, e_np, d_np, leaf_size)
+    first = int(np.searchsorted(codes, codes[1500], side="left"))
+    last = int(np.searchsorted(codes, codes[1500], side="right"))
+    chunk = (s_np >= first) & (s_np < last)
+    total = last - first
+    want = [leaf_size] * (total // leaf_size) + (
+        [total % leaf_size] if total % leaf_size else []
+    )
+    if total > leaf_size:
+        np.testing.assert_array_equal((e_np - s_np)[chunk], want)
+        assert np.all(d_np[chunk] == MORTON_LEVELS)
+    part = adaptive_cell_leaf_partition(
+        jnp.asarray(codes), leaf_size=leaf_size, capacity=int(s_np.size) + 3
+    )
+    k = int(part.num_leaves)
+    assert k == s_np.size and not bool(part.overflow)
+    np.testing.assert_array_equal(np.asarray(part.leaf_starts)[:k], s_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_ends)[:k], e_np)
+    np.testing.assert_array_equal(np.asarray(part.leaf_depths)[:k], d_np)
 
 
 def test_partition_is_jittable_with_static_capacity():
@@ -163,24 +205,27 @@ def test_num_valid_reproduces_the_unpadded_partition(n_live, rows):
     assert _live_triples(shard) == _live_triples(unpadded)
 
 
-def test_the_sentinel_alone_builds_one_oversized_padding_leaf():
+def test_the_sentinel_alone_makes_live_leaves_of_dead_rows():
     """Why ``num_valid`` exists, pinned as a negative control.
 
     Sorting the dead rows last is necessary but not sufficient: they all carry
-    the *same* code, so no Morton level ever splits them and they collapse into
-    a single leaf far wider than ``leaf_size``. Under trace that leaf truncates
-    into a live, mass-0, radius-0 leaf at a real position, which fails the MAC
-    against everything near it. If this test ever starts failing because the
-    naive partition became well behaved, ``num_valid`` may be reconsidered --
-    until then it is load bearing.
+    the *same* code, so no Morton level ever splits them and they fill one
+    deepest-level cell. Cut into leaf_size chunks, that cell becomes live leaves
+    of dead rows that count against the capacity and enter every walk (before
+    the chunk cut it was one leaf wider than the leaf table, which truncated
+    under trace into a mass-0, radius-0 leaf at a real position). If this test
+    ever starts failing because the naive partition became well behaved,
+    ``num_valid`` may be reconsidered -- until then it is load bearing.
     """
     leaf_size, n_live, rows = 64, 5000, 8192
     padded = _pad_with_sentinel(_sorted_codes(n_live), rows)
 
     naive = adaptive_cell_leaf_partition(padded, leaf_size=leaf_size, capacity=1024)
-    widest = int(np.max(np.asarray(naive.leaf_ends) - np.asarray(naive.leaf_starts)))
-    assert widest > leaf_size, "expected the padding run to exceed one leaf"
-    assert widest >= rows - n_live
+    k_naive = int(naive.num_leaves)
+    naive_ends = np.asarray(naive.leaf_ends)[:k_naive]
+    assert int(naive_ends.max()) == rows, "expected leaves made of dead rows"
+    dead_leaves = int(np.sum(np.asarray(naive.leaf_starts)[:k_naive] >= n_live))
+    assert dead_leaves == -(-(rows - n_live) // leaf_size)
 
     guarded = adaptive_cell_leaf_partition(
         padded, leaf_size=leaf_size, capacity=1024, num_valid=n_live
@@ -189,6 +234,7 @@ def test_the_sentinel_alone_builds_one_oversized_padding_leaf():
     occ = np.asarray(guarded.leaf_ends)[:k] - np.asarray(guarded.leaf_starts)[:k]
     assert int(occ.max()) <= leaf_size
     assert int(np.asarray(guarded.leaf_ends)[:k].max()) == n_live
+    assert k == k_naive - dead_leaves
 
 
 def test_num_valid_is_traceable_and_default_is_unchanged():

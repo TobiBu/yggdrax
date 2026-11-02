@@ -16,11 +16,16 @@ static shapes: the leaf count is data dependent, so the leaf arrays are padded
 to a caller-chosen ``capacity`` (empty leaves ``start = end = n``) and an
 overflow flag says when the capacity did not hold. A particle's leaf depth is
 the smallest Morton level at which its cell holds at most ``leaf_size``
-particles (cells at the deepest level are leaves whatever they hold, so
-coincident particles cannot recurse forever); the leaf key is the cell at that
-depth, and leaves are the runs of equal keys -- consistent because a cell's
-occupancy is a property of the cell, so every particle of a qualifying cell
-picks the same depth.
+particles (cells at the deepest level hold whatever they hold, so coincident
+particles cannot recurse forever); the leaf key is the cell at that depth, and
+leaves are the runs of equal keys -- consistent because a cell's occupancy is a
+property of the cell, so every particle of a qualifying cell picks the same
+depth. A deepest-level run longer than ``leaf_size`` is cut into consecutive
+chunks of at most ``leaf_size`` particles: every leaf then fits the
+``leaf_size``-wide leaf tables downstream, which otherwise dropped the
+particles past the ``leaf_size``-th without a flag (Plummer 1e8 in a cubic box:
+20,151 level-21 cells over 64, 131,286 particles past the 64th). The chunks of
+one cell share its code and depth; the Karras build breaks those ties by index.
 
 Cost: no pass per Morton level. A particle's cell at level ``d`` overflows
 exactly when a window of ``leaf_size + 1`` consecutive particles containing it
@@ -99,8 +104,10 @@ def adaptive_cell_leaf_partition(
     capacity
         Static leaf capacity the arrays are padded to.
     max_level
-        Deepest level examined; cells at this level are leaves whatever they
-        hold. Static, at most :data:`MORTON_LEVELS`.
+        Deepest level examined; a cell at this level that still holds more than
+        ``leaf_size`` particles becomes consecutive leaves of at most
+        ``leaf_size`` (same code and depth). Static, at most
+        :data:`MORTON_LEVELS`.
     num_valid
         Number of leading live codes, for a capacity-padded input whose trailing
         rows are dead (a distributed shard). May be traced. ``None`` means every
@@ -109,13 +116,15 @@ def adaptive_cell_leaf_partition(
         Dead rows must already sort last -- give them the maximal Morton code --
         but that alone is not enough, and the failure is not obvious: every dead
         row then carries the *same* code, so their common-prefix depth is total,
-        no level ever satisfies ``occ <= leaf_size``, and they collapse into one
-        leaf of ``n - num_valid`` rows. Wider than the leaf table, that leaf
-        either trips the eager leaf-size check or, under trace, truncates into a
-        live leaf of mass 0 and radius 0 sitting at a real position -- which
-        fails the MAC against everything near it and floods the near list. So
-        ``num_valid`` cuts the run boundaries, the leaf starts, the leaf count
-        and the last leaf's end; the dead rows then belong to no leaf at all.
+        no level ever satisfies ``occ <= leaf_size``, and they fill one
+        deepest-level cell of ``n - num_valid`` rows. Cut into leaf_size chunks,
+        that cell becomes live leaves of dead rows (mass 0, at whatever position
+        the padding holds) that count against the capacity and enter every walk;
+        before the chunk cut it was one leaf wider than the leaf table, which
+        truncated under trace into a mass-0, radius-0 leaf that failed the MAC
+        against everything near it and flooded the near list. So ``num_valid``
+        cuts the run boundaries, the leaf starts, the leaf count and the last
+        leaf's end; the dead rows then belong to no leaf at all.
 
     min_level
         No leaf coarser than this Morton level: a cell shallower than it is split
@@ -189,6 +198,10 @@ def adaptive_cell_leaf_partition(
         [jnp.ones((1,), bool), (key[1:] != key[:-1]) | (depth[1:] != depth[:-1])]
     )
     first = first & ~is_dead
+    # Only a max_level run can exceed S (a shallower depth fits by definition),
+    # so the chunk cut leaves every other run alone, bit for bit.
+    run_start = lax.cummax(jnp.where(first, idx, jnp.asarray(0, INDEX_DTYPE)))
+    first = first | (((idx - run_start) % S == 0) & ~is_dead)
     slot = jnp.cumsum(first.astype(INDEX_DTYPE)) - 1  # leaf index of each particle
     # Live-leaf count. Equal to ``slot[-1] + 1`` once ``first`` is masked, but
     # stated directly so it cannot be read as counting padding.
@@ -283,6 +296,10 @@ def adaptive_cell_leaf_partition_numpy(
             break
     key = codes >> (3 * (MORTON_LEVELS - depth)).astype(np.uint64)
     change = np.concatenate([[True], (key[1:] != key[:-1]) | (depth[1:] != depth[:-1])])
+    # a max_level run longer than a leaf is cut into chunks of leaf_size
+    idx = np.arange(n)
+    run_start = np.maximum.accumulate(np.where(change, idx, 0))
+    change |= (idx - run_start) % int(leaf_size) == 0
     starts = np.flatnonzero(change)
     ends = np.concatenate([starts[1:], [n]])
     return starts, ends, depth[starts]

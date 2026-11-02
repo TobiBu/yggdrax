@@ -184,3 +184,87 @@ def test_the_public_template_rebuild_honours_cell_min_level():
         return int(np.sum(rr[:, 1] >= rr[:, 0]))
 
     assert live_leaves(6) > live_leaves(0)
+
+
+def test_the_template_rebuild_returns_the_exact_live_leaf_count():
+    """``return_num_leaves`` appends the partition's live leaf count, counted before
+    the cut to the capacity: equal to the numpy reference on a tree that fits, and
+    still the count the positions NEED when the capacity overflowed -- what a
+    caller re-plans its next capacity from (jaccpot's segment retry). Through the
+    private rebuild and the public wrapper, under jit; the tree itself is bitwise
+    the default call's."""
+    from yggdrax import tree as public
+
+    n, leaf_size = 3000, 16
+    P = jnp.asarray(_plummer(n, 4), jnp.float32)
+    M = jnp.ones((n,), jnp.float32)
+    bounds = infer_bounds(P)
+    codes = np.asarray(jnp.sort(morton_encode(P, bounds))).astype(np.uint64)
+    s_ref, _, _ = adaptive_cell_leaf_partition_numpy(codes, leaf_size=leaf_size)
+    live = int(s_ref.size)
+    for cap, overflowed in ((live + 40, False), (live // 2, True)):
+        topo, *_ = build_static_cells_tree(
+            P, M, bounds, leaf_size=leaf_size, leaf_capacity=cap, return_reordered=True
+        )
+
+        @jax.jit
+        def private(pos):
+            return rebuild_static_radix_tree_from_template(
+                pos,
+                M,
+                topo,
+                bounds=bounds,
+                return_reordered=True,
+                leaf_partition="cells",
+                return_overflow=True,
+                return_num_leaves=True,
+            )
+
+        tree, ps, ms, inv, over, num_leaves = private(P)
+        assert bool(over) is overflowed
+        assert int(num_leaves) == live
+        default = rebuild_static_radix_tree_from_template(
+            P,
+            M,
+            topo,
+            bounds=bounds,
+            return_reordered=True,
+            leaf_partition="cells",
+            return_overflow=True,
+        )
+        for got, want in zip(
+            jax.tree_util.tree_leaves((tree, ps, ms, inv, over)),
+            jax.tree_util.tree_leaves(default),
+        ):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        if not overflowed:
+            assert _check_tree(tree, n, cap, leaf_size) == live
+
+        template = public.RadixTree(topology=topo, build_mode="static_radix")
+        # without return_overflow the count is the last element on its own
+        out = public.rebuild_static_radix_tree_from_template(
+            P,
+            M,
+            template,
+            bounds=bounds,
+            return_reordered=True,
+            leaf_partition="cells",
+            return_num_leaves=True,
+        )
+        assert len(out) == 5 and isinstance(out[0], public.RadixTree)
+        assert int(out[-1]) == live
+        out = public.rebuild_static_radix_tree_from_template(
+            P,
+            M,
+            template,
+            bounds=bounds,
+            leaf_partition="cells",
+            return_overflow=True,
+            return_num_leaves=True,
+        )
+        assert len(out) == 3 and isinstance(out[0], public.RadixTree)
+        assert bool(out[1]) is overflowed and int(out[2]) == live
+
+    bt = build_static_radix_tree(P, M, bounds, leaf_size=32)
+    with pytest.raises(ValueError, match="return_num_leaves"):
+        rebuild_static_radix_tree_from_template(P, M, bt, return_num_leaves=True)

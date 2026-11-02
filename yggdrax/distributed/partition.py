@@ -85,22 +85,54 @@ def _choose_pivots(
     ``count`` restricts sampling to the live prefix. Sampling a padded shard at even
     ranks over the whole array draws mostly the padding sentinel, which drags every
     pivot to the top of the code range and sends the real particles to one device.
+
+    With ``count`` each sample is WEIGHTED by the particles it stands for: device
+    ``d``'s ``num_samples`` samples stand for ``count_d`` particles, so each carries
+    weight ``count_d`` (``count_d / num_samples`` particles, scaled by
+    ``num_samples`` to stay integer). Pivot ``k`` is the first pooled sample (in code
+    order) whose INCLUSIVE cumulative weight ``C`` passes ``k / ndev`` of the total
+    ``W``: the number of samples with ``C * ndev <= k * W``, in int64, exact. Equal
+    sample weight per device -- the rule before 2026-11 -- could not move a cut on
+    nearly exact ranges: the pivot sat at the boundary between the devices' sample
+    sets whatever their counts, and the imbalance grew with every repartition
+    (Plummer 2e5 on two forced CPU devices, 8 KDK steps of 5e-3 per repartition:
+    +0.14 % -> +1.34 % of the mean over 40; Plummer 8e6 on two A100s 0.1-0.4 % of a
+    shard per repartition).
+
+    When every live device holds the same count ``n`` the inclusive weight of the
+    ``i``-th pooled sample is ``(i + 1) n`` and the rule reduces to the old index
+    ``floor(k * num_samples * live / ndev)``: the pivots are bit-identical to the
+    unweighted ones (and ``count=None`` keeps the unweighted form verbatim). A device
+    with no live particle weighs 0 and samples its padding sentinel, which sorts
+    last, so it moves no pivot -- as before.
     """
 
     n = codes_sorted.shape[0] if count is None else count
     idx = (jnp.arange(num_samples) * jnp.asarray(n)) // num_samples
     samples = codes_sorted[idx]
-    total = num_samples * ndev
-    if count is not None:
-        # A device with NO live particle samples its padding sentinel; those sort
-        # last, so they are excluded by ranking over the live devices' samples only.
-        # Bit-identical to the plain form whenever every device holds particles.
-        live_dev = (jnp.asarray(count) > 0).astype(_COUNT_DTYPE)
-        samples = jnp.where(live_dev > 0, samples, _CODE_SENTINEL)
-        total = num_samples * jnp.maximum(jax.lax.psum(live_dev, axis_name), 1)
-    all_samples = jnp.sort(jax.lax.all_gather(samples, axis_name, tiled=True))
-    piv_idx = (jnp.arange(1, ndev) * total) // ndev
-    return _align_pivots(all_samples[piv_idx], align_level)
+    if count is None:
+        total = num_samples * ndev
+        all_samples = jnp.sort(jax.lax.all_gather(samples, axis_name, tiled=True))
+        piv_idx = (jnp.arange(1, ndev) * total) // ndev
+        return _align_pivots(all_samples[piv_idx], align_level)
+
+    c = jnp.asarray(count)
+    samples = jnp.where(c > 0, samples, _CODE_SENTINEL)
+    pooled = jax.lax.all_gather(samples, axis_name, tiled=True)
+    # tiled all_gather is device-major, so device d's weight repeats num_samples times
+    counts = jax.lax.all_gather(c.astype(jnp.int64), axis_name, tiled=False)
+    weights = jnp.repeat(counts, num_samples, total_repeat_length=ndev * num_samples)
+    # ties: samples sharing a code may come in any order, the chosen VALUE cannot
+    # change (the cumulative weight before and after a run of equal codes is fixed)
+    order = jnp.argsort(pooled, stable=True)
+    sorted_samples = pooled[order]
+    inclusive = jnp.cumsum(weights[order])
+    w_total = inclusive[-1]
+    targets = jnp.arange(1, ndev, dtype=jnp.int64) * w_total
+    piv_idx = jnp.sum(inclusive[None, :] * jnp.int64(ndev) <= targets[:, None], axis=1)
+    # every device empty: W = 0 puts every index past the end (all sentinels anyway)
+    piv_idx = jnp.minimum(piv_idx, ndev * num_samples - 1)
+    return _align_pivots(sorted_samples[piv_idx], align_level)
 
 
 def _tree_take(payload: Any, order: Array) -> Any:
@@ -418,6 +450,9 @@ def sfc_repartition(
     num_samples:
         Samples per device for the pivots. Balance overshoot is about
         ``2 * ndev / num_samples`` of a shard; 8 gives ~50 % at ndev 2. Static.
+        The samples are weighted by their device's live count
+        (:func:`_choose_pivots`), so the overshoot is set afresh by every
+        repartition and does not accumulate.
     axis_name:
         Mesh axis; must match the enclosing ``shard_map``.
     payload:
