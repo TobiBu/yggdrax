@@ -65,6 +65,23 @@ def is_out_of_memory(exc: BaseException) -> bool:
     return any(marker in text for marker in _OUT_OF_MEMORY_MARKERS)
 
 
+def is_capacity_exceeded(exc: BaseException) -> bool:
+    """Whether ``exc`` is a traversal outgrowing the bench's fixed capacities.
+
+    The traversal raises when its pair queue, interaction list or neighbour
+    list outgrows the ``DualTreeTraversalConfig`` the bench pinned. Like an
+    allocation failure, that is a size the configuration cannot run, not a
+    wrong result.
+
+    Args:
+        exc: The exception raised while measuring one size.
+
+    Returns:
+        ``True`` for a capacity overflow.
+    """
+    return isinstance(exc, RuntimeError) and "capacity exceeded" in str(exc)
+
+
 def out_of_memory_stop(n: int, exc: BaseException) -> dict[str, Any]:
     """Return a ``sweep.stopped_early`` record for a size that did not fit.
 
@@ -73,13 +90,15 @@ def out_of_memory_stop(n: int, exc: BaseException) -> dict[str, Any]:
 
     Args:
         n: The size that failed.
-        exc: The allocation failure.
+        exc: The allocation failure or capacity overflow.
 
     Returns:
         The record, ready for the payload's ``sweep.stopped_early``.
     """
     record = {
-        "reason": "out_of_memory",
+        "reason": (
+            "capacity_exceeded" if is_capacity_exceeded(exc) else "out_of_memory"
+        ),
         "at_n": n,
         "detail": f"{type(exc).__name__}: {str(exc)[:400]}",
     }

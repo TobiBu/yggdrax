@@ -42,6 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
 from bench.differentiability._common import (
     device_memory_stats,
     dump_json,
+    is_capacity_exceeded,
     is_out_of_memory,
     out_of_memory_stop,
     run_metadata,
@@ -314,7 +315,7 @@ def main() -> None:
         try:
             records.append(_measure(n))
         except Exception as exc:
-            if not is_out_of_memory(exc):
+            if not (is_out_of_memory(exc) or is_capacity_exceeded(exc)):
                 raise
             stopped_early = out_of_memory_stop(n, exc)
             break
