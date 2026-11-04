@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal, Optional
 
 import jax
@@ -812,10 +813,21 @@ def _build_leaf_kdtree_topology(points: Array, leaf_size: int) -> dict:
     leaf ids, level order) depends only on the static depth and is built as
     NumPy constants; only the data-dependent arrays (permutation, ranges, split
     metadata) are traced.
+
+    So are the per-level bucket occupancies, which is less obvious and is what
+    the level loop below exploits: with a ceil-median split they follow from
+    ``n`` and the level alone, so the counting reduction and its prefix sum are
+    host arithmetic, the bucket labels are provably sorted at every level, and
+    the final regrouping sort is a no-op. See the comment on the loop.
+
+    Run eagerly this dispatches roughly a dozen primitives per level and pays
+    each launch; :func:`_leaf_kdtree_topology_arrays` is the jitted twin that
+    callers reach through :func:`build_leaf_kdtree`.
     """
 
     points = jnp.asarray(points)
     n = int(points.shape[0])
+    dim = int(points.shape[1])
     idx = INDEX_DTYPE
 
     depth = _leaf_kdtree_depth(n, int(leaf_size))
@@ -829,37 +841,69 @@ def _build_leaf_kdtree_topology(points: Array, leaf_size: int) -> dict:
     split_value_nodes = jnp.full(total, jnp.nan, dtype=points.dtype)
     row = jnp.arange(n, dtype=idx)
 
+    # Bucket occupancies are not data-dependent. The split is at the ceil-median,
+    # so a bucket of c points becomes ceil(c/2) on the left and floor(c/2) on the
+    # right, and the recursion from [n] gives every level's counts in closed form.
+    # Two consequences are used below.
+    #
+    # 1. The per-level counting reduction and its prefix sum are host arithmetic
+    #    over `nb` entries, not a segment_sum over all n points.
+    # 2. The labels are *sorted ascending* at every level: level 0's are all zero,
+    #    and `bucket*2 + go_right` sends a sorted array to a sorted one because
+    #    `go_right` is monotone within each bucket. So the extent reductions may
+    #    declare `indices_are_sorted`, which is worth an order of magnitude -- an
+    #    unsorted segment reduction scatters with atomics onto `nb` outputs and
+    #    contends hardest exactly where `nb` is smallest, at the top of the tree.
+    #
+    # Point (2) also retires the final regrouping sort: the labels are already
+    # sorted when the loop ends, and a stable sort of a sorted key permutes
+    # nothing.
+    counts_np = np.array([n], dtype=np.int64)
+
     for level in range(depth):
         nb = 1 << level
+        half_np = (counts_np + 1) // 2  # ceil -> left child gets the larger half
+        starts_np = np.concatenate(
+            [np.zeros(1, dtype=np.int64), np.cumsum(counts_np)[:-1]]
+        )
+        # One reduction over [p, -p] rather than a max and a min over p: the max
+        # of the negated coordinates *is* the negated min, exactly, so the width
+        # is a sum of the two halves and `max - min` is reproduced bit for bit.
         pts = points[order]
-        seg_max = jax.ops.segment_max(pts, bucket, num_segments=nb)
-        seg_min = jax.ops.segment_min(pts, bucket, num_segments=nb)
-        wdim = jnp.argmax(seg_max - seg_min, axis=-1).astype(idx)  # [nb]
+        extents = jax.ops.segment_max(
+            jnp.concatenate([pts, -pts], axis=1),
+            bucket,
+            num_segments=nb,
+            indices_are_sorted=True,
+        )
+        wdim = jnp.argmax(extents[:, :dim] + extents[:, dim:], axis=-1).astype(
+            idx
+        )  # [nb]
         coord = jnp.take_along_axis(pts, wdim[bucket][:, None], axis=-1).squeeze(-1)
         # Sort points by (bucket, coord) so each bucket's points are contiguous
         # and ascending along the split dimension.
         bucket, coord_sorted, order = jax.lax.sort(
             (bucket, coord, order), dimension=0, num_keys=2
         )
-        counts = jax.ops.segment_sum(jnp.ones(n, dtype=idx), bucket, num_segments=nb)
-        starts = jnp.cumsum(counts) - counts
-        within = row - starts[bucket]
-        half = (counts + 1) // 2  # ceil -> left child gets the larger half
-        go_right = (within >= half[bucket]).astype(idx)
         node_ids = (nb - 1) + jnp.arange(nb, dtype=idx)
         split_dim_nodes = split_dim_nodes.at[node_ids].set(wdim)
-        boundary = jnp.clip(starts + half, 0, n - 1)
-        split_value_nodes = split_value_nodes.at[node_ids].set(coord_sorted[boundary])
+        boundary_np = np.clip(starts_np + half_np, 0, max(n - 1, 0))
+        split_value_nodes = split_value_nodes.at[node_ids].set(
+            coord_sorted[jnp.asarray(boundary_np, dtype=idx)]
+        )
+        # `row >= starts + half` is `row - starts >= half`, the rank test the
+        # device-side `within` computed, with one fewer gather over n.
+        threshold = jnp.asarray(starts_np + half_np, dtype=idx)
+        go_right = (row >= threshold[bucket]).astype(idx)
         bucket = bucket * 2 + go_right
+        counts_np = np.stack([half_np, counts_np - half_np], axis=1).reshape(-1)
 
-    # Final stable grouping by leaf bucket -> contiguous leaf ranges.
-    bucket, order = jax.lax.sort((bucket, order), dimension=0, num_keys=1)
     particle_indices = order
-    leaf_counts = jax.ops.segment_sum(
-        jnp.ones(n, dtype=idx), bucket, num_segments=num_leaves
+    leaf_start = jnp.asarray(
+        np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts_np)[:-1]]),
+        dtype=idx,
     )
-    leaf_start = jnp.cumsum(leaf_counts) - leaf_counts
-    leaf_end_incl = leaf_start + leaf_counts - 1
+    leaf_end_incl = jnp.asarray(np.cumsum(counts_np) - 1, dtype=idx)
 
     # ---- structural arrays (depend only on depth -> NumPy constants) ----
     ids_np = np.arange(total)
@@ -896,6 +940,41 @@ def _build_leaf_kdtree_topology(points: Array, leaf_size: int) -> dict:
         "split_value": split_value_nodes,
         "num_internal": int(num_internal),
     }
+
+
+@partial(jax.jit, static_argnames=("leaf_size",))
+def _leaf_kdtree_topology_arrays(points: Array, *, leaf_size: int) -> dict:
+    """JIT-compiled twin of :func:`_build_leaf_kdtree_topology`'s array outputs.
+
+    The build is a Python ``for`` over the split levels, so run eagerly it
+    dispatches roughly twenty primitives per level -- a sort, two segment
+    reductions, a gather and the scatters -- and pays the launch latency of each
+    one. Under ``jit`` the same loop is traced into a single computation. This
+    is the octree build's lesson from the performance report's 6.3 applied to
+    the KD-tree: the fix was never to change the algorithm, it was to stop
+    building eagerly.
+
+    ``num_internal`` is deliberately not returned: it is a function of the point
+    count and ``leaf_size`` alone, so the caller reads it off the host rather
+    than letting ``jit`` turn a Python ``int`` into a traced array.
+
+    Parameters
+    ----------
+    points
+        Reference points of shape ``(n_points, dim)``.
+    leaf_size
+        Maximum points per leaf bucket; static, since it fixes the tree's depth
+        and therefore every output shape.
+
+    Returns
+    -------
+    dict
+        The topology's array fields, exactly as
+        :func:`_build_leaf_kdtree_topology` returns them.
+    """
+
+    topology = _build_leaf_kdtree_topology(points, int(leaf_size))
+    return {name: value for name, value in topology.items() if name != "num_internal"}
 
 
 def build_leaf_kdtree(
@@ -938,8 +1017,9 @@ def build_leaf_kdtree(
     if leaf_size < 1:
         raise ValueError(f"leaf_size must be >= 1, received {leaf_size}")
 
-    topo = _build_leaf_kdtree_topology(points_arr, int(leaf_size))
     n = int(points_arr.shape[0])
+    topo = dict(_leaf_kdtree_topology_arrays(points_arr, leaf_size=int(leaf_size)))
+    topo["num_internal"] = (1 << _leaf_kdtree_depth(n, int(leaf_size))) - 1
     return LeafKDTree(
         points=points_arr,
         particle_indices=topo["particle_indices"],
