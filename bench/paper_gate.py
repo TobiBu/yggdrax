@@ -109,7 +109,14 @@ def _svgd_scaling(new: dict, old: dict, rep: _Report) -> None:
     for rec in overlap:
         prev = old_by_n[rec["n"]]
         where = f"n={rec['n']}"
-        if "rel_error_vs_exact" in prev or "rel_error_vs_exact" in rec:
+        if prev.get("rel_error_vs_exact") is None and "exact_s" not in prev:
+            # The committed run never timed the exact update at this N (its
+            # exact cutoff was lower), so there is nothing to compare against.
+            rep.note(
+                f"{where}: rel_error_vs_exact newly measured "
+                f"({rec.get('rel_error_vs_exact')!r}); none committed"
+            )
+        elif "rel_error_vs_exact" in prev or "rel_error_vs_exact" in rec:
             rep.close(
                 where,
                 "rel_error_vs_exact",
