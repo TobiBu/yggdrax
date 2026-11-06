@@ -30,6 +30,18 @@ Particles are mapped to 21-bit-per-axis Z-order (Morton) codes on `uint64`
 Morton code makes spatial neighbors contiguous in memory, which is what lets the
 radix builder and the prefix-sum moment queries be efficient.
 
+The finest cell is the box over `2**21` per axis, so a box set by a few far
+particles makes it wide against a dense centre. Many leaves then share one
+level-21 cell and the radix tree gets deeper; its level tables hold
+`MAX_TREE_LEVELS` (64) levels. A deeper tree cannot be represented: an eager build
+raises `TreeDepthError`, whose message (and `.report`) names the Morton box, the
+level-21 cell, the farthest particle and the 99.9th-percentile radius
+(`domain_report`, `format_domain_report`). `check_tree_depth(tree, positions)`
+runs the same check on a built tree; under a trace it returns `None`, and the
+caller must fold the depth into its own verdict (jaccpot's traced rebuild does).
+Example: the 1e8 Sgr IC's sampler tails to 30 Mpc made a 44 Mpc box, 22 pc cells
+and a tree 68 levels deep.
+
 ## Multipole Acceptance Criterion (MAC)
 
 The MAC decides, for a target/source node pair, whether the source is
