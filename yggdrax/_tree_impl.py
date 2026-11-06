@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from beartype import beartype
+from jax import core as jax_core
 from jax import lax
 from jaxtyping import Array, Float, jaxtyped
 
@@ -1258,6 +1259,24 @@ def _build_tree_from_leaf_partitions(
 
     max_level = jnp.max(node_level)
     num_levels = max_level + as_index(1)
+    if not isinstance(max_level, jax_core.Tracer) and int(max_level) >= MAX_TREE_LEVELS:
+        # an eager build: say it now, with the box that caused it (the level
+        # tables below hold MAX_TREE_LEVELS levels, the clip drops the rest)
+        from ._depth_guard import TreeDepthError, domain_report, format_domain_report
+
+        report = domain_report(positions, (bounds_min, bounds_max))
+        raise TreeDepthError(
+            f"radix tree {int(max_level) + 1} levels deep, past the bound of "
+            f"{MAX_TREE_LEVELS} (MAX_TREE_LEVELS): its level tables hold no node "
+            "below that, so every level-ordered sweep (M2M, L2L) would silently "
+            "skip them. Many leaves share a level-21 Morton cell: the box is too "
+            f"large for the dense centre. {format_domain_report(report)}. Clip or "
+            "remove the outlying particles (escapers), or build on a smaller "
+            "explicit box.",
+            depth=int(max_level) + 1,
+            bound=MAX_TREE_LEVELS,
+            report=report,
+        )
 
     # The stable sort of the levels gives nodes_by_level (jnp.argsort's result,
     # same index dtype) AND the sorted levels, whose run starts are the level

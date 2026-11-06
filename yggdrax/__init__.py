@@ -6,6 +6,12 @@ before creating arrays, with ``jax.config.update("jax_enable_x64", True)`` or
 ``JAX_ENABLE_X64=1``; the functions that need it raise if it is off.
 """
 
+from ._depth_guard import (
+    TreeDepthError,
+    check_tree_depth,
+    domain_report,
+    format_domain_report,
+)
 from .bounds import infer_bounds
 from .dtypes import INDEX_DTYPE, as_index
 from .geometry import TreeGeometry, compute_tree_geometry
@@ -95,6 +101,10 @@ from .types import PreparedTreeArtifacts, TraversalArtifacts, TraversalResult
 
 __all__ = [
     "MAX_TREE_LEVELS",
+    "TreeDepthError",
+    "check_tree_depth",
+    "domain_report",
+    "format_domain_report",
     "FMM_CORE_REQUIRED_FIELDS",
     "MORTON_TOPOLOGY_REQUIRED_FIELDS",
     "FMM_TOPOLOGY_REQUIRED_FIELDS",
