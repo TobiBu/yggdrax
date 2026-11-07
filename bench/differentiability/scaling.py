@@ -1,7 +1,23 @@
 """Scaling benchmark: tree build + dual-tree traversal time vs N.
 
 Measures wall-clock build time and interaction/neighbor traversal time for the
-radix, octree, and KD-tree backends over a sweep of particle counts. Includes a
+radix, octree, and KD-tree backends over a sweep of particle counts.
+
+Two paths are timed per size:
+
+* ``legacy`` (per backend): adaptive ``Tree.from_particles`` build, then the
+  eager ``build_interactions_and_neighbors`` dual walk with its per-node CSR
+  output. This is what the first paper draft reported.
+* ``fast`` (radix only): the jitted static-shape cell-leaf radix build
+  (``build_static_cells_tree``), the geometry and Dehnen extents, and the flat
+  ``dual_tree_walk_mutual`` emitting each unordered far/near node pair once.
+  Each stage is timed under ``jax.jit``, and so is the fused build+walk step
+  (the number that matters for a rebuild inside a differentiated function).
+  Capacities (leaf capacity, pair queue, far/near list caps) are sized from an
+  untimed probe run and then fixed, so the timed calls never overflow; the
+  sizing and the overflow flags are recorded.
+
+Includes a
 CPU ``scipy.spatial.cKDTree`` build+query baseline for context (not a fair
 full comparison -- it does neither the dual-tree far-field nor the GPU work --
 but it anchors "why GPU").
@@ -54,6 +70,18 @@ def _parse_args() -> argparse.Namespace:
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
     )
     p.add_argument("--no-scipy", action="store_true", help="Skip cKDTree baseline.")
+    p.add_argument(
+        "--no-legacy",
+        action="store_true",
+        help="Skip the per-backend adaptive build + eager dual walk "
+        "(build_interactions_and_neighbors) timings.",
+    )
+    p.add_argument(
+        "--no-fast",
+        action="store_true",
+        help="Skip the fast path: jitted static cell-leaf radix build + "
+        "dual_tree_walk_mutual, timed separately and as one fused jit.",
+    )
     p.add_argument(
         "--output", type=str, default="results/differentiability/scaling.json"
     )
@@ -117,13 +145,187 @@ def main() -> None:
         mass = jax.random.uniform(km, (n,), minval=0.5, maxval=1.5, dtype=jnp.float32)
         return pos, mass
 
+    from yggdrax._interactions_impl import _build_mac_extents
+    from yggdrax._tree_impl import build_static_cells_tree
+    from yggdrax.bounds import infer_bounds
+    from yggdrax.interactions import dual_tree_walk_mutual
+
+    def _pow2(x: int) -> int:
+        return 1 << max(int(x) - 1, 1).bit_length()
+
+    def _fast_path(pos, mass) -> dict:
+        """Jitted cell-leaf radix build + mutual walk, capacities sized first."""
+        n = int(pos.shape[0])
+        leaf = args.leaf_size
+        bounds = infer_bounds(pos)
+
+        # --- size the leaf capacity from the partition's own live-leaf count.
+        cap0 = max(64, 4 * (-(-n // leaf)))
+        _, _, _, _, ovf, nl = build_static_cells_tree(
+            pos,
+            mass,
+            bounds,
+            leaf_size=leaf,
+            leaf_capacity=cap0,
+            return_reordered=True,
+            return_overflow=True,
+            return_num_leaves=True,
+        )
+        live_leaves = int(nl)
+        leaf_capacity = int(1.1 * live_leaves) + 8
+
+        def build(p, m):
+            topo, ps, _ms, _inv, overflow = build_static_cells_tree(
+                p,
+                m,
+                bounds,
+                leaf_size=leaf,
+                leaf_capacity=leaf_capacity,
+                return_reordered=True,
+                return_overflow=True,
+            )
+            return topo, ps, overflow
+
+        def walk_inputs(topo, ps):
+            geometry = compute_tree_geometry(topo, ps)
+            num_internal = topo.left_child.shape[0]
+            total = topo.parent.shape[0]
+            idx = topo.parent.dtype
+            pad = jnp.full((total - num_internal,), -1, idx)
+            lf = jnp.concatenate([jnp.asarray(topo.left_child, idx), pad])
+            rf = jnp.concatenate([jnp.asarray(topo.right_child, idx), pad])
+            root = jnp.argmin(topo.parent).astype(idx)
+            centers = jnp.asarray(geometry.center)
+            extents = jnp.asarray(
+                _build_mac_extents(topo.parent, geometry, num_internal, "dehnen", 1.0)[
+                    0
+                ],
+                centers.dtype,
+            )
+            active = topo.node_ranges[:, 1] >= topo.node_ranges[:, 0]
+            return lf, rf, centers, extents, root, active
+
+        def make_walk(q, far_cap, near_cap):
+            def walk(lf, rf, centers, extents, root, active):
+                return dual_tree_walk_mutual(
+                    lf,
+                    rf,
+                    centers,
+                    extents,
+                    args.theta,
+                    root,
+                    max_pair_queue=q,
+                    far_cap=far_cap,
+                    near_cap=near_cap,
+                    mac_type="dehnen",
+                    node_active=active,
+                )
+
+            return walk
+
+        build_jit = jax.jit(build)
+        inputs_jit = jax.jit(walk_inputs)
+        topo, ps, overflow = build_jit(pos, mass)
+        if bool(overflow):
+            raise RuntimeError(f"cell partition overflowed at n={n}")
+        winputs = inputs_jit(topo, ps)
+
+        # --- size queue and list caps: double on overflow, then tighten.
+        q, far_cap, near_cap = 1 << 14, 1 << 16, 1 << 16
+        for _ in range(16):
+            res = jax.jit(make_walk(q, far_cap, near_cap))(*winputs)
+            qo, fo, no = (
+                bool(res.queue_overflow),
+                bool(res.far_overflow),
+                bool(res.near_overflow),
+            )
+            if not (qo or fo or no):
+                break
+            q, far_cap, near_cap = (
+                q * (4 if qo else 1),
+                far_cap * (4 if fo else 1),
+                near_cap * (4 if no else 1),
+            )
+        else:
+            raise RuntimeError(f"mutual walk capacities did not converge at n={n}")
+        peak = int(res.peak_wavefront)
+        far_count, near_count = int(res.far_count), int(res.near_count)
+        q = _pow2(int(1.5 * peak) + 1)
+        far_cap = _pow2(int(1.25 * far_count) + 1)
+        near_cap = _pow2(int(1.25 * near_count) + 1)
+        walk = make_walk(q, far_cap, near_cap)
+        walk_jit = jax.jit(walk)
+
+        @jax.jit
+        def step(p, m):
+            t, s, o = build(p, m)
+            r = walk(*walk_inputs(t, s))
+            return (
+                r.far_count,
+                r.near_count,
+                o,
+                r.queue_overflow,
+                r.far_overflow,
+                r.near_overflow,
+            )
+
+        build_timing = time_callable(
+            lambda: build_jit(pos, mass), warmup=args.warmup, runs=args.runs
+        )
+        inputs_timing = time_callable(
+            lambda: inputs_jit(topo, ps), warmup=args.warmup, runs=args.runs
+        )
+        walk_timing = time_callable(
+            lambda: walk_jit(*winputs), warmup=args.warmup, runs=args.runs
+        )
+        step_timing = time_callable(
+            lambda: step(pos, mass), warmup=args.warmup, runs=args.runs
+        )
+        res = walk_jit(*winputs)
+        flags = step(pos, mass)
+        if any(bool(x) for x in flags[2:]) or bool(res.queue_overflow):
+            raise RuntimeError(
+                f"fast path overflowed in the timed configuration at n={n}"
+            )
+        out = {
+            "tree": "radix_static_cells",
+            "walk": "dual_tree_walk_mutual",
+            "mac_type": "dehnen",
+            "build": build_timing.as_dict(),
+            "geometry_and_extents": inputs_timing.as_dict(),
+            "traverse": walk_timing.as_dict(),
+            "fused_build_and_traverse": step_timing.as_dict(),
+            "live_leaves": live_leaves,
+            "leaf_capacity": leaf_capacity,
+            "max_pair_queue": q,
+            "far_cap": far_cap,
+            "near_cap": near_cap,
+            "rounds": int(res.rounds),
+            "peak_wavefront": int(res.peak_wavefront),
+            # canonical (unordered) pairs; directed = 2x, comparable to the
+            # legacy walk's per-node lists.
+            "far_pairs_canonical": int(res.far_count),
+            "near_pairs_canonical": int(res.near_count),
+        }
+        print(
+            f"n={n:>9d} fast    "
+            f"build={build_timing.min_s * 1e3:8.2f} ms  "
+            f"traverse={walk_timing.min_s * 1e3:8.2f} ms  "
+            f"fused={step_timing.min_s * 1e3:8.2f} ms  "
+            f"(leaves {live_leaves}, rounds {out['rounds']}, peak {out['peak_wavefront']})"
+        )
+        return out
+
     def _measure(n: int) -> dict:
         """Measure one size; raises if it does not fit in memory."""
         pos, mass = make_problem(n, args.seed)
         pos_np = np.asarray(pos)
         entry: dict = {"n": n, "backends": {}}
 
-        for backend in args.backends:
+        if not args.no_fast:
+            entry["fast"] = _fast_path(pos, mass)
+
+        for backend in [] if args.no_legacy else args.backends:
 
             def build():
                 return Tree.from_particles(
@@ -188,6 +390,8 @@ def main() -> None:
             "runs": args.runs,
             "warmup": args.warmup,
             "seed": args.seed,
+            "legacy": not args.no_legacy,
+            "fast": not args.no_fast,
         },
         "metadata": run_metadata(),
         "sweep": {"stopped_early": stopped_early},
