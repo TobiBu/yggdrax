@@ -186,7 +186,9 @@ def main() -> None:
             return topo, ps, overflow
 
         def walk_inputs(topo, ps):
-            geometry = compute_tree_geometry(topo, ps)
+            # leaf_size is traced inside jit; without the static bound the
+            # geometry gather falls back to (num_leaves, n, 3).
+            geometry = compute_tree_geometry(topo, ps, max_leaf_size=leaf)
             w = mutual_walk_inputs(
                 topo, geometry, mac_type="dehnen", mask_empty_nodes=True
             )
