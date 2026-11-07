@@ -196,6 +196,7 @@ def _accumulate_block_pairs(
     nbins: int,
     triu: Array | None,
     chunk_size: int,
+    row_weight: Array | None = None,
 ) -> Array:
     """Chunked, differentiable reduction of soft-bin weights over leaf pairs.
 
@@ -225,6 +226,10 @@ def _accumulate_block_pairs(
         triu: Optional ``(max_leaf, max_leaf)`` per-block weight (e.g. a strict
             upper-triangular mask for within-leaf pairs), or None.
         chunk_size: Number of leaf pairs per chunk.
+        row_weight: Optional ``(Q,)`` per-leaf-pair weight, e.g. a 0/1 validity
+            mask for the ``-1``-padded slots of a fixed-capacity pair list. None
+            weights every pair 1 (and leaves the reduction bit-identical to the
+            form without the argument).
 
     Returns:
         Per-bin accumulated soft counts, shape ``(nbins,)``.
@@ -252,7 +257,7 @@ def _accumulate_block_pairs(
     # Small case: a single block reproduces the unchunked reduction exactly
     # (no padding, no scan), so the result is bit-identical to the naive form.
     if q <= chunk_size:
-        return contrib(tgt_rows, src_rows, None)
+        return contrib(tgt_rows, src_rows, row_weight)
 
     n_chunks = -(-q // chunk_size)  # ceil division
     pad = n_chunks * chunk_size - q
@@ -261,8 +266,9 @@ def _accumulate_block_pairs(
     src = jnp.concatenate([src_rows, idx_pad]).reshape(n_chunks, chunk_size)
     # Padded rows gather leaf 0 but carry weight 0, so they contribute nothing
     # to the value or the gradient.
+    live = jnp.ones(q, dtype=dtype) if row_weight is None else row_weight
     valid = jnp.concatenate(
-        [jnp.ones(q, dtype=dtype), jnp.zeros(pad, dtype=dtype)]
+        [jnp.asarray(live, dtype=dtype), jnp.zeros(pad, dtype=dtype)]
     ).reshape(n_chunks, chunk_size)
 
     @jax.checkpoint
