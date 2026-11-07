@@ -35,6 +35,7 @@ from .tree import (
     get_node_levels,
     get_nodes_by_level,
     node_levels_from_parent,
+    resolve_tree_topology,
 )
 
 _DEFAULT_MAX_NEIGHBORS = 2048
@@ -5268,7 +5269,7 @@ def mutual_walk_inputs(
         raise ValueError(
             f"mutual_walk_inputs needs a geometric mac_type, received {mac_type!r}"
         )
-    topology = tree.topology if hasattr(tree, "topology") else tree
+    topology = resolve_tree_topology(tree)
     idx = topology.parent.dtype if index_dtype is None else index_dtype
     num_internal = int(topology.left_child.shape[0])
     num_leaves = int(topology.parent.shape[0]) - num_internal
