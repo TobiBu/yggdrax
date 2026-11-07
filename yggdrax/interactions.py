@@ -12,6 +12,7 @@ from ._interactions_impl import (
     DualTreeTraversalConfig,
     DualTreeWalkResult,
     MACType,
+    MutualWalkInputs,
     MutualWalkResult,
     NodeInteractionList,
     NodeNeighborList,
@@ -21,6 +22,7 @@ from ._interactions_impl import (
     _interaction_capacity_candidates,
     dual_tree_walk_mutual,
     interactions_for_node,
+    mutual_walk_inputs,
     neighbors_for_leaf,
 )
 from .geometry import TreeGeometry
@@ -610,6 +612,7 @@ __all__ = [
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
+    "MutualWalkInputs",
     "MutualWalkResult",
     "CompactTaggedFarPairs",
     "NodeInteractionList",
@@ -618,6 +621,7 @@ __all__ = [
     "build_interactions_and_neighbors_split",
     "build_compact_far_pairs",
     "dual_tree_walk_mutual",
+    "mutual_walk_inputs",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_well_separated_interactions",

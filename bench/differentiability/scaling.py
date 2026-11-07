@@ -145,10 +145,9 @@ def main() -> None:
         mass = jax.random.uniform(km, (n,), minval=0.5, maxval=1.5, dtype=jnp.float32)
         return pos, mass
 
-    from yggdrax._interactions_impl import _build_mac_extents
     from yggdrax._tree_impl import build_static_cells_tree
     from yggdrax.bounds import infer_bounds
-    from yggdrax.interactions import dual_tree_walk_mutual
+    from yggdrax.interactions import dual_tree_walk_mutual, mutual_walk_inputs
 
     def _pow2(x: int) -> int:
         return 1 << max(int(x) - 1, 1).bit_length()
@@ -188,22 +187,17 @@ def main() -> None:
 
         def walk_inputs(topo, ps):
             geometry = compute_tree_geometry(topo, ps)
-            num_internal = topo.left_child.shape[0]
-            total = topo.parent.shape[0]
-            idx = topo.parent.dtype
-            pad = jnp.full((total - num_internal,), -1, idx)
-            lf = jnp.concatenate([jnp.asarray(topo.left_child, idx), pad])
-            rf = jnp.concatenate([jnp.asarray(topo.right_child, idx), pad])
-            root = jnp.argmin(topo.parent).astype(idx)
-            centers = jnp.asarray(geometry.center)
-            extents = jnp.asarray(
-                _build_mac_extents(topo.parent, geometry, num_internal, "dehnen", 1.0)[
-                    0
-                ],
-                centers.dtype,
+            w = mutual_walk_inputs(
+                topo, geometry, mac_type="dehnen", mask_empty_nodes=True
             )
-            active = topo.node_ranges[:, 1] >= topo.node_ranges[:, 0]
-            return lf, rf, centers, extents, root, active
+            return (
+                w.left_child_full,
+                w.right_child_full,
+                w.centers,
+                w.radii,
+                w.root,
+                w.node_active,
+            )
 
         def make_walk(q, far_cap, near_cap):
             def walk(lf, rf, centers, extents, root, active):
