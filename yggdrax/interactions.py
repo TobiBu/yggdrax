@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Callable
 
 from . import _interactions_impl
+from ._dehnen_accept import (
+    WALK_TABLE_GM,
+    WALK_TABLE_POWER0,
+    WALK_TABLE_THRESHOLD,
+    dehnen_pair_accept,
+    walk_table_width,
+)
 from ._interactions_impl import (
     DEFAULT_PAIR_QUEUE_MULTIPLIER,
     CompactTaggedFarPairs,
@@ -12,6 +19,7 @@ from ._interactions_impl import (
     DualTreeTraversalConfig,
     DualTreeWalkResult,
     MACType,
+    MutualWalkBackend,
     MutualWalkInputs,
     MutualWalkResult,
     NodeInteractionList,
@@ -26,6 +34,11 @@ from ._interactions_impl import (
     neighbors_for_leaf,
 )
 from .geometry import TreeGeometry
+from .pallas.mutual_walk import (
+    PallasWalkResult,
+    mutual_walk_pallas,
+    pallas_mutual_walk_supported,
+)
 from .tree import resolve_tree_topology
 
 
@@ -612,16 +625,25 @@ __all__ = [
     "DualTreeRetryEvent",
     "DualTreeTraversalConfig",
     "DualTreeWalkResult",
+    "MutualWalkBackend",
     "MutualWalkInputs",
     "MutualWalkResult",
+    "PallasWalkResult",
+    "WALK_TABLE_GM",
+    "WALK_TABLE_POWER0",
+    "WALK_TABLE_THRESHOLD",
     "CompactTaggedFarPairs",
     "NodeInteractionList",
     "NodeNeighborList",
     "build_interactions_and_neighbors",
     "build_interactions_and_neighbors_split",
     "build_compact_far_pairs",
+    "dehnen_pair_accept",
     "dual_tree_walk_mutual",
     "mutual_walk_inputs",
+    "mutual_walk_pallas",
+    "pallas_mutual_walk_supported",
+    "walk_table_width",
     "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_well_separated_interactions",
