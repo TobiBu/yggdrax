@@ -35,6 +35,7 @@ from .tree import (
     get_node_levels,
     get_nodes_by_level,
     node_levels_from_parent,
+    resolve_tree_topology,
 )
 
 _DEFAULT_MAX_NEIGHBORS = 2048
@@ -5183,6 +5184,116 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
         jnp.where(ok, values_b, neg1), mode="drop", unique_indices=True
     )
     return buf_a, buf_b, count + jnp.sum(live, dtype=idx), overflow
+
+
+class MutualWalkInputs(NamedTuple):
+    """Node arrays for :func:`dual_tree_walk_mutual`, from :func:`mutual_walk_inputs`.
+
+    Field names match the walk's parameters. ``theta`` sits between ``radii``
+    and ``root`` in the walk's signature, so pass the fields by name:
+    ``dual_tree_walk_mutual(w.left_child_full, w.right_child_full, w.centers,
+    w.radii, theta, w.root, mac_type=..., node_active=w.node_active, ...)``.
+    ``node_active`` is ``None`` unless empty-node masking was requested.
+    """
+
+    left_child_full: Array
+    right_child_full: Array
+    centers: Array
+    radii: Array
+    root: Array
+    node_active: Optional[Array]
+
+
+def mutual_walk_inputs(
+    tree: object,
+    geometry: TreeGeometry,
+    *,
+    mac_type: MACType = "dehnen",
+    dehnen_radius_scale: float = 1.0,
+    mask_empty_nodes: bool = False,
+    index_dtype: Any = None,
+) -> MutualWalkInputs:
+    """Build the inputs under which the mutual walk reproduces the dual walk.
+
+    :func:`dual_tree_walk_mutual` takes caller-supplied child arrays, centres
+    and radii, so it applies none of the dual walk's per-backend defaults. The
+    one that matters is the Dehnen radius scale: on a kd-tree the dual walk
+    raises a scale left at ``1.0`` to ``_DEFAULT_KDTREE_DEHNEN_RADIUS_SCALE``
+    (:func:`_resolve_dehnen_radius_scale`), and a hand-built input that skips
+    this walks a different MAC. At N = 2e4, leaf 64, theta 0.6 that is 42k
+    directed far pairs against the dual walk's 55k. This helper resolves the
+    scale the same way the dual walk does, so feeding its output to
+    ``dual_tree_walk_mutual(..., mac_type=mac_type)`` gives the dual walk's far
+    and near lists as sets on the radix, octree and kd backends alike.
+
+    Traceable. Shapes depend only on the topology's static shapes, so a
+    ``jax.jit`` that rebuilds the tree can call this too.
+
+    Parameters
+    ----------
+    tree
+        A tree container or its topology, in the shared layout: internal nodes
+        ``[0, num_internal)``, leaves after, ``left_child``/``right_child`` of
+        length ``num_internal``, root's parent negative.
+    geometry
+        The tree's :class:`TreeGeometry` (``compute_tree_geometry``).
+    mac_type
+        Acceptance criterion. Pass the same value to the walk: it selects box
+        or sphere radii here and the acceptance test there.
+    dehnen_radius_scale
+        As for :func:`build_interactions_and_neighbors`. ``1.0`` means the
+        backend default, which is ``1.2`` on a kd-tree.
+    mask_empty_nodes
+        Return ``node_active = node_ranges[:, 1] >= node_ranges[:, 0]``. Needed
+        for capacity-padded trees (``build_static_cells_tree``), whose empty
+        padding leaves would otherwise flood the near list. ``False`` (default)
+        returns ``None``, so the walk does no extra gathers.
+    index_dtype
+        Index dtype of the child arrays and root, which the walk's outputs
+        follow. Defaults to the topology's ``parent`` dtype.
+
+    Returns
+    -------
+    MutualWalkInputs
+        Child arrays padded with ``-1`` for leaves, node centres, MAC radii in
+        the centres' dtype, the root index and the optional activity mask.
+
+    Raises
+    ------
+    ValueError
+        If ``mac_type`` is not a geometric criterion (``bh``, ``dehnen`` or
+        ``engblom``).
+    """
+
+    if mac_type not in ("bh", "dehnen", "engblom"):
+        raise ValueError(
+            f"mutual_walk_inputs needs a geometric mac_type, received {mac_type!r}"
+        )
+    topology = resolve_tree_topology(tree)
+    idx = topology.parent.dtype if index_dtype is None else index_dtype
+    num_internal = int(topology.left_child.shape[0])
+    num_leaves = int(topology.parent.shape[0]) - num_internal
+    pad = jnp.full((num_leaves,), -1, idx)
+    left = jnp.concatenate([jnp.asarray(topology.left_child, idx), pad])
+    right = jnp.concatenate([jnp.asarray(topology.right_child, idx), pad])
+    root = jnp.argmin(topology.parent).astype(idx)
+    centers = jnp.asarray(geometry.center)
+    scale = _resolve_dehnen_radius_scale(topology, mac_type, dehnen_radius_scale)
+    radii = _build_mac_extents(
+        topology.parent, geometry, num_internal, mac_type, scale
+    )[0]
+    node_active = None
+    if mask_empty_nodes:
+        ranges = jnp.asarray(topology.node_ranges)
+        node_active = ranges[:, 1] >= ranges[:, 0]
+    return MutualWalkInputs(
+        left_child_full=left,
+        right_child_full=right,
+        centers=centers,
+        radii=jnp.asarray(radii, centers.dtype),
+        root=root,
+        node_active=node_active,
+    )
 
 
 @partial(
