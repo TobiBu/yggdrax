@@ -29,6 +29,7 @@ from jaxtyping import Array, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .geometry import TreeGeometry
+from .pallas.mutual_walk import mutual_walk_pallas, pallas_mutual_walk_supported
 from .tree import (
     get_leaf_nodes,
     get_level_offsets,
@@ -5101,6 +5102,10 @@ class MutualWalkResult(NamedTuple):
     reports the queue it needed; ``rounds`` is the number of wavefront rounds.
     Both let a caller size the queue of a later traced call from data instead of
     from a capacity that merely did not overflow.
+
+    Under ``backend="pallas"`` the same pairs come as SETS in a nondeterministic
+    order, and the padding past each count is negative but not necessarily
+    ``-1`` (see :func:`dual_tree_walk_mutual`).
     """
 
     far_a: Array
@@ -5296,6 +5301,12 @@ def mutual_walk_inputs(
     )
 
 
+#: ``dual_tree_walk_mutual(backend=...)``: the XLA wavefront loop, the Pallas
+#: kernel (one launch per round), or the kernel wherever it can run.
+MutualWalkBackend = Literal["flat", "pallas", "auto"]
+_MUTUAL_WALK_BACKENDS = ("flat", "pallas", "auto")
+
+
 @partial(
     jax.jit,
     static_argnames=(
@@ -5308,7 +5319,7 @@ def mutual_walk_inputs(
         "pair_accept",
     ),
 )
-def dual_tree_walk_mutual(
+def _dual_tree_walk_mutual_flat(
     left_child_full: Array,
     right_child_full: Array,
     centers: Array,
@@ -5329,123 +5340,7 @@ def dual_tree_walk_mutual(
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
 ) -> MutualWalkResult:
-    """Symmetric dual-tree walk emitting each unordered node pair once.
-
-    Fully device-resident and traceable: a ``lax.while_loop`` over a
-    fixed-capacity wavefront of node pairs, O(tree depth) rounds.
-
-    Parameters
-    ----------
-    left_child_full:
-        ``(total_nodes,)`` left-child indices, **-1 for leaves**. A caller with
-        ``(num_internal,)`` arrays pads them; the -1 is what marks a leaf here,
-        so no separate leaf mask is needed.
-    right_child_full:
-        ``(total_nodes,)`` right-child indices, likewise -1 for leaves.
-    centers:
-        ``(total_nodes, 3)`` node centres used by the MAC, supplied by the caller
-        rather than derived from a ``TreeGeometry``. That is deliberate: the
-        mutual FMM's MAC is defined on **centres of mass**, recomputed from the
-        live positions on every evaluation, not on the bounding-sphere proxies
-        ``_build_mac_extents`` selects. Letting the caller pass them keeps this
-        walk agnostic and reproduces jaccpot's host traversal pair-for-pair.
-    radii:
-        ``(total_nodes,)`` node radii used by the MAC -- for the mutual FMM the
-        exact max centre-of-mass-to-particle distance, again caller-supplied for
-        the reason above.
-    theta:
-        Accepts a pair when ``theta * |c_b - c_a| > r_a + r_b`` -- strict, and
-        symmetric in the two nodes by construction, which is what lets one
-        decision serve both directions.
-    root:
-        Index of the root node.
-    max_pair_queue:
-        Wavefront capacity, in node pairs.
-    far_cap:
-        Output capacity for the canonical far list.
-    near_cap:
-        Output capacity for the canonical near list.
-    mac_type:
-        ``None`` (default) keeps the strict rule above. A ``MACType`` routes the
-        test through :func:`_compute_mac_ok` instead -- the non-strict
-        ``(r_a + r_b)^2 <= theta^2 d^2`` of the dual-tree walk for ``bh`` and
-        ``dehnen`` (they differ from the strict rule only on exact equality) and
-        the Engblom form -- so a caller that feeds the dual walk's own
-        ``mac_extents`` gets the dual walk's far and near lists as sets. Static.
-    node_active:
-        Optional ``(total_nodes,)`` boolean mask. A pair whose target or source
-        node is inactive is DEAD: never accepted, never a near pair, never
-        refined. Empty padding nodes of a capacity-padded leaf partition
-        (``yggdrax._cell_partition``) are what this is for -- with all of them
-        at one centre and radius zero they otherwise fail the MAC against each
-        other and flood the near list. ``None`` = every node active (no extra
-        gathers; bit-identical to the walk without the argument).
-    seed_a:
-        Optional ``(K,)`` node-index array, the first node of each of K seed pairs
-        that replace the single ``(root, root)`` pair. Given together with
-        ``seed_b`` or not at all; ``root`` is then unused.
-    seed_b:
-        Optional ``(K,)`` node-index array, the second node of each seed pair. Pairs are canonicalised to ``(min, max)`` here, as
-        every refined pair already is, so the caller's order does not matter and a
-        seed cannot be emitted in the opposite orientation from its own descendants.
-
-        This is what makes a ONE-SIDED cross-domain evaluation need no new kernel.
-        Concatenate an imported source set onto the local nodes at indices
-        ``[n_local, n_local + n_remote)`` and seed ``(local_root, imported_i)``: the
-        canonicalisation then orders every emitted pair as (local target, imported
-        source) exactly, for free, because every local index is strictly below every
-        imported one. The imported entries carry ``left = right = -1``, so the walk
-        refines only on the local side and terminates there.
-    seed_count:
-        Optional live prefix length of the seed, traced. ``None`` means all K. Seeds
-        beyond it are dead, as are ``-1`` entries, so a caller with a
-        capacity-padded seed buffer passes the count and pads with ``-1``.
-    wavefront_ladder:
-        Compile the round body for the static widths of
-        :func:`_wavefront_ladder` and let each round run at the narrowest width
-        that holds its live wavefront. ``False`` runs every round at the full
-        ``max_pair_queue`` width. ``None`` (default) takes
-        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
-        the same pairs in the same order -- and differ only in per-round cost
-        and compile time. Static.
-    separation_floor:
-        Accept a pair only if also ``|c_b - c_a| >= r_a + r_b + separation_floor``:
-        with exact radii no particle of one node of an accepted pair is closer than
-        the floor to a particle of the other. A far field computed with the
-        unsoftened expansion stays out of a softening kernel's reach this way.
-        ``0`` (default) adds no test, so the lists are the walk's without it.
-        Static.
-    pair_accept:
-        Optional acceptance test that REPLACES the opening-angle rule (``theta`` and
-        ``mac_type`` are then unused): called once per round as
-        ``pair_accept(pair_accept_data, a, b, dist_sq, radius_a, radius_b)`` on the
-        round's node pairs, it returns a boolean mask, and a pair is accepted where
-        the mask holds, it is live and ``a != b``. The separation floor still
-        applies on top; a rejected pair is a near pair (two leaves) or refined,
-        exactly as under the geometric rule. This is how an error-controlled
-        criterion (Dehnen 2014 eq 16a) runs in this walk without the walk knowing
-        about multipoles: the caller's per-node data rides in ``pair_accept_data``.
-        The test must be symmetric in ``a`` and ``b``, since every pair is visited
-        in one orientation only. Static (a hashable callable).
-    pair_accept_data:
-        Pytree of arrays handed to ``pair_accept`` as its first argument, traced.
-        ``None`` (default) when there is no ``pair_accept``.
-
-    Returns
-    -------
-    MutualWalkResult
-        The canonical far and near pair lists, ``-1``-padded to ``far_cap`` and
-        ``near_cap``, with their live counts, the three overflow flags, the peak
-        wavefront and the round count. Index dtype follows ``left_child_full``.
-        The flags must be read -- see :class:`MutualWalkResult`.
-
-    Raises
-    ------
-    ValueError
-        If only one of ``seed_a`` / ``seed_b`` is given, if they are not
-        matching 1-D arrays, or if the seed holds more pairs than
-        ``max_pair_queue``.
-    """
+    """The flat (XLA) backend of :func:`dual_tree_walk_mutual`; same arguments."""
     idx = jnp.asarray(left_child_full).dtype
 
     def ix(x):
@@ -5703,3 +5598,310 @@ def dual_tree_walk_mutual(
         peak_wavefront=final[12],
         rounds=final[13],
     )
+
+
+def dual_tree_walk_mutual(
+    left_child_full: Array,
+    right_child_full: Array,
+    centers: Array,
+    radii: Array,
+    theta: float,
+    root: Array,
+    *,
+    max_pair_queue: int,
+    far_cap: int,
+    near_cap: int,
+    mac_type: Optional[MACType] = None,
+    node_active: Optional[Array] = None,
+    seed_a: Optional[Array] = None,
+    seed_b: Optional[Array] = None,
+    seed_count: Optional[Array] = None,
+    wavefront_ladder: Optional[bool] = None,
+    separation_floor: float = 0.0,
+    pair_accept: Optional[Callable[..., Array]] = None,
+    pair_accept_data: Any = None,
+    backend: MutualWalkBackend = "flat",
+    pallas_interpret: bool = False,
+) -> MutualWalkResult:
+    """Symmetric dual-tree walk emitting each unordered node pair once.
+
+    Fully device-resident and traceable: a ``lax.while_loop`` over a
+    fixed-capacity wavefront of node pairs, O(tree depth) rounds.
+
+    Parameters
+    ----------
+    left_child_full:
+        ``(total_nodes,)`` left-child indices, **-1 for leaves**. A caller with
+        ``(num_internal,)`` arrays pads them; the -1 is what marks a leaf here,
+        so no separate leaf mask is needed.
+    right_child_full:
+        ``(total_nodes,)`` right-child indices, likewise -1 for leaves.
+    centers:
+        ``(total_nodes, 3)`` node centres used by the MAC, supplied by the caller
+        rather than derived from a ``TreeGeometry``. That is deliberate: the
+        mutual FMM's MAC is defined on **centres of mass**, recomputed from the
+        live positions on every evaluation, not on the bounding-sphere proxies
+        ``_build_mac_extents`` selects. Letting the caller pass them keeps this
+        walk agnostic and reproduces jaccpot's host traversal pair-for-pair.
+    radii:
+        ``(total_nodes,)`` node radii used by the MAC -- for the mutual FMM the
+        exact max centre-of-mass-to-particle distance, again caller-supplied for
+        the reason above.
+    theta:
+        Accepts a pair when ``theta * |c_b - c_a| > r_a + r_b`` -- strict, and
+        symmetric in the two nodes by construction, which is what lets one
+        decision serve both directions.
+    root:
+        Index of the root node.
+    max_pair_queue:
+        Wavefront capacity, in node pairs.
+    far_cap:
+        Output capacity for the canonical far list.
+    near_cap:
+        Output capacity for the canonical near list.
+    mac_type:
+        ``None`` (default) keeps the strict rule above. A ``MACType`` routes the
+        test through :func:`_compute_mac_ok` instead -- the non-strict
+        ``(r_a + r_b)^2 <= theta^2 d^2`` of the dual-tree walk for ``bh`` and
+        ``dehnen`` (they differ from the strict rule only on exact equality) and
+        the Engblom form -- so a caller that feeds the dual walk's own
+        ``mac_extents`` gets the dual walk's far and near lists as sets. Static.
+    node_active:
+        Optional ``(total_nodes,)`` boolean mask. A pair whose target or source
+        node is inactive is DEAD: never accepted, never a near pair, never
+        refined. Empty padding nodes of a capacity-padded leaf partition
+        (``yggdrax._cell_partition``) are what this is for -- with all of them
+        at one centre and radius zero they otherwise fail the MAC against each
+        other and flood the near list. ``None`` = every node active (no extra
+        gathers; bit-identical to the walk without the argument).
+    seed_a:
+        Optional ``(K,)`` node-index array, the first node of each of K seed pairs
+        that replace the single ``(root, root)`` pair. Given together with
+        ``seed_b`` or not at all; ``root`` is then unused.
+    seed_b:
+        Optional ``(K,)`` node-index array, the second node of each seed pair. Pairs are canonicalised to ``(min, max)`` here, as
+        every refined pair already is, so the caller's order does not matter and a
+        seed cannot be emitted in the opposite orientation from its own descendants.
+
+        This is what makes a ONE-SIDED cross-domain evaluation need no new kernel.
+        Concatenate an imported source set onto the local nodes at indices
+        ``[n_local, n_local + n_remote)`` and seed ``(local_root, imported_i)``: the
+        canonicalisation then orders every emitted pair as (local target, imported
+        source) exactly, for free, because every local index is strictly below every
+        imported one. The imported entries carry ``left = right = -1``, so the walk
+        refines only on the local side and terminates there.
+    seed_count:
+        Optional live prefix length of the seed, traced. ``None`` means all K. Seeds
+        beyond it are dead, as are ``-1`` entries, so a caller with a
+        capacity-padded seed buffer passes the count and pads with ``-1``.
+    wavefront_ladder:
+        Compile the round body for the static widths of
+        :func:`_wavefront_ladder` and let each round run at the narrowest width
+        that holds its live wavefront. ``False`` runs every round at the full
+        ``max_pair_queue`` width. ``None`` (default) takes
+        ``YGGDRAX_MUTUAL_WALK_LADDER`` (default on, read at import). The two produce identical results --
+        the same pairs in the same order -- and differ only in per-round cost
+        and compile time. Static.
+    separation_floor:
+        Accept a pair only if also ``|c_b - c_a| >= r_a + r_b + separation_floor``:
+        with exact radii no particle of one node of an accepted pair is closer than
+        the floor to a particle of the other. A far field computed with the
+        unsoftened expansion stays out of a softening kernel's reach this way.
+        ``0`` (default) adds no test, so the lists are the walk's without it.
+        Static.
+    pair_accept:
+        Optional acceptance test that REPLACES the opening-angle rule (``theta`` and
+        ``mac_type`` are then unused): called once per round as
+        ``pair_accept(pair_accept_data, a, b, dist_sq, radius_a, radius_b)`` on the
+        round's node pairs, it returns a boolean mask, and a pair is accepted where
+        the mask holds, it is live and ``a != b``. The separation floor still
+        applies on top; a rejected pair is a near pair (two leaves) or refined,
+        exactly as under the geometric rule. This is how an error-controlled
+        criterion (Dehnen 2014 eq 16a) runs in this walk without the walk knowing
+        about multipoles: the caller's per-node data rides in ``pair_accept_data``.
+        The test must be symmetric in ``a`` and ``b``, since every pair is visited
+        in one orientation only. Static (a hashable callable).
+    pair_accept_data:
+        Pytree of arrays handed to ``pair_accept`` as its first argument, traced.
+        ``None`` (default) when there is no ``pair_accept``.
+    backend:
+        Which implementation walks. ``"flat"`` (default): the XLA wavefront loop
+        described above. ``"pallas"``: the same walk with one Pallas launch per
+        round (:func:`yggdrax.pallas.mutual_walk.mutual_walk_pallas`), several
+        times faster on a GPU (6.7e7 particles, A100: 56 against 459 ms). It
+        needs an Ampere-or-later GPU (or ``pallas_interpret``), ``mac_type``
+        ``"bh"`` or ``"dehnen"``, no ``pair_accept`` (for Dehnen's eq (16a) call
+        ``mutual_walk_pallas(error_table=...)`` directly) and a concrete
+        ``theta``, which the kernel bakes in. ``"auto"``: ``"pallas"`` where
+        those hold, ``"flat"`` otherwise. Both backends return the same far and
+        near pair SETS, round count and peak wavefront; the Pallas lists come in
+        a nondeterministic order, padded with negative values (not necessarily
+        ``-1``), a far or near overflow does not stop that walk early, and it
+        also raises ``queue_overflow`` if it stops at its round bound (256) with
+        pairs still queued. ``wavefront_ladder`` does not apply to it. Static.
+    pallas_interpret:
+        Run the Pallas backend in Pallas interpret mode (CPU semantics, slow;
+        for tests on machines without a suitable GPU). With ``backend="auto"``
+        it also selects the Pallas backend where it would otherwise fall back.
+
+    Returns
+    -------
+    MutualWalkResult
+        The canonical far and near pair lists, ``-1``-padded to ``far_cap`` and
+        ``near_cap``, with their live counts, the three overflow flags, the peak
+        wavefront and the round count. Index dtype follows ``left_child_full``.
+        The flags must be read -- see :class:`MutualWalkResult`.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``seed_a`` / ``seed_b`` is given, if they are not
+        matching 1-D arrays, if the seed holds more pairs than
+        ``max_pair_queue``, if ``backend`` is not one of ``"flat"``,
+        ``"pallas"``, ``"auto"``, or if ``backend="pallas"`` cannot run here or
+        with these arguments.
+    TypeError
+        If the Pallas backend is selected with a traced ``theta``.
+    """
+    resolved = _resolve_mutual_walk_backend(
+        backend,
+        mac_type=mac_type,
+        pair_accept=pair_accept,
+        interpret=bool(pallas_interpret),
+    )
+    if resolved == "flat":
+        return _dual_tree_walk_mutual_flat(
+            left_child_full,
+            right_child_full,
+            centers,
+            radii,
+            theta,
+            root,
+            max_pair_queue=max_pair_queue,
+            far_cap=far_cap,
+            near_cap=near_cap,
+            mac_type=mac_type,
+            node_active=node_active,
+            seed_a=seed_a,
+            seed_b=seed_b,
+            seed_count=seed_count,
+            wavefront_ladder=wavefront_ladder,
+            separation_floor=separation_floor,
+            pair_accept=pair_accept,
+            pair_accept_data=pair_accept_data,
+        )
+    try:
+        theta_value = float(theta)
+    except (TypeError, jax.errors.ConcretizationTypeError) as err:
+        raise TypeError(
+            "backend='pallas' needs a concrete theta (the kernel compiles it in); "
+            "close over a Python float instead of passing a traced value, or use "
+            "backend='flat'"
+        ) from err
+    idx = jnp.asarray(left_child_full).dtype
+    if (seed_a is None) != (seed_b is None):
+        raise ValueError("seed_a and seed_b must be given together")
+    if seed_a is not None and seed_b is not None:
+        sa_seed = jnp.asarray(seed_a, dtype=idx)
+        sb_seed = jnp.asarray(seed_b, dtype=idx)
+        if sa_seed.shape != sb_seed.shape or sa_seed.ndim != 1:
+            raise ValueError(
+                f"seed_a and seed_b must be matching 1-D arrays, got "
+                f"{sa_seed.shape} and {sb_seed.shape}"
+            )
+        # canonicalised as the flat walk does: the split rule breaks radius ties
+        # by orientation, so an uncanonical seed would refine differently
+        seed_a = jnp.minimum(sa_seed, sb_seed)
+        seed_b = jnp.maximum(sa_seed, sb_seed)
+    walk = mutual_walk_pallas(
+        left_child_full,
+        right_child_full,
+        centers,
+        radii,
+        theta_value,
+        root,
+        max_pair_queue=int(max_pair_queue),
+        far_cap=int(far_cap),
+        near_cap=int(near_cap),
+        node_active=node_active,
+        seed_a=seed_a,
+        seed_b=seed_b,
+        seed_count=seed_count,
+        separation_floor=float(separation_floor),
+        interpret=bool(pallas_interpret),
+    )
+    return MutualWalkResult(
+        far_a=walk.far_a.astype(idx),
+        far_b=walk.far_b.astype(idx),
+        far_count=walk.far_count.astype(idx),
+        near_a=walk.near_a.astype(idx),
+        near_b=walk.near_b.astype(idx),
+        near_count=walk.near_count.astype(idx),
+        far_overflow=walk.far_overflow,
+        near_overflow=walk.near_overflow,
+        queue_overflow=walk.queue_overflow,
+        peak_wavefront=walk.peak_wavefront.astype(idx),
+        rounds=walk.rounds.astype(idx),
+    )
+
+
+def _resolve_mutual_walk_backend(
+    backend: str,
+    *,
+    mac_type: Optional[MACType],
+    pair_accept: Optional[Callable[..., Array]],
+    interpret: bool,
+) -> str:
+    """Resolve ``dual_tree_walk_mutual``'s ``backend`` to ``"flat"`` or ``"pallas"``.
+
+    Parameters
+    ----------
+    backend
+        ``"flat"``, ``"pallas"`` or ``"auto"``.
+    mac_type
+        The walk's ``mac_type``; the kernel tests only the non-strict geometric
+        MAC of ``"bh"`` / ``"dehnen"``.
+    pair_accept
+        The walk's ``pair_accept``; an arbitrary callable cannot run in the kernel.
+    interpret
+        Pallas interpret mode, which runs anywhere.
+
+    Returns
+    -------
+    str
+        ``"flat"`` or ``"pallas"``.
+
+    Raises
+    ------
+    ValueError
+        On an unknown ``backend``, or ``"pallas"`` where it cannot run.
+    """
+    if backend not in _MUTUAL_WALK_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_MUTUAL_WALK_BACKENDS}, got {backend!r}"
+        )
+    if backend == "flat":
+        return "flat"
+    unsupported = []
+    if mac_type not in ("bh", "dehnen"):
+        unsupported.append(
+            f"mac_type={mac_type!r} (the kernel tests the non-strict 'bh'/'dehnen' "
+            "MAC; pass one of those)"
+        )
+    if pair_accept is not None:
+        unsupported.append(
+            "a pair_accept callable (for Dehnen's eq (16a) call "
+            "mutual_walk_pallas(error_table=..., error_order=...) directly)"
+        )
+    runnable = bool(interpret) or pallas_mutual_walk_supported()
+    if backend == "auto":
+        return "pallas" if runnable and not unsupported else "flat"
+    if unsupported:
+        raise ValueError("backend='pallas' cannot run " + "; ".join(unsupported))
+    if not runnable:
+        raise ValueError(
+            "backend='pallas' needs an Ampere-or-later GPU (sm_80+) as the default "
+            "device; pass pallas_interpret=True to run the kernel in interpret "
+            "mode, or use backend='auto' to fall back to the flat walk"
+        )
+    return "pallas"

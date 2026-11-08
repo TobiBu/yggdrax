@@ -69,6 +69,7 @@ applications = [
 packages = [
   "yggdrax",
   "yggdrax.distributed",
+  "yggdrax.pallas",
   "yggdrax.applications",
   "yggdrax.applications.corrfunc",
   "yggdrax.applications.svgd",
