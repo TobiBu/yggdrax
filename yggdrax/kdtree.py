@@ -12,7 +12,8 @@ import numpy as np
 from beartype import beartype
 from jaxtyping import Array, jaxtyped
 
-from .dtypes import INDEX_DTYPE
+from .dtypes import INDEX_DTYPE, is_traced
+from .periodic import BoxSize, minimum_image, normalize_box_size, wrap_positions
 
 
 @dataclass(frozen=True)
@@ -145,10 +146,17 @@ def _register_kdtree_pytree() -> None:
 _register_kdtree_pytree()
 
 
-def _pairwise_squared_distances(queries: Array, points: Array) -> Array:
-    """Return squared pairwise distances with shape ``(n_queries, n_points)``."""
+def _pairwise_squared_distances(
+    queries: Array, points: Array, box_size: Optional[tuple[float, ...]] = None
+) -> Array:
+    """Return squared pairwise distances with shape ``(n_queries, n_points)``.
+
+    With ``box_size`` the distances are minimum-image distances.
+    """
 
     deltas = queries[:, None, :] - points[None, :, :]
+    if box_size is not None:
+        deltas = minimum_image(deltas, box_size)
     return jnp.sum(deltas * deltas, axis=-1)
 
 
@@ -1045,8 +1053,9 @@ def _query_neighbors_dense(
     k: int,
     exclude_self: bool,
     return_squared: bool,
+    box_size: Optional[tuple[float, ...]] = None,
 ) -> tuple[Array, Array]:
-    distances_sq = _pairwise_squared_distances(queries_arr, tree.points)
+    distances_sq = _pairwise_squared_distances(queries_arr, tree.points, box_size)
     if exclude_self and (queries_arr.shape[0] == tree.num_points):
         diag_len = queries_arr.shape[0]
         diag_idx = jnp.arange(diag_len)
@@ -1067,6 +1076,7 @@ def _query_neighbors_tiled(
     exclude_self: bool,
     point_block_size: int,
     return_squared: bool,
+    box_size: Optional[tuple[float, ...]] = None,
 ) -> tuple[Array, Array]:
     num_points = tree.num_points
     if point_block_size < 1:
@@ -1098,7 +1108,7 @@ def _query_neighbors_tiled(
             points_padded, (start, 0), (block_size, tree.dimension)
         )
         block_ids = jax.lax.dynamic_slice(point_ids, (start,), (block_size,))
-        d2 = _pairwise_squared_distances(queries_arr, block_points)
+        d2 = _pairwise_squared_distances(queries_arr, block_points, box_size)
         valid = block_ids >= 0
         d2 = jnp.where(valid[None, :], d2, jnp.inf)
 
@@ -1203,9 +1213,15 @@ def _query_neighbors_tree(
     k: int,
     exclude_self: bool,
     return_squared: bool,
+    box_size: Optional[tuple[float, ...]] = None,
 ) -> tuple[Array, Array]:
     points = tree.points
     indices = jnp.asarray(tree.indices, dtype=jnp.int32)
+    box = None if box_size is None else jnp.asarray(box_size, dtype=queries_arr.dtype)
+
+    def image(delta: Array) -> Array:
+        return delta if box_size is None else minimum_image(delta, box_size)
+
     split_dims = jnp.asarray(tree.split_dim, dtype=jnp.int32)
     leaf_point_ids = jnp.asarray(tree.leaf_point_ids, dtype=jnp.int32)
     leaf_valid = jnp.asarray(tree.leaf_valid_mask, dtype=jnp.bool_)
@@ -1235,7 +1251,7 @@ def _query_neighbors_tree(
             def update_node(_):
                 point_id = indices[current]
                 point = points[point_id]
-                point_d2 = jnp.sum((query - point) ** 2)
+                point_d2 = jnp.sum(image(query - point) ** 2)
                 if use_self_mask:
                     point_d2 = jnp.where(point_id == query_id, jnp.inf, point_d2)
                 worst_slot = jnp.argmax(d2_state)
@@ -1257,7 +1273,7 @@ def _query_neighbors_tree(
                 valid = leaf_valid[leaf_ord]
                 safe_idx = jnp.clip(cand_idx, 0, num_points - 1)
                 cand_points = points[safe_idx]
-                cand_d2 = jnp.sum((cand_points - query[None, :]) ** 2, axis=1)
+                cand_d2 = jnp.sum(image(cand_points - query[None, :]) ** 2, axis=1)
                 cand_d2 = jnp.where(valid, cand_d2, jnp.inf)
                 if use_self_mask:
                     cand_d2 = jnp.where(cand_idx == query_id, jnp.inf, cand_d2)
@@ -1290,7 +1306,16 @@ def _query_neighbors_tree(
                 near_side = jnp.asarray(split_distance > 0, dtype=jnp.int32)
                 near_child = 2 * current + 1 + near_side
                 far_child = 2 * current + 2 - near_side
-                far_in_range = (split_distance * split_distance) <= radius_state
+                if box is None:
+                    gap = split_distance
+                else:
+                    # Points and queries lie in [0, L): the far side is also
+                    # reached across the box face behind the query, at least
+                    # L - q (far side below the plane) or q (above) away.
+                    q_k = query[split_dim]
+                    wrap_gap = jnp.where(split_distance > 0, box[split_dim] - q_k, q_k)
+                    gap = jnp.minimum(jnp.abs(split_distance), wrap_gap)
+                far_in_range = (gap * gap) <= radius_state
                 return jax.lax.select(
                     (previous == near_child)
                     | ((previous == parent) & (near_child >= num_nodes)),
@@ -1320,7 +1345,7 @@ def _query_neighbors_tree(
             )
             return best_idx, best_d2
         safe_idx = jnp.clip(best_idx, 0, num_points - 1)
-        distances = jnp.linalg.norm(points[safe_idx] - query[None, :], axis=-1)
+        distances = jnp.linalg.norm(image(points[safe_idx] - query[None, :]), axis=-1)
         distances = jnp.where(best_idx >= 0, distances, jnp.inf)
         distances, best_idx = jax.lax.sort(
             (distances, best_idx), dimension=0, num_keys=2
@@ -1366,6 +1391,7 @@ def query_neighbors(
     backend: Literal["dense", "tiled", "tree", "auto"] = "tiled",
     point_block_size: int = 4096,
     return_squared: bool = False,
+    box_size: Optional[BoxSize] = None,
 ) -> tuple[Array, Array]:
     """Return nearest-neighbor indices and distances for each query point.
 
@@ -1389,6 +1415,16 @@ def query_neighbors(
         Block size used by the tiled backend.
     return_squared
         If ``True``, return squared Euclidean distances instead of distances.
+    box_size
+        Optional periodic box ``[0, L)^d`` (a float, or one length per
+        dimension): distances are then minimum-image distances, on every
+        backend. Queries are wrapped into the box; the tree's points must
+        already lie in it (build the tree from
+        :func:`yggdrax.periodic.wrap_positions` output) -- the ``"tree"``
+        backend's pruning relies on it, and it is checked when the points are
+        concrete. ``None`` (default) is the non-periodic query, unchanged.
+        Each point is found once, at its minimum image, so ``k`` neighbours
+        are unambiguous only while they are closer than ``min(L) / 2``.
 
     Returns
     -------
@@ -1398,7 +1434,8 @@ def query_neighbors(
     Raises
     ------
     ValueError
-        If ``k`` is out of range or ``backend`` is not a supported value.
+        If ``k`` is out of range, ``backend`` is not a supported value, or
+        (``box_size`` given, concrete points) a tree point lies outside the box.
     """
 
     queries_arr = _validate_queries(tree, queries)
@@ -1411,6 +1448,14 @@ def query_neighbors(
 
     resolved_backend = _resolve_query_backend(tree, queries_arr, backend, k=k)
 
+    box = normalize_box_size(box_size, tree.dimension)
+    if box is None:
+        periodic = {}
+    else:
+        queries_arr = wrap_positions(queries_arr, box)
+        _check_points_in_box(tree.points, box)
+        periodic = {"box_size": box}
+
     if resolved_backend == "dense":
         return _query_neighbors_dense(
             tree,
@@ -1418,6 +1463,7 @@ def query_neighbors(
             k=k,
             exclude_self=exclude_self,
             return_squared=return_squared,
+            **periodic,
         )
     if resolved_backend == "tree":
         return _query_neighbors_tree(
@@ -1426,6 +1472,7 @@ def query_neighbors(
             k=k,
             exclude_self=exclude_self,
             return_squared=return_squared,
+            **periodic,
         )
     return _query_neighbors_tiled(
         tree,
@@ -1434,7 +1481,22 @@ def query_neighbors(
         exclude_self=exclude_self,
         point_block_size=point_block_size,
         return_squared=return_squared,
+        **periodic,
     )
+
+
+def _check_points_in_box(points: Array, box: tuple[float, ...]) -> None:
+    """Raise if concrete ``points`` leave the periodic box ``[0, L)^d``."""
+
+    if is_traced(points):
+        return
+    pts = np.asarray(points)
+    lengths = np.asarray(box, dtype=pts.dtype)
+    if not (np.all(pts >= 0) and np.all(pts < lengths)):
+        raise ValueError(
+            "box_size given but the tree's points are not all inside [0, L)^d; "
+            "build the tree from yggdrax.periodic.wrap_positions(points, box_size)"
+        )
 
 
 def _prepare_radius_inputs(
@@ -1471,6 +1533,7 @@ def _count_neighbors_tiled(
     radius_sq_qr: Array,
     include_self: bool,
     point_block_size: int,
+    box_size: Optional[tuple[float, ...]] = None,
 ) -> Array:
     num_points = tree.num_points
     if point_block_size < 1:
@@ -1500,7 +1563,7 @@ def _count_neighbors_tiled(
             points_padded, (start, 0), (block_size, tree.dimension)
         )
         block_ids = jax.lax.dynamic_slice(point_ids, (start,), (block_size,))
-        d2 = _pairwise_squared_distances(queries_arr, block_points)
+        d2 = _pairwise_squared_distances(queries_arr, block_points, box_size)
         valid = block_ids >= 0
         within = (d2[:, :, None] <= radius_sq_qr[:, None, :]) & valid[None, :, None]
 
@@ -1520,6 +1583,7 @@ def _count_neighbors_tree(
     *,
     radius_sq_qr: Array,
     include_self: bool,
+    box_size: Optional[tuple[float, ...]] = None,
 ) -> Array:
     points = tree.points
     indices = jnp.asarray(tree.indices, dtype=jnp.int32)
@@ -1533,6 +1597,10 @@ def _count_neighbors_tree(
     num_points = tree.num_points
     use_self_mask = bool((not include_self) and (n_queries == num_points))
     query_ids = jnp.arange(n_queries, dtype=jnp.int32)
+    box = None if box_size is None else jnp.asarray(box_size, dtype=queries_arr.dtype)
+
+    def image(delta: Array) -> Array:
+        return delta if box_size is None else minimum_image(delta, box_size)
 
     def single_query(query: Array, query_id: Array) -> Array:
         radius_sq = radius_sq_qr[query_id]
@@ -1552,7 +1620,7 @@ def _count_neighbors_tree(
             def update_node(_):
                 point_id = indices[current]
                 point = points[point_id]
-                point_d2 = jnp.sum((query - point) ** 2)
+                point_d2 = jnp.sum(image(query - point) ** 2)
                 within = point_d2 <= radius_sq
                 if use_self_mask:
                     within = within & (point_id != query_id)
@@ -1564,7 +1632,7 @@ def _count_neighbors_tree(
                 valid = leaf_valid[leaf_ord]
                 safe_idx = jnp.clip(cand_idx, 0, num_points - 1)
                 cand_points = points[safe_idx]
-                cand_d2 = jnp.sum((cand_points - query[None, :]) ** 2, axis=1)
+                cand_d2 = jnp.sum(image(cand_points - query[None, :]) ** 2, axis=1)
                 within = (cand_d2[:, None] <= radius_sq[None, :]) & valid[:, None]
                 if use_self_mask:
                     within = within & (cand_idx[:, None] != query_id)
@@ -1596,7 +1664,15 @@ def _count_neighbors_tree(
                 near_side = jnp.asarray(split_distance > 0, dtype=jnp.int32)
                 near_child = 2 * current + 1 + near_side
                 far_child = 2 * current + 2 - near_side
-                far_in_range = (split_distance * split_distance) <= radius_sq_max
+                if box is None:
+                    gap = split_distance
+                else:
+                    # as in _query_neighbors_tree: the far side is also reached
+                    # across the box face behind the query
+                    q_k = query[split_dim]
+                    wrap_gap = jnp.where(split_distance > 0, box[split_dim] - q_k, q_k)
+                    gap = jnp.minimum(jnp.abs(split_distance), wrap_gap)
+                far_in_range = (gap * gap) <= radius_sq_max
                 return jax.lax.select(
                     (previous == near_child)
                     | ((previous == parent) & (near_child >= num_nodes)),
@@ -1657,6 +1733,7 @@ def count_neighbors(
     include_self: bool = True,
     backend: Literal["tiled", "tree", "auto"] = "tiled",
     point_block_size: int = 2048,
+    box_size: Optional[BoxSize] = None,
 ) -> Array:
     """Count reference points within a radius (or radii) of each query point.
 
@@ -1676,6 +1753,13 @@ def count_neighbors(
         pruning), or ``"auto"`` (chosen by problem size and device).
     point_block_size
         Block size used by the tiled backend.
+    box_size
+        Optional periodic box ``[0, L)^d``: points are counted by minimum-image
+        distance, on both backends, with the same conditions as
+        :func:`query_neighbors` (queries are wrapped, the tree's points must
+        already lie in the box). A count is exact for ``radius < min(L) / 2``;
+        beyond that each point is still counted once, at its minimum image.
+        ``None`` (default) is the non-periodic count, unchanged.
 
     Returns
     -------
@@ -1686,7 +1770,8 @@ def count_neighbors(
     Raises
     ------
     ValueError
-        If ``backend`` is not one of the supported values.
+        If ``backend`` is not one of the supported values, or (``box_size``
+        given, concrete points) a tree point lies outside the box.
     """
 
     queries_arr = _validate_queries(tree, queries)
@@ -1699,12 +1784,20 @@ def count_neighbors(
         backend,
         num_radii=int(radius_sq_qr.shape[1]),
     )
+    box = normalize_box_size(box_size, tree.dimension)
+    if box is None:
+        periodic = {}
+    else:
+        queries_arr = wrap_positions(queries_arr, box)
+        _check_points_in_box(tree.points, box)
+        periodic = {"box_size": box}
     if resolved_backend == "tree":
         counts = _count_neighbors_tree(
             tree,
             queries_arr,
             radius_sq_qr=radius_sq_qr,
             include_self=include_self,
+            **periodic,
         )
     else:
         counts = _count_neighbors_tiled(
@@ -1713,6 +1806,7 @@ def count_neighbors(
             radius_sq_qr=radius_sq_qr,
             include_self=include_self,
             point_block_size=point_block_size,
+            **periodic,
         )
     if radius_ndim == 0:
         return counts[:, 0]

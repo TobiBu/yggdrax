@@ -30,6 +30,12 @@ from jaxtyping import Array, jaxtyped
 from .dtypes import INDEX_DTYPE, as_index, require_x64
 from .geometry import TreeGeometry
 from .pallas.mutual_walk import mutual_walk_pallas, pallas_mutual_walk_supported
+from .periodic import (
+    BoxSize,
+    far_pair_is_unambiguous,
+    minimum_image,
+    normalize_box_size,
+)
 from .tree import (
     get_leaf_nodes,
     get_level_offsets,
@@ -764,6 +770,76 @@ def _resolve_pair_actions(
     return actions, forward_tags, reverse_tags
 
 
+def _periodic_demote_accepts(
+    actions: Array,
+    *,
+    periodic_ok: Array,
+    valid_pairs: Array,
+    different_nodes: Array,
+    target_leaf: Array,
+    source_leaf: Array,
+) -> Array:
+    """Overrule a pair policy's far acceptance where the periodic guard fails.
+
+    The built-in MAC already carries the guard in ``mac_ok``; a ``pair_policy``
+    may accept without consulting ``mac_ok``, so in a periodic walk its accepts are
+    checked again here. A refused accept becomes a near pair for two different
+    leaves and a refinement otherwise -- what the default actions would have done.
+
+    Parameters
+    ----------
+    actions
+        Per-pair actions from the pair policy.
+    periodic_ok
+        Per-pair periodic guard (:func:`yggdrax.periodic.far_pair_is_unambiguous`).
+    valid_pairs
+        Live-pair mask.
+    different_nodes
+        ``target != source``.
+    target_leaf
+        Target is a leaf.
+    source_leaf
+        Source is a leaf.
+
+    Returns
+    -------
+    Array
+        The actions with every unguarded accept demoted.
+    """
+
+    refused = (actions == as_index(_ACTION_ACCEPT)) & (~periodic_ok)
+    near = valid_pairs & target_leaf & source_leaf & different_nodes
+    demoted = jnp.where(near, as_index(_ACTION_NEAR), as_index(_ACTION_REFINE))
+    return jnp.where(refused, demoted, actions)
+
+
+def _resolve_box_size(
+    geometry: TreeGeometry, box_size: Optional[BoxSize]
+) -> Optional[tuple[float, ...]]:
+    """The walk's static periodic box, one length per dimension of ``geometry``.
+
+    Every walk route normalises here, so the jitted kernels see the same hashable
+    tuple whichever route a caller enters through (and a scalar and its
+    per-dimension spelling compile to the same kernel).
+
+    Parameters
+    ----------
+    geometry
+        The walk's node geometry; fixes the dimension.
+    box_size
+        The caller's box, or ``None``.
+
+    Returns
+    -------
+    tuple of float or None
+        Per-dimension box lengths, or ``None`` for a non-periodic walk.
+    """
+
+    if box_size is None:
+        return None
+    return normalize_box_size(box_size, int(jnp.shape(geometry.center)[-1]))
+
+
 def _per_key_prefix(keys: Array, mask: Array, num_segments: int = 0) -> Array:
     """Exclusive prefix count per key among masked entries.
 
@@ -1035,6 +1111,7 @@ def _raise_if_true(flag, message: str) -> None:
         "max_pair_queue",
         "mac_type",
         "separation_floor",
+        "box_size",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -1051,6 +1128,7 @@ def _dual_tree_walk_impl(
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     max_interactions_per_node: int,
     max_neighbors_per_leaf: int,
     max_pair_queue: int,
@@ -1159,6 +1237,9 @@ def _dual_tree_walk_impl(
     mac_extents, _ = _build_mac_extents(
         parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
+    # Bounding radii of the periodic far-pair guard: geometry.radius bounds every
+    # particle's distance from its node centre, whatever proxy the MAC uses.
+    guard_radii = jnp.asarray(geometry.radius) if box_size is not None else None
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
     left_child_full = jnp.concatenate([left_child, leaf_fill], axis=0)
@@ -1292,6 +1373,8 @@ def _dual_tree_walk_impl(
         center_target = centers[safe_targets]
         center_source = centers[safe_sources]
         delta = center_target - center_source
+        if box_size is not None:
+            delta = minimum_image(delta, box_size)
         valid_scale = valid_pairs[:, None].astype(delta.dtype)
         delta = delta * valid_scale
         dist_sq = jnp.sum(delta * delta, axis=1)
@@ -1309,6 +1392,15 @@ def _dual_tree_walk_impl(
             different_nodes=different_nodes,
             separation_floor=separation_floor,
         )
+        periodic_ok: Optional[Array] = None
+        if box_size is not None and guard_radii is not None:
+            periodic_ok = far_pair_is_unambiguous(
+                dist_sq,
+                guard_radii[safe_targets],
+                guard_radii[safe_sources],
+                box_size,
+            )
+            mac_ok = mac_ok & periodic_ok
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
         source_internal = valid_pairs_bool & (sources < num_internal_val)
@@ -1342,6 +1434,15 @@ def _dual_tree_walk_impl(
                 dist_sq=dist_sq,
                 extent_target=extent_mac_target,
                 extent_source=extent_mac_source,
+            )
+        if periodic_ok is not None and pair_policy is not None:
+            pair_actions = _periodic_demote_accepts(
+                pair_actions,
+                periodic_ok=periodic_ok,
+                valid_pairs=valid_pairs_bool,
+                different_nodes=different_nodes,
+                target_leaf=target_leaf,
+                source_leaf=source_leaf,
             )
 
         should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
@@ -1825,6 +1926,7 @@ def _dual_tree_walk_impl(
     static_argnames=(
         "mac_type",
         "separation_floor",
+        "box_size",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -1842,6 +1944,7 @@ def _dual_tree_walk_count_impl(
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     collect_far: bool = True,
     collect_near: bool = True,
     process_block: int = _DEFAULT_PAIR_BATCH,
@@ -1926,6 +2029,9 @@ def _dual_tree_walk_count_impl(
     mac_extents, extents_leaf = _build_mac_extents(
         parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
+    # Bounding radii of the periodic far-pair guard: geometry.radius bounds every
+    # particle's distance from its node centre, whatever proxy the MAC uses.
+    guard_radii = jnp.asarray(geometry.radius) if box_size is not None else None
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
     left_child_full = jnp.concatenate([left_child, leaf_fill], axis=0)
@@ -1959,6 +2065,8 @@ def _dual_tree_walk_count_impl(
         center_target = centers[safe_targets]
         center_source = centers[safe_sources]
         delta = center_target - center_source
+        if box_size is not None:
+            delta = minimum_image(delta, box_size)
         valid_scale = valid_pairs[:, None].astype(delta.dtype)
         delta = delta * valid_scale
         dist_sq = jnp.sum(delta * delta, axis=1)
@@ -1976,6 +2084,15 @@ def _dual_tree_walk_count_impl(
             different_nodes=different_nodes,
             separation_floor=separation_floor,
         )
+        periodic_ok: Optional[Array] = None
+        if box_size is not None and guard_radii is not None:
+            periodic_ok = far_pair_is_unambiguous(
+                dist_sq,
+                guard_radii[safe_targets],
+                guard_radii[safe_sources],
+                box_size,
+            )
+            mac_ok = mac_ok & periodic_ok
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
         source_internal = valid_pairs_bool & (sources < num_internal_val)
@@ -2007,6 +2124,15 @@ def _dual_tree_walk_count_impl(
                 dist_sq=dist_sq,
                 extent_target=extent_mac_target,
                 extent_source=extent_mac_source,
+            )
+        if periodic_ok is not None and pair_policy is not None:
+            pair_actions = _periodic_demote_accepts(
+                pair_actions,
+                periodic_ok=periodic_ok,
+                valid_pairs=valid_pairs_bool,
+                different_nodes=different_nodes,
+                target_leaf=target_leaf,
+                source_leaf=source_leaf,
             )
 
         should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
@@ -2170,6 +2296,7 @@ def _dual_tree_walk_count_impl(
     static_argnames=(
         "mac_type",
         "separation_floor",
+        "box_size",
         "pair_policy",
         "collect_far",
         "collect_near",
@@ -2192,6 +2319,7 @@ def _dual_tree_walk_compact_fill_impl(
     policy_state: object = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     max_pair_queue: int,
     total_far_pairs: int,
     total_near_pairs: int,
@@ -2258,6 +2386,9 @@ def _dual_tree_walk_compact_fill_impl(
     mac_extents, _ = _build_mac_extents(
         parent, geometry, num_internal, mac_type, dehnen_radius_scale
     )
+    # Bounding radii of the periodic far-pair guard: geometry.radius bounds every
+    # particle's distance from its node centre, whatever proxy the MAC uses.
+    guard_radii = jnp.asarray(geometry.radius) if box_size is not None else None
 
     leaf_fill = jnp.full((total_nodes - num_internal,), -1, dtype=INDEX_DTYPE)
     left_child_full = jnp.concatenate([left_child, leaf_fill], axis=0)
@@ -2393,6 +2524,8 @@ def _dual_tree_walk_compact_fill_impl(
         center_target = centers[safe_targets]
         center_source = centers[safe_sources]
         delta = center_target - center_source
+        if box_size is not None:
+            delta = minimum_image(delta, box_size)
         valid_scale = valid_pairs[:, None].astype(delta.dtype)
         delta = delta * valid_scale
         dist_sq = jnp.sum(delta * delta, axis=1)
@@ -2410,6 +2543,15 @@ def _dual_tree_walk_compact_fill_impl(
             different_nodes=different_nodes,
             separation_floor=separation_floor,
         )
+        periodic_ok: Optional[Array] = None
+        if box_size is not None and guard_radii is not None:
+            periodic_ok = far_pair_is_unambiguous(
+                dist_sq,
+                guard_radii[safe_targets],
+                guard_radii[safe_sources],
+                box_size,
+            )
+            mac_ok = mac_ok & periodic_ok
 
         target_internal = valid_pairs_bool & (targets < num_internal_val)
         source_internal = valid_pairs_bool & (sources < num_internal_val)
@@ -2443,6 +2585,15 @@ def _dual_tree_walk_compact_fill_impl(
                 dist_sq=dist_sq,
                 extent_target=extent_mac_target,
                 extent_source=extent_mac_source,
+            )
+        if periodic_ok is not None and pair_policy is not None:
+            pair_actions = _periodic_demote_accepts(
+                pair_actions,
+                periodic_ok=periodic_ok,
+                valid_pairs=valid_pairs_bool,
+                different_nodes=different_nodes,
+                target_leaf=target_leaf,
+                source_leaf=source_leaf,
             )
 
         should_accept = valid_pairs_bool & (pair_actions == as_index(_ACTION_ACCEPT))
@@ -3127,6 +3278,7 @@ def _run_dual_tree_walk_raw(
     collect_near: bool,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     process_block: Optional[int] = None,
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
 ) -> _DualTreeWalkRawOutputs:
@@ -3137,6 +3289,7 @@ def _run_dual_tree_walk_raw(
 
     theta_val = float(theta)
     dehnen_scale_val = _resolve_dehnen_radius_scale(tree, mac_type, dehnen_radius_scale)
+    box_size = _resolve_box_size(geometry, box_size)
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     nodes_by_level = get_nodes_by_level(tree)
@@ -3168,6 +3321,7 @@ def _run_dual_tree_walk_raw(
             bool(collect_far),
             bool(collect_near),
             str(mac_type),
+            box_size,
         )
         # Not on the traced path: see the ladder collapse below. A capacity the
         # walk cannot verify must not also depend on what ran eagerly earlier in
@@ -3334,6 +3488,7 @@ def _run_dual_tree_walk_raw(
             policy_state=policy_state,
             dehnen_radius_scale=dehnen_scale_val,
             separation_floor=separation_floor,
+            box_size=box_size,
             collect_far=collect_far,
             collect_near=collect_near,
             process_block=count_process_block,
@@ -3506,6 +3661,7 @@ def _run_dual_tree_walk_raw(
                 policy_state=policy_state,
                 dehnen_radius_scale=dehnen_scale_val,
                 separation_floor=separation_floor,
+                box_size=box_size,
                 max_pair_queue=int(queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -3588,6 +3744,7 @@ def _run_dual_tree_walk_raw(
                     policy_state=policy_state,
                     dehnen_radius_scale=dehnen_scale_val,
                     separation_floor=separation_floor,
+                    box_size=box_size,
                     max_interactions_per_node=interaction_capacity,
                     max_neighbors_per_leaf=neighbor_capacity,
                     max_pair_queue=queue_capacity,
@@ -3749,6 +3906,7 @@ def _run_far_only_compact_with_bounded_count_pass(
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
 ) -> CompactTaggedFarPairs:
@@ -3758,6 +3916,7 @@ def _run_far_only_compact_with_bounded_count_pass(
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
+    box_size = _resolve_box_size(geometry, box_size)
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     queue_max = max(4, int(traversal_config.max_pair_queue))
@@ -3835,6 +3994,7 @@ def _run_far_only_compact_with_bounded_count_pass(
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
             separation_floor=separation_floor,
+            box_size=box_size,
             collect_far=True,
             collect_near=False,
             process_block=int(count_process_block),
@@ -3921,6 +4081,7 @@ def _run_far_only_compact_with_bounded_count_pass(
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
                 separation_floor=separation_floor,
+                box_size=box_size,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=0,
@@ -3952,6 +4113,7 @@ def _run_near_only_compact_with_bounded_count_pass(
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
 ) -> NodeNeighborList:
@@ -3961,6 +4123,7 @@ def _run_near_only_compact_with_bounded_count_pass(
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
+    box_size = _resolve_box_size(geometry, box_size)
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     num_leaves = max(1, total_nodes - num_internal)
@@ -4034,6 +4197,7 @@ def _run_near_only_compact_with_bounded_count_pass(
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
             separation_floor=separation_floor,
+            box_size=box_size,
             collect_far=False,
             collect_near=True,
             process_block=int(count_process_block),
@@ -4116,6 +4280,7 @@ def _run_near_only_compact_with_bounded_count_pass(
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
                 separation_floor=separation_floor,
+                box_size=box_size,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=0,
                 total_near_pairs=int(total_near_pairs),
@@ -4147,6 +4312,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
     traversal_config: DualTreeTraversalConfig,
     dehnen_radius_scale: float,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     process_block: Optional[int],
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]],
     timing_callback: Optional[Callable[[str, float], None]] = None,
@@ -4158,6 +4324,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
     dehnen_radius_scale = _resolve_dehnen_radius_scale(
         tree, mac_type, dehnen_radius_scale
     )
+    box_size = _resolve_box_size(geometry, box_size)
     total_nodes = int(tree.parent.shape[0])
     num_internal = int(jnp.asarray(tree.left_child).shape[0])
     num_leaves = max(1, total_nodes - num_internal)
@@ -4254,6 +4421,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
             separation_floor=separation_floor,
+            box_size=box_size,
             collect_far=True,
             collect_near=True,
             process_block=int(count_process_block),
@@ -4302,6 +4470,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
                 separation_floor=separation_floor,
+                box_size=box_size,
                 max_pair_queue=int(queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -4351,6 +4520,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
             policy_state=policy_state,
             dehnen_radius_scale=float(dehnen_radius_scale),
             separation_floor=separation_floor,
+            box_size=box_size,
             collect_far=True,
             collect_near=True,
             process_block=int(count_process_block),
@@ -4421,6 +4591,7 @@ def _run_far_and_near_compact_with_shared_bounded_count_pass(
                 policy_state=policy_state,
                 dehnen_radius_scale=float(dehnen_radius_scale),
                 separation_floor=separation_floor,
+                box_size=box_size,
                 max_pair_queue=int(fill_queue_capacity),
                 total_far_pairs=int(total_far_pairs),
                 total_near_pairs=int(total_near_pairs),
@@ -4538,6 +4709,7 @@ def build_well_separated_interactions(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
 ) -> NodeInteractionList:
     """Construct multipole-to-local interaction lists using a MAC walk.
 
@@ -4562,6 +4734,7 @@ def build_well_separated_interactions(
         collect_near=False,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -4584,6 +4757,7 @@ def build_compact_far_pairs(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
 ) -> CompactTaggedFarPairs:
     """Construct exact-length far pairs directly from the generic dual-tree walk."""
 
@@ -4600,6 +4774,7 @@ def build_compact_far_pairs(
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
             separation_floor=separation_floor,
+            box_size=box_size,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -4619,6 +4794,7 @@ def build_compact_far_pairs(
         collect_near=False,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -4642,6 +4818,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
     timing_callback: Optional[Callable[[str, float], None]] = None,
     compact_far_pair_capacity: Optional[int] = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
@@ -4665,6 +4842,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
             separation_floor=separation_floor,
+            box_size=box_size,
             process_block=process_block,
             retry_logger=retry_logger,
             timing_callback=timing_callback,
@@ -4686,6 +4864,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
             collect_near=True,
             dehnen_radius_scale=dehnen_radius_scale,
             separation_floor=separation_floor,
+            box_size=box_size,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -4708,6 +4887,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
     neighbors = build_leaf_neighbor_lists(
         tree,
@@ -4724,6 +4904,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
     return far_pairs, neighbors
 
@@ -4745,6 +4926,7 @@ def build_leaf_neighbor_lists(
     retry_logger: Optional[Callable[[DualTreeRetryEvent], None]] = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
 ) -> NodeNeighborList:
     """Construct near-field adjacency for leaf nodes via a MAC walk."""
 
@@ -4766,6 +4948,7 @@ def build_leaf_neighbor_lists(
             traversal_config=resolved_cfg,
             dehnen_radius_scale=dehnen_radius_scale,
             separation_floor=separation_floor,
+            box_size=box_size,
             process_block=process_block,
             retry_logger=retry_logger,
         )
@@ -4785,6 +4968,7 @@ def build_leaf_neighbor_lists(
         collect_near=True,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -4807,6 +4991,8 @@ def build_interactions_and_neighbors_split(
     separation_floor: float = 0.0,
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
+    *,
+    box_size: Optional[BoxSize] = None,
 ) -> tuple[NodeInteractionList, NodeNeighborList]:
     """Construct far and near traversal products with separate walks.
 
@@ -4829,6 +5015,7 @@ def build_interactions_and_neighbors_split(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
     neighbors = build_leaf_neighbor_lists(
         tree,
@@ -4845,6 +5032,7 @@ def build_interactions_and_neighbors_split(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
     return interactions, neighbors
 
@@ -4866,6 +5054,7 @@ def build_interactions_and_neighbors(
     pair_policy: Optional[PairPolicy] = None,
     policy_state: object = None,
     *,
+    box_size: Optional[BoxSize] = None,
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
@@ -4904,6 +5093,7 @@ def build_interactions_and_neighbors(
         collect_near=True,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         process_block=process_block,
         retry_logger=retry_logger,
     )
@@ -5199,6 +5389,9 @@ class MutualWalkInputs(NamedTuple):
     ``dual_tree_walk_mutual(w.left_child_full, w.right_child_full, w.centers,
     w.radii, theta, w.root, mac_type=..., node_active=w.node_active, ...)``.
     ``node_active`` is ``None`` unless empty-node masking was requested.
+    ``box_size`` (a normalised tuple of floats, static) and ``periodic_radii``
+    are ``None`` unless a periodic box was given; pass both on to the walk as
+    ``box_size=w.box_size, periodic_radii=w.periodic_radii``.
     """
 
     left_child_full: Array
@@ -5207,6 +5400,8 @@ class MutualWalkInputs(NamedTuple):
     radii: Array
     root: Array
     node_active: Optional[Array]
+    box_size: Optional[tuple[float, ...]] = None
+    periodic_radii: Optional[Array] = None
 
 
 def mutual_walk_inputs(
@@ -5217,6 +5412,7 @@ def mutual_walk_inputs(
     dehnen_radius_scale: float = 1.0,
     mask_empty_nodes: bool = False,
     index_dtype: Any = None,
+    box_size: Optional[BoxSize] = None,
 ) -> MutualWalkInputs:
     """Build the inputs under which the mutual walk reproduces the dual walk.
 
@@ -5256,18 +5452,27 @@ def mutual_walk_inputs(
     index_dtype
         Index dtype of the child arrays and root, which the walk's outputs
         follow. Defaults to the topology's ``parent`` dtype.
+    box_size
+        Optional periodic box, as for :func:`build_interactions_and_neighbors`.
+        The tree must have been built on it (``box_size=`` at build time, or
+        wrapped positions on bounds ``(0, L)``), so no node straddles a face
+        and the centres and radii need no periodic change. The result then
+        carries the normalised box and ``periodic_radii = geometry.radius``,
+        the bounding radii the dual walk's periodic guard uses, so the mutual
+        walk on this output reproduces the periodic dual walk too.
 
     Returns
     -------
     MutualWalkInputs
         Child arrays padded with ``-1`` for leaves, node centres, MAC radii in
-        the centres' dtype, the root index and the optional activity mask.
+        the centres' dtype, the root index, the optional activity mask and, for
+        a periodic box, the box and the guard radii.
 
     Raises
     ------
     ValueError
         If ``mac_type`` is not a geometric criterion (``bh``, ``dehnen`` or
-        ``engblom``).
+        ``engblom``), or ``box_size`` does not match the centres' dimension.
     """
 
     if mac_type not in ("bh", "dehnen", "engblom"):
@@ -5291,6 +5496,10 @@ def mutual_walk_inputs(
     if mask_empty_nodes:
         ranges = jnp.asarray(topology.node_ranges)
         node_active = ranges[:, 1] >= ranges[:, 0]
+    box_lengths = normalize_box_size(box_size, int(centers.shape[-1]))
+    periodic_radii = None
+    if box_lengths is not None:
+        periodic_radii = jnp.asarray(geometry.radius, centers.dtype)
     return MutualWalkInputs(
         left_child_full=left,
         right_child_full=right,
@@ -5298,6 +5507,8 @@ def mutual_walk_inputs(
         radii=jnp.asarray(radii, centers.dtype),
         root=root,
         node_active=node_active,
+        box_size=box_lengths,
+        periodic_radii=periodic_radii,
     )
 
 
@@ -5316,6 +5527,7 @@ _MUTUAL_WALK_BACKENDS = ("flat", "pallas", "auto")
         "mac_type",
         "wavefront_ladder",
         "separation_floor",
+        "box_size",
         "pair_accept",
     ),
 )
@@ -5337,6 +5549,8 @@ def _dual_tree_walk_mutual_flat(
     seed_count: Optional[Array] = None,
     wavefront_ladder: Optional[bool] = None,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
+    periodic_radii: Optional[Array] = None,
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
 ) -> MutualWalkResult:
@@ -5348,6 +5562,7 @@ def _dual_tree_walk_mutual_flat(
 
     index_neg1 = ix(-1)
     theta_sq = jnp.asarray(theta, dtype=centers.dtype) ** 2
+    box_lengths = normalize_box_size(box_size, int(jnp.shape(centers)[-1]))
     if (seed_a is None) != (seed_b is None):
         raise ValueError("seed_a and seed_b must be given together")
     if seed_a is None:
@@ -5435,6 +5650,8 @@ def _dual_tree_walk_mutual_flat(
             b_leaf = left_b < 0
             same = jnp.asarray(sa == sb)
             delta = centers[sb] - centers[sa]
+            if box_lengths is not None:
+                delta = minimum_image(delta, box_lengths)
             dist_sq = jnp.sum(delta * delta, axis=-1)
             if pair_accept is not None:
                 accept = (
@@ -5467,6 +5684,15 @@ def _dual_tree_walk_mutual_flat(
                     + jnp.asarray(separation_floor, dtype=dist_sq.dtype)
                 )
                 accept = accept & (reach * reach <= dist_sq)
+            if box_lengths is not None:
+                if periodic_radii is None:
+                    bound_a, bound_b = radius_a, radius_b
+                else:
+                    bound_a = periodic_radii[sa]
+                    bound_b = periodic_radii[sb]
+                accept = accept & far_pair_is_unambiguous(
+                    dist_sq, bound_a, bound_b, box_lengths
+                )
             both_leaf = a_leaf & b_leaf
             is_near = live & (~accept) & both_leaf & (~same)
             refine = live & (~accept) & (~both_leaf)
@@ -5618,6 +5844,8 @@ def dual_tree_walk_mutual(
     seed_count: Optional[Array] = None,
     wavefront_ladder: Optional[bool] = None,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
+    periodic_radii: Optional[Array] = None,
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
     backend: MutualWalkBackend = "flat",
@@ -5709,13 +5937,34 @@ def dual_tree_walk_mutual(
         unsoftened expansion stays out of a softening kernel's reach this way.
         ``0`` (default) adds no test, so the lists are the walk's without it.
         Static.
+    box_size:
+        Optional periodic box ``[0, L)^d``: a float (cube) or a tuple of
+        per-dimension lengths; ``None`` (default) is the non-periodic walk,
+        bit-identical to the walk without the argument. With a box, ``dist_sq``
+        (and so the MAC, the separation floor and ``pair_accept``) is the
+        **minimum-image** centre distance ``d``, and a pair is accepted only if
+        also ``r_a + r_b + d < min(L) / 2`` -- the condition under which one
+        image of the node pair is the minimum image of every particle pair in it
+        (:func:`yggdrax.periodic.far_pair_is_unambiguous`). The ``r`` here are
+        ``periodic_radii`` (default ``radii``) and must bound every particle's
+        distance from its node centre; centres must be inside the box (wrapped
+        positions). A refused pair refines, or is a near pair for two leaves,
+        whose particle pairs the caller evaluates with
+        :func:`yggdrax.periodic.minimum_image`. The Pallas backend does not
+        take a box: ``"auto"`` then walks flat and ``"pallas"`` raises. Static.
+    periodic_radii:
+        Optional ``(total_nodes,)`` radii for the periodic guard only. ``None``
+        (default) uses ``radii``. Pass bounding radii here when ``radii`` are a
+        MAC proxy that does not bound particle distances (``bh`` box
+        half-extents); :func:`mutual_walk_inputs` does this. Ignored without
+        ``box_size``.
     pair_accept:
         Optional acceptance test that REPLACES the opening-angle rule (``theta`` and
         ``mac_type`` are then unused): called once per round as
         ``pair_accept(pair_accept_data, a, b, dist_sq, radius_a, radius_b)`` on the
         round's node pairs, it returns a boolean mask, and a pair is accepted where
-        the mask holds, it is live and ``a != b``. The separation floor still
-        applies on top; a rejected pair is a near pair (two leaves) or refined,
+        the mask holds, it is live and ``a != b``. The separation floor (and the
+        periodic guard of ``box_size``) still applies on top; a rejected pair is a near pair (two leaves) or refined,
         exactly as under the geometric rule. This is how an error-controlled
         criterion (Dehnen 2014 eq 16a) runs in this walk without the walk knowing
         about multipoles: the caller's per-node data rides in ``pair_accept_data``.
@@ -5768,6 +6017,7 @@ def dual_tree_walk_mutual(
         mac_type=mac_type,
         pair_accept=pair_accept,
         interpret=bool(pallas_interpret),
+        periodic=box_size is not None,
     )
     if resolved == "flat":
         return _dual_tree_walk_mutual_flat(
@@ -5787,6 +6037,8 @@ def dual_tree_walk_mutual(
             seed_count=seed_count,
             wavefront_ladder=wavefront_ladder,
             separation_floor=separation_floor,
+            box_size=normalize_box_size(box_size),
+            periodic_radii=periodic_radii,
             pair_accept=pair_accept,
             pair_accept_data=pair_accept_data,
         )
@@ -5851,6 +6103,7 @@ def _resolve_mutual_walk_backend(
     mac_type: Optional[MACType],
     pair_accept: Optional[Callable[..., Array]],
     interpret: bool,
+    periodic: bool = False,
 ) -> str:
     """Resolve ``dual_tree_walk_mutual``'s ``backend`` to ``"flat"`` or ``"pallas"``.
 
@@ -5865,6 +6118,8 @@ def _resolve_mutual_walk_backend(
         The walk's ``pair_accept``; an arbitrary callable cannot run in the kernel.
     interpret
         Pallas interpret mode, which runs anywhere.
+    periodic
+        Whether the walk has a ``box_size``; the kernel has no periodic guard.
 
     Returns
     -------
@@ -5892,6 +6147,11 @@ def _resolve_mutual_walk_backend(
         unsupported.append(
             "a pair_accept callable (for Dehnen's eq (16a) call "
             "mutual_walk_pallas(error_table=..., error_order=...) directly)"
+        )
+    if periodic:
+        unsupported.append(
+            "a periodic box_size (the kernel has no minimum-image distance or "
+            "periodic far-pair guard; use backend='flat')"
         )
     runnable = bool(interpret) or pallas_mutual_walk_supported()
     if backend == "auto":

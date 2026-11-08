@@ -39,6 +39,7 @@ from .pallas.mutual_walk import (
     mutual_walk_pallas,
     pallas_mutual_walk_supported,
 )
+from .periodic import BoxSize
 from .tree import resolve_tree_topology
 
 
@@ -63,6 +64,7 @@ def build_well_separated_interactions(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: BoxSize | None = None,
 ) -> NodeInteractionList:
     """Construct only the far-field interaction list from a dual-tree walk.
 
@@ -100,6 +102,16 @@ def build_well_separated_interactions(
         extents); ``0`` (default) adds no test. A softening kernel with compact
         support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
         unsoftened far field exact.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
 
     Returns
     -------
@@ -122,6 +134,7 @@ def build_well_separated_interactions(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
 
 
@@ -140,6 +153,7 @@ def build_compact_far_pairs(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: BoxSize | None = None,
 ) -> CompactTaggedFarPairs:
     """Construct exact-length tagged far pairs from the dual-tree walk.
 
@@ -177,6 +191,16 @@ def build_compact_far_pairs(
         extents); ``0`` (default) adds no test. A softening kernel with compact
         support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
         unsoftened far field exact.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
 
     Returns
     -------
@@ -199,6 +223,7 @@ def build_compact_far_pairs(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
 
 
@@ -218,6 +243,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: BoxSize | None = None,
     timing_callback: Callable[..., object] | None = None,
     compact_far_pair_capacity: int | None = None,
 ) -> tuple[CompactTaggedFarPairs, NodeNeighborList]:
@@ -259,6 +285,16 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         extents); ``0`` (default) adds no test. A softening kernel with compact
         support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
         unsoftened far field exact.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
     timing_callback
         Optional callable invoked with per-stage timing diagnostics.
     compact_far_pair_capacity
@@ -287,6 +323,7 @@ def build_compact_far_pairs_and_leaf_neighbor_lists(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         timing_callback=timing_callback,
         compact_far_pair_capacity=compact_far_pair_capacity,
     )
@@ -308,6 +345,7 @@ def build_leaf_neighbor_lists(
     retry_logger: Callable[[DualTreeRetryEvent], object] | None = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: BoxSize | None = None,
 ) -> NodeNeighborList:
     """Construct only the near-field neighbor list from a dual-tree walk.
 
@@ -348,6 +386,16 @@ def build_leaf_neighbor_lists(
         extents); ``0`` (default) adds no test. A softening kernel with compact
         support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
         unsoftened far field exact.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
 
     Returns
     -------
@@ -371,6 +419,7 @@ def build_leaf_neighbor_lists(
         retry_logger=retry_logger,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
     )
 
 
@@ -390,6 +439,7 @@ def build_interactions_and_neighbors(
     pair_policy: PairPolicy | None = None,
     policy_state: object = None,
     *,
+    box_size: BoxSize | None = None,
     return_result: bool = False,
     return_compact_far_pairs: bool = False,
     return_interactions: bool = True,
@@ -449,6 +499,16 @@ def build_interactions_and_neighbors(
         Optional JAX-traceable callable overriding the built-in MAC decision.
     policy_state
         Opaque state threaded to ``pair_policy`` on every evaluation.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
     return_result
         If ``True``, also return the raw :class:`DualTreeWalkResult` (including
         ``interaction_tags``).
@@ -482,6 +542,7 @@ def build_interactions_and_neighbors(
         mac_type=mac_type,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         pair_policy=pair_policy,
         policy_state=policy_state,
         return_result=return_result,
@@ -505,6 +566,8 @@ def build_interactions_and_neighbors_split(
     separation_floor: float = 0.0,
     pair_policy: PairPolicy | None = None,
     policy_state: object = None,
+    *,
+    box_size: BoxSize | None = None,
 ) -> tuple:
     """Construct far and near products using two separate dual-tree walks.
 
@@ -545,6 +608,16 @@ def build_interactions_and_neighbors_split(
         Optional JAX-traceable callable overriding the built-in MAC.
     policy_state
         Opaque state threaded to ``pair_policy``.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
 
     Returns
     -------
@@ -567,6 +640,7 @@ def build_interactions_and_neighbors_split(
         mac_type=mac_type,
         dehnen_radius_scale=dehnen_radius_scale,
         separation_floor=separation_floor,
+        box_size=box_size,
         pair_policy=pair_policy,
         policy_state=policy_state,
     )

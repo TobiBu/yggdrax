@@ -18,6 +18,7 @@ from jax import lax
 from jaxtyping import Array, Float, jaxtyped
 
 from .dtypes import INDEX_DTYPE, as_index, require_x64
+from .periodic import BoxSize, periodic_bounds, wrap_positions
 
 
 class RadixTree(NamedTuple):
@@ -457,7 +458,7 @@ STATIC_RADIX_LEAF_PARTITIONS = ("buckets", "cells")
 def build_static_cells_tree(
     positions: Array,
     masses: Array,
-    bounds: Bounds,
+    bounds: Optional[Bounds] = None,
     *,
     leaf_size: int,
     leaf_capacity: int,
@@ -466,6 +467,7 @@ def build_static_cells_tree(
     num_valid: Array | int | None = None,
     min_level: int = 0,
     return_num_leaves: bool = False,
+    box_size: Optional[BoxSize] = None,
 ):
     """Fixed-shape radix tree over adaptive Morton-CELL leaves (device-built).
 
@@ -492,7 +494,8 @@ def build_static_cells_tree(
     masses
         Particle masses ``(n,)``.
     bounds
-        Morton domain ``(min_corner, max_corner)``.
+        Morton domain ``(min_corner, max_corner)``. Required unless
+        ``box_size`` is given, and must be ``None`` when it is.
     leaf_size
         Maximum particles per leaf (the leaf table width downstream).
     leaf_capacity
@@ -522,6 +525,14 @@ def build_static_cells_tree(
         the exact number of cell leaves the positions need, counted BEFORE the
         cut to ``leaf_capacity`` -- so past an overflow it is the capacity a
         rebuild would have needed, which a caller re-plans from.
+    box_size
+        Optional periodic box ``[0, L)^3`` (a float or one length per axis;
+        static, see :mod:`yggdrax.periodic`). The positions are wrapped into
+        the box (:func:`~yggdrax.periodic.wrap_positions`) and the Morton domain
+        is the box itself, so ``positions_sorted`` holds wrapped coordinates and
+        no node straddles a face, as a periodic walk needs. The domain's upper
+        corner sits ``2**-20 L`` above ``L`` so that no particle quantises to
+        the reserved padding code. Traces under ``jit``.
 
     Returns
     -------
@@ -532,9 +543,22 @@ def build_static_cells_tree(
     Raises
     ------
     ValueError
-        If ``leaf_size`` or ``leaf_capacity`` is not positive.
+        If ``leaf_size`` or ``leaf_capacity`` is not positive, or if not exactly
+        one of ``bounds`` and ``box_size`` is given.
     """
     require_x64("63-bit Morton codes")
+    if box_size is not None:
+        if bounds is not None:
+            raise ValueError("pass either bounds or box_size, not both")
+        positions = wrap_positions(positions, box_size)
+        lower, upper = periodic_bounds(
+            box_size, int(positions.shape[-1]), positions.dtype
+        )
+        # rint quantisation maps a coordinate within L / 2**22 of L to the top
+        # Morton cell; on every axis at once that is the reserved padding code
+        bounds = (lower, upper * (1.0 + 2.0**-20))
+    elif bounds is None:
+        raise ValueError("build_static_cells_tree needs bounds or box_size")
     from ._cell_partition import adaptive_cell_leaf_partition
     from .morton import morton_encode  # local import to avoid circulars
 
