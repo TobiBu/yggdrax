@@ -37,7 +37,7 @@ Two drivers:
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -202,6 +202,7 @@ def recover_parameter_traced(
     num_steps: int = 80,
     config: TracedPairCountConfig | None = None,
     probe_a: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 0.9, 0.99),
+    acceptance: Literal["window", "geometric"] = "window",
 ) -> RecoveryResult:
     """Recover ``a_true`` with the tree rebuilt inside the differentiated loss.
 
@@ -219,7 +220,7 @@ def recover_parameter_traced(
         a_true: Ground-truth clustering strength generating the target counts.
         a_init: Initial guess for the optimizer.
         sharpness: Soft-window sharpness.
-        theta: Opening angle for the traversal.
+        theta: Opening angle; used only by ``acceptance="geometric"``.
         leaf_size: Maximum particles per cell leaf.
         learning_rate: Adam step size.
         num_steps: Number of optimization steps.
@@ -228,6 +229,9 @@ def recover_parameter_traced(
         probe_a: Clustering strengths probed when planning; they should span
             the range the optimizer can reach (``a`` is clipped to ``[0,
             0.99]``).
+        acceptance: Far-pair rule of the planned config (see
+            :class:`~yggdrax.applications.corrfunc.traced.TracedPairCountConfig`);
+            ``"window"`` is accurate to its ``window_eps`` at any leaf size.
 
     Returns:
         A :class:`RecoveryResult` with the optimization trajectory.
@@ -242,7 +246,13 @@ def recover_parameter_traced(
     if config is None:
         probes = [pos_true] + [catalog(model, a) for a in (a_init, *probe_a)]
         config = plan_traced_pair_counts(
-            probes, theta=theta, leaf_size=leaf_size, bounds=bounds
+            probes,
+            edges=edges,
+            sharpness=sharpness,
+            acceptance=acceptance,
+            theta=theta,
+            leaf_size=leaf_size,
+            bounds=bounds,
         )
 
     def log_counts(positions: Array) -> tuple[Array, Array]:

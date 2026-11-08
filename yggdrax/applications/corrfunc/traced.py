@@ -26,9 +26,35 @@ unordered node pair at most once, ``a < b``):
 * **far node pair** ``(A, B)``: ``count_A * count_B * w_k(|com_A - com_B|)``,
   the monopole at the centres of mass.
 
-These three sets tile the unordered particle pairs, so at a ``theta`` small
-enough that the walk accepts nothing as far the result is the brute-force sum
-(up to summation order).
+These three sets tile the unordered particle pairs.
+
+Acceptance. Which node pairs are far is decided by
+``TracedPairCountConfig.acceptance``:
+
+* ``"window"`` (default). Every particle separation of nodes ``a`` and ``b``
+  lies in ``[d - s, d + s]``, with ``d`` the distance of the box centres and
+  ``s`` the sum of the bounding-sphere radii. A pair is
+
+  - **pruned** (``dual_tree_walk_mutual(pair_discard=...)``: not emitted, not
+    refined) when every bin's window is at most ``window_eps`` over that
+    range -- beyond the last edge, or below the first if it is above 0;
+  - **accepted** as far when every bin's window varies by at most
+    ``window_eps`` over it -- deep inside one bin, so the monopole
+    ``n_a n_b w_k(d_com)`` misses each particle pair by at most ``window_eps``;
+  - otherwise refined, down to leaf pairs summed exactly.
+
+  The error is then set by ``window_eps``, not by ``theta`` (unused) or the
+  leaf size. With a sharp window almost nothing inside ``[r_min, r_max]`` is
+  flat enough to accept, so the tree mostly prunes and the rest is exact
+  pairwise work. Measured (n = 1500 uniform, 10 log bins over [0.01, 0.5],
+  sharpness 100, eps 1e-6): max per-bin relative error 2e-10 at leaf 16,
+  4e-13 at leaf 32.
+* ``"geometric"``. The opening-angle MAC of ``mac_type`` at ``theta``. Its far
+  error is the monopole's over a separation range of about ``d (1 +- theta)``,
+  which straddles bin edges for a sharp window; cell leaves are small, so many
+  such pairs are accepted (same setup, leaf 16: 2e-3 at theta 0.2, 4e-2 at
+  0.4, 1e-1 at 0.6). Note that a single-particle leaf has radius 0, so this
+  rule accepts a pair of them at any theta (exactly, as a point pair).
 
 Differentiability. The topology -- Morton codes, leaf ranges, the pair lists --
 is built from ``stop_gradient(positions)`` and carries no gradient. The counts
@@ -81,7 +107,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +122,13 @@ from yggdrax.interactions import dual_tree_walk_mutual, mutual_walk_inputs
 
 from .binning import soft_bin_weights
 from .estimator import _DEFAULT_NEAR_CHUNK, _accumulate_block_pairs
+
+# Default ``TracedPairCountConfig.window_eps``: an absolute bound per particle
+# pair and bin. The per-bin RELATIVE error it gives is far smaller in practice
+# (2e-10 at n = 1500 uniform, 10 log bins over [0.01, 0.5], sharpness 100,
+# leaf 16); tests/applications/test_corrfunc_traced.py holds it below 1e-6
+# across leaf sizes, clustering and window shapes.
+_DEFAULT_WINDOW_EPS = 1e-6
 
 __all__ = [
     "TracedPairCountConfig",
@@ -120,12 +153,20 @@ class TracedPairCountConfig:
         max_pair_queue: Wavefront capacity of the mutual walk, in node pairs.
         far_cap: Capacity of the canonical far node-pair list.
         near_cap: Capacity of the canonical near leaf-pair list.
-        theta: Opening angle of the acceptance criterion.
-        mac_type: Geometric acceptance criterion (``"bh"``, ``"dehnen"`` or
-            ``"engblom"``).
+        theta: Opening angle; used only by ``acceptance="geometric"``.
+        mac_type: Geometric criterion (``"bh"``, ``"dehnen"`` or
+            ``"engblom"``) of ``acceptance="geometric"``.
         near_chunk: Leaf pairs per chunk of the near-field reduction; bounds the
             live ``(chunk, leaf_size, leaf_size, nbins)`` intermediate. Does not
             change the result beyond summation order.
+        acceptance: ``"window"`` (default) accepts a node pair only where every
+            bin's soft window varies by at most ``window_eps`` over the pair's
+            whole separation range, and prunes a pair whose windows are all at
+            most ``window_eps`` there (see the module docstring); the error is
+            then set by ``window_eps``, independent of ``theta`` and the leaf
+            size. ``"geometric"`` is the plain opening-angle MAC.
+        window_eps: Absolute tolerance on the window, per particle pair and bin,
+            of ``acceptance="window"``.
     """
 
     leaf_size: int
@@ -136,6 +177,8 @@ class TracedPairCountConfig:
     theta: float = 0.5
     mac_type: MACType = "dehnen"
     near_chunk: int = _DEFAULT_NEAR_CHUNK
+    acceptance: Literal["window", "geometric"] = "window"
+    window_eps: float = _DEFAULT_WINDOW_EPS
 
 
 class TracedPairCounts(NamedTuple):
@@ -172,6 +215,72 @@ class _Topology(NamedTuple):
     num_leaves: Array
 
 
+def _window_min_max(edges_u: Array, sharpness: Array, u_lo: Array, u_hi: Array):
+    """``(w_min, w_max)`` per bin of the soft windows over ``[u_lo, u_hi]``."""
+    lower, upper = edges_u[:-1], edges_u[1:]
+
+    def window(u):
+        u = u[:, None]
+        return jax.nn.sigmoid(sharpness * (u - lower)) - jax.nn.sigmoid(
+            sharpness * (u - upper)
+        )
+
+    mid = 0.5 * (lower + upper)
+    peak = jnp.clip(mid[None, :], u_lo[:, None], u_hi[:, None])
+    w_peak = jax.nn.sigmoid(sharpness * (peak - lower)) - jax.nn.sigmoid(
+        sharpness * (peak - upper)
+    )
+    w_lo, w_hi = window(u_lo), window(u_hi)
+    return jnp.minimum(w_lo, w_hi), jnp.maximum(jnp.maximum(w_lo, w_hi), w_peak)
+
+
+def _separation_interval_u(dist_sq, radius_a, radius_b, log: bool):
+    """Bounds of every particle separation of a node pair, in window coordinates."""
+    d = jnp.sqrt(dist_sq)
+    s = radius_a + radius_b
+    lo = d - s
+    hi = d + s
+    if log:
+        tiny = jnp.finfo(d.dtype).tiny
+        # lo <= 0: the nodes may touch, so the range reaches r -> 0 (u -> -inf)
+        return jnp.log(jnp.maximum(lo, tiny)), jnp.log(jnp.maximum(hi, tiny))
+    return lo, hi
+
+
+def _make_window_predicates(log: bool):
+    """``(accept, discard)`` callables for ``dual_tree_walk_mutual``.
+
+    Both take ``data = (edges_u, sharpness, eps)``. ``accept``: every bin's
+    window varies by at most ``eps`` over the pair's separation range, so the
+    monopole term ``n_a n_b w_k(d_com)`` is within ``eps`` per particle pair of
+    the exact sum. ``discard``: every window is at most ``eps`` there, so the
+    pair contributes at most ``eps`` per particle pair and is pruned.
+    """
+
+    def accept(data, a, b, dist_sq, radius_a, radius_b):
+        del a, b
+        edges_u, sharpness, eps = data
+        u_lo, u_hi = _separation_interval_u(dist_sq, radius_a, radius_b, log)
+        w_min, w_max = _window_min_max(edges_u, sharpness, u_lo, u_hi)
+        return jnp.all(w_max - w_min <= eps, axis=-1)
+
+    def discard(data, a, b, dist_sq, radius_a, radius_b):
+        del a, b
+        edges_u, sharpness, eps = data
+        u_lo, u_hi = _separation_interval_u(dist_sq, radius_a, radius_b, log)
+        _, w_max = _window_min_max(edges_u, sharpness, u_lo, u_hi)
+        return jnp.all(w_max <= eps, axis=-1)
+
+    return accept, discard
+
+
+# Module-level, so the walk's static arguments hash the same on every call.
+_WINDOW_PREDICATES = {
+    True: _make_window_predicates(True),
+    False: _make_window_predicates(False),
+}
+
+
 def _resolve_bounds(positions: Array, bounds) -> tuple[Array, Array]:
     """Morton domain: the given bounds or the padded box of ``positions``."""
     if bounds is None:
@@ -183,12 +292,18 @@ def _resolve_bounds(positions: Array, bounds) -> tuple[Array, Array]:
 
 
 def _build_topology(
-    positions: Array, config: TracedPairCountConfig, bounds
+    positions: Array,
+    config: TracedPairCountConfig,
+    bounds,
+    edges: Array | None = None,
+    sharpness: float | Array | None = None,
+    log: bool = True,
 ) -> _Topology:
     """Rebuild the tree and run the mutual walk, all traceable, no gradient.
 
     The evaluator and the planner both call this, so a plan sized by the probe
-    is a plan for exactly the walk the evaluator runs.
+    is a plan for exactly the walk the evaluator runs. ``edges``, ``sharpness``
+    and ``log`` are needed (and only read) by ``acceptance="window"``.
     """
     pos = jax.lax.stop_gradient(positions)
     box = _resolve_bounds(pos, bounds)
@@ -209,19 +324,51 @@ def _build_topology(
     w = mutual_walk_inputs(
         tree, geometry, mac_type=config.mac_type, mask_empty_nodes=True
     )
-    walk = dual_tree_walk_mutual(
-        w.left_child_full,
-        w.right_child_full,
-        w.centers,
-        w.radii,
-        config.theta,
-        w.root,
-        max_pair_queue=config.max_pair_queue,
-        far_cap=config.far_cap,
-        near_cap=config.near_cap,
-        mac_type=config.mac_type,
-        node_active=w.node_active,
-    )
+    if config.acceptance == "geometric":
+        walk = dual_tree_walk_mutual(
+            w.left_child_full,
+            w.right_child_full,
+            w.centers,
+            w.radii,
+            config.theta,
+            w.root,
+            max_pair_queue=config.max_pair_queue,
+            far_cap=config.far_cap,
+            near_cap=config.near_cap,
+            mac_type=config.mac_type,
+            node_active=w.node_active,
+        )
+    elif config.acceptance == "window":
+        if edges is None or sharpness is None:
+            raise ValueError('acceptance="window" needs edges and sharpness')
+        accept, discard = _WINDOW_PREDICATES[bool(log)]
+        edges_ng = jax.lax.stop_gradient(jnp.asarray(edges, dtype=pos.dtype))
+        edges_u = jnp.log(edges_ng) if log else edges_ng
+        data = (
+            edges_u,
+            jax.lax.stop_gradient(jnp.asarray(sharpness, dtype=pos.dtype)),
+            jnp.asarray(config.window_eps, dtype=pos.dtype),
+        )
+        # Bounding spheres about the box centres, NOT the MAC's (possibly
+        # scaled, depth-padded) extents: the rule needs every particle
+        # separation of a pair inside [d - s, d + s].
+        walk = dual_tree_walk_mutual(
+            w.left_child_full,
+            w.right_child_full,
+            jnp.asarray(geometry.center),
+            jnp.asarray(geometry.radius, dtype=pos.dtype),
+            config.theta,
+            w.root,
+            max_pair_queue=config.max_pair_queue,
+            far_cap=config.far_cap,
+            near_cap=config.near_cap,
+            node_active=w.node_active,
+            pair_accept=accept,
+            pair_discard=discard,
+            pair_accept_data=data,
+        )
+    else:
+        raise ValueError(f"unknown acceptance {config.acceptance!r}")
     return _Topology(
         order=tree.particle_indices,
         node_ranges=tree.node_ranges,
@@ -264,7 +411,7 @@ def traced_soft_pair_counts(
         A :class:`TracedPairCounts`. ``counts`` has shape ``(nbins,)``; read
         ``overflow`` before trusting it.
     """
-    topo = _build_topology(positions, config, bounds)
+    topo = _build_topology(positions, config, bounds, edges, sharpness, log)
     walk = topo.walk
     dtype = positions.dtype
     n = int(positions.shape[0])
@@ -370,6 +517,11 @@ def _pow2(x: int) -> int:
 def plan_traced_pair_counts(
     positions: Array | Sequence[Array],
     *,
+    edges: Array | None = None,
+    sharpness: float | Array | None = None,
+    log: bool = True,
+    acceptance: Literal["window", "geometric"] = "window",
+    window_eps: float = _DEFAULT_WINDOW_EPS,
     theta: float = 0.5,
     leaf_size: int = 16,
     mac_type: MACType = "dehnen",
@@ -377,6 +529,7 @@ def plan_traced_pair_counts(
     near_chunk: int = _DEFAULT_NEAR_CHUNK,
     leaf_slack: float = 1.25,
     list_slack: float = 1.5,
+    min_list_cap: int = 256,
     max_doublings: int = 16,
 ) -> TracedPairCountConfig:
     """Size the static capacities of :func:`traced_soft_pair_counts` by probing.
@@ -395,7 +548,15 @@ def plan_traced_pair_counts(
     Args:
         positions: One catalogue ``(n, 3)``, a batch ``(B, n, 3)``, or a
             sequence of catalogues.
-        theta: Opening angle.
+        edges: Bin edges the traced call will use; required by
+            ``acceptance="window"``, whose walk depends on them.
+        sharpness: Window sharpness the traced call will use; required by
+            ``acceptance="window"``.
+        log: Bin in ``log`` separation, as for the traced call.
+        acceptance: ``"window"`` or ``"geometric"``; see
+            :class:`TracedPairCountConfig`.
+        window_eps: Window tolerance of ``acceptance="window"``.
+        theta: Opening angle of ``acceptance="geometric"``.
         leaf_size: Maximum particles per cell leaf.
         mac_type: Geometric acceptance criterion.
         bounds: Fixed Morton domain, as for :func:`traced_soft_pair_counts`.
@@ -403,6 +564,10 @@ def plan_traced_pair_counts(
         near_chunk: Near-field chunk size stored in the config.
         leaf_slack: Multiplier on the probed live-leaf count.
         list_slack: Multiplier on the probed wavefront peak and list lengths.
+        min_list_cap: Floor on the queue and list capacities. A list the
+            probes barely use (the window rule's far list, often a handful of
+            pairs) would otherwise get a cap a slightly different catalogue
+            overflows; a floor costs almost nothing.
         max_doublings: Give up after this many capacity increases.
 
     Returns:
@@ -410,7 +575,11 @@ def plan_traced_pair_counts(
 
     Raises:
         RuntimeError: If the walk capacities do not converge.
+        ValueError: If ``acceptance="window"`` is planned without ``edges``
+            and ``sharpness``.
     """
+    if acceptance == "window" and (edges is None or sharpness is None):
+        raise ValueError('acceptance="window" is planned from edges and sharpness')
     if isinstance(positions, (list, tuple)):
         catalogues = [jnp.asarray(p) for p in positions]
     else:
@@ -448,8 +617,14 @@ def plan_traced_pair_counts(
                 theta=float(theta),
                 mac_type=mac_type,
                 near_chunk=int(near_chunk),
+                acceptance=acceptance,
+                window_eps=float(window_eps),
             )
-            walk = jax.jit(lambda p, c=cfg: _build_topology(p, c, bounds).walk)(pos)
+            walk = jax.jit(
+                lambda p, c=cfg: _build_topology(
+                    p, c, bounds, edges, sharpness, log
+                ).walk
+            )(pos)
             qo, fo, no = (
                 bool(walk.queue_overflow),
                 bool(walk.far_overflow),
@@ -473,10 +648,14 @@ def plan_traced_pair_counts(
     return TracedPairCountConfig(
         leaf_size=leaf,
         leaf_capacity=int(leaf_slack * need_leaves) + 8,
-        max_pair_queue=_pow2(int(np.ceil(list_slack * need_queue)) + 1),
-        far_cap=_pow2(int(np.ceil(list_slack * need_far)) + 1),
-        near_cap=_pow2(int(np.ceil(list_slack * need_near)) + 1),
+        max_pair_queue=_pow2(
+            max(min_list_cap, int(np.ceil(list_slack * need_queue)) + 1)
+        ),
+        far_cap=_pow2(max(min_list_cap, int(np.ceil(list_slack * need_far)) + 1)),
+        near_cap=_pow2(max(min_list_cap, int(np.ceil(list_slack * need_near)) + 1)),
         theta=float(theta),
         mac_type=mac_type,
         near_chunk=int(near_chunk),
+        acceptance=acceptance,
+        window_eps=float(window_eps),
     )
