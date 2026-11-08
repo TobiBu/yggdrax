@@ -175,6 +175,9 @@ jobs:
               tests/distributed/test_import.py
               tests/distributed/test_frontier_payload.py
               tests/distributed/test_halo_payload.py
+          - shard: stats
+            paths: >-
+              tests/distributed/test_distributed_stats.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75

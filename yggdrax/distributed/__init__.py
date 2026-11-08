@@ -48,6 +48,16 @@ from .partition import (
     sfc_repartition,
 )
 from .sharding import AXIS_NAME, available_devices, device_count, make_mesh
+from .stats import (
+    DistributedKNN,
+    DistributedPairCounts,
+    DistributedStatsConfig,
+    PairAcceptance,
+    distributed_knn,
+    distributed_pair_counts,
+    exact_acceptance,
+    geometric_acceptance,
+)
 from .summary import (
     SummaryTree,
     TreeSummary,
@@ -58,6 +68,14 @@ from .summary import (
 
 __all__ = [
     "AXIS_NAME",
+    "DistributedKNN",
+    "DistributedPairCounts",
+    "DistributedStatsConfig",
+    "PairAcceptance",
+    "distributed_knn",
+    "distributed_pair_counts",
+    "exact_acceptance",
+    "geometric_acceptance",
     "CoarseFrontier",
     "GlobalCoarseTree",
     "HaloImport",
