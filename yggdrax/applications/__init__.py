@@ -13,6 +13,10 @@ Sub-packages:
   functions via soft-binned dual-tree pair counting.
 * :mod:`yggdrax.applications.svgd` -- tree-accelerated Stein variational
   gradient descent using the kernel-aware pair-policy hook.
+* :mod:`yggdrax.applications.point_process` -- a differentiable Thomas-process
+  forward model composed with the distributed xi / kNN-CDF statistics:
+  parameter gradients, Fisher forecasts and recovery on independent
+  realisations.
 
 Two modules (:mod:`yggdrax.applications.svgd.bandwidth_learning` and
 :mod:`yggdrax.applications.corrfunc.inference_demo`) fit parameters with
