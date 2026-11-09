@@ -9,13 +9,20 @@ Two paths are timed per size:
   eager ``build_interactions_and_neighbors`` dual walk with its per-node CSR
   output. This is what the first paper draft reported.
 * ``fast`` (radix only): the jitted static-shape cell-leaf radix build
-  (``build_static_cells_tree``), the geometry and Dehnen extents, and the flat
+  (``build_static_cells_tree``), the geometry and Dehnen extents, and
   ``dual_tree_walk_mutual`` emitting each unordered far/near node pair once.
+  One arm per ``--walk-backends`` entry: ``flat`` (the XLA wavefront loop,
+  record key ``fast``) and ``pallas`` (one Pallas kernel launch per round,
+  record key ``fast_pallas``). Every arm after the first must reproduce the
+  first's counts, rounds, peak wavefront and sorted far/near pair sets, or the
+  run stops.
   Each stage is timed under ``jax.jit``, and so is the fused build+walk step
   (the number that matters for a rebuild inside a differentiated function).
   Capacities (leaf capacity, pair queue, far/near list caps) are sized from an
   untimed probe run and then fixed, so the timed calls never overflow; the
-  sizing and the overflow flags are recorded.
+  sizing and the overflow flags are recorded. Both the walk and the fused
+  step return the full walk result: returning only the counts lets XLA drop
+  the flat walk's list writes, and the timing would no longer include them.
 
 Includes a
 CPU ``scipy.spatial.cKDTree`` build+query baseline for context (not a fair
@@ -83,6 +90,28 @@ def _parse_args() -> argparse.Namespace:
         "dual_tree_walk_mutual, timed separately and as one fused jit.",
     )
     p.add_argument(
+        "--walk-backends",
+        type=str,
+        nargs="+",
+        choices=("flat", "pallas"),
+        default=["flat", "pallas"],
+        help="Fast-path walk arms (dual_tree_walk_mutual(backend=...)): the "
+        "XLA wavefront loop and/or the Pallas kernel (Ampere+ GPU, or "
+        "--pallas-interpret). The first arm is the reference the others are "
+        "checked against. 'pallas' is dropped with a note when it cannot run.",
+    )
+    p.add_argument(
+        "--pallas-interpret",
+        action="store_true",
+        help="Run the Pallas walk in interpret mode (CPU validation; not a timing).",
+    )
+    p.add_argument(
+        "--no-pair-set-check",
+        dest="check_pair_sets",
+        action="store_false",
+        help="Skip comparing the arms' sorted pair sets (counts are still compared).",
+    )
+    p.add_argument(
         "--output", type=str, default="results/differentiability/scaling.json"
     )
     p.add_argument(
@@ -121,6 +150,7 @@ def main() -> None:
         args.runs = 2
         args.warmup = 1
         args.gpu_select = "none"
+        args.pallas_interpret = True
 
     select_free_gpu(args.gpu_select, tag="scaling")
 
@@ -147,13 +177,42 @@ def main() -> None:
 
     from yggdrax._tree_impl import build_static_cells_tree
     from yggdrax.bounds import infer_bounds
-    from yggdrax.interactions import dual_tree_walk_mutual, mutual_walk_inputs
+    from yggdrax.interactions import (
+        dual_tree_walk_mutual,
+        mutual_walk_inputs,
+        pallas_mutual_walk_supported,
+    )
+
+    if (
+        "pallas" in args.walk_backends
+        and not args.pallas_interpret
+        and not pallas_mutual_walk_supported()
+    ):
+        print(
+            "[scaling] the Pallas walk needs an Ampere+ GPU (or "
+            "--pallas-interpret); dropping the pallas arm"
+        )
+        args.walk_backends = [b for b in args.walk_backends if b != "pallas"]
 
     def _pow2(x: int) -> int:
         return 1 << max(int(x) - 1, 1).bit_length()
 
+    @jax.jit
+    def _sorted_pair_keys(a, b, count, num_nodes):
+        """Pair list -> sorted int64 keys, so lists in any order compare as sets."""
+        live = jnp.arange(a.shape[0]) < count
+        keys = a.astype(jnp.int64) * num_nodes + b.astype(jnp.int64)
+        return jnp.sort(jnp.where(live, keys, jnp.iinfo(jnp.int64).max))
+
     def _fast_path(pos, mass) -> dict:
-        """Jitted cell-leaf radix build + mutual walk, capacities sized first."""
+        """Jitted cell-leaf radix build + mutual walk, one arm per walk backend.
+
+        The build and the walk inputs are shared by the arms and timed once.
+        Each arm sizes its own queue and list caps (an untimed probe), then
+        times the walk alone and the fused build+walk step. Arms after the
+        first are checked against the first: same counts, rounds, peak and
+        the same sorted far/near pair sets.
+        """
         n = int(pos.shape[0])
         leaf = args.leaf_size
         bounds = infer_bounds(pos)
@@ -201,7 +260,7 @@ def main() -> None:
                 w.node_active,
             )
 
-        def make_walk(q, far_cap, near_cap):
+        def make_walk(backend, q, far_cap, near_cap):
             def walk(lf, rf, centers, extents, root, active):
                 return dual_tree_walk_mutual(
                     lf,
@@ -215,6 +274,8 @@ def main() -> None:
                     near_cap=near_cap,
                     mac_type="dehnen",
                     node_active=active,
+                    backend=backend,
+                    pallas_interpret=args.pallas_interpret,
                 )
 
             return walk
@@ -225,45 +286,7 @@ def main() -> None:
         if bool(overflow):
             raise RuntimeError(f"cell partition overflowed at n={n}")
         winputs = inputs_jit(topo, ps)
-
-        # --- size queue and list caps: double on overflow, then tighten.
-        q, far_cap, near_cap = 1 << 14, 1 << 16, 1 << 16
-        for _ in range(16):
-            res = jax.jit(make_walk(q, far_cap, near_cap))(*winputs)
-            qo, fo, no = (
-                bool(res.queue_overflow),
-                bool(res.far_overflow),
-                bool(res.near_overflow),
-            )
-            if not (qo or fo or no):
-                break
-            q, far_cap, near_cap = (
-                q * (4 if qo else 1),
-                far_cap * (4 if fo else 1),
-                near_cap * (4 if no else 1),
-            )
-        else:
-            raise RuntimeError(f"mutual walk capacities did not converge at n={n}")
-        peak = int(res.peak_wavefront)
-        far_count, near_count = int(res.far_count), int(res.near_count)
-        q = _pow2(int(1.5 * peak) + 1)
-        far_cap = _pow2(int(1.25 * far_count) + 1)
-        near_cap = _pow2(int(1.25 * near_count) + 1)
-        walk = make_walk(q, far_cap, near_cap)
-        walk_jit = jax.jit(walk)
-
-        @jax.jit
-        def step(p, m):
-            t, s, o = build(p, m)
-            r = walk(*walk_inputs(t, s))
-            return (
-                r.far_count,
-                r.near_count,
-                o,
-                r.queue_overflow,
-                r.far_overflow,
-                r.near_overflow,
-            )
+        num_nodes = int(winputs[0].shape[0])
 
         build_timing = time_callable(
             lambda: build_jit(pos, mass), warmup=args.warmup, runs=args.runs
@@ -271,46 +294,159 @@ def main() -> None:
         inputs_timing = time_callable(
             lambda: inputs_jit(topo, ps), warmup=args.warmup, runs=args.runs
         )
-        walk_timing = time_callable(
-            lambda: walk_jit(*winputs), warmup=args.warmup, runs=args.runs
-        )
-        step_timing = time_callable(
-            lambda: step(pos, mass), warmup=args.warmup, runs=args.runs
-        )
-        res = walk_jit(*winputs)
-        flags = step(pos, mass)
-        if any(bool(x) for x in flags[2:]) or bool(res.queue_overflow):
-            raise RuntimeError(
-                f"fast path overflowed in the timed configuration at n={n}"
+        del topo, ps
+
+        def arm(backend: str) -> tuple[dict, tuple]:
+            # --- size queue and list caps: grow on overflow, then tighten.
+            q, far_cap, near_cap = 1 << 14, 1 << 16, 1 << 16
+            for _ in range(16):
+                res = jax.jit(make_walk(backend, q, far_cap, near_cap))(*winputs)
+                qo, fo, no = (
+                    bool(res.queue_overflow),
+                    bool(res.far_overflow),
+                    bool(res.near_overflow),
+                )
+                if not (qo or fo or no):
+                    break
+                q, far_cap, near_cap = (
+                    q * (4 if qo else 1),
+                    far_cap * (4 if fo else 1),
+                    near_cap * (4 if no else 1),
+                )
+            else:
+                raise RuntimeError(
+                    f"mutual walk ({backend}) capacities did not converge at n={n}"
+                )
+            peak = int(res.peak_wavefront)
+            far_count, near_count = int(res.far_count), int(res.near_count)
+            del res
+            q = _pow2(int(1.5 * peak) + 1)
+            far_cap = _pow2(int(1.25 * far_count) + 1)
+            near_cap = _pow2(int(1.25 * near_count) + 1)
+            walk = make_walk(backend, q, far_cap, near_cap)
+            walk_jit = jax.jit(walk)
+
+            @jax.jit
+            def step(p, m):
+                # Return the whole walk result, lists included. Returning only
+                # the counts lets XLA drop the flat walk's dead list writes
+                # from its while loop (-24 % at 3e7, 2026-11-09), so "fused"
+                # would time a walk that emits nothing; the Pallas kernel's
+                # outputs cannot be dropped, so the arms would not compare.
+                t, s, o = build(p, m)
+                return o, walk(*walk_inputs(t, s))
+
+            walk_timing = time_callable(
+                lambda: walk_jit(*winputs), warmup=args.warmup, runs=args.runs
             )
-        out = {
-            "tree": "radix_static_cells",
-            "walk": "dual_tree_walk_mutual",
-            "mac_type": "dehnen",
-            "build": build_timing.as_dict(),
-            "geometry_and_extents": inputs_timing.as_dict(),
-            "traverse": walk_timing.as_dict(),
-            "fused_build_and_traverse": step_timing.as_dict(),
-            "live_leaves": live_leaves,
-            "leaf_capacity": leaf_capacity,
-            "max_pair_queue": q,
-            "far_cap": far_cap,
-            "near_cap": near_cap,
-            "rounds": int(res.rounds),
-            "peak_wavefront": int(res.peak_wavefront),
-            # canonical (unordered) pairs; directed = 2x, comparable to the
-            # legacy walk's per-node lists.
-            "far_pairs_canonical": int(res.far_count),
-            "near_pairs_canonical": int(res.near_count),
-        }
-        print(
-            f"n={n:>9d} fast    "
-            f"build={build_timing.min_s * 1e3:8.2f} ms  "
-            f"traverse={walk_timing.min_s * 1e3:8.2f} ms  "
-            f"fused={step_timing.min_s * 1e3:8.2f} ms  "
-            f"(leaves {live_leaves}, rounds {out['rounds']}, peak {out['peak_wavefront']})"
-        )
-        return out
+            step_timing = time_callable(
+                lambda: step(pos, mass), warmup=args.warmup, runs=args.runs
+            )
+            fused_overflow, fused = step(pos, mass)
+            flags = (fused.far_count, fused.near_count)
+            fused_flags = (
+                fused_overflow,
+                fused.queue_overflow,
+                fused.far_overflow,
+                fused.near_overflow,
+            )
+            del fused
+            res = walk_jit(*winputs)
+            if (
+                any(bool(x) for x in fused_flags)
+                or bool(res.queue_overflow)
+                or bool(res.far_overflow)
+                or bool(res.near_overflow)
+            ):
+                raise RuntimeError(
+                    f"fast path ({backend}) overflowed in the timed "
+                    f"configuration at n={n}"
+                )
+            out = {
+                "tree": "radix_static_cells",
+                "walk": "dual_tree_walk_mutual",
+                "walk_backend": backend,
+                "pallas_interpret": bool(backend == "pallas" and args.pallas_interpret),
+                "mac_type": "dehnen",
+                "build": build_timing.as_dict(),
+                "geometry_and_extents": inputs_timing.as_dict(),
+                "traverse": walk_timing.as_dict(),
+                "fused_build_and_traverse": step_timing.as_dict(),
+                "live_leaves": live_leaves,
+                "leaf_capacity": leaf_capacity,
+                "num_nodes": num_nodes,
+                "max_pair_queue": q,
+                "far_cap": far_cap,
+                "near_cap": near_cap,
+                "rounds": int(res.rounds),
+                "peak_wavefront": int(res.peak_wavefront),
+                # canonical (unordered) pairs; directed = 2x, comparable to the
+                # legacy walk's per-node lists.
+                "far_pairs_canonical": int(res.far_count),
+                "near_pairs_canonical": int(res.near_count),
+                # the fused step's own counts (must equal the walk's)
+                "fused_far_pairs_canonical": int(flags[0]),
+                "fused_near_pairs_canonical": int(flags[1]),
+            }
+            if out["fused_far_pairs_canonical"] != out["far_pairs_canonical"] or (
+                out["fused_near_pairs_canonical"] != out["near_pairs_canonical"]
+            ):
+                raise RuntimeError(
+                    f"fast path ({backend}) fused step and walk disagree at n={n}"
+                )
+            keys = None
+            if args.check_pair_sets:
+                keys = (
+                    _sorted_pair_keys(res.far_a, res.far_b, res.far_count, num_nodes),
+                    _sorted_pair_keys(
+                        res.near_a, res.near_b, res.near_count, num_nodes
+                    ),
+                )
+            del res
+            print(
+                f"n={n:>9d} fast/{backend:6s} "
+                f"build={build_timing.min_s * 1e3:8.2f} ms  "
+                f"traverse={walk_timing.min_s * 1e3:8.2f} ms  "
+                f"fused={step_timing.min_s * 1e3:8.2f} ms  "
+                f"(leaves {live_leaves}, rounds {out['rounds']}, "
+                f"peak {out['peak_wavefront']}, far {out['far_pairs_canonical']}, "
+                f"near {out['near_pairs_canonical']})",
+                flush=True,
+            )
+            return out, keys
+
+        arms: dict[str, dict] = {}
+        ref = None
+        for backend in args.walk_backends:
+            out, keys = arm(backend)
+            if ref is None:
+                ref = (backend, out, keys)
+            else:
+                ref_backend, ref_out, ref_keys = ref
+                same_counts = all(
+                    out[k] == ref_out[k]
+                    for k in (
+                        "far_pairs_canonical",
+                        "near_pairs_canonical",
+                        "rounds",
+                        "peak_wavefront",
+                    )
+                )
+                check = {"reference": ref_backend, "same_counts": same_counts}
+                if keys is not None and ref_keys is not None:
+                    check["same_far_set"] = bool(jnp.array_equal(keys[0], ref_keys[0]))
+                    check["same_near_set"] = bool(jnp.array_equal(keys[1], ref_keys[1]))
+                out["matches_reference"] = check
+                print(f"n={n:>9d} fast/{backend:6s} vs {ref_backend}: {check}")
+                if not all(v for k, v in check.items() if k != "reference"):
+                    raise RuntimeError(
+                        f"walk backend {backend} disagrees with {ref_backend} at "
+                        f"n={n}: {check}"
+                    )
+            del keys
+            arms[backend] = out
+        del ref
+        return arms
 
     def _measure(n: int) -> dict:
         """Measure one size; raises if it does not fit in memory."""
@@ -319,7 +455,10 @@ def main() -> None:
         entry: dict = {"n": n, "backends": {}}
 
         if not args.no_fast:
-            entry["fast"] = _fast_path(pos, mass)
+            # "fast" stays the flat walk (the key the figure has always read);
+            # every other walk backend gets "fast_<backend>".
+            for backend, out in _fast_path(pos, mass).items():
+                entry["fast" if backend == "flat" else f"fast_{backend}"] = out
 
         for backend in [] if args.no_legacy else args.backends:
 
@@ -388,6 +527,9 @@ def main() -> None:
             "seed": args.seed,
             "legacy": not args.no_legacy,
             "fast": not args.no_fast,
+            "walk_backends": args.walk_backends,
+            "pallas_interpret": args.pallas_interpret,
+            "check_pair_sets": args.check_pair_sets,
         },
         "metadata": run_metadata(),
         "sweep": {"stopped_early": stopped_early},

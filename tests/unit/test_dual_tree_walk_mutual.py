@@ -23,9 +23,9 @@ import pytest
 from yggdrax import DualTreeTraversalConfig, Tree, compute_tree_geometry
 from yggdrax._interactions_impl import (
     MutualWalkResult,
-    _build_mac_extents,
     build_interactions_and_neighbors,
     dual_tree_walk_mutual,
+    mutual_walk_inputs,
 )
 
 
@@ -49,22 +49,22 @@ def _tree(n=3000, leaf=16, seed=9):
 
 
 def _mutual_inputs(topology, geometry, mac_type, scale=1.0, idx=None):
-    idx = topology.parent.dtype if idx is None else idx
+    w = mutual_walk_inputs(
+        topology,
+        geometry,
+        mac_type=mac_type,
+        dehnen_radius_scale=scale,
+        index_dtype=idx,
+    )
     num_internal = int(topology.left_child.shape[0])
-    total_nodes = int(topology.parent.shape[0])
-    num_leaves = total_nodes - num_internal
-    left = jnp.concatenate(
-        [jnp.asarray(topology.left_child, idx), jnp.full((num_leaves,), -1, idx)]
+    return (
+        w.left_child_full,
+        w.right_child_full,
+        w.centers,
+        w.radii,
+        w.root,
+        num_internal,
     )
-    right = jnp.concatenate(
-        [jnp.asarray(topology.right_child, idx), jnp.full((num_leaves,), -1, idx)]
-    )
-    root = jnp.argmin(topology.parent).astype(idx)
-    centers = jnp.asarray(geometry.center)
-    extents = _build_mac_extents(
-        topology.parent, geometry, num_internal, mac_type, scale
-    )[0]
-    return left, right, centers, jnp.asarray(extents, centers.dtype), root, num_internal
 
 
 def _dual_sets(topology, geometry, theta, mac_type, scale=1.0, separation_floor=0.0):

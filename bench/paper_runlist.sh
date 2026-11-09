@@ -175,13 +175,19 @@ bench --smoke "$OUT/differentiability/scaling.json" -- "$PY" bench/differentiabi
 gate rerun diff_scaling "$OUT/differentiability/scaling.json" --base "$BASE" \
   --path results/differentiability/scaling.json
 
-# The fast path alone (static cell-leaf radix build + flat mutual walk), past the
-# sizes the legacy eager walk can reach; the sweep records the first size that does
-# not fit instead of dropping it. No committed baseline yet, so no gate.
+# The fast path alone (static cell-leaf radix build + the flat and the Pallas mutual
+# walk), past the sizes the legacy eager walk can reach; the sweep records the first
+# size that does not fit instead of dropping it. Every power of two 2^11..2^26: the
+# cell leaves step one Morton level per factor 8 in N, so the leaf occupancy is a
+# sawtooth, and N = 2^(3k+2) are the sizes at equal occupancy (~42 per leaf).
+POW2=""
+for e in $(seq 11 26); do POW2="$POW2 $((1 << e))"; done
 step "differentiability/scaling_fast.json"
+# shellcheck disable=SC2086
 bench --smoke "$OUT/differentiability/scaling_fast.json" -- "$PY" \
-  bench/differentiability/scaling.py --no-legacy --no-scipy \
-  --sizes 1000000 3000000 10000000 30000000 67108864
+  bench/differentiability/scaling.py --no-legacy --no-scipy --sizes $POW2
+gate rerun diff_scaling "$OUT/differentiability/scaling_fast.json" --base "$BASE" \
+  --path results/differentiability/scaling_fast.json
 
 step "differentiability/autodiff_overhead.json"
 bench --smoke "$OUT/differentiability/autodiff_overhead.json" -- "$PY" \

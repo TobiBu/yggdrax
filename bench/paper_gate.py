@@ -143,6 +143,24 @@ def _diff_scaling(new: dict, old: dict, rep: _Report) -> None:
             for key in ("num_nodes", "num_far_interactions", "num_near_neighbors"):
                 if key in vals and key in before:
                     rep.equal(f"n={rec['n']} {backend}", key, vals[key], before[key])
+        # the fast path: every walk arm must reproduce the flat walk's tree and
+        # pair counts as committed (older files have only the flat arm, "fast")
+        fast_before = prev.get("fast")
+        if fast_before is None:
+            continue
+        for arm in ("fast", "fast_pallas"):
+            vals = rec.get(arm)
+            if vals is None:
+                continue
+            for key in (
+                "live_leaves",
+                "rounds",
+                "peak_wavefront",
+                "far_pairs_canonical",
+                "near_pairs_canonical",
+            ):
+                if key in vals and key in fast_before:
+                    rep.equal(f"n={rec['n']} {arm}", key, vals[key], fast_before[key])
 
 
 def _corrfunc_scaling(new: dict, old: dict, rep: _Report) -> None:

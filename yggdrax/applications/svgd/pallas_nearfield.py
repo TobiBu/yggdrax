@@ -49,7 +49,11 @@ import numpy as np
 from jax import lax
 from jaxtyping import Array, Float
 
-from yggdrax.applications.svgd._pallas_compat import KernelRef, pallas_backend_kwargs
+from yggdrax.pallas._compat import (
+    KernelRef,
+    pallas_backend_kwargs,
+    pallas_triton_supported,
+)
 
 if TYPE_CHECKING:
     # Under a type checker Pallas is present, so ``pl`` is the module and the
@@ -141,24 +145,14 @@ def pallas_stein_nearfield_supported() -> bool:
 
     Returns:
         ``True`` only when Pallas and its Triton backend import and the default
-        backend is an Ampere-or-later GPU. Device-discovery failures return
-        ``False`` rather than raising, because this is called to pick a lane.
+        backend is an Ampere-or-later GPU (the shared gate,
+        :func:`yggdrax.pallas._compat.pallas_triton_supported`). Device-discovery
+        failures return ``False`` rather than raising, because this is called to
+        pick a lane.
     """
     if pl is None:
         return False
-    if jax.default_backend() != "gpu":
-        return False
-    try:
-        device = jax.devices()[0]
-    except Exception:  # pragma: no cover - backend discovery is environmental
-        return False
-    capability = getattr(device, "compute_capability", None)
-    if capability is None:
-        return False
-    try:
-        return float(capability) >= 8.0
-    except (TypeError, ValueError):  # pragma: no cover - vendor-specific strings
-        return False
+    return pallas_triton_supported()
 
 
 def prefer_fused_nearfield(num_leaves: int) -> bool:
