@@ -80,6 +80,7 @@ See `examples/getting_started.ipynb` for a runnable walkthrough.
 concepts
 periodic_boundaries
 distributed_statistics
+point_process
 backend_contract
 gpu_benchmark_recommended_setup
 api
