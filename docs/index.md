@@ -81,6 +81,7 @@ concepts
 periodic_boundaries
 distributed_statistics
 point_process
+differentiating_a_tree_code
 backend_contract
 gpu_benchmark_recommended_setup
 api
