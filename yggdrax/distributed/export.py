@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple, Optional, cast
 
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
@@ -504,10 +505,13 @@ def build_send_buffers(
         jnp.asarray(cell) >= 0
     )
     dev = jnp.where(live, as_index(cell) // mc, ndev_i)
-    # dead rows sort last, so the live prefix is contiguous and grouped by device
-    key = dev * as_index(num_nodes + 1) + jnp.where(
+    # dead rows sort last, so the live prefix is contiguous and grouped by device.
+    # The key is ndev * num_nodes wide: past 2^31 (11 devices of 2e8 nodes) int32
+    # wraps and the grouping breaks, so it is int64 whenever x64 is on.
+    kdt = jnp.int64 if jax.config.read("jax_enable_x64") else INDEX_DTYPE
+    key = dev.astype(kdt) * jnp.asarray(num_nodes + 1, kdt) + jnp.where(
         live, as_index(node), as_index(num_nodes)
-    )
+    ).astype(kdt)
     order = jnp.argsort(key, stable=True)
     s_dev, s_node, s_cell = dev[order], jnp.asarray(node)[order], as_index(cell)[order]
     s_live = s_dev < ndev_i
