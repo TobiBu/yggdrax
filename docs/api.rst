@@ -58,6 +58,9 @@ Morton ordering and primitives
    :members:
    :undoc-members:
 
+.. automodule:: yggdrax.periodic
+   :members:
+
 .. automodule:: yggdrax.dtypes
    :members:
    :undoc-members:

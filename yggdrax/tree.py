@@ -17,6 +17,7 @@ from .dtypes import INDEX_DTYPE, as_index, is_traced
 from .kdtree import LeafKDTree as KDTreeTopology
 from .kdtree import build_leaf_kdtree
 from .octree import OctreeTopology, augment_radix_topology_with_octree
+from .periodic import BoxSize, normalize_box_size, periodic_bounds, wrap_positions
 from .protocols import MortonLeafBoundsProtocol
 
 MAX_TREE_LEVELS = _tree_impl.MAX_TREE_LEVELS
@@ -225,6 +226,7 @@ class Tree:
         max_refine_levels: int = 2,
         aspect_threshold: float = 8.0,
         min_refined_leaf_particles: int = 2,
+        box_size: Optional[BoxSize] = None,
     ) -> "Tree":
         """Build a concrete tree, dispatching on ``tree_type``.
 
@@ -270,6 +272,13 @@ class Tree:
             Accepted and ignored (fixed-depth only; removed in Y2).
         min_refined_leaf_particles
             Accepted and ignored (fixed-depth only; removed in Y2).
+        box_size
+            Optional periodic box ``[0, L)^d`` (a float, or one length per
+            dimension). The positions are wrapped into the box and the tree is
+            built on the fixed bounds ``([0]*d, L)`` instead of inferred ones, so
+            no node straddles the box and ``positions_sorted`` holds the wrapped
+            coordinates. Mutually exclusive with ``bounds``. ``None`` (default)
+            leaves the build unchanged. Pass the same ``box_size`` to the walk.
 
         Returns
         -------
@@ -279,11 +288,13 @@ class Tree:
         Raises
         ------
         ValueError
-            If ``tree_type`` is not registered. The registered builder raises its
-            own ``ValueError`` for an unsupported ``build_mode``, including the
+            If ``tree_type`` is not registered, or both ``bounds`` and
+            ``box_size`` are given. The registered builder raises its own
+            ``ValueError`` for an unsupported ``build_mode``, including the
             removed ``"fixed_depth"``.
         """
 
+        positions, bounds = _apply_periodic_box(positions, bounds, box_size)
         request = TreeBuildRequest(
             positions=positions,
             masses=masses,
@@ -308,6 +319,50 @@ class Tree:
                 f"Unsupported tree_type '{tree_type}'. Supported: ({supported})"
             )
         return builder(request)
+
+
+def _apply_periodic_box(
+    positions: Array,
+    bounds: Optional[tuple[Array, Array]],
+    box_size: Optional[BoxSize],
+) -> tuple[Array, Optional[tuple[Array, Array]]]:
+    """Wrap positions into a periodic box and fix the build bounds to it.
+
+    Parameters
+    ----------
+    positions
+        Particle positions of shape ``(n, d)``.
+    bounds
+        The caller's bounds; must be ``None`` when ``box_size`` is given.
+    box_size
+        Periodic box, or ``None`` for a non-periodic build.
+
+    Returns
+    -------
+    tuple
+        ``(positions, bounds)``: unchanged when ``box_size`` is ``None``,
+        otherwise the wrapped positions and ``([0]*d, L)``.
+
+    Raises
+    ------
+    ValueError
+        If both ``bounds`` and ``box_size`` are given.
+    """
+
+    if box_size is None:
+        return positions, bounds
+    if bounds is not None:
+        raise ValueError(
+            "pass either bounds or box_size: a periodic build uses the box "
+            "[0, L)^d as its bounds"
+        )
+    positions = jnp.asarray(positions)
+    dim = int(positions.shape[-1])
+    lengths = normalize_box_size(box_size, dim)
+    assert lengths is not None
+    return wrap_positions(positions, lengths), periodic_bounds(
+        lengths, dim, dtype=positions.dtype
+    )
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1521,7 @@ def build_tree(
     workspace: Optional[RadixTreeWorkspace] = None,
     return_workspace: bool = False,
     config: Optional[TreeBuildConfig] = None,
+    box_size: Optional[BoxSize] = None,
 ):
     """Build an adaptive LBVH radix tree, inferring bounds when not provided.
 
@@ -1491,6 +1547,10 @@ def build_tree(
     config
         Optional :class:`TreeBuildConfig`; when given it overrides the
         equivalent individual keyword arguments.
+    box_size
+        Optional periodic box: wrap ``positions`` into ``[0, L)^d`` and build on
+        those fixed bounds (see :meth:`Tree.from_particles`). Mutually exclusive
+        with ``bounds``.
 
     Returns
     -------
@@ -1500,6 +1560,7 @@ def build_tree(
         are set.
     """
 
+    positions, bounds = _apply_periodic_box(positions, bounds, box_size)
     resolved = _resolve_tree_build_options(
         config=config,
         return_reordered=return_reordered,
