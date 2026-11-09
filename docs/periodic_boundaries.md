@@ -132,8 +132,10 @@ is a valid lower bound for points in the box.
 - **Coarse trees near the box scale.** Nodes whose `r_a + r_b + d` reaches `L/2`
   are never far. A tree with only a few large leaves therefore turns most pairs
   into near pairs. This is correct but slow, and it disappears at realistic `N`.
-- **Distributed walks** (`yggdrax.distributed`) do not take `box_size` yet.
-  Periodic wraps across domains are a separate item (C1).
+- **Distributed walks**: the distributed clustering statistics
+  (`yggdrax.distributed.stats`, `docs/distributed_statistics.md`) are periodic
+  across domains. The FMM-oriented LET stages (`let.py`, `cross_walk.py`) do not
+  take `box_size`.
 - **Pallas mutual walk**: not periodic (see above).
 - `rebuild_static_radix_tree_from_template` takes no `box_size`; wrap the
   positions yourself and pass the bounds `build_static_cells_tree(box_size=L)`
