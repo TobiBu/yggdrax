@@ -73,6 +73,7 @@ packages = [
   "yggdrax.applications",
   "yggdrax.applications.corrfunc",
   "yggdrax.applications.knn_stats",
+  "yggdrax.applications.point_process",
   "yggdrax.applications.svgd",
 ]
 
