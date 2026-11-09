@@ -118,7 +118,11 @@ from yggdrax import MACType
 from yggdrax._tree_impl import build_static_cells_tree
 from yggdrax.bounds import infer_bounds
 from yggdrax.geometry import compute_tree_geometry
-from yggdrax.interactions import dual_tree_walk_mutual, mutual_walk_inputs
+from yggdrax.interactions import (
+    MutualWalkResult,
+    dual_tree_walk_mutual,
+    mutual_walk_inputs,
+)
 
 from .binning import soft_bin_weights
 from .estimator import _DEFAULT_NEAR_CHUNK, _accumulate_block_pairs
@@ -210,7 +214,7 @@ class _Topology(NamedTuple):
     order: Array  # (n,) Morton slot -> particle index
     node_ranges: Array  # (num_nodes, 2) inclusive particle-slot ranges
     num_internal: int
-    walk: object  # MutualWalkResult
+    walk: MutualWalkResult
     leaf_overflow: Array
     num_leaves: Array
 

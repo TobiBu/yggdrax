@@ -191,7 +191,7 @@ def _accumulate_block_pairs(
     tgt_rows: Array,
     src_rows: Array,
     edges: Array,
-    sharpness: float,
+    sharpness: float | Array,
     log: bool,
     nbins: int,
     triu: Array | None,
