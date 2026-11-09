@@ -56,13 +56,39 @@ Acceptance. Which node pairs are far is decided by
   0.4, 1e-1 at 0.6). Note that a single-particle leaf has radius 0, so this
   rule accepts a pair of them at any theta (exactly, as a point pair).
 
+Smooth acceptance (``smooth_band = beta > 1``). Both rules above are hard:
+each node-pair decision is piecewise constant in the positions, so the counts
+jump where a pair switches between far, refined and pruned -- by up to the
+rule's error on that pair. The smooth rule blends instead. Each visited pair
+``P`` gets a far fraction ``sigma_P`` and a keep fraction ``kappa_P`` in
+``[0, 1]``, C2 ramps (in log) of the window variation / window maximum over the
+pair's separation range (window rule; band ``[eps / beta, eps]``) or of
+``(r_a + r_b) / d`` (geometric; band ``[theta / beta, theta]``), and contributes
+
+    C(P) = kappa_P * (sigma_P * far_P + (1 - sigma_P) * sum_children C(Q)),
+
+with a leaf pair's ``sum_children`` its exact sum. Only band pairs
+(``0 < sigma < 1`` or ``kappa < 1``) are both emitted far and refined, via the
+walk's ``pair_band`` hook, which also records each emitted pair's nearest band
+ancestor. The weight of every emitted term is then a product along that
+ancestry, recomputed here from LIVE node geometry (an exact range min / max of
+the positions), so ``grad`` includes the ``d sigma / dx`` terms. Two more
+choices make the blend continuous at fixed leaf membership: the walk splits the
+node with more particles (not the larger radius, whose order flips with the
+positions and would switch the decomposition under a band pair), and pruning
+is blended like acceptance. What remains discontinuous is a change of leaf
+membership (a particle crossing a cell face), whose jump is bounded by the far
+error of the pairs involved. See ``docs/differentiating_a_tree_code.md``.
+
 Differentiability. The topology -- Morton codes, leaf ranges, the pair lists --
 is built from ``stop_gradient(positions)`` and carries no gradient. The counts
 are then a smooth function of the positions *given* that topology: gradients
 flow through the exact near-field separations and through the centres of mass
-of the far pairs, the fixed-topology gradient of ``docs/differentiability_model.md``.
-The topology is piecewise constant in the positions, so this is the gradient of
-the estimator almost everywhere.
+of the far pairs: the fixed-topology gradient. The topology is piecewise
+constant in the positions, so this is the gradient of the estimator almost
+everywhere; across a switch the estimator jumps (see "Smooth acceptance" and
+``docs/differentiating_a_tree_code.md`` for how accurate it is and where it
+breaks).
 
 Accuracy. "Small theta" is not "no far pairs": a single-particle leaf has
 radius 0, so the non-strict Dehnen test accepts a pair of them at any theta --
@@ -171,6 +197,18 @@ class TracedPairCountConfig:
             size. ``"geometric"`` is the plain opening-angle MAC.
         window_eps: Absolute tolerance on the window, per particle pair and bin,
             of ``acceptance="window"``.
+        smooth_band: Ratio ``beta >= 1`` of the smooth (blended) acceptance
+            band; ``1.0`` (default) is the hard rule. With ``beta > 1`` a node
+            pair inside the band contributes ``sigma * far + (1 - sigma) *
+            refined`` (and, for the window rule's pruning, ``kappa`` times
+            itself), with ``sigma``, ``kappa`` smooth in the positions, which
+            makes the counts continuous across acceptance switches (see the
+            module docstring and ``docs/differentiating_a_tree_code.md``). The
+            band is ``[eps / beta, eps]`` on the window variation (window
+            rule) or ``[theta / beta, theta]`` on ``(r_a + r_b) / d``
+            (geometric), so the error bound of the hard rule at the outer edge
+            still holds.
+        band_cap: Capacity of the walk's band list (``smooth_band > 1`` only).
     """
 
     leaf_size: int
@@ -183,6 +221,13 @@ class TracedPairCountConfig:
     near_chunk: int = _DEFAULT_NEAR_CHUNK
     acceptance: Literal["window", "geometric"] = "window"
     window_eps: float = _DEFAULT_WINDOW_EPS
+    smooth_band: float = 1.0
+    band_cap: int = 0
+
+    @property
+    def smooth(self) -> bool:
+        """Whether the blended (continuous) acceptance rule is on."""
+        return float(self.smooth_band) > 1.0
 
 
 class TracedPairCounts(NamedTuple):
@@ -206,6 +251,8 @@ class TracedPairCounts(NamedTuple):
     far_count: Array  # int: canonical far pairs needed
     near_count: Array  # int: canonical near pairs needed
     peak_wavefront: Array  # int: largest wavefront any round tried to push
+    band_overflow: Array  # bool: band_count > band_cap (smooth rule only)
+    band_count: Array  # int: band pairs needed (0 for the hard rule)
 
 
 class _Topology(NamedTuple):
@@ -285,6 +332,198 @@ _WINDOW_PREDICATES = {
 }
 
 
+# --------------------------------------------------------------------------
+# smooth (blended) acceptance
+# --------------------------------------------------------------------------
+
+
+def _smootherstep(t: Array) -> Array:
+    """C2 ramp ``6t^5 - 15t^4 + 10t^3`` on ``[0, 1]`` (``t`` already clipped)."""
+    return t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+
+
+def _ramp(x: Array, lo: Array, log_beta: Array) -> Array:
+    """0 for ``x <= lo``, 1 for ``x >= lo * beta``, C2 in ``log x`` between.
+
+    ``x`` is floored at ``lo`` before the log, so ``x = 0`` gives a finite value
+    and a zero (not NaN) gradient.
+    """
+    t = jnp.log(jnp.maximum(x, lo) / lo) / log_beta
+    return _smootherstep(jnp.clip(t, 0.0, 1.0))
+
+
+def _safe_sqrt(x: Array) -> Array:
+    """``sqrt(x)`` with a zero gradient at ``x = 0``; same values as sqrt."""
+    pos = x > 0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, x, 1.0)), 0.0)
+
+
+def _blend_fractions(kind: str, log: bool, params, dist_sq, radius_a, radius_b):
+    """``(sigma, kappa)`` of node pairs: far fraction and keep fraction.
+
+    ``kind="window"``, ``params = (edges_u, sharpness, eps, log_beta)``: with
+    ``v`` the largest per-bin window variation and ``m`` the largest window over
+    the pair's separation range ``[d - s, d + s]``, ``sigma`` ramps from 1 at
+    ``v <= eps / beta`` to 0 at ``v >= eps``, and ``kappa`` from 0 at
+    ``m <= eps / beta`` to 1 at ``m >= eps``.
+
+    ``kind="geometric"``, ``params = (theta, log_beta)``: ``sigma`` ramps from 1
+    at ``(r_a + r_b) / d <= theta / beta`` to 0 at ``>= theta``; ``kappa = 1``.
+
+    Smooth in the node geometry, so -- evaluated on differentiable centres and
+    radii -- in the positions; the walk evaluates the same function on
+    ``stop_gradient`` geometry to decide what to emit.
+    """
+    if kind == "window":
+        edges_u, sharpness, eps, log_beta = params
+        d = _safe_sqrt(dist_sq)
+        s = radius_a + radius_b
+        lo, hi = d - s, d + s
+        if log:
+            tiny = jnp.finfo(d.dtype).tiny
+            lo, hi = jnp.log(jnp.maximum(lo, tiny)), jnp.log(jnp.maximum(hi, tiny))
+        w_min, w_max = _window_min_max(edges_u, sharpness, lo, hi)
+        v = jnp.max(w_max - w_min, axis=-1)
+        m = jnp.max(w_max, axis=-1)
+        eps_lo = eps / jnp.exp(log_beta)
+        sigma = 1.0 - _ramp(v, eps_lo, log_beta)
+        kappa = _ramp(m, eps_lo, log_beta)
+        return sigma, kappa
+    theta, log_beta = params
+    s = radius_a + radius_b
+    # ratio^2 = (s / d)^2. A self pair (d = 0) is never far: sigma = 0, and the
+    # double ``where`` keeps its gradient zero instead of NaN.
+    apart = dist_sq > 0
+    ratio_sq = (s * s) / jnp.where(apart, dist_sq, 1.0)
+    theta_lo_sq = (theta / jnp.exp(log_beta)) ** 2
+    sigma = 1.0 - _ramp(ratio_sq, theta_lo_sq, 2.0 * log_beta)
+    sigma = jnp.where(apart, sigma, 0.0)
+    return sigma, jnp.ones_like(sigma)
+
+
+def _make_smooth_predicates(kind: str, log: bool):
+    """``(accept, discard, band)`` hooks of the smooth rule for the walk.
+
+    ``data = (params, node_radius)``. The walk's own ``radii`` argument is the
+    position-independent split key (the node count), so the hooks read the
+    bounding radii from ``data`` by node index.
+    """
+
+    def fractions(data, a, b, dist_sq):
+        params, node_radius = data
+        return _blend_fractions(
+            kind, log, params, dist_sq, node_radius[a], node_radius[b]
+        )
+
+    def accept(data, a, b, dist_sq, radius_a, radius_b):
+        del radius_a, radius_b
+        sigma, kappa = fractions(data, a, b, dist_sq)
+        return (sigma > 0) & (kappa > 0)
+
+    def discard(data, a, b, dist_sq, radius_a, radius_b):
+        del radius_a, radius_b
+        _, kappa = fractions(data, a, b, dist_sq)
+        return kappa <= 0
+
+    def band(data, a, b, dist_sq, radius_a, radius_b):
+        del radius_a, radius_b
+        sigma, kappa = fractions(data, a, b, dist_sq)
+        return ((sigma > 0) & (sigma < 1)) | (kappa < 1)
+
+    return accept, (discard if kind == "window" else None), band
+
+
+_SMOOTH_PREDICATES = {
+    (kind, log): _make_smooth_predicates(kind, log)
+    for kind in ("window", "geometric")
+    for log in (True, False)
+}
+
+
+def _smooth_params(config: "TracedPairCountConfig", dtype, edges, sharpness, log):
+    """The ``params`` of :func:`_blend_fractions` for ``config``, no gradient."""
+    log_beta = jnp.log(jnp.asarray(config.smooth_band, dtype=dtype))
+    if config.acceptance == "geometric":
+        return (jnp.asarray(config.theta, dtype=dtype), log_beta)
+    if edges is None or sharpness is None:
+        raise ValueError('acceptance="window" needs edges and sharpness')
+    edges_ng = jax.lax.stop_gradient(jnp.asarray(edges, dtype=dtype))
+    return (
+        jnp.log(edges_ng) if log else edges_ng,
+        jax.lax.stop_gradient(jnp.asarray(sharpness, dtype=dtype)),
+        jnp.asarray(config.window_eps, dtype=dtype),
+        log_beta,
+    )
+
+
+def _range_min_max_table(values: Array) -> tuple[Array, Array]:
+    """Sparse tables of running min / max over power-of-two windows.
+
+    ``tables[k][i]`` covers slots ``[i, i + 2^k)`` (clamped to the end), so any
+    inclusive range is the min / max of two overlapping table entries. Built
+    with ``minimum`` / ``maximum`` only, so the result is exactly the range's
+    min / max and differentiable (to the extremal element).
+    """
+    n = int(values.shape[0])
+    levels = max(1, int(np.ceil(np.log2(max(n, 1)))) + 1)
+    mins, maxs = [values], [values]
+    for k in range(1, levels):
+        step = 1 << (k - 1)
+        idx = jnp.minimum(jnp.arange(n) + step, n - 1)
+        mins.append(jnp.minimum(mins[-1], mins[-1][idx]))
+        maxs.append(jnp.maximum(maxs[-1], maxs[-1][idx]))
+    return jnp.stack(mins), jnp.stack(maxs)
+
+
+def _node_geometry(tables, ranges: Array, nodes: Array) -> tuple[Array, Array]:
+    """Bounding-box centre and sphere radius of ``nodes``, differentiable.
+
+    The same formulas as :func:`yggdrax.geometry.compute_tree_geometry`
+    (min / max of the node's particles, ``half = max(half, 1e-6)``,
+    ``radius = |half|``), evaluated on live positions, so the values equal the
+    walk's ``stop_gradient`` geometry while gradients reach the extremal
+    particles.
+    """
+    mins, maxs = tables
+    levels = int(mins.shape[0])
+    start = ranges[nodes, 0]
+    end = jnp.maximum(ranges[nodes, 1], start)
+    length = end - start + 1
+    k = sum((length >= (1 << j)).astype(start.dtype) for j in range(1, levels))
+    right = end - (jnp.asarray(1, start.dtype) << k) + 1
+    lo = jnp.minimum(mins[k, start], mins[k, right])
+    hi = jnp.maximum(maxs[k, start], maxs[k, right])
+    center = 0.5 * (lo + hi)
+    half = jnp.maximum(0.5 * (hi - lo), jnp.asarray(1e-6, dtype=lo.dtype))
+    return center, jnp.linalg.norm(half, axis=-1)
+
+
+def _pair_fractions(kind, log, params, tables, ranges, a, b):
+    """Differentiable ``(sigma, kappa)`` of node pairs ``(a, b)``."""
+    ca, ra = _node_geometry(tables, ranges, a)
+    cb, rb = _node_geometry(tables, ranges, b)
+    delta = cb - ca
+    return _blend_fractions(kind, log, params, jnp.sum(delta * delta, axis=-1), ra, rb)
+
+
+def _ancestry_products(factor: Array, parent: Array) -> Array:
+    """``prod`` of ``factor`` over each band slot and all its band ancestors.
+
+    Pointer doubling over the ``parent`` links (``-1`` at a root): after ``j``
+    rounds each slot holds the product over its next ``2^j`` ancestors, so
+    ``ceil(log2(cap)) + 1`` rounds cover any chain. Differentiable in
+    ``factor``.
+    """
+    cap = int(factor.shape[0])
+    prod, anc = factor, parent
+    for _ in range(max(1, int(np.ceil(np.log2(max(cap, 2)))) + 1)):
+        has = anc >= 0
+        safe = jnp.where(has, anc, 0)
+        prod = prod * jnp.where(has, prod[safe], 1.0)
+        anc = jnp.where(has, anc[safe], -1)
+    return prod
+
+
 def _resolve_bounds(positions: Array, bounds) -> tuple[Array, Array]:
     """Morton domain: the given bounds or the padded box of ``positions``."""
     if bounds is None:
@@ -302,18 +541,23 @@ def _build_topology(
     edges: Array | None = None,
     sharpness: float | Array | None = None,
     log: bool = True,
+    membership: Array | None = None,
 ) -> _Topology:
     """Rebuild the tree and run the mutual walk, all traceable, no gradient.
 
     The evaluator and the planner both call this, so a plan sized by the probe
     is a plan for exactly the walk the evaluator runs. ``edges``, ``sharpness``
     and ``log`` are needed (and only read) by ``acceptance="window"``.
+    ``membership`` (default ``positions``) are the positions the tree's leaf
+    partition is built from; the node geometry and the walk always use
+    ``positions``.
     """
     pos = jax.lax.stop_gradient(positions)
-    box = _resolve_bounds(pos, bounds)
+    build_pos = pos if membership is None else jax.lax.stop_gradient(membership)
+    box = _resolve_bounds(build_pos, bounds)
     masses = jnp.ones(pos.shape[0], dtype=pos.dtype)
     tree, pos_sorted, _, _, leaf_overflow, num_leaves = build_static_cells_tree(
-        pos,
+        build_pos,
         masses,
         box,
         leaf_size=config.leaf_size,
@@ -322,13 +566,47 @@ def _build_topology(
         return_overflow=True,
         return_num_leaves=True,
     )
+    if membership is not None:
+        pos_sorted = pos[tree.particle_indices]
     # max_leaf_size: leaf_size is traced under jit; without the static bound
     # the geometry's leaf gather falls back to (num_leaves, n, 3).
     geometry = compute_tree_geometry(tree, pos_sorted, max_leaf_size=config.leaf_size)
     w = mutual_walk_inputs(
         tree, geometry, mac_type=config.mac_type, mask_empty_nodes=True
     )
-    if config.acceptance == "geometric":
+    if config.smooth:
+        if config.acceptance not in ("window", "geometric"):
+            raise ValueError(f"unknown acceptance {config.acceptance!r}")
+        accept, discard, band = _SMOOTH_PREDICATES[(config.acceptance, bool(log))]
+        params = _smooth_params(config, pos.dtype, edges, sharpness, log)
+        node_radius = jnp.asarray(geometry.radius, dtype=pos.dtype)
+        # The walk's ``radii`` only pick which node of a refined pair to split
+        # (the larger). Bounding radii move with the positions, so their order
+        # flips and the decomposition below a band pair would switch between
+        # two splits: a jump. The node COUNT is piecewise constant at fixed
+        # leaf membership, so the split order is too. The hooks read the true
+        # radii from ``data``.
+        counts = jnp.maximum(
+            tree.node_ranges[:, 1] - tree.node_ranges[:, 0] + 1, 0
+        ).astype(pos.dtype)
+        walk = dual_tree_walk_mutual(
+            w.left_child_full,
+            w.right_child_full,
+            jnp.asarray(geometry.center),
+            counts,
+            config.theta,
+            w.root,
+            max_pair_queue=config.max_pair_queue,
+            far_cap=config.far_cap,
+            near_cap=config.near_cap,
+            node_active=w.node_active,
+            pair_accept=accept,
+            pair_discard=discard,
+            pair_band=band,
+            band_cap=max(1, int(config.band_cap)),
+            pair_accept_data=(params, node_radius),
+        )
+    elif config.acceptance == "geometric":
         walk = dual_tree_walk_mutual(
             w.left_child_full,
             w.right_child_full,
@@ -391,6 +669,7 @@ def traced_soft_pair_counts(
     sharpness: float | Array = 100.0,
     log: bool = True,
     bounds: tuple[Array, Array] | None = None,
+    membership: Array | None = None,
 ) -> TracedPairCounts:
     """Soft pair counts ``sum_{i<j} w_k(r_ij)``, rebuilding the tree inside.
 
@@ -410,12 +689,40 @@ def traced_soft_pair_counts(
             padded box of ``positions`` on every call (no gradient flows into
             it). Fixed bounds keep the leaf structure comparable across calls;
             every particle must lie inside them.
+        membership: Optional positions ``(n, 3)`` that fix the tree's LEAF
+            PARTITION (no gradient flows into them); the node geometry, the
+            acceptance decisions and every separation still use
+            ``positions``, so the estimator stays correct to the same error
+            bound. ``None`` (default) builds the partition from ``positions``.
+            Pass the start of an HMC trajectory or of a line search: with the
+            smooth rule the counts are then continuous in ``positions`` along
+            the whole of it, because a particle crossing a cell face no longer
+            restructures the tree. Must lie inside ``bounds`` when given.
 
     Returns:
         A :class:`TracedPairCounts`. ``counts`` has shape ``(nbins,)``; read
         ``overflow`` before trusting it.
     """
-    topo = _build_topology(positions, config, bounds, edges, sharpness, log)
+    topo = _build_topology(
+        positions, config, bounds, edges, sharpness, log, membership=membership
+    )
+    return _accumulate(positions, edges, config, topo, sharpness, log)
+
+
+def _accumulate(
+    positions: Array,
+    edges: Array,
+    config: TracedPairCountConfig,
+    topo: _Topology,
+    sharpness: float | Array,
+    log: bool,
+) -> TracedPairCounts:
+    """The differentiable half: soft counts of ``positions`` over ``topo``.
+
+    Split from the build so a caller can hold a topology fixed (the benches in
+    ``bench/differentiability`` evaluate a step's end point on the start
+    point's topology to separate the smooth change from the switch).
+    """
     walk = topo.walk
     dtype = positions.dtype
     n = int(positions.shape[0])
@@ -459,6 +766,18 @@ def traced_soft_pair_counts(
     near_live = walk.near_a >= 0
     near_t = jnp.where(near_live, walk.near_a - ni, 0)
     near_s = jnp.where(near_live, walk.near_b - ni, 0)
+    # far node pairs (live slots): needed by the smooth weights below
+    far_live = walk.far_a >= 0
+    fa = jnp.where(far_live, walk.far_a, 0)
+    fb = jnp.where(far_live, walk.far_b, 0)
+    if config.smooth:
+        near_factor, far_factor = _smooth_weights(
+            walk, config, edges, sharpness, log, pos_sorted, ranges, fa, fb
+        )
+        near_weight = jnp.where(near_live, near_factor, 0.0)
+    else:
+        near_weight = near_live.astype(dtype)
+        far_factor = None
     cross = _accumulate_block_pairs(
         blocks,
         leaf_mask,
@@ -470,13 +789,10 @@ def traced_soft_pair_counts(
         nbins,
         None,
         int(config.near_chunk),
-        row_weight=near_live.astype(dtype),
+        row_weight=near_weight,
     )
 
     # far node pairs: monopole at the centres of mass, each once
-    far_live = walk.far_a >= 0
-    fa = jnp.where(far_live, walk.far_a, 0)
-    fb = jnp.where(far_live, walk.far_b, 0)
     prefix = jnp.concatenate(
         [jnp.zeros((1, 3), dtype), jnp.cumsum(pos_sorted, axis=0)], axis=0
     )
@@ -493,12 +809,21 @@ def traced_soft_pair_counts(
     d_far = jnp.sqrt(jnp.sum((com_a - com_b) ** 2, axis=-1) + 1e-30)
     w_far = soft_bin_weights(d_far, edges, sharpness, log=log)  # (far_cap, nbins)
     pair_weight = jnp.where(far_live, cnt_a * cnt_b, 0.0)
+    if far_factor is not None:
+        pair_weight = pair_weight * far_factor
     far = jnp.sum(pair_weight[:, None] * w_far, axis=0)
 
     leaf_overflow = jnp.asarray(topo.leaf_overflow, bool)
     overflow = (
         leaf_overflow | walk.queue_overflow | walk.far_overflow | walk.near_overflow
     )
+    if walk.band_overflow is not None and walk.band_count is not None:
+        band_overflow = jnp.asarray(walk.band_overflow, bool)
+        band_count = walk.band_count
+        overflow = overflow | band_overflow
+    else:
+        band_overflow = jnp.asarray(False)
+        band_count = jnp.zeros((), dtype=walk.far_count.dtype)
     return TracedPairCounts(
         counts=within + cross + far,
         overflow=overflow,
@@ -510,7 +835,63 @@ def traced_soft_pair_counts(
         far_count=walk.far_count,
         near_count=walk.near_count,
         peak_wavefront=walk.peak_wavefront,
+        band_overflow=band_overflow,
+        band_count=band_count,
     )
+
+
+def _smooth_weights(
+    walk: MutualWalkResult,
+    config: TracedPairCountConfig,
+    edges: Array,
+    sharpness: float | Array,
+    log: bool,
+    pos_sorted: Array,
+    ranges: Array,
+    fa: Array,
+    fb: Array,
+) -> tuple[Array, Array]:
+    """Blend weights of the smooth rule: ``(near_factor, far_factor)``.
+
+    Recomputed on live node geometry, so the gradient includes the
+    ``d(sigma)/dx`` terms: the counts are then continuous across acceptance
+    switches and their gradient is the gradient of the blended estimator, not of
+    a frozen-weight surrogate. ``near_factor[i]`` is the product of the band
+    factors ``kappa (1 - sigma)`` over the ancestry of near pair ``i`` (itself
+    included); ``far_factor[i]`` is ``sigma kappa`` of far pair ``(fa, fb)[i]``
+    times the product over its strict ancestors.
+    """
+    if (
+        walk.band_a is None
+        or walk.band_b is None
+        or walk.band_parent is None
+        or walk.band_accepted is None
+        or walk.band_count is None
+        or walk.far_parent is None
+        or walk.near_parent is None
+    ):
+        raise ValueError("the smooth rule needs a walk run with pair_band")
+    dtype = pos_sorted.dtype
+    kind = config.acceptance
+    params = _smooth_params(config, dtype, edges, sharpness, log)
+    tables = _range_min_max_table(pos_sorted)
+    cap = int(walk.band_a.shape[0])
+    band_live = jnp.arange(cap) < jnp.minimum(walk.band_count, cap)
+    ba = jnp.where(band_live, walk.band_a, 0)
+    bb = jnp.where(band_live, walk.band_b, 0)
+    b_sigma, b_kappa = _pair_fractions(kind, log, params, tables, ranges, ba, bb)
+    b_factor = b_kappa * (1.0 - b_sigma * walk.band_accepted.astype(dtype))
+    band_prod = _ancestry_products(
+        jnp.where(band_live, b_factor, 1.0),
+        jnp.where(band_live, walk.band_parent, -1),
+    )
+
+    def hang(parent: Array) -> Array:
+        has = parent >= 0
+        return jnp.where(has, band_prod[jnp.where(has, parent, 0)], 1.0)
+
+    f_sigma, f_kappa = _pair_fractions(kind, log, params, tables, ranges, fa, fb)
+    return hang(walk.near_parent), f_sigma * f_kappa * hang(walk.far_parent)
 
 
 def _pow2(x: int) -> int:
@@ -526,6 +907,7 @@ def plan_traced_pair_counts(
     log: bool = True,
     acceptance: Literal["window", "geometric"] = "window",
     window_eps: float = _DEFAULT_WINDOW_EPS,
+    smooth_band: float = 1.0,
     theta: float = 0.5,
     leaf_size: int = 16,
     mac_type: MACType = "dehnen",
@@ -560,6 +942,8 @@ def plan_traced_pair_counts(
         acceptance: ``"window"`` or ``"geometric"``; see
             :class:`TracedPairCountConfig`.
         window_eps: Window tolerance of ``acceptance="window"``.
+        smooth_band: Blend-band ratio of the smooth rule; ``1.0`` is the hard
+            rule. See :class:`TracedPairCountConfig`.
         theta: Opening angle of ``acceptance="geometric"``.
         leaf_size: Maximum particles per cell leaf.
         mac_type: Geometric acceptance criterion.
@@ -591,7 +975,10 @@ def plan_traced_pair_counts(
         catalogues = [arr] if arr.ndim == 2 else [arr[b] for b in range(arr.shape[0])]
 
     leaf = int(leaf_size)
-    need_leaves = need_queue = need_far = need_near = 1
+    if float(smooth_band) < 1.0:
+        raise ValueError(f"smooth_band must be >= 1, got {smooth_band}")
+    smooth = float(smooth_band) > 1.0
+    need_leaves = need_queue = need_far = need_near = need_band = 1
     for pos in catalogues:
         n = int(pos.shape[0])
         box = _resolve_bounds(pos, bounds)
@@ -611,6 +998,7 @@ def plan_traced_pair_counts(
 
         # --- walk: grow the caps until the probe fits, then record its need ---
         q, far_cap, near_cap = 1 << 12, 1 << 14, 1 << 14
+        band_cap = (1 << 14) if smooth else 0
         for _ in range(max_doublings):
             cfg = TracedPairCountConfig(
                 leaf_size=leaf,
@@ -623,6 +1011,8 @@ def plan_traced_pair_counts(
                 near_chunk=int(near_chunk),
                 acceptance=acceptance,
                 window_eps=float(window_eps),
+                smooth_band=float(smooth_band),
+                band_cap=band_cap,
             )
             walk = jax.jit(
                 lambda p, c=cfg: _build_topology(
@@ -634,11 +1024,13 @@ def plan_traced_pair_counts(
                 bool(walk.far_overflow),
                 bool(walk.near_overflow),
             )
-            if not (qo or fo or no):
+            bo = smooth and bool(walk.band_overflow)
+            if not (qo or fo or no or bo):
                 break
             q *= 4 if qo else 1
             far_cap *= 4 if fo else 1
             near_cap *= 4 if no else 1
+            band_cap *= 4 if bo else 1
         else:
             raise RuntimeError(
                 f"mutual walk capacities did not converge after {max_doublings} "
@@ -648,6 +1040,8 @@ def plan_traced_pair_counts(
         need_queue = max(need_queue, int(walk.peak_wavefront))
         need_far = max(need_far, int(walk.far_count))
         need_near = max(need_near, int(walk.near_count))
+        if smooth:
+            need_band = max(need_band, int(walk.band_count))
 
     return TracedPairCountConfig(
         leaf_size=leaf,
@@ -662,4 +1056,10 @@ def plan_traced_pair_counts(
         near_chunk=int(near_chunk),
         acceptance=acceptance,
         window_eps=float(window_eps),
+        smooth_band=float(smooth_band),
+        band_cap=(
+            _pow2(max(min_list_cap, int(np.ceil(list_slack * need_band)) + 1))
+            if smooth
+            else 0
+        ),
     )

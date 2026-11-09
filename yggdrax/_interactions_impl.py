@@ -5309,6 +5309,21 @@ class MutualWalkResult(NamedTuple):
     queue_overflow: Array
     peak_wavefront: Array
     rounds: Array
+    # Band outputs, set only by a walk given ``pair_band`` (``None`` otherwise).
+    # ``far_parent[i]`` / ``near_parent[i]``: slot in the band list of the
+    # nearest band ancestor of the emitted pair (for a near pair that is itself
+    # a band pair, its own slot), ``-1`` if it has none. ``band_a``/``band_b``:
+    # the band pairs in visiting order, ``band_parent`` the slot of each one's
+    # nearest band ancestor (always a smaller slot), ``band_accepted`` whether it
+    # was also emitted far. See :func:`dual_tree_walk_mutual`.
+    far_parent: Optional[Array] = None
+    near_parent: Optional[Array] = None
+    band_a: Optional[Array] = None
+    band_b: Optional[Array] = None
+    band_parent: Optional[Array] = None
+    band_accepted: Optional[Array] = None
+    band_count: Optional[Array] = None
+    band_overflow: Optional[Array] = None
 
 
 # Width ladder of the flat mutual walk (Tier 3 of the tree-walk plan, 2026-09-11).
@@ -5379,6 +5394,90 @@ def _flat_append(buf_a, buf_b, count, mask, values_a, values_b, cap):
         jnp.where(ok, values_b, neg1), mode="drop", unique_indices=True
     )
     return buf_a, buf_b, count + jnp.sum(live, dtype=idx), overflow
+
+
+def _flat_slots(count: Array, mask: Array, cap: int) -> tuple[Array, Array]:
+    """Write slots of :func:`_flat_append` for the masked entries.
+
+    Returns ``(slot, safe)``: ``slot`` the slot each masked entry takes (may be
+    ``>= cap``), ``safe`` the same with out-of-range and unmasked entries sent to
+    ``cap`` (dropped by a ``mode="drop"`` scatter). Index dtype follows ``count``.
+    """
+    idx = count.dtype
+    live = mask.astype(idx)
+    slot = count + jnp.cumsum(live, dtype=idx) - live
+    ok = mask & (slot < jnp.asarray(cap, idx))
+    return slot, jnp.where(ok, slot, jnp.asarray(cap, idx))
+
+
+def _band_round(
+    band_state: tuple[Array, ...],
+    *,
+    width: int,
+    live: Array,
+    band: Array,
+    accept: Array,
+    is_near: Array,
+    sa: Array,
+    sb: Array,
+    far_n: Array,
+    near_n: Array,
+    far_cap: int,
+    near_cap: int,
+    band_cap: int,
+) -> tuple[tuple[Array, ...], Array]:
+    """One round's band bookkeeping of the flat mutual walk (``pair_band``).
+
+    ``band_state`` is the walk's band carry ``(queue_parent, far_parent,
+    near_parent, band_a, band_b, band_parent, band_accepted, band_count,
+    band_overflow)``; ``far_n`` / ``near_n`` are the list counts BEFORE this
+    round's appends. Returns the updated carry without its first entry (the
+    queue's parents are rebuilt by the caller from the refinement) and
+    ``parent_out``: per pair of the round, the band slot its children and its
+    own near entry hang from.
+    """
+    (
+        q_parent,
+        far_parent,
+        near_parent,
+        band_a,
+        band_b,
+        band_parent,
+        band_acc,
+        band_n,
+        band_over,
+    ) = band_state
+    idx = band_n.dtype
+    neg1 = jnp.asarray(-1, idx)
+    parent_in = jnp.where(live, q_parent[:width], neg1)
+    band_slot, band_safe = _flat_slots(band_n, band, band_cap)
+    band_over = band_over | jnp.any(band & (band_slot >= jnp.asarray(band_cap, idx)))
+    band_a = band_a.at[band_safe].set(sa, mode="drop", unique_indices=True)
+    band_b = band_b.at[band_safe].set(sb, mode="drop", unique_indices=True)
+    band_parent = band_parent.at[band_safe].set(
+        parent_in, mode="drop", unique_indices=True
+    )
+    band_acc = band_acc.at[band_safe].set(accept, mode="drop", unique_indices=True)
+    band_n = band_n + jnp.sum(band.astype(idx), dtype=idx)
+    parent_out = jnp.where(band, band_slot, parent_in)
+    _, far_safe = _flat_slots(far_n, accept, far_cap)
+    far_parent = far_parent.at[far_safe].set(
+        parent_in, mode="drop", unique_indices=True
+    )
+    _, near_safe = _flat_slots(near_n, is_near, near_cap)
+    near_parent = near_parent.at[near_safe].set(
+        parent_out, mode="drop", unique_indices=True
+    )
+    return (
+        far_parent,
+        near_parent,
+        band_a,
+        band_b,
+        band_parent,
+        band_acc,
+        band_n,
+        band_over,
+    ), parent_out
 
 
 class MutualWalkInputs(NamedTuple):
@@ -5530,6 +5629,8 @@ _MUTUAL_WALK_BACKENDS = ("flat", "pallas", "auto")
         "box_size",
         "pair_accept",
         "pair_discard",
+        "pair_band",
+        "band_cap",
     ),
 )
 def _dual_tree_walk_mutual_flat(
@@ -5555,9 +5656,14 @@ def _dual_tree_walk_mutual_flat(
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
     pair_discard: Optional[Callable[..., Array]] = None,
+    pair_band: Optional[Callable[..., Array]] = None,
+    band_cap: int = 0,
 ) -> MutualWalkResult:
     """The flat (XLA) backend of :func:`dual_tree_walk_mutual`; same arguments."""
     idx = jnp.asarray(left_child_full).dtype
+    banded = pair_band is not None
+    if banded and int(band_cap) < 1:
+        raise ValueError("pair_band needs band_cap >= 1")
 
     def ix(x):
         return jnp.asarray(x, dtype=idx)
@@ -5608,6 +5714,21 @@ def _dual_tree_walk_mutual_flat(
         init_size,  # peak wavefront (the seed)
         ix(0),  # rounds
     )
+    band_init: tuple[Array, ...] = ()
+    if banded:
+        # Appended after the 14 base slots, so every index above is unchanged.
+        band_init = (
+            jnp.full((max_pair_queue,), -1, dtype=idx),  # 14 queue band parent
+            jnp.full((far_cap,), -1, dtype=idx),  # 15 far_parent
+            jnp.full((near_cap,), -1, dtype=idx),  # 16 near_parent
+            jnp.full((band_cap,), -1, dtype=idx),  # 17 band_a
+            jnp.full((band_cap,), -1, dtype=idx),  # 18 band_b
+            jnp.full((band_cap,), -1, dtype=idx),  # 19 band_parent
+            jnp.zeros((band_cap,), dtype=bool),  # 20 band_accepted
+            ix(0),  # 21 band_count
+            jnp.asarray(False),  # 22 band_overflow
+        )
+    init = init + band_init
 
     def make_round(width: int):
         # One round of the wavefront loop at a static width ``width`` >= the live
@@ -5632,7 +5753,7 @@ def _dual_tree_walk_mutual_flat(
                 wf_over,
                 peak,
                 rounds,
-            ) = state
+            ) = state[:14]
             cur_a = cur_a[:width]
             cur_b = cur_b[:width]
             live = (jnp.arange(width, dtype=idx) < size) & (cur_a >= 0)
@@ -5703,8 +5824,38 @@ def _dual_tree_walk_mutual_flat(
                     dist_sq, bound_a, bound_b, box_lengths
                 )
             both_leaf = a_leaf & b_leaf
-            is_near = live & (~accept) & both_leaf & (~same)
-            refine = live & (~accept) & (~both_leaf)
+            band = None
+            if pair_band is not None:
+                # A band pair is emitted far if accepted AND still refined (or
+                # emitted near, for two leaves), and logged so the caller can
+                # weight everything below it.
+                band = live & jnp.asarray(
+                    pair_band(pair_accept_data, sa, sb, dist_sq, radius_a, radius_b),
+                    dtype=bool,
+                )
+                opened = (~accept) | band
+            else:
+                opened = ~accept
+            is_near = live & opened & both_leaf & (~same)
+            refine = live & opened & (~both_leaf)
+            band_out: tuple[Array, ...] = ()
+            parent_out = None
+            if band is not None:
+                band_out, parent_out = _band_round(
+                    state[14:],
+                    width=width,
+                    live=live,
+                    band=band,
+                    accept=accept,
+                    is_near=is_near,
+                    sa=sa,
+                    sb=sb,
+                    far_n=far_n,
+                    near_n=near_n,
+                    far_cap=far_cap,
+                    near_cap=near_cap,
+                    band_cap=band_cap,
+                )
             far_a, far_b, far_n, far_of = _flat_append(
                 far_a, far_b, far_n, accept, sa, sb, far_cap
             )
@@ -5759,7 +5910,7 @@ def _dual_tree_walk_mutual_flat(
                     unique_indices=True,
                 )
             )
-            return (
+            base = (
                 new_a,
                 new_b,
                 jnp.minimum(push_total, ix(max_pair_queue)),
@@ -5775,6 +5926,19 @@ def _dual_tree_walk_mutual_flat(
                 jnp.maximum(peak, push_total),
                 rounds + ix(1),
             )
+            if parent_out is None:
+                return base
+            push_parent = jnp.repeat(parent_out, _MAX_REFINEMENT_PAIRS)
+            new_parent = (
+                jnp.full((max_pair_queue,), -1, dtype=idx)
+                .at[safe_slot]
+                .set(
+                    jnp.where(push_ok, push_parent, index_neg1),
+                    mode="drop",
+                    unique_indices=True,
+                )
+            )
+            return base + (new_parent,) + band_out
 
         return round_fun
 
@@ -5787,7 +5951,10 @@ def _dual_tree_walk_mutual_flat(
     def healthy(state):
         size = state[2]
         far_over, near_over, wf_over = state[9], state[10], state[11]
-        return (size > 0) & (~far_over) & (~near_over) & (~wf_over)
+        ok = (size > 0) & (~far_over) & (~near_over) & (~wf_over)
+        if banded:
+            ok = ok & (~state[14:][8])
+        return ok
 
     def run_rung(state, width, lower=None, upper=None):
         # One ``while_loop`` per rung, so the carry is updated IN PLACE. A
@@ -5820,6 +5987,8 @@ def _dual_tree_walk_mutual_flat(
         for w, lo in zip(reversed(widths[:-1]), reversed(lowers)):
             state = run_rung(state, w, lower=lo, upper=w)
         final = lax.while_loop(healthy, make_round(max_pair_queue), state)
+    # the band carry, past the 14 base slots (empty without ``pair_band``)
+    band_final: tuple[Array, ...] = tuple(final)[14:]
     return MutualWalkResult(
         far_a=final[3],
         far_b=final[4],
@@ -5832,6 +6001,20 @@ def _dual_tree_walk_mutual_flat(
         queue_overflow=final[11],
         peak_wavefront=final[12],
         rounds=final[13],
+        **(
+            dict(
+                far_parent=band_final[1],
+                near_parent=band_final[2],
+                band_a=band_final[3],
+                band_b=band_final[4],
+                band_parent=band_final[5],
+                band_accepted=band_final[6],
+                band_count=band_final[7],
+                band_overflow=band_final[8],
+            )
+            if banded
+            else {}
+        ),
     )
 
 
@@ -5858,6 +6041,8 @@ def dual_tree_walk_mutual(
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
     pair_discard: Optional[Callable[..., Array]] = None,
+    pair_band: Optional[Callable[..., Array]] = None,
+    band_cap: int = 0,
     backend: MutualWalkBackend = "flat",
     pallas_interpret: bool = False,
 ) -> MutualWalkResult:
@@ -5995,6 +6180,28 @@ def dual_tree_walk_mutual(
         Must be symmetric in ``a`` and ``b``. ``None`` (default) drops nothing
         and leaves the walk unchanged. Flat backend only. Static (a hashable
         callable).
+    pair_band:
+        Optional blend-band test, called once per round with the same arguments
+        as ``pair_accept`` on the pairs that survive ``pair_discard``. A live
+        pair where its mask holds is a BAND pair: it is emitted far if accepted
+        and is *also* opened -- refined, or emitted near for two leaves -- and it
+        is appended to a band list. Each queued pair carries the band-list slot
+        of its nearest band ancestor; the walk returns it for every emitted pair
+        (``far_parent``: the slot the far pair hangs from; ``near_parent``: that,
+        or the pair's own slot when it is a band pair) and for every band pair
+        (``band_parent``), with ``band_accepted`` saying which band pairs were
+        also emitted far. A caller that weights a band pair's far term by
+        ``sigma`` and everything below it by ``1 - sigma`` then gets every
+        emitted pair's weight as a product along this ancestry, without a second
+        walk: this is how a smooth acceptance rule blends the far and the
+        refined sum continuously (``yggdrax.applications.corrfunc.traced``).
+        Must be symmetric in ``a`` and ``b``. ``None`` (default) leaves the walk
+        and its result unchanged (the band fields stay ``None``). Flat backend
+        only. Static (a hashable callable).
+    band_cap:
+        Capacity of the band list; required (>= 1) with ``pair_band``. A walk
+        that needs more raises ``band_overflow`` and stops, like the other caps.
+        Static.
     backend:
         Which implementation walks. ``"flat"`` (default): the XLA wavefront loop
         described above. ``"pallas"``: the same walk with one Pallas launch per
@@ -6041,6 +6248,7 @@ def dual_tree_walk_mutual(
         interpret=bool(pallas_interpret),
         periodic=box_size is not None,
         pair_discard=pair_discard,
+        pair_band=pair_band,
     )
     if resolved == "flat":
         return _dual_tree_walk_mutual_flat(
@@ -6065,6 +6273,8 @@ def dual_tree_walk_mutual(
             pair_accept=pair_accept,
             pair_accept_data=pair_accept_data,
             pair_discard=pair_discard,
+            pair_band=pair_band,
+            band_cap=int(band_cap),
         )
     try:
         theta_value = float(theta)
@@ -6129,6 +6339,7 @@ def _resolve_mutual_walk_backend(
     interpret: bool,
     periodic: bool = False,
     pair_discard: Optional[Callable[..., Array]] = None,
+    pair_band: Optional[Callable[..., Array]] = None,
 ) -> str:
     """Resolve ``dual_tree_walk_mutual``'s ``backend`` to ``"flat"`` or ``"pallas"``.
 
@@ -6147,6 +6358,8 @@ def _resolve_mutual_walk_backend(
         Whether the walk has a ``box_size``; the kernel has no periodic guard.
     pair_discard
         The walk's ``pair_discard``; the kernel has no pruning hook.
+    pair_band
+        The walk's ``pair_band``; the kernel has no band list.
 
     Returns
     -------
@@ -6177,6 +6390,8 @@ def _resolve_mutual_walk_backend(
         )
     if pair_discard is not None:
         unsupported.append("a pair_discard callable (use backend='flat')")
+    if pair_band is not None:
+        unsupported.append("a pair_band callable (use backend='flat')")
     if periodic:
         unsupported.append(
             "a periodic box_size (the kernel has no minimum-image distance or "
