@@ -129,7 +129,10 @@ def _choose_pivots(
     inclusive = jnp.cumsum(weights[order])
     w_total = inclusive[-1]
     targets = jnp.arange(1, ndev, dtype=jnp.int64) * w_total
-    piv_idx = jnp.sum(inclusive[None, :] * jnp.int64(ndev) <= targets[:, None], axis=1)
+    # the number of samples with C * ndev <= target: ``inclusive`` is non-decreasing
+    # (weights are counts), so that is a binary search, not an
+    # (ndev - 1) x (ndev * num_samples) comparison (0.5 GB per device at 1024 GPUs)
+    piv_idx = jnp.searchsorted(inclusive * jnp.int64(ndev), targets, side="right")
     # every device empty: W = 0 puts every index past the end (all sentinels anyway)
     piv_idx = jnp.minimum(piv_idx, ndev * num_samples - 1)
     return _align_pivots(sorted_samples[piv_idx], align_level)

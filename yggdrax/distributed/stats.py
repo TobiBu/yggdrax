@@ -60,6 +60,7 @@ __all__ = [
     "PairAcceptance",
     "distributed_knn",
     "distributed_pair_counts",
+    "estimate_capacities",
     "exact_acceptance",
     "geometric_acceptance",
     "knn_shard",
@@ -130,6 +131,28 @@ class DistributedStatsConfig:
         safe under ``jax.grad`` too: it picks the native ragged all-to-all only
         on GPU/TPU with ``jax >=`` :data:`~yggdrax.distributed.comm.RAGGED_NATIVE_FIXED_JAX`,
         the release that also fixed the native op's reverse-pass side effect.
+    summary_exchange:
+        How the summary cells reach the senders. ``"neighbors"`` (default): each
+        device ships only the cells that can touch another device's domain, and
+        only to that device, with one ragged all-to-all; per-device memory and
+        traffic scale with the domain's surface, not with the device count.
+        ``"all_gather"``: every device gathers every other device's cells
+        (O(devices x cells) per device; the C1 path, kept as a reference). Both
+        give the same halo, hence the same result.
+    summary_coarse_depth:
+        ``"neighbors"`` only: each device publishes the ``2**depth`` nodes of its
+        tree ``depth`` levels below the root (``all_gather``-ed, O(devices x
+        2**depth) per device) to decide where its cells go.
+    summary_neighbors:
+        ``"neighbors"`` only: most devices one device sends its cells to.
+        Default all others. More destinations flag
+        ``summary_exchange_overflow``.
+    summary_send_capacity, summary_recv_capacity:
+        ``"neighbors"`` only: cell rows a device sends (summed over its
+        destinations) and receives (summed over its senders). Default
+        ``summary_neighbors * summary_capacity``, which cannot overflow but is
+        O(devices x cells) again; :meth:`for_problem` sizes them from the
+        surface.
     """
 
     capacity: int
@@ -150,6 +173,11 @@ class DistributedStatsConfig:
     num_samples: int = 64
     chunk: int = 256
     exchange: str = "auto"
+    summary_exchange: str = "neighbors"
+    summary_coarse_depth: int = 4
+    summary_neighbors: Optional[int] = None
+    summary_send_capacity: Optional[int] = None
+    summary_recv_capacity: Optional[int] = None
 
     def resolved(self) -> "DistributedStatsConfig":
         """Fill every ``None`` capacity from the others.
@@ -162,6 +190,15 @@ class DistributedStatsConfig:
         if self.exchange not in ("auto", "buf", "native"):
             raise ValueError(
                 f"exchange must be 'auto', 'buf' or 'native'; got {self.exchange!r}"
+            )
+        if self.summary_exchange not in ("neighbors", "all_gather"):
+            raise ValueError(
+                "summary_exchange must be 'neighbors' or 'all_gather'; got "
+                f"{self.summary_exchange!r}"
+            )
+        if not 0 <= int(self.summary_coarse_depth) <= 10:
+            raise ValueError(
+                f"summary_coarse_depth must be in [0, 10]; got {self.summary_coarse_depth}"
             )
         leaf_cap = self.leaf_capacity or self.capacity
         return replace(
@@ -222,6 +259,259 @@ class DistributedStatsConfig:
         )
         fields.update(overrides)
         return cls(**fields).resolved()
+
+    @classmethod
+    def for_box(
+        cls,
+        n_per_device: float,
+        *,
+        ndev: int,
+        box_size: BoxSize,
+        reach: float,
+        leaf_size: int = 16,
+        clustering: float = 2.0,
+        **kwargs: Any,
+    ) -> "DistributedStatsConfig":
+        """Capacities from the geometry of the problem (:func:`estimate_capacities`).
+
+        Parameters
+        ----------
+        n_per_device:
+            Mean particles per device.
+        ndev:
+            Devices in the mesh.
+        box_size:
+            Periodic box.
+        reach:
+            ``r_hi`` of the cut for ξ (:func:`soft_window_cutoffs`), ``r_max``
+            for kNN.
+        leaf_size:
+            Cell-tree leaf size.
+        clustering:
+            Safety factor on everything that grows with the local density (halo,
+            walk lists, exported cells): 1 for uniform points, about
+            ``1 + xi_bar(reach)`` for a clustered field.
+        **kwargs:
+            Model parameters of :func:`estimate_capacities`, then any config
+            field, set explicitly.
+
+        Returns
+        -------
+        DistributedStatsConfig
+            The resolved configuration.
+        """
+        model_keys = (
+            "leaf_fill",
+            "shape_factor",
+            "cell_reach_ratio",
+            "summary_max_leaves",
+            "summary_coarse_depth",
+            "num_samples",
+            "imbalance",
+        )
+        model = {k: kwargs.pop(k) for k in model_keys if k in kwargs}
+        est = estimate_capacities(
+            n_per_device,
+            ndev=ndev,
+            box_size=box_size,
+            reach=reach,
+            leaf_size=leaf_size,
+            clustering=clustering,
+            **model,
+        )
+        fields = dict(est["config"])
+        fields.update(kwargs)
+        return cls(**fields).resolved()
+
+
+def _pow2_ceil(x: float) -> int:
+    return 1 << max(0, int(math.ceil(math.log2(max(float(x), 1.0)))))
+
+
+def estimate_capacities(
+    n_per_device: float,
+    *,
+    ndev: int,
+    box_size: BoxSize,
+    reach: float,
+    leaf_size: int = 16,
+    clustering: float = 2.0,
+    leaf_fill: float = 0.25,
+    shape_factor: float = 1.3,
+    cell_reach_ratio: float = 0.5,
+    summary_max_leaves: Optional[int] = None,
+    summary_coarse_depth: int = 4,
+    num_samples: Optional[int] = None,
+    imbalance: Optional[float] = None,
+) -> dict:
+    """Every capacity of the pipeline from N, the box, the reach and the leaf size.
+
+    The model (``docs/distributed_statistics.md``, *Sizing*) treats a device's
+    domain as a cube of side ``l = (V / ndev)^(1/3)`` at the mean density
+    ``n = N / V``, and every quantity that grows with the local density is
+    multiplied by ``clustering``. It is calibrated on uniform points (CPU, up to
+    8 devices) and errs high; the per-device counters each run returns
+    (``halo``, ``near_pairs``, ``export_pairs``, ``sent``, ``summary_recv``,
+    ``leaves``, ``peak_wavefront``, ``export_wavefront``) are what to tighten it
+    with.
+
+    Parameters
+    ----------
+    n_per_device:
+        Mean particles per device.
+    ndev:
+        Devices.
+    box_size:
+        Periodic box (a float or per-axis tuple).
+    reach:
+        Halo reach: ``r_hi`` (ξ) or ``r_max`` (kNN).
+    leaf_size:
+        Cell-tree leaf size.
+    clustering:
+        Density safety factor (1 uniform; about ``1 + xi_bar(reach)``).
+    leaf_fill:
+        Mean leaf occupancy as a fraction of ``leaf_size``; 0.256 measured for
+        uniform points at leaf size 16.
+    shape_factor:
+        Surface of a Morton domain over that of a cube of the same volume.
+    cell_reach_ratio:
+        Target bounding radius of a summary cell, in units of ``reach``, when
+        ``summary_max_leaves`` is not given. Cells much smaller than the reach
+        multiply the export walk's (cell, leaf) pairs as ``(reach / R_cell)^3``;
+        larger ones thicken the halo by ``R_cell``.
+    summary_max_leaves:
+        Leaves per summary cell; default from ``cell_reach_ratio``.
+    summary_coarse_depth:
+        Depth of the published coarse cut (``2**depth`` balls per device).
+    num_samples:
+        Partition samples per device. Default ``16 sqrt(ndev)`` (a power of two,
+        64 to 4096): the domain-size error of the sample sort is about
+        ``0.41 sqrt(ndev) / num_samples`` of a domain, one sigma.
+    imbalance:
+        Partition capacity over the mean; default 4 sigma of that error plus 2 %.
+
+    Returns
+    -------
+    dict
+        ``config`` (keyword arguments of :class:`DistributedStatsConfig`) and
+        ``model`` (the intermediate lengths and fractions, for the record).
+    """
+    ndev = int(ndev)
+    box = normalize_box_size(box_size, 3)
+    if box is None:
+        raise ValueError("estimate_capacities needs a periodic box")
+    n_per = float(n_per_device)
+    vol = float(np.prod(box))
+    nbar = n_per * ndev / vol
+    v_dom = vol / ndev
+    ell = v_dom ** (1.0 / 3.0)
+    c = float(clustering)
+    root3_2 = math.sqrt(3.0) / 2.0
+    fourpi3 = 4.0 * math.pi / 3.0
+
+    s = int(num_samples or min(4096, max(64, _pow2_ceil(16.0 * math.sqrt(ndev)))))
+    sigma = 0.41 * math.sqrt(ndev) / s
+    imb = float(imbalance or (1.0 + 4.0 * sigma + 0.02))
+    capacity = max(leaf_size, int(math.ceil(imb * n_per)))
+
+    m_leaf = max(1.0, leaf_fill * leaf_size)  # particles per leaf
+    v_leaf = m_leaf / nbar
+    r_leaf = root3_2 * v_leaf ** (1.0 / 3.0)
+    if summary_max_leaves is None:
+        want = (cell_reach_ratio * reach / root3_2) ** 3 / v_leaf
+        summary_max_leaves = int(
+            min(1 << 16, max(4, 1 << max(0, int(round(math.log2(max(want, 1.0)))))))
+        )
+    m_cell = int(summary_max_leaves)
+    r_cell = root3_2 * (m_cell * v_leaf) ** (1.0 / 3.0)
+
+    def shell(h):
+        """Volume of a domain grown by ``h``, minus the domain (Minkowski sum)."""
+        return (
+            shape_factor * (6.0 * ell * ell * h + 3.0 * math.pi * ell * h * h)
+            + fourpi3 * h**3
+        )
+
+    # halo: particles of other domains within reach of a leaf of a cell of mine
+    h_halo = reach + r_cell + r_leaf
+    halo_frac = 0.0 if ndev == 1 else min(c * shell(h_halo) / v_dom, ndev - 1.0)
+    halo = max(leaf_size, int(math.ceil(halo_frac * n_per)))
+
+    leaf_cap = int(math.ceil(1.2 * capacity / m_leaf)) + 8
+    halo_leaf_cap = int(math.ceil(1.2 * (capacity + halo) / m_leaf)) + 8
+    summary_cap = int(math.ceil(2.0 * leaf_cap / m_cell)) + 16
+
+    # summary exchange: a cell goes to a device when its centre is within
+    # R_cell + reach + (largest leaf radius) of that device's coarse boxes
+    h_sum = reach + 2.0 * r_cell + 2.0 * r_leaf
+    # domains a domain grown by h_sum overlaps: the 3 x 3 x 3 stencil of a cubic
+    # lattice for h_sum < l, (2 ceil(h/l) + 1)^3 in general; Morton domains are
+    # ragged, hence 1.5x
+    grid = 2 * math.ceil(h_sum / ell) + 1
+    neighbors = max(1, min(ndev - 1, int(math.ceil(1.5 * (grid**3 - 1)))))
+    cell_rows = summary_cap * c * shell(h_sum) / v_dom
+    rows = max(16, min(neighbors * summary_cap, int(math.ceil(1.5 * cell_rows))))
+
+    # the walk over [local ; halo]: an owned leaf pairs with the leaves whose
+    # sphere gap is below the reach; the walk emits each unordered pair once,
+    # 0.59-0.69 of ``leaves * nu`` measured (uniform, 1-8 devices)
+    leaves_own = capacity / m_leaf
+    nu = nbar * fourpi3 * (reach + r_leaf) ** 3 / m_leaf
+    near = max(1 << 12, int(math.ceil(0.75 * c * leaves_own * nu)))
+
+    # export: a shipped leaf is named by every receiver cell within reach of it
+    halo_leaves = halo / m_leaf
+    refs = (1.0 + reach / r_cell) ** 3
+    export_near = max(1 << 12, int(math.ceil(c * refs * halo_leaves)))
+    send_leaf = max(1 << 10, int(math.ceil(2.0 * halo_leaves)))
+
+    config = dict(
+        capacity=capacity,
+        halo_capacity=halo,
+        leaf_size=int(leaf_size),
+        leaf_capacity=leaf_cap,
+        halo_leaf_capacity=halo_leaf_cap,
+        summary_max_leaves=m_cell,
+        summary_capacity=summary_cap,
+        summary_coarse_depth=int(summary_coarse_depth),
+        summary_neighbors=neighbors,
+        summary_send_capacity=rows,
+        summary_recv_capacity=rows,
+        export_queue=rows + export_near,
+        export_near_cap=export_near,
+        send_leaf_capacity=send_leaf,
+        send_capacity=int(math.ceil(1.5 * halo)),
+        max_pair_queue=near,
+        near_cap=near,
+        far_cap=1 << 12,
+        num_samples=s,
+    )
+    # every capacity is an index range (INDEX_DTYPE, int32 by default)
+    limit = int(jnp.iinfo(INDEX_DTYPE).max)
+    clamped = sorted(k for k, v in config.items() if isinstance(v, int) and v > limit)
+    for k in clamped:
+        config[k] = limit
+    model = dict(
+        clamped=clamped,
+        n_per_device=n_per,
+        ndev=ndev,
+        box=list(box),
+        reach=float(reach),
+        density=nbar,
+        domain_side=ell,
+        clustering=c,
+        leaf_particles=m_leaf,
+        leaf_radius=r_leaf,
+        cell_radius=r_cell,
+        halo_shell=h_halo,
+        halo_fraction=halo_frac,
+        summary_shell=h_sum,
+        partition_sigma=sigma,
+        imbalance=imb,
+        neighbor_leaves=nu,
+        export_refs_per_leaf=refs,
+    )
+    return dict(config=config, model=model)
 
 
 class PairAcceptance(NamedTuple):
@@ -433,6 +723,7 @@ class _Tree(NamedTuple):
     active: Array  # (nodes,) non-empty
     center: Array  # (nodes, 3)
     radius: Array  # (nodes,) bounding radius about ``center``
+    half: Array  # (nodes, 3) half-extents of the particle box about ``center``
     parent: Array
     num_internal: int
     overflow: Array
@@ -469,10 +760,16 @@ def _cell_tree(pos, num_valid, box, bounds, leaf_size: int, leaf_capacity: int):
         active=ranges[:, 1] >= ranges[:, 0],
         center=jnp.asarray(geom.center),
         radius=jnp.asarray(geom.radius, pos.dtype),
+        half=jnp.asarray(geom.half_extent, pos.dtype),
         parent=jnp.asarray(tree.parent, idx),
         num_internal=ni,
         overflow=jnp.asarray(overflow, bool),
     )
+
+
+def _live_leaves(t: _Tree) -> Array:
+    """Non-empty leaves of a cell tree (what ``leaf_capacity`` must cover)."""
+    return jnp.sum(t.active[t.num_internal :].astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
 
 
 def _node_sums(t: _Tree, values_sorted: Array) -> Array:
@@ -588,6 +885,219 @@ class _Halo(NamedTuple):
     diag: dict
 
 
+#: Relative slack on the neighbour tests. They decide which cells a sender gets;
+#: a cell kept by slack is pruned by the export walk itself, so slack costs a few
+#: rows and never changes the halo. It absorbs the rounding difference between
+#: these tests and the walk's own disjointness test (a few ulps in float32).
+_NEIGHBOR_SLACK = 1e-5
+
+
+def _coarse_cut(t: _Tree, depth: int) -> Array:
+    """The live nodes ``depth`` levels below the root, ``(2**depth,)``, ``-1``-padded.
+
+    A leaf above that depth stands for itself. The result is a cut: every live
+    leaf has exactly one ancestor-or-self in it.
+    """
+    nodes = jnp.reshape(t.root, (1,)).astype(INDEX_DTYPE)
+    none = as_index(-1)
+    for _ in range(int(depth)):
+        live = nodes >= 0
+        safe = jnp.where(live, nodes, 0)
+        lc, rc = t.left[safe], t.right[safe]
+        split = live & (lc >= 0)
+        a = jnp.where(split, lc, nodes)
+        b = jnp.where(split, rc, none)
+        nodes = jnp.stack([a, b], axis=1).reshape(-1)
+    safe = jnp.where(nodes >= 0, nodes, 0)
+    return jnp.where((nodes >= 0) & t.active[safe], nodes, none)
+
+
+class _Cells(NamedTuple):
+    """The summary cells a device received (the ``"neighbors"`` exchange)."""
+
+    center: Array  # (R, 3)
+    radius: Array  # (R,) bounding radius + reach
+    live: Array  # (R,)
+    owner: Array  # (R,) the device the cell belongs to
+    diag: dict
+
+
+def _reaches_box(p, r, c, half, box, tol) -> Array:
+    """Is point ``p`` within ``r`` of the axis-aligned box ``c +- half``?
+
+    Minimum image per axis, which is the exact periodic point-to-box distance
+    (over every image of the box). Broadcasts; spelled per axis so that XLA fuses
+    it into one elementwise pass. ``tol`` is an absolute slack for rounding.
+    """
+    d2 = None
+    for ax in range(3):
+        dx = p[..., ax] - c[..., ax]
+        if box is not None:
+            dx = dx - box[ax] * jnp.round(dx / box[ax])
+        gap = jnp.maximum(jnp.abs(dx) - half[..., ax], 0.0)
+        d2 = gap * gap if d2 is None else d2 + gap * gap
+    s = r * (1.0 + _NEIGHBOR_SLACK) + tol
+    assert d2 is not None
+    return d2 <= s * s
+
+
+def _neighbor_cells(t: _Tree, cut, c_center, c_radius, live_cell, ndev, box, cfg):
+    """Ship each summary cell only to the devices it can touch (static shapes).
+
+    The export walk on sender ``i`` emits (cell ``c`` of receiver ``j``, leaf
+    ``l`` of ``i``) only if the two balls intersect: ``c`` is a ball of radius
+    ``R_c + reach_c`` and ``l`` the circumsphere of its bounding box, of radius
+    ``r_l``, centred inside that box. Every leaf lies under one node of a CUT of
+    ``i``'s tree (:func:`_coarse_cut`, ``2**summary_coarse_depth`` nodes), so its
+    sphere lies inside that node's particle box grown by the node's largest leaf
+    radius. If ``c``'s centre is farther than ``R_c + reach_c + max r_l`` from
+    every such box (minimum image), the walk emits nothing for ``c``: ``i`` does
+    not need it. Each device publishes its cut as boxes plus leaf radii, and
+
+    1. picks its destinations: devices with a box within reach of one of its
+       own coarse BOUNDING balls, which contain every inflated cell
+       (``B x ndev x B`` tests);
+    2. per destination, sends the cells within reach of that device's boxes
+       (``S x B`` tests each, a loop over destinations);
+    3. ships them with one ragged all-to-all (cells are topology: no gradient).
+
+    The receiver's export walk then sees a subset of the cells it used to see,
+    containing every cell that could produce a pair, so the halo is unchanged.
+    Boxes, unlike the coarse nodes' spheres, do not overhang the domain by a
+    fraction of a coarse node, which at hundreds of devices is far more than the
+    reach.
+    """
+    S = int(cut.cells.shape[0])
+    depth = int(cfg.summary_coarse_depth)
+    dtype = c_center.dtype
+    me = jax.lax.axis_index(AXIS_NAME)
+    boxa = None if box is None else tuple(float(b) for b in box)
+    # absolute rounding slack: a few ulps of the coordinates' magnitude
+    if boxa is not None:
+        scale = max(boxa)
+    else:  # live nodes only: a padded node's centre is not a coordinate
+        scale = jnp.max(jnp.where(t.active[:, None], jnp.abs(t.center), 0.0))
+    tol = 16.0 * float(jnp.finfo(dtype).eps) * scale
+
+    # -- this device's cut as particle boxes + largest leaf radius below each
+    co = _coarse_cut(t, depth)
+    B = int(co.shape[0])
+    co_live = co >= 0
+    co_safe = jnp.where(co_live, co, 0)
+    co_center = jax.lax.stop_gradient(t.center[co_safe])
+    co_half = jnp.where(co_live[:, None], t.half[co_safe], 0.0)
+    big = as_index(int(t.ranges.shape[0]) * 4 + 4)
+    co_start = jnp.where(co_live, t.ranges[co_safe, 0], big)
+    co_order = jnp.argsort(co_start)
+    co_sorted = co_start[co_order]
+    n_co = jnp.sum(co_live.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+
+    def home_of(start, live):
+        """The coarse node whose slot range holds ``start`` (``B`` when dead)."""
+        k = jnp.searchsorted(co_sorted, start, side="right") - 1
+        k = co_order[jnp.clip(k, 0, jnp.maximum(n_co - 1, 0))]
+        return jnp.where(live, k, B)
+
+    ni = t.num_internal
+    leaf_live = t.active[ni:]
+    leaf_home = home_of(t.ranges[ni:, 0], leaf_live)
+    co_rl = jax.ops.segment_max(
+        jnp.where(leaf_live, t.radius[ni:], 0.0), leaf_home, num_segments=B + 1
+    )[:B]
+    co_rl = jnp.where(co_live, jnp.maximum(co_rl, 0.0), 0.0)
+    all_co_center = jax.lax.all_gather(co_center, AXIS_NAME, tiled=False)
+    all_co_half = jax.lax.all_gather(co_half, AXIS_NAME, tiled=False)
+    all_co_rl = jax.lax.all_gather(co_rl, AXIS_NAME, tiled=False)
+    all_co_live = jax.lax.all_gather(co_live, AXIS_NAME, tiled=False)
+
+    # -- bounding balls of my inflated cells, one per coarse node: a cell joins the
+    # coarse node whose slot range holds its first slot (any assignment would be
+    # a valid bound; this one is tight)
+    cell_start = t.ranges[jnp.where(live_cell, cut.cells, 0), 0]
+    home = home_of(cell_start, live_cell)
+    off = c_center - co_center[jnp.where(live_cell, home, 0)]
+    reach_ball = jnp.sqrt(jnp.sum(off * off, axis=-1)) + c_radius
+    bound = jax.ops.segment_max(
+        jnp.where(live_cell, reach_ball, -1.0), home, num_segments=B + 1
+    )[:B]
+    bound_live = co_live & (bound >= 0.0)
+
+    # -- destinations: B x ndev x B ball-to-box tests
+    touch = _reaches_box(
+        co_center[:, None, None, :],
+        bound[:, None, None] + all_co_rl[None],
+        all_co_center[None],
+        all_co_half[None],
+        boxa,
+        tol,
+    )
+    touch = touch & bound_live[:, None, None] & all_co_live[None]
+    dest_mask = jnp.any(touch, axis=(0, 2)) & (jnp.arange(ndev) != me)
+    K = max(1, min(ndev - 1, int(cfg.summary_neighbors or ndev - 1)))
+    n_dest = jnp.sum(dest_mask.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    dests = jnp.flatnonzero(dest_mask, size=K, fill_value=ndev).astype(INDEX_DTYPE)
+
+    # -- per destination, the cells that touch its cut; rows grouped by
+    # destination in device order (the ragged exchange's layout)
+    Cs = int(cfg.summary_send_capacity or K * S)
+    R = int(cfg.summary_recv_capacity or K * S)
+    rows = jnp.concatenate([c_center, c_radius[:, None]], axis=1)
+    rows = jax.lax.stop_gradient(rows)
+
+    def per_dest(i, state):
+        buf, sizes, used = state
+        d = dests[i]
+        valid = d < ndev
+        ds = jnp.where(valid, d, 0)
+        hit = jnp.zeros((S,), bool)
+        for b in range(B):  # B is small and static: one fused pass over the cells
+            hit = hit | (
+                all_co_live[ds, b]
+                & _reaches_box(
+                    c_center,
+                    c_radius + all_co_rl[ds, b],
+                    all_co_center[ds, b],
+                    all_co_half[ds, b],
+                    boxa,
+                    tol,
+                )
+            )
+        hit = hit & live_cell & valid
+        cnt = jnp.sum(hit.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        slot = used + jnp.cumsum(hit.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
+        buf = buf.at[jnp.where(hit, slot, as_index(Cs))].set(rows, mode="drop")
+        sizes = sizes.at[ds].add(jnp.where(valid, cnt, 0))
+        return buf, sizes, used + cnt
+
+    n_loop = jnp.minimum(n_dest, as_index(K))
+    buf0 = jnp.zeros((Cs, 4), dtype)
+    sizes0 = jnp.zeros((ndev,), INDEX_DTYPE)
+    buf, send_sizes, n_sent = jax.lax.fori_loop(
+        as_index(0), n_loop, per_dest, (buf0, sizes0, as_index(0))
+    )
+    recv, recv_sizes, _ = ragged_all_to_all_exchange(
+        buf, send_sizes, output_capacity=R, method=cfg.exchange
+    )
+    n_recv = jnp.sum(recv_sizes).astype(INDEX_DTYPE)
+    r = jnp.arange(R, dtype=INDEX_DTYPE)
+    live = r < jnp.minimum(n_recv, as_index(R))
+    ends = jnp.cumsum(recv_sizes.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    owner = jnp.clip(jnp.searchsorted(ends, r, side="right"), 0, ndev - 1)
+    overflow = (n_dest > as_index(K)) | (n_sent > as_index(Cs)) | (n_recv > as_index(R))
+    return _Cells(
+        center=recv[:, :3],
+        radius=jnp.where(live, recv[:, 3], 0.0),
+        live=live,
+        owner=owner.astype(INDEX_DTYPE),
+        diag=dict(
+            summary_exchange_overflow=overflow,
+            summary_sent=n_sent,
+            summary_recv=n_recv,
+            summary_dests=n_dest,
+        ),
+    )
+
+
 def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg):
     """Summary, export walk, send buffers and the halo exchange of one device.
 
@@ -612,9 +1122,6 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
     reach = cell_reach(cut) if callable(cell_reach) else cell_reach
     c_center = t.center[safe]
     c_radius = jnp.where(live_cell, t.radius[safe] + reach, 0.0)
-    all_center = jax.lax.all_gather(c_center, AXIS_NAME, tiled=False)
-    all_radius = jax.lax.all_gather(c_radius, AXIS_NAME, tiled=False)
-    all_live = jax.lax.all_gather(live_cell, AXIS_NAME, tiled=False)
 
     walk_fn = functools.partial(
         dual_tree_walk_mutual,
@@ -622,30 +1129,71 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
         pair_accept=_never,
         pair_discard=_disjoint,
     )
-    ex = export_walk(
-        t.left,
-        t.right,
-        t.center,
-        t.radius,
-        t.root,
-        all_center,
-        all_radius,
-        all_live,
-        0.0,
-        me,
+    walk_kw: dict[str, Any] = dict(
         max_pair_queue=int(cfg.export_queue),
         far_cap=8,
         near_cap=int(cfg.export_near_cap),
         node_active=t.active,
         walk_fn=walk_fn,
     )
+    n_cells = jnp.sum(live_cell.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    if cfg.summary_exchange == "all_gather" or ndev == 1:
+        # every device's cells, everywhere: O(ndev x S) per device
+        all_center = jax.lax.all_gather(c_center, AXIS_NAME, tiled=False)
+        all_radius = jax.lax.all_gather(c_radius, AXIS_NAME, tiled=False)
+        all_live = jax.lax.all_gather(live_cell, AXIS_NAME, tiled=False)
+        ex = export_walk(
+            t.left,
+            t.right,
+            t.center,
+            t.radius,
+            t.root,
+            all_center,
+            all_radius,
+            all_live,
+            0.0,
+            me,
+            **walk_kw,
+        )
+        near_dest, dest_block = ex.near_cell, S
+        sx = dict(
+            summary_exchange_overflow=jnp.asarray(False),
+            summary_sent=jnp.asarray(0, INDEX_DTYPE),
+            summary_recv=(jax.lax.psum(n_cells, AXIS_NAME) - n_cells).astype(
+                INDEX_DTYPE
+            ),
+            summary_dests=jnp.asarray(ndev - 1, INDEX_DTYPE),
+        )
+    else:
+        nb = _neighbor_cells(t, cut, c_center, c_radius, live_cell, ndev, box, cfg)
+        # the received cells are one block of one pseudo-device; ``my_device = 1``
+        # names no row of it, so nothing is masked (none of them is mine)
+        ex = export_walk(
+            t.left,
+            t.right,
+            t.center,
+            t.radius,
+            t.root,
+            nb.center[None],
+            nb.radius[None],
+            nb.live[None],
+            0.0,
+            as_index(1),
+            **walk_kw,
+        )
+        has = ex.near_cell >= 0
+        # route by the cell's owner: ``build_send_buffers`` with one cell per
+        # "block" reads the destination straight off the cell index
+        near_dest = jnp.where(has, nb.owner[jnp.where(has, ex.near_cell, 0)], -1)
+        dest_block = 1
+        sx = nb.diag
     num_nodes = int(t.ranges.shape[0])
     sb = build_send_buffers(
-        ex.near_cell,
+        near_dest,
         ex.near_node,
         ex.near_count,
         ndev=ndev,
-        max_cells=S,
+        max_cells=dest_block,
         num_nodes=num_nodes,
         node_capacity=int(cfg.send_leaf_capacity),
         csr_capacity=int(cfg.export_near_cap),
@@ -704,7 +1252,14 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
         halo_overflow=halo_overflow,
         halo_count=n_halo,
         export_count=ex.near_count,
+        export_wavefront=(
+            ex.peak_wavefront
+            if ex.peak_wavefront is not None
+            else jnp.asarray(-1, INDEX_DTYPE)
+        ),
         send_count=total,
+        summary_cells=n_cells,
+        **sx,
     )
     return _Halo(
         pos=jnp.where(live[:, None], recv[:, :3], 0.0),
@@ -746,15 +1301,19 @@ def _any(x: Array) -> Array:
     return jax.lax.psum(jnp.asarray(x, jnp.int32), AXIS_NAME) > 0
 
 
-def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays):
+def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays, live=None):
     """``acc + sum fn(chunk of arrays)`` over ``n_items`` rows, ``chunk`` at a time.
 
     ``fn`` is rematerialised (``jax.checkpoint``) in the reverse pass: a chunk's
     residuals are its integer inputs, not its ``(chunk, leaf, leaf, nbins)``
     intermediates, so a gradient stores O(rows) rather than O(pairs x bins). The
     forward is unchanged.
+
+    ``live`` (``(n_items,)`` bool) marks the rows that can contribute; a chunk
+    with none is skipped by a ``lax.cond`` (``fn`` must give zero on such rows).
+    The lists are capacity-padded, so this makes the cost follow the live pairs,
+    not the capacity. ``cond`` differentiates, so the gradient skips them too.
     """
-    fn = jax.checkpoint(fn, prevent_cse=False)
     chunk = max(1, min(int(chunk), max(n_items, 1)))
     n_chunks = -(-n_items // chunk)
     pad = n_chunks * chunk - n_items
@@ -766,11 +1325,29 @@ def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays):
         return a.reshape((n_chunks, chunk) + a.shape[1:])
 
     xs = tuple(prep(a) for a in arrays)
+    if live is None:
+        step = jax.checkpoint(fn, prevent_cse=False)
 
-    def body(acc, x):
-        return acc + fn(*x), None
+        def body(acc, x):
+            return acc + step(*x), None
 
-    out, _ = jax.lax.scan(body, acc0, xs)
+        out, _ = jax.lax.scan(body, acc0, xs)
+        return out
+
+    any_live = jnp.any(prep(jnp.asarray(live, bool)), axis=1)
+
+    # the checkpoint wraps the cond, not the other way round: a cond's partial
+    # evaluation keeps the residuals of its branches, which would store every
+    # chunk's windows again (290 MB against 28 MB measured)
+    @functools.partial(jax.checkpoint, prevent_cse=False)
+    def step_skip(go, *args):
+        return jax.lax.cond(go, lambda a: fn(*a), lambda a: jnp.zeros_like(acc0), args)
+
+    def body_skip(acc, x):
+        go, args = x
+        return acc + step_skip(go, *args), None
+
+    out, _ = jax.lax.scan(body_skip, acc0, (any_live, xs))
     return out
 
 
@@ -997,6 +1574,7 @@ def _pair_counts_body(
         zero,
         leaf_ids,
         leaf_ok,
+        live=leaf_ok,
     )
     near_ok = walk.near_a >= 0
     near = _scan_chunks(
@@ -1007,6 +1585,7 @@ def _pair_counts_body(
         jnp.where(near_ok, walk.near_a - ni, 0),
         jnp.where(near_ok, walk.near_b - ni, 0),
         near_ok,
+        live=near_ok,
     )
 
     # far pairs: closed-form monopole of the ownership weights at the centroids
@@ -1034,6 +1613,7 @@ def _pair_counts_body(
         partition_overflow=_any(part_over),
         leaf_overflow=_any(t_loc.overflow | t.overflow),
         summary_overflow=_any(halo.diag["summary_overflow"]),
+        summary_exchange_overflow=_any(halo.diag["summary_exchange_overflow"]),
         export_overflow=_any(halo.diag["export_overflow"]),
         send_overflow=_any(halo.diag["send_overflow"]),
         halo_overflow=_any(halo.diag["halo_overflow"]),
@@ -1044,7 +1624,14 @@ def _pair_counts_body(
         particles=p_count[None],
         halo=halo.diag["halo_count"][None],
         export_pairs=halo.diag["export_count"][None],
+        export_wavefront=halo.diag["export_wavefront"][None],
         sent=halo.diag["send_count"][None],
+        summary_cells=halo.diag["summary_cells"][None],
+        summary_sent=halo.diag["summary_sent"][None],
+        summary_recv=halo.diag["summary_recv"][None],
+        summary_dests=halo.diag["summary_dests"][None],
+        leaves_local=_live_leaves(t_loc)[None],
+        leaves=_live_leaves(t)[None],
         near_pairs=walk.near_count[None],
         far_pairs=walk.far_count[None],
         peak_wavefront=walk.peak_wavefront[None],
@@ -1565,6 +2152,7 @@ def _knn_body(
         partition_overflow=_any(part_over),
         leaf_overflow=_any(t_loc.overflow | t.overflow),
         summary_overflow=_any(halo.diag["summary_overflow"]),
+        summary_exchange_overflow=_any(halo.diag["summary_exchange_overflow"]),
         export_overflow=_any(halo.diag["export_overflow"]),
         send_overflow=_any(halo.diag["send_overflow"]),
         halo_overflow=_any(halo.diag["halo_overflow"]),
@@ -1577,7 +2165,14 @@ def _knn_body(
         particles=p_count[None],
         halo=halo.diag["halo_count"][None],
         export_pairs=halo.diag["export_count"][None],
+        export_wavefront=halo.diag["export_wavefront"][None],
         sent=halo.diag["send_count"][None],
+        summary_cells=halo.diag["summary_cells"][None],
+        summary_sent=halo.diag["summary_sent"][None],
+        summary_recv=halo.diag["summary_recv"][None],
+        summary_dests=halo.diag["summary_dests"][None],
+        leaves_local=_live_leaves(t_loc)[None],
+        leaves=_live_leaves(t)[None],
         near_pairs=walk.near_count[None],
         peak_wavefront=walk.peak_wavefront[None],
     )

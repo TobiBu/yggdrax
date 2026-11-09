@@ -1,4 +1,4 @@
-# Distributed clustering statistics (C1, C2)
+# Distributed clustering statistics (C1, C2, C3)
 
 `yggdrax.distributed.stats` computes two clustering statistics on particles
 sharded across devices in a periodic box `[0, L)^3`:
@@ -25,9 +25,12 @@ input shard (any rows) ──wrap──► sfc_partition ──► local shard (
                                                         │
                     local cell tree (build_static_cells_tree, box_size=L, num_valid=count)
                                                         │
-              summary cells (occupancy_cut): centre, radius + REACH ──all_gather──► every device
+              summary cells (occupancy_cut): centre, radius + REACH
                                                         │
-  export walk: my tree vs every other device's cells (min-image; prune disjoint spheres;
+      coarse boxes (2^depth per device) ──all_gather──► destinations of my cells
+      each cell ──ragged_all_to_all──► only the devices whose boxes it can reach
+                                                        │
+  export walk: my tree vs the cells I received (min-image; prune disjoint spheres;
                 never accept far) ──► (cell, my leaf) near list
                                                         │
   build_send_buffers (one copy of each leaf per destination) ─► expand leaves to particles
@@ -53,11 +56,12 @@ Step by step:
    of at most `summary_max_leaves` leaves). A cell is published as a ball: its
    bounding centre, and its bounding radius **plus the cell's reach**. The reach
    is how far from the cell a remote particle can matter. For ξ it is `r_hi`, the
-   upper cut of the binned range. For kNN it is a per-cell bound (below). The
-   balls of all devices are `all_gather`ed: O(cells) per device, not O(N).
+   upper cut of the binned range. For kNN it is a per-cell bound (below). Each
+   cell goes only to the devices that could need it (*The summary exchange*,
+   below): O(domain surface) per device, independent of the device count.
 3. **Export walk (sender push).** Each device walks its own full tree against
-   every other device's balls (`export_walk`, one `dual_tree_walk_mutual` over
-   `[all cells ; my nodes]`). The walk never accepts a far pair. It prunes a
+   the balls it received (`export_walk`, one `dual_tree_walk_mutual` over
+   `[received cells ; my nodes]`). The walk never accepts a far pair. It prunes a
    (cell, node) pair when the two spheres are disjoint under the minimum image,
    `d > R_cell + reach + r_node`. Every surviving (cell, leaf) pair is a leaf the
    receiver needs. A device never exports to itself.
@@ -78,6 +82,99 @@ Step by step:
 6. **Reduce.** ξ: per-bin partial sums are `psum`med. kNN: distances stay
    sharded with their global ids, and a CDF reduction on a radius grid is
    `psum`med.
+
+## The summary exchange (C3)
+
+C1 `all_gather`ed every device's summary cells to every device. That costs
+O(devices × cells) memory and traffic per device, and the export walk is seeded
+with every one of those cells. At 2048³ particles on 128 GPUs that is about 1.4e9
+rows, 65 GB per device; at 1024 GPUs, 540 GB. `summary_exchange="neighbors"`
+(the default) replaces it. `"all_gather"` stays available as the reference.
+
+**Which cells a device needs.** Sender `i`'s export walk emits a pair
+(cell `c` of receiver `j`, leaf `l` of `i`) only if the two balls intersect:
+
+- `c` is a ball of radius `R_c + reach_c`;
+- `l` is its leaf sphere, the circumsphere of its particle box, centred inside
+  that box.
+
+Every leaf of `i` lies under exactly one node of a cut of `i`'s tree (the
+`2^depth` nodes `depth` levels below the root, `summary_coarse_depth`, default
+4). So its sphere lies inside that node's particle box, grown by the node's
+largest leaf radius `ρ`. If `c`'s centre is farther than `R_c + reach_c + ρ`
+from every such box under the minimum image, the walk emits nothing for `c`,
+and `i` does not need `c`. The per-axis minimum image gives the exact periodic
+point-to-box distance over all images, so the test is exact across faces too.
+
+**What crosses the network.**
+
+1. Each device `all_gather`s its cut: per node, the particle box, the largest
+   leaf radius and a live flag. That is 7 floats per node, `ndev × 2^depth` per
+   device: 0.5 MB at 1024 GPUs.
+2. Each device picks its destinations. It bounds its own inflated cells by one
+   ball per coarse node: the coarse centre, with radius `max(|c − centre| +
+   R_c + reach_c)` over the cells homed there. A device is a destination when
+   one of these balls reaches one of its boxes (`B × ndev × B` tests). At most
+   `summary_neighbors` destinations are allowed, in device order.
+3. For each destination it selects the cells within reach of that device's
+   boxes (`S × B` tests per destination, a loop over destinations), groups the
+   rows by destination, and ships them with one `ragged_all_to_all`
+   (`summary_send_capacity` / `summary_recv_capacity` rows).
+4. The receiver runs the export walk over the cells it received, as one block,
+   and routes each emitted pair to the cell's owner.
+
+Cells are topology: they come from `stop_gradient` positions, and the exchange
+is outside every gradient path.
+
+**Identical results.** The receiver sees a subset of the cells it saw before.
+That subset contains every cell that could produce a pair, so the export lists,
+the send buffers and the halo are the same sets. Both rules carry a relative
+slack of 1e-5 and an absolute slack of 16 ulps of the box: they keep a few
+extra cells, which the walk then prunes, and never drop a needed one. The tests
+(`tests/distributed/test_distributed_stats_exchange.py`, 1, 2, 4 and 8 fake
+devices) assert this. Per-device halo, send, partition and near-pair counts are
+equal, and ξ counts, kNN distances and ξ gradients are **bit-identical** between
+the two exchanges. The point sets are:
+
+- faces and corners;
+- clustered;
+- a "line" of points, whose Morton domains are x-slabs. There each device talks
+  to exactly 2 others: slab 0 and slab `ndev − 1` through the periodic face, and
+  1 other for the end slabs without the box.
+
+`summary_exchange_overflow` fires when there are more destinations than
+`summary_neighbors`, or more rows than either capacity.
+
+**Memory per device.** A cell row costs about 50 B in float32. That covers the
+row in the gathered or received arrays plus the export walk's per-node arrays
+and seed. Measured on fake CPU devices, uniform, 16384 per device, ξ reach 3.4
+mean spacings, float64, sized by `for_box`
+(`bench/distributed/summary_memory.py`):
+
+| devices | all_gather: rows held | live rows received | neighbors: rows held | live rows received | destinations |
+|---|---|---|---|---|---|
+| 1 | 2 590 | 0 | 2 590 | 0 | 0 |
+| 2 | 5 232 | 553 | 2 616 | 547 | 1 |
+| 4 | 10 612 | 3 798 | 7 959 | 2 663 | 3 |
+| 8 | 21 640 | 7 212 | 18 935 | 2 890 | 7 |
+
+At this size every domain touches every other, so the gain only shows in the
+live rows. The capacity is the destination count × cells until the model's
+surface estimate is smaller. The model below, for the flagship's weak series
+(6.7e7 particles per device, 3.4 spacings, clustering 2, float32), gives the
+rows each device allocates:
+
+| devices | cells per device | all_gather | GB | neighbors | GB | ratio |
+|---|---|---|---|---|---|---|
+| 4 | 1.08e7 | 4.3e7 | 2.0 | 6.8e6 | 0.42 | 6 |
+| 16 | 1.13e7 | 1.8e8 | 8.4 | 7.1e6 | 0.44 | 25 |
+| 64 | 1.13e7 | 7.2e8 | 33.7 | 7.1e6 | 0.44 | 102 |
+| 128 | 1.10e7 | 1.4e9 | 65.6 | 6.9e6 | 0.43 | 203 |
+| 1024 | 1.13e7 | 1.2e10 | 539 | 7.1e6 | 0.44 | 1625 |
+
+The neighbours path is flat in the device count: a device receives the cells of
+a shell around its domain. The cost is CPU work: `S × B` box tests per
+destination (about 7e9 at the flagship size, with up to 39 destinations).
 
 ## Payload 1: soft binned pair counts
 
@@ -212,6 +309,106 @@ retry with larger capacities. `DistributedStatsConfig.for_problem` gives
 generous defaults from the per-device particle count. The counters (`halo_count`,
 `near_count`, ...) come back per device, so a caller can tighten them after a
 probe run.
+
+New capacities of the neighbour exchange:
+
+| capacity | what overflows | flag |
+|---|---|---|
+| `summary_neighbors` | devices one device sends cells to | `summary_exchange_overflow` |
+| `summary_send_capacity`, `summary_recv_capacity` | cell rows sent / received | `summary_exchange_overflow` |
+
+## Sizing (C3)
+
+`DistributedStatsConfig.for_box(n_per_device, ndev=, box_size=, reach=,
+leaf_size=, clustering=)` derives every capacity from the problem's geometry
+(`estimate_capacities` returns the same numbers plus the model's intermediate
+lengths). `reach` is `r_hi` for ξ and `r_max` for kNN. `clustering` is a safety
+factor on everything that grows with the local density: 1 for uniform points,
+about `1 + ξ̄(reach)` for a clustered field. `scaling.py` uses 1.5 for uniform
+and 4 for clustered initial conditions.
+
+The model treats each domain as a cube. The symbols:
+
+| symbol | meaning |
+|---|---|
+| `n̄ = N / V` | mean density |
+| `l = (V / ndev)^(1/3)` | domain side |
+| `m = f_leaf · leaf_size` | particles per leaf; `f_leaf` = 0.25, measured 0.256–0.275 for uniform points at leaf size 16 |
+| `r_l = (√3/2)(m / n̄)^(1/3)` | leaf radius |
+| `R_c = (√3/2)(M m / n̄)^(1/3)` | summary-cell radius, for `M = summary_max_leaves` leaves per cell |
+| `shell(h) = σ (6 l² h + 3π l h²) + (4π/3) h³` | volume of the domain grown by `h`, minus the domain (a Minkowski sum) |
+| `σ` | Morton surface factor, 1.3 |
+
+| capacity | formula |
+|---|---|
+| partition `capacity` | `(1 + 4 s_p + 0.02) n`, with `s_p = 0.41 √ndev / num_samples`: the sample sort's domain error, one sigma. `num_samples = 16 √ndev` (64 to 4096), so the imbalance stays about 1.1 at any device count. |
+| `halo_capacity` | `c · shell(r + R_c + r_l) / l³ · n` (0 on one device, at most `(ndev − 1) n`) |
+| `leaf_capacity`, `halo_leaf_capacity` | `1.2 · rows / m` (C1's default was one leaf per row, 4× too many) |
+| `summary_max_leaves` | the power of two that makes `R_c ≈ reach / 2`. Much smaller cells multiply the export walk's (cell, leaf) pairs by `(reach / R_c)³`; larger ones thicken the halo by `R_c`. |
+| `summary_capacity` | `2 · leaf_capacity / M` (a cut cell holds more than `M / 2` leaves on average) |
+| `summary_neighbors` | `1.5 ((2 ⌈h_s / l⌉ + 1)³ − 1)`, `h_s = r + 2 R_c + 2 r_l`: the 3×3×3 stencil, ×1.5 for ragged domains |
+| `summary_send/recv_capacity` | `1.5 c · shell(h_s) / l³ · summary_capacity` |
+| `near_cap = max_pair_queue` | `0.75 c · (capacity / m) · ν`, `ν = n̄ (4π/3)(r + r_l)³ / m`: the leaves within reach of a leaf. The walk emits 0.59–0.69 of `leaves · ν` (measured). |
+| `export_near_cap` | `c (1 + r / R_c)³ · halo / m`: each shipped leaf is named by the receiver cells within reach of it |
+| `export_queue` | `summary_recv_capacity + export_near_cap` (the walk is seeded with every received row) |
+| `send_capacity`, `send_leaf_capacity` | `1.5 · halo`, `2 · halo / m` |
+
+Capacities above the index range (`INDEX_DTYPE`, int32) are clamped, and
+`estimate_capacities(...)["model"]["clamped"]` names them. That is a sign the
+problem does not fit, not a working configuration.
+
+**Evidence.** Measured counters over the model's capacity at `clustering = 1`
+(uniform points, `ξ` reach 2.8 spacings, kNN `r_max` 2.5, 4096–16384 per device
+on 1, 2 and 8 fake devices). Every ratio is below 1:
+
+| counter / capacity | max ratio | | counter / capacity | max ratio |
+|---|---|---|---|---|
+| particles / capacity | 0.96 | | near_pairs / near_cap (ξ) | 0.84 |
+| halo / halo_capacity | 0.73 | | near_pairs / near_cap (kNN) | 0.60 |
+| leaves / leaf_capacity | 0.79 | | export_pairs / export_near_cap | 0.53 |
+| summary cells / capacity | 0.48 | | sent / send_capacity | 0.49 |
+| summary_recv / capacity | 0.48 | | peak_wavefront / max_pair_queue | 0.54 |
+
+The per-device counters each run returns are what to recalibrate with on the
+GPUs: `particles`, `halo`, `sent`, `export_pairs`, `export_wavefront`,
+`near_pairs`, `peak_wavefront`, `leaves_local`, `leaves`, `summary_cells`,
+`summary_sent`, `summary_recv` and `summary_dests`. `scaling.py` records them
+next to the capacities, and on an overflow it grows the stage that overflowed
+and reruns.
+
+**Where the memory goes.** These are XLA's compiled plans for ξ, float32,
+8.4e6 particles per device (2048³ on 1024 devices), from CPU compiles on 2
+devices, with the 1024-device capacities. Each row is cumulative:
+
+| stage | temp |
+|---|---|
+| partition | 0.73 GB |
+| + local tree | 1.04 GB |
+| + summary exchange and halo import | 1.88 GB |
+| + combined tree | 2.34 GB |
+| + walk and statistic, with 1M-slot walk lists | 2.55 GB |
+
+On top of that, every slot of `max_pair_queue` and every slot of `near_cap`
+adds about **156 B**. That is the refinement round's per-pair temporaries and
+the near list as the loop carries it. With the model's capacities at 3.4
+spacings and clustering 1.5 (2.9e8 slots each), the plan is 77 GB, and it is
+the same on 2 and 4 devices.
+
+So the walk lists decide how many particles fit on a GPU. They must cover the
+near leaf pairs, about 0.6 ν / m per particle: about 17 for ξ at 3.4 spacings,
+and 4 measured for kNN with k = 8 and the adaptive first pass. This cost grows
+as `(reach + r_l)³`.
+
+Two consequences:
+
+- Tight capacities matter more than anything else.
+  `bench/distributed/scaling.py --tighten F` refits every capacity to `F` × the
+  counters of a probe.
+- On a 128-device CPU compile the plan carries a further term: the `buf`
+  exchange's all-gather of every send buffer, about 30 GB there. The native
+  exchange that GPUs use (jax ≥ 0.9.1) does not have it, and XLA:CPU cannot
+  compile the native op, so CPU plans of the GPU path come from small device
+  counts with the large-mesh capacities.
 
 ## Periodic treatment
 
@@ -458,6 +655,25 @@ devices:
 - Second derivatives. The dependency sweep uses finite differences of
   gradients, not forward-over-reverse.
 
+## Other scale fixes (C3)
+
+- **The near field skips empty chunks.** The ξ near field scans the
+  capacity-padded leaf-pair list in chunks. A chunk with no live pair is now
+  skipped with a `lax.cond`, so the cost follows the live pairs, not
+  `near_cap`. The `jax.checkpoint` wraps the cond: a cond's partial evaluation
+  would otherwise store its branch's windows. Measured at 2048 per device on 4
+  fake devices: forward 3.9 → 0.86 s and value+grad 7.3 → 1.07 s, with the
+  gradient's compiled temp unchanged (28 MB). Results are bit-identical.
+- **Partition pivots.** `_choose_pivots` counted the samples below each target
+  with an `(ndev − 1) × (ndev · num_samples)` comparison: 0.5 GB per device at
+  1024 GPUs. It is now a `searchsorted` on the non-decreasing cumulative
+  weights, with identical pivots.
+- **Send-buffer key.** `build_send_buffers` sorted on `dev · (num_nodes + 1) +
+  node` in `INDEX_DTYPE`, which wraps in int32 past 2³¹: 11 devices of 2e8 tree
+  nodes. The key is int64 when x64 is on, which the statistics require.
+- **Counters.** `leaves_local`, `leaves`, `export_wavefront`, `summary_cells`,
+  `summary_sent`, `summary_recv` and `summary_dests` are new per-device stats.
+
 ## Not covered (follow-ups)
 
 - Cross-correlations (DD/DR/RR with distinct catalogues) need a "data" and a
@@ -465,5 +681,27 @@ devices:
   pattern.
 - Soft kNN distances: the top-k indices are discrete. A smooth CDF comes from a
   smooth step in `ln r` around each `r_k`, which the CDF reduction offers.
-- GPU scaling and capacities at 2048³ (C3), including the gradient's memory
-  ceiling (`bench/distributed/grad_memory.py`).
+- GPU runs. Everything in C3 ran on fake CPU devices: the neighbour exchange,
+  the sizing, and `bench/distributed/scaling.py` with its HPC scripts
+  (`bench/slurm/stats_scaling_*`). The native ragged all-to-all, `jax.distributed` under SLURM,
+  the GPU memory numbers and the sizing model at 10⁷–10⁸ per device are
+  untested.
+- The walk's memory sets the flagship's size. Every near leaf pair is
+  materialised, at about 312 B per pair (wavefront slot plus near-list slot).
+  The CPU plans give these estimates per A100-40GB:
+
+  | payload | particles per GPU | 2048³ needs |
+  |---|---|---|
+  | ξ, 3.4 spacings | ~5e6 | ~1500 GPUs |
+  | kNN, k = 8 | ~2e7 | ~400 GPUs |
+
+  So 2048³ on 128 GPUs (6.7e7 per device) does not fit for either payload. For
+  ξ the model even clamps `near_cap` to int32. Options:
+  - more devices (1024 on JUWELS gives 8.4e6 per device);
+  - a smaller reach in spacings;
+  - the A4a window rule, which turns most pairs into far pairs;
+  - streaming the near field out of the walk round by round, so the queue never
+    holds every pair.
+
+  The memory-ceiling runs (`bench/slurm/README.md`, step 3) measure where the
+  limit is.
