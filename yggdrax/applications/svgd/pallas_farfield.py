@@ -45,13 +45,13 @@ import numpy as np
 from jax import lax
 from jaxtyping import Array, Float
 
-from yggdrax.applications.svgd._pallas_compat import KernelRef, pallas_backend_kwargs
 from yggdrax.applications.svgd.pallas_nearfield import (
     _integer_cotangent,
     _pow2_ceil,
     _resolve_tile,
     _target_rows_from_offsets,
 )
+from yggdrax.pallas._compat import KernelRef, pallas_backend_kwargs
 
 if TYPE_CHECKING:
     from jax.experimental import pallas as pl

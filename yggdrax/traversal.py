@@ -16,6 +16,7 @@ from .interactions import (
     MACType,
     build_interactions_and_neighbors,
 )
+from .periodic import BoxSize
 from .tree import Tree, TreeType
 from .types import PreparedTreeArtifacts, traversal_result_from_expanse
 
@@ -33,6 +34,7 @@ def build_prepared_tree_artifacts(
     traversal_config: Optional[DualTreeTraversalConfig] = None,
     dehnen_radius_scale: float = 1.0,
     separation_floor: float = 0.0,
+    box_size: Optional[BoxSize] = None,
 ) -> PreparedTreeArtifacts:
     """Build a tree, geometry, and interactions in one call.
 
@@ -69,6 +71,16 @@ def build_prepared_tree_artifacts(
         extents); ``0`` (default) adds no test. A softening kernel with compact
         support ``h`` is exactly Newtonian past ``h``, so a floor of ``h`` makes an
         unsoftened far field exact.
+    box_size
+        Optional periodic box ``[0, L)^d``: a float (cube) or one length per
+        dimension; ``None`` (default) is the non-periodic walk, bit-identical to
+        the walk without the argument. With a box, node distances are
+        minimum-image distances and a far pair is accepted only if also
+        ``r_a + r_b + d < min(L) / 2`` (bounding-sphere radii), so one image of it
+        is the minimum image of every particle pair inside; near pairs are
+        evaluated by the caller with :func:`yggdrax.periodic.minimum_image`. Build
+        the tree with ``Tree.from_particles(..., box_size=L)`` so nodes do not
+        straddle the box. See ``docs/periodic_boundaries.md``.
 
     Returns
     -------
@@ -83,7 +95,10 @@ def build_prepared_tree_artifacts(
         If the tree build did not return reordered particle buffers.
     """
 
-    bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    if box_size is None:
+        bounds_resolved = infer_bounds(positions) if bounds is None else bounds
+    else:
+        bounds_resolved = bounds  # the periodic build fixes the box itself
     tree = Tree.from_particles(
         positions,
         masses,
@@ -91,6 +106,7 @@ def build_prepared_tree_artifacts(
         bounds=bounds_resolved,
         return_reordered=True,
         leaf_size=int(leaf_size),
+        box_size=box_size,
     )
     if (
         tree.positions_sorted is None
@@ -117,6 +133,7 @@ def build_prepared_tree_artifacts(
         mac_type=mac_type,
         dehnen_radius_scale=float(dehnen_radius_scale),
         separation_floor=separation_floor,
+        box_size=box_size,
         return_result=True,
     )
     traversal_result = (

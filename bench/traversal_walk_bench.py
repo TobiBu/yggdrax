@@ -157,8 +157,7 @@ def main() -> int:
         build_interactions_and_neighbors,
         compute_tree_geometry,
     )
-    from yggdrax._interactions_impl import _build_mac_extents
-    from yggdrax.interactions import dual_tree_walk_mutual
+    from yggdrax.interactions import dual_tree_walk_mutual, mutual_walk_inputs
 
     pos, mass = _plummer(args.n)
     tree = Tree.from_particles(
@@ -238,19 +237,10 @@ def main() -> int:
         )
 
     if "mutual" in walks:
-        idx = topo.parent.dtype
-        left_full = jnp.concatenate(
-            [jnp.asarray(topo.left_child, idx), jnp.full((num_leaves,), -1, idx)]
-        )
-        right_full = jnp.concatenate(
-            [jnp.asarray(topo.right_child, idx), jnp.full((num_leaves,), -1, idx)]
-        )
-        root = jnp.argmin(topo.parent).astype(idx)
-        centers = jnp.asarray(geometry.center)
-        extents = _build_mac_extents(
-            topo.parent, geometry, num_internal, args.mac_type, 1.0
-        )[0]
-        extents = jnp.asarray(extents, dtype=centers.dtype)
+        # Radix tree, so the helper's backend scale resolution leaves 1.0 as is.
+        inputs = mutual_walk_inputs(topo, geometry, mac_type=args.mac_type)
+        left_full, right_full = inputs.left_child_full, inputs.right_child_full
+        centers, extents, root = inputs.centers, inputs.radii, inputs.root
 
         @jax.jit
         def mutual(lf, rf, c, r, rt):

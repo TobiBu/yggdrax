@@ -46,6 +46,14 @@ from .octree import (
     OctreeTopology,
     build_explicit_octree_metadata,
 )
+from .periodic import (
+    BoxSize,
+    minimum_image,
+    pairwise_periodic_distance_sq,
+    periodic_displacement,
+    periodic_distance_sq,
+    wrap_positions,
+)
 from .protocols import (
     MortonLeafBoundsProtocol,
     TopologyContainerProtocol,
@@ -146,6 +154,12 @@ __all__ = [
     "build_compact_far_pairs_and_leaf_neighbor_lists",
     "build_leaf_neighbor_lists",
     "build_prepared_tree_artifacts",
+    "BoxSize",
+    "minimum_image",
+    "pairwise_periodic_distance_sq",
+    "periodic_displacement",
+    "periodic_distance_sq",
+    "wrap_positions",
     "build_tree",
     "build_octree",
     "build_octree_jit",
