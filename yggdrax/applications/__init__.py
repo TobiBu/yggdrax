@@ -11,6 +11,8 @@ Sub-packages:
 
 * :mod:`yggdrax.applications.corrfunc` -- differentiable two-point correlation
   functions via soft-binned dual-tree pair counting.
+* :mod:`yggdrax.applications.knn_stats` -- differentiable k-nearest-neighbour
+  CDFs (Banerjee & Abel 2021) on the traced KD-tree search.
 * :mod:`yggdrax.applications.svgd` -- tree-accelerated Stein variational
   gradient descent using the kernel-aware pair-policy hook.
 
