@@ -777,17 +777,25 @@ def mutual_walk_pallas(
     # op, the initial buffers were arguments of the while loop and stayed alive
     # beside its outputs: twice the walk's memory at the peak. Under a trace the
     # jit simply inlines.
+    #
+    # Every output is an index, a count or a flag, so no derivative flows through
+    # the walk; stopping the float inputs' gradients says so to JAX, which would
+    # otherwise try to differentiate the pallas_call (and refuse: it aliases its
+    # buffers) whenever the geometry carries a tangent, as it does when the walk
+    # runs inside a differentiated function. Exact, and the identity in the
+    # compiled program.
+    stop = jax.lax.stop_gradient
     return _mutual_walk_jit(
         left_child_full,
         right_child_full,
-        centers,
-        radii,
+        stop(centers),
+        stop(radii),
         root,
         node_active,
         seed_a,
         seed_b,
         seed_count,
-        error_table if int(error_order) > 0 else None,
+        stop(error_table) if int(error_order) > 0 else None,
         theta=float(theta),
         max_pair_queue=int(max_pair_queue),
         far_cap=int(far_cap),
