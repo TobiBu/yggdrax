@@ -68,7 +68,7 @@ def _transform(values: Array, log: bool) -> Array:
 def soft_bin_weights(
     separations: Float[Array, " ..."],
     edges: Float[Array, " nbins+1"],
-    sharpness: float,
+    sharpness: float | Array,
     *,
     log: bool = True,
 ) -> Float[Array, " ... nbins"]:
