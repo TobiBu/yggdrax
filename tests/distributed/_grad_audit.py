@@ -109,10 +109,14 @@ class _Sweep:
             self.whiles.append(LiveWhile(_where(eqn), sum(ins)))
             return carry
         if name == "scan":
-            nc, ncarry = p["num_consts"], p["num_carry"]
-            consts = ins[:nc]
-            carry = list(ins[nc : nc + ncarry])
-            xs = ins[nc + ncarry :]
+            if "num_consts" in p:  # older jax (e.g. 0.8.3): counts as params
+                nc, ncarry = p["num_consts"], p["num_carry"]
+                consts = ins[:nc]
+                carry = list(ins[nc : nc + ncarry])
+                xs = ins[nc + ncarry :]
+            else:  # newer jax (e.g. 0.11.2): FlatTree (consts, carry, xs)
+                consts, carry, xs = (list(g) for g in p["ft_in"].update(ins).unpack())
+                ncarry = len(carry)
             while True:
                 out = self.run(p["jaxpr"], consts + carry + xs)
                 new = [a or b for a, b in zip(carry, out[:ncarry])]
