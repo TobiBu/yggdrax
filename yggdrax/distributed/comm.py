@@ -43,6 +43,12 @@ _COUNT_DTYPE = jnp.int32
 #: In a LET this silently drops the entire cross-domain near field: a ~45 % force
 #: error on a 17.8M-particle disc across 4 GPUs while angular momentum, energy and
 #: every overflow flag stayed healthy.
+#:
+#: The same floor covers gradients. Executing the op's reverse pass is just another
+#: source of allocator churn: jaccpot's ``JAX_RAGGED_GRAD_FIXED_VERSION`` is this
+#: version, for this defect (on 0.9.0.1 a forward run after one gradient lost the
+#: whole cross-domain halo). ``tests/distributed/test_distributed_stats_grad.py``
+#: re-checks it on GPU with ``YGGDRAX_CHECK_UPSTREAM_RAGGED_FIX=1``.
 RAGGED_NATIVE_FIXED_JAX = (0, 9, 1)
 
 #: XLA flag that selects the NCCL send/recv ragged fallback when ``false``.

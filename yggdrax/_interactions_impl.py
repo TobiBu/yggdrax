@@ -5529,6 +5529,7 @@ _MUTUAL_WALK_BACKENDS = ("flat", "pallas", "auto")
         "separation_floor",
         "box_size",
         "pair_accept",
+        "pair_discard",
     ),
 )
 def _dual_tree_walk_mutual_flat(
@@ -5553,6 +5554,7 @@ def _dual_tree_walk_mutual_flat(
     periodic_radii: Optional[Array] = None,
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
+    pair_discard: Optional[Callable[..., Array]] = None,
 ) -> MutualWalkResult:
     """The flat (XLA) backend of :func:`dual_tree_walk_mutual`; same arguments."""
     idx = jnp.asarray(left_child_full).dtype
@@ -5653,6 +5655,13 @@ def _dual_tree_walk_mutual_flat(
             if box_lengths is not None:
                 delta = minimum_image(delta, box_lengths)
             dist_sq = jnp.sum(delta * delta, axis=-1)
+            if pair_discard is not None:
+                # pruned pairs leave the round here: every later mask is ANDed
+                # with ``live``, so they are neither emitted nor refined
+                live = live & ~jnp.asarray(
+                    pair_discard(pair_accept_data, sa, sb, dist_sq, radius_a, radius_b),
+                    dtype=bool,
+                )
             if pair_accept is not None:
                 accept = (
                     live
@@ -5848,6 +5857,7 @@ def dual_tree_walk_mutual(
     periodic_radii: Optional[Array] = None,
     pair_accept: Optional[Callable[..., Array]] = None,
     pair_accept_data: Any = None,
+    pair_discard: Optional[Callable[..., Array]] = None,
     backend: MutualWalkBackend = "flat",
     pallas_interpret: bool = False,
 ) -> MutualWalkResult:
@@ -5971,8 +5981,20 @@ def dual_tree_walk_mutual(
         The test must be symmetric in ``a`` and ``b``, since every pair is visited
         in one orientation only. Static (a hashable callable).
     pair_accept_data:
-        Pytree of arrays handed to ``pair_accept`` as its first argument, traced.
-        ``None`` (default) when there is no ``pair_accept``.
+        Pytree of arrays handed to ``pair_accept`` (and ``pair_discard``) as its
+        first argument, traced. ``None`` (default) when there is neither.
+    pair_discard:
+        Optional pruning test, called once per round with the same arguments as
+        ``pair_accept`` (``dist_sq`` is the minimum-image distance under a
+        ``box_size``). A live pair where its mask holds is DROPPED before any
+        other decision: not accepted, not a near pair, not refined, so nothing
+        below it is visited. Self pairs ``(a, a)`` are passed too; a test that
+        must keep them checks ``a != b``. This is for interactions that vanish
+        beyond a range (a pair-count window past its last bin edge, a halo
+        reach): pruning there costs no list capacity, where accepting would.
+        Must be symmetric in ``a`` and ``b``. ``None`` (default) drops nothing
+        and leaves the walk unchanged. Flat backend only. Static (a hashable
+        callable).
     backend:
         Which implementation walks. ``"flat"`` (default): the XLA wavefront loop
         described above. ``"pallas"``: the same walk with one Pallas launch per
@@ -6018,6 +6040,7 @@ def dual_tree_walk_mutual(
         pair_accept=pair_accept,
         interpret=bool(pallas_interpret),
         periodic=box_size is not None,
+        pair_discard=pair_discard,
     )
     if resolved == "flat":
         return _dual_tree_walk_mutual_flat(
@@ -6041,6 +6064,7 @@ def dual_tree_walk_mutual(
             periodic_radii=periodic_radii,
             pair_accept=pair_accept,
             pair_accept_data=pair_accept_data,
+            pair_discard=pair_discard,
         )
     try:
         theta_value = float(theta)
@@ -6104,6 +6128,7 @@ def _resolve_mutual_walk_backend(
     pair_accept: Optional[Callable[..., Array]],
     interpret: bool,
     periodic: bool = False,
+    pair_discard: Optional[Callable[..., Array]] = None,
 ) -> str:
     """Resolve ``dual_tree_walk_mutual``'s ``backend`` to ``"flat"`` or ``"pallas"``.
 
@@ -6120,6 +6145,8 @@ def _resolve_mutual_walk_backend(
         Pallas interpret mode, which runs anywhere.
     periodic
         Whether the walk has a ``box_size``; the kernel has no periodic guard.
+    pair_discard
+        The walk's ``pair_discard``; the kernel has no pruning hook.
 
     Returns
     -------
@@ -6148,6 +6175,8 @@ def _resolve_mutual_walk_backend(
             "a pair_accept callable (for Dehnen's eq (16a) call "
             "mutual_walk_pallas(error_table=..., error_order=...) directly)"
         )
+    if pair_discard is not None:
+        unsupported.append("a pair_discard callable (use backend='flat')")
     if periodic:
         unsupported.append(
             "a periodic box_size (the kernel has no minimum-image distance or "
