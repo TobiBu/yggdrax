@@ -162,6 +162,7 @@ def _route_payload(
     output_capacity: int,
     axis_name: str,
     payload_fill: Any = None,
+    method: str = "auto",
 ) -> Any:
     """Ragged-exchange a payload PYTREE: one round per (dtype, fill) group.
 
@@ -187,6 +188,7 @@ def _route_payload(
             output_capacity=output_capacity,
             axis_name=axis_name,
             fill_value=fill,
+            method=method,
         )
         col = 0
         for i in members:
@@ -235,6 +237,7 @@ def _route(
     axis_name,
     payload=None,
     payload_fill=None,
+    method="auto",
 ):
     """Ragged-exchange a shard already grouped by destination device.
 
@@ -247,13 +250,18 @@ def _route(
     """
 
     pos_out, recv_sizes, _ = ragged_all_to_all_exchange(
-        positions, send_sizes, output_capacity=output_capacity, axis_name=axis_name
+        positions,
+        send_sizes,
+        output_capacity=output_capacity,
+        axis_name=axis_name,
+        method=method,
     )
     mass_out, _, _ = ragged_all_to_all_exchange(
         masses[:, None],
         send_sizes,
         output_capacity=output_capacity,
         axis_name=axis_name,
+        method=method,
     )
     code_out, _, _ = ragged_all_to_all_exchange(
         codes[:, None],
@@ -261,12 +269,18 @@ def _route(
         output_capacity=output_capacity,
         axis_name=axis_name,
         fill_value=jnp.uint64(_CODE_SENTINEL),
+        method=method,
     )
     count = jnp.sum(recv_sizes).astype(_COUNT_DTYPE)
     if payload is None:
         return pos_out, mass_out[:, 0], code_out[:, 0], count, None
     pl_out = _route_payload(
-        payload, send_sizes, output_capacity, axis_name, payload_fill=payload_fill
+        payload,
+        send_sizes,
+        output_capacity,
+        axis_name,
+        payload_fill=payload_fill,
+        method=method,
     )
     return pos_out, mass_out[:, 0], code_out[:, 0], count, pl_out
 
@@ -284,6 +298,7 @@ def sfc_partition(
     payload: Any = None,
     count: Optional[Array] = None,
     payload_fill: Any = None,
+    exchange_method: str = "auto",
 ):
     """Sample-sort this device's shard into contiguous Morton domains.
 
@@ -315,6 +330,10 @@ def sfc_partition(
         re-partitioning a shard that is already capacity-padded: the padding would
         be routed as particles and push real ones out of the capacity. Measured --
         it silently lost half the particles before this argument existed.
+    exchange_method:
+        Implementation of every ragged exchange of the routing
+        (:func:`~yggdrax.distributed.comm.ragged_all_to_all_exchange`'s ``method``).
+        All of them are linear in the routed values, so gradients pass through.
     """
 
     if bounds is None:
@@ -349,7 +368,13 @@ def sfc_partition(
 
     if payload is None:
         pos_out, mass_out, code_out, count, _ = _route(
-            positions, masses, codes, send_sizes, output_capacity, axis_name
+            positions,
+            masses,
+            codes,
+            send_sizes,
+            output_capacity,
+            axis_name,
+            method=exchange_method,
         )
         pos_out, mass_out, code_out, _lo, _hi, _ = _resort_by_code(
             pos_out, mass_out, code_out, count
@@ -366,6 +391,7 @@ def sfc_partition(
         axis_name,
         payload=pl,
         payload_fill=payload_fill,
+        method=exchange_method,
     )
     pos_out, mass_out, code_out, _, _, pl_out = _resort_by_code(
         pos_out, mass_out, code_out, count, payload=pl_out

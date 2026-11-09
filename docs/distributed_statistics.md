@@ -1,4 +1,4 @@
-# Distributed clustering statistics (C1)
+# Distributed clustering statistics (C1, C2)
 
 `yggdrax.distributed.stats` computes two clustering statistics on particles
 sharded across devices in a periodic box `[0, L)^3`:
@@ -11,8 +11,12 @@ devices they give the same answer, to floating-point summation order, whenever
 no far node pair is accepted (the default `exact_acceptance()`). The tests check
 this at 1, 2, 4 and 8 fake CPU devices against brute force.
 
-The driver is forward only. Gradients are C2. The choices below keep a gradient
-at fixed topology possible; see *Differentiability*.
+Both drivers are differentiable with respect to the particle positions (and the
+weights of ξ, and the query positions of kNN) at fixed topology. The gradient
+equals the single-device gradient and brute-force O(N²) autodiff to round-off
+(≤ 6e-15 measured) on every device count. *Differentiability* lists what the
+forward pass was built to allow; *Gradients (C2)* is how the reverse pass works
+and how it was checked.
 
 ## Data flow (per device, inside one `shard_map`)
 
@@ -109,8 +113,9 @@ centroids. The periodic guard `r_a + r_b + d < L/2` makes that image the same fo
 every particle pair inside (`docs/periodic_boundaries.md`).
 
 The alternative is to count a cross pair once (on the lower device, say). That
-halves the cross-pair arithmetic but needs the same halo. It also breaks the
-symmetry the gradient of C2 relies on (below).
+halves the cross-pair arithmetic but needs the same halo. The gradient would
+still be right, since C2 differentiates through the halo import (below), but the
+½ weighting keeps both owners' work identical and the far monopole closed-form.
 
 **Pluggable acceptance.** `PairAcceptance(accept, discard, data)` uses the
 signature of `dual_tree_walk_mutual`'s `pair_accept`:
@@ -236,18 +241,222 @@ probe run.
   input routed through gathers by those integers and through the two ragged
   exchanges (partition and halo). Both exchanges are linear in the values. On
   CPU they run as `all_gather` + gather (`method="buf"`), which differentiates;
-  the native `ragged_all_to_all` has a transpose rule in recent JAX (see
-  jaccpot's `JAX_RAGGED_GRAD_FIXED_VERSION`).
+  the native `ragged_all_to_all` has a transpose rule (see *Gradients* for the
+  version gate).
 - **The hard cut and the minimum image** are piecewise smooth. Away from
   measure-zero ties their Jacobian is that of the plain distance. The hard cut
   sits where `W_b ≤ eps`, so the gradient it drops is at most `eps` per pair.
 - **Safe distances.** Masked pairs (padding, self, out of range) have their
   `r²` replaced before the `sqrt`, so no NaN cotangent reaches a coincident pair.
 - **The ½ weighting** makes the cross-pair term symmetric between the two
-  owners. So C2 can choose either of two routes. One returns halo cotangents to
-  their owners with `reverse_halo`. The other has each device differentiate only
-  through its own particles and take the cross term with weight 1 instead of ½,
-  needing no reverse exchange.
+  owners. That left C2 two routes. One returns the halo cotangents to their
+  owners. The other has each device differentiate only through its own
+  particles and take the cross term at weight 1 instead of ½, which needs no
+  reverse exchange. C2 takes the first; *Gradients* says why.
+
+## Gradients (C2)
+
+```python
+loss = lambda x, w: f(distributed_pair_counts(x, edges, box_size=L, config=cfg,
+                                              weights=w).counts)
+g_x, g_w = jax.grad(loss, argnums=(0, 1))(positions, weights)
+
+loss = lambda x, q: f(distributed_knn(x, queries=q, k=k, r_max=r_max, box_size=L,
+                                      config=cfg, r_grid=r, sharpness=s).cdf)
+g_data, g_queries = jax.grad(loss, argnums=(0, 1))(data, randoms)
+```
+
+Both public drivers are traceable: they take device arrays (or tracers), pad the
+input shards with `jnp`, and the kNN driver puts its distances back into input
+order with a device scatter, not on the host. They work under `jit`, `grad`,
+`value_and_grad` and `lax.scan`. The per-device bodies (`pair_counts_shard`,
+`knn_shard`) differentiate inside a caller's own `shard_map` too, with
+`check_vma=False` and a replicated output, as in the tests.
+
+**What the gradient is.** It is the gradient of the statistic *at fixed
+topology*. Every call rebuilds the partition, trees, walks and halo from the
+current positions, but none of them carries a cotangent. With the default
+`exact_acceptance()` the forward does not depend on the topology, so this is the
+gradient of the statistic itself, up to the measure-zero points named in
+*Differentiability*:
+
+- a pair crossing the hard cut changes the count by at most `eps`;
+- a kNN neighbour set changes at ties, and at `r_max`;
+- the minimum image switches at `L/2`, which lies beyond every reach.
+
+With `geometric_acceptance` it is the gradient of the monopole approximation that
+the forward evaluates. The centroids are computed from the live positions, so it
+is consistent, but this was not tested.
+
+Differentiable inputs:
+
+- ξ: positions and weights.
+- kNN: data and query positions. The distance to a neighbour beyond `r_max` is
+  `inf` and has no gradient; mask it before it enters a loss, as the soft CDF
+  does. The hard CDF is piecewise constant, so its gradient is zero.
+
+`edges`, `sharpness` (ξ) and `eps` set the cut and must be concrete.
+
+### The reverse of the halo: differentiate through the import
+
+C1 left two routes open. C2 takes **(a)**: differentiate through the halo import
+and let the transpose of each exchange return the halo cotangents to their owners.
+
+- A cross pair `(i, j)` with `i` on device A and `j` on device B is evaluated on A
+  as `½ f(x_i, x̃_j)`, where `x̃_j` is j's halo copy, and on B as `½ f(x̃_i, x_j)`.
+- On A, `∂/∂x_i` gives `½ ∂_i f` directly. The cotangent `½ ∂_j f` lands on the
+  halo row `x̃_j`.
+- The halo row came from `x_j` through `pos[src]` (a gather on B), then the ragged
+  exchange, then a gather on A. Its transpose runs backwards: a gather on A, the
+  reverse exchange, then a scatter-add into `x_j`'s row on B.
+- Device B does the same with the roles swapped. Each side receives two halves,
+  so the sum is `∂_i f + ∂_j f`: exactly the single-device gradient, neither half
+  of it nor double.
+- The partition exchange is transposed the same way, so cotangents end up on the
+  caller's input rows.
+
+**Why not (b).** Route (b) has each device differentiate only through its own
+particles and give the cross term weight 1. It needs no reverse exchange, and for
+ξ it would be correct. It is wrong for kNN: the relation is not symmetric (`j` among
+`i`'s k nearest does not put `i` among `j`'s), so the term `d_ij` exists on one
+device only, and `x_j`'s share of its cotangent must travel back to `j`'s owner.
+One rule for both payloads, with no payload-specific weighting of values against
+gradients, is worth one reverse exchange. That exchange is the same size as the
+forward one: on GPU (`native`) a ragged all-to-all of the halo, and on CPU
+(`buf`) a `psum_scatter` of the gathered send buffers.
+
+`reverse_halo.export_reverse_halo` is not used. JAX's transposes of the gather and
+the exchange *are* that reverse halo: a scatter-add of cotangents to their source
+rows, built by autodiff. A hand-written `custom_vjp` would only duplicate it.
+
+### The exchange, and the native ragged all-to-all
+
+`DistributedStatsConfig.exchange` (`"auto"`, `"buf"`, `"native"`) selects both
+exchanges. It is passed to `sfc_partition(exchange_method=...)` and to the halo.
+
+`"auto"` resolves through `comm.resolve_ragged_method`. It picks the native op
+only on GPU/TPU with `jax >= RAGGED_NATIVE_FIXED_JAX = (0, 9, 1)`, and `buf`
+elsewhere. That is the same gate jaccpot puts on its gradient path
+(`JAX_RAGGED_GRAD_FIXED_VERSION = (0, 9, 1)`), for the same reason. Both are one
+XLA defect: `RaggedAllToAllStartThunk::Initialize` cached peer buffer addresses
+from the first run, and allocator churn made the op write to stale addresses.
+Donation causes such churn in a forward, and running a gradient causes it too. It
+was fixed in XLA `4e0cc7e356`, which shipped in jax 0.9.1. jaccpot measured that
+on 0.9.0.1 a forward after one gradient loses the whole cross-domain halo, while
+every flag stays clean.
+
+CPU has no native lowering, so these tests run `buf`.
+`test_forward_survives_a_gradient` asserts that a forward after a gradient is
+bit-identical to one before it, for both payloads. On ≥ 2 GPUs,
+`YGGDRAX_CHECK_UPSTREAM_RAGGED_FIX=1` adds a test that runs the same check
+through `exchange="native"`, and compares its gradient with `buf`'s.
+
+**The jaccpot env's jax is 0.8.3.** There `"auto"` gives `buf` on GPU too: it is
+correct, but it all-gathers every device's send buffer, which costs O(ndev ×
+send_capacity) memory and bandwidth per device. C3 needs jax ≥ 0.9.1 on the GPUs.
+
+### Memory: the near field is rematerialised
+
+The near field is a `lax.scan` over chunks of leaf pairs. Under reverse mode a
+scan stores every chunk's intermediates, which here means `(chunk, leaf, leaf,
+nbins)` windows: O(near pairs × leaf² × bins). The chunk function is wrapped in
+`jax.checkpoint`, so the reverse pass stores only its integer inputs and
+recomputes the windows. The forward is unchanged.
+
+Measured as XLA's compiled per-device temp for ξ at N = 8192 on 4 CPU devices,
+fp64, leaf 16, 8 bins:
+
+| | forward | value + grad |
+|---|---|---|
+| with `jax.checkpoint` | 41 MB | 50 MB |
+| without | 41 MB | 13 556 MB |
+
+kNN needs no remat: the top-k search is topology. Its only differentiated values
+are the `(rows, k)` distances recomputed at the frozen indices.
+
+`bench/distributed/grad_memory.py` reports the forward's and value+grad's
+compiled temp, runtime peak (GPU), compile time and run time per device, for both
+payloads in fp32 and fp64. It runs the per-device bodies in a caller's
+`shard_map` on pre-sharded input, as a large run would, and sizes the halo from a
+forward probe. On a GPU it picks free cards with `autocvd` (`--gpu-select free`).
+CPU, `N = 32768`, uniform, defaults (ξ: 8 log bins 0.01–0.05, s = 60; kNN: k = 8,
+`r_max` = 0.08, soft CDF):
+
+| payload | dtype | devices | fwd temp | v+g temp | ratio | fwd time | v+g time |
+|---|---|---|---|---|---|---|---|
+| ξ | fp32 | 4 | 146 MB | 164 MB | 1.13× | 9.7 s | 20.2 s |
+| ξ | fp64 | 4 | 157 MB | 186 MB | 1.18× | 11.2 s | 22.0 s |
+| kNN | fp32 | 4 | 199 MB | 205 MB | 1.03× | 1.79 s | 1.84 s |
+| kNN | fp64 | 4 | 212 MB | 223 MB | 1.05× | 1.50 s | 1.54 s |
+| ξ | fp32 | 8 | 78 MB | 97 MB | 1.24× | 11.2 s | 16.1 s |
+| ξ | fp64 | 8 | 85 MB | 114 MB | 1.35× | 9.1 s | 18.8 s |
+| kNN | fp32 | 8 | 105 MB | 114 MB | 1.08× | 1.24 s | 1.22 s |
+| kNN | fp64 | 8 | 112 MB | 129 MB | 1.15× | 1.09 s | 1.05 s |
+
+The temps are XLA's compiled plan per device, which is deterministic. The times
+come from a workstation that was running the test suite at the same time, so read
+them as rough ratios: about 2× for ξ, about 1× for kNN, whose cost is the
+topology search. At this N the halo is 1.4–2.7× a device's own particles (the
+probe sized `halo_fraction` to 1.8 on 4 devices and 3.3 on 8), so the capacities,
+not N, set the memory. The ratio that will matter at scale is the GPU one, which
+C3 measures.
+
+### How it was checked (jaccpot's audit method)
+
+`tests/distributed/test_distributed_stats_grad.py`, on 1, 2, 4 and 8 fake CPU
+devices:
+
+- **Equality.** The gradient equals brute-force O(N²) autodiff of the same
+  statistic, and the 1-device gradient, to 1e-10. The max error relative to the
+  largest component was measured at N = 640 (the kNN-CDF case uses 640 data and
+  320 queries):
+
+  | case | vs brute force | vs 1 device |
+  |---|---|---|
+  | ξ positions, faces/corners | ≤ 1.1e-15 | ≤ 1.1e-15 |
+  | ξ weights, faces/corners | ≤ 3.3e-16 | ≤ 2.8e-16 |
+  | ξ positions, clustered (one cluster on the corner) | ≤ 6.2e-15 | ≤ 2.1e-15 |
+  | ξ weights, clustered | ≤ 3.7e-15 | ≤ 1.9e-15 |
+  | kNN distances, both sets | ≤ 2.9e-16 | ≤ 2.4e-16 |
+  | soft kNN-CDF of random queries, d/d(data) | ≤ 6.3e-16 | — |
+  | soft kNN-CDF, d/d(queries) | ≤ 2.1e-15 | — |
+
+- **Finite differences.** Central differences converge onto AD as h²: the
+  relative error is 5.7e-5, 5.7e-7 and 5.6e-9 at h = 1e-5, 1e-6 and 1e-7 for ξ
+  positions, identical to FD of the brute-force statistic. The windows are sharp,
+  so truncation dominates. The weights' error is 6e-11. For the soft kNN-CDF the
+  test runs at a step that leaves every brute-force neighbour set unchanged,
+  which it checks first.
+- **Trace probe.** `make_jaxpr(grad(loss))` traces in under a second.
+- **Liveness sweep** (`tests/distributed/_grad_audit.py`). It propagates
+  "reachable from the differentiated inputs" through the forward jaxpr. The
+  propagation runs through floats only, stops at `stop_gradient`, and recurses
+  into `shard_map`, `jit`, `scan`, `while`, `cond` and `checkpoint`. No `while`,
+  `sort` or `top_k` is reached, so no topology decision is differentiated. The
+  control sweep without the seam finds 10 live `while` loops for ξ and 17 for
+  kNN: the mutual walks, `compute_tree_geometry`, the chunked top-k and
+  `_node_max`.
+- **Dependency sweep.** It perturbs particles that hug a corner or a face, whose
+  partners mostly sit in another Morton domain through the periodic image. The
+  change in the full gradient matches brute force to 1e-10 of its scale, rows
+  that brute force leaves untouched stay untouched to 1e-12, and some of the
+  changed rows lie across a face.
+- **Ragged side effect.** A forward after a gradient is bit-identical to one
+  before it. The native version is opt-in on GPU (above).
+- **`jit(value_and_grad)`** equals the eager gradient. A `lax.scan` of three
+  gradient steps equals the same steps taken one at a time; the topology is
+  rebuilt inside each step.
+
+### Not covered by C2
+
+- No GPU run, so the native ragged exchange's transpose and the opt-in
+  side-effect test have not been run, and no runtime peak memory has been
+  measured. Everything above is on fake CPU devices with `buf`.
+- Large N: the remat table and the bench are CPU, N ≤ 32768.
+- `geometric_acceptance` gradients (consistent by construction, untested) and
+  gradients with respect to `sharpness`, `edges` or `r_grid`.
+- Second derivatives. The dependency sweep uses finite differences of
+  gradients, not forward-over-reverse.
 
 ## Not covered (follow-ups)
 
@@ -256,4 +465,5 @@ probe run.
   pattern.
 - Soft kNN distances: the top-k indices are discrete. A smooth CDF comes from a
   smooth step in `ln r` around each `r_k`, which the CDF reduction offers.
-- GPU scaling and capacities at 2048³ (C3), and gradients (C2).
+- GPU scaling and capacities at 2048³ (C3), including the gradient's memory
+  ceiling (`bench/distributed/grad_memory.py`).

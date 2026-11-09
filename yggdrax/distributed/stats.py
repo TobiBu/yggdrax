@@ -22,8 +22,11 @@ pair is accepted, which is the default :func:`exact_acceptance`.
 
 Topology (codes, sorts, trees, walks, send lists) is computed from
 ``stop_gradient`` positions; every value the statistics read is the live input
-routed through integer gathers and the two (linear) exchanges. Gradients are not
-built here (C2), but nothing in the forward pass blocks them at fixed topology.
+routed through integer gathers and the two (linear) exchanges. ``jax.grad`` with
+respect to positions (and weights) therefore runs through both drivers at fixed
+topology: the reverse pass of each exchange returns the halo's cotangents to the
+owners, and the result equals the single-device gradient (C2; see the design
+note's *Gradients* section).
 """
 
 from __future__ import annotations
@@ -120,6 +123,13 @@ class DistributedStatsConfig:
         Partition samples per device (:func:`sfc_partition`).
     chunk:
         Leaf pairs (or query leaves) evaluated per step of the near-field scan.
+    exchange:
+        Implementation of the partition and halo exchanges: ``"auto"``,
+        ``"buf"`` or ``"native"``
+        (:func:`~yggdrax.distributed.comm.resolve_ragged_method`). ``"auto"`` is
+        safe under ``jax.grad`` too: it picks the native ragged all-to-all only
+        on GPU/TPU with ``jax >=`` :data:`~yggdrax.distributed.comm.RAGGED_NATIVE_FIXED_JAX`,
+        the release that also fixed the native op's reverse-pass side effect.
     """
 
     capacity: int
@@ -139,6 +149,7 @@ class DistributedStatsConfig:
     first_pass_reach_factor: float = 2.0
     num_samples: int = 64
     chunk: int = 256
+    exchange: str = "auto"
 
     def resolved(self) -> "DistributedStatsConfig":
         """Fill every ``None`` capacity from the others.
@@ -148,6 +159,10 @@ class DistributedStatsConfig:
         DistributedStatsConfig
             A copy with no ``None`` field.
         """
+        if self.exchange not in ("auto", "buf", "native"):
+            raise ValueError(
+                f"exchange must be 'auto', 'buf' or 'native'; got {self.exchange!r}"
+            )
         leaf_cap = self.leaf_capacity or self.capacity
         return replace(
             self,
@@ -553,6 +568,7 @@ def _partition(pos, weights, flags, gid, count, ndev, box, bounds, cfg):
         payload={"flags": flags, "gid": gid},
         payload_fill={"flags": 0, "gid": -1},
         count=count,
+        exchange_method=cfg.exchange,
     )
     assert payload is not None  # a payload was passed, so one comes back
     overflow = p_count > as_index(int(cfg.capacity))
@@ -662,11 +678,17 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
 
     H = int(cfg.halo_capacity)
     block = jnp.concatenate([s_pos, s_w[:, None], s_flags], axis=1)
+    # the halo import: linear in the values, so its reverse pass (the transpose
+    # of the exchange) returns every halo cotangent to the row it was sent from
     recv, recv_sizes, _ = ragged_all_to_all_exchange(
-        block, send_sizes, output_capacity=H
+        block, send_sizes, output_capacity=H, method=cfg.exchange
     )
     recv_gid, _, _ = ragged_all_to_all_exchange(
-        s_gid[:, None], send_sizes, output_capacity=H, fill_value=-1
+        s_gid[:, None],
+        send_sizes,
+        output_capacity=H,
+        fill_value=-1,
+        method=cfg.exchange,
     )
     n_halo = jnp.sum(recv_sizes).astype(INDEX_DTYPE)
     halo_overflow = n_halo > as_index(H)
@@ -725,7 +747,14 @@ def _any(x: Array) -> Array:
 
 
 def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays):
-    """``acc + sum fn(chunk of arrays)`` over ``n_items`` rows, ``chunk`` at a time."""
+    """``acc + sum fn(chunk of arrays)`` over ``n_items`` rows, ``chunk`` at a time.
+
+    ``fn`` is rematerialised (``jax.checkpoint``) in the reverse pass: a chunk's
+    residuals are its integer inputs, not its ``(chunk, leaf, leaf, nbins)``
+    intermediates, so a gradient stores O(rows) rather than O(pairs x bins). The
+    forward is unchanged.
+    """
+    fn = jax.checkpoint(fn, prevent_cse=False)
     chunk = max(1, min(int(chunk), max(n_items, 1)))
     n_chunks = -(-n_items // chunk)
     pad = n_chunks * chunk - n_items
@@ -1026,9 +1055,15 @@ def _pair_counts_body(
 
 
 def _split_for_mesh(positions, ndev, *extra):
-    """Host split of ``(N, ...)`` arrays into ``ndev`` equal padded input shards."""
-    positions = np.asarray(positions)
-    n = positions.shape[0]
+    """Split ``(N, ...)`` arrays into ``ndev`` equal padded input shards.
+
+    Traceable: the pad is a ``jnp.concatenate``, so positions (and any ``extra``
+    array) may be tracers under ``jit``/``grad``, and the cotangent of a padded
+    shard is the plain slice back to the input rows. Only the per-device counts
+    are host values (they depend on shapes alone).
+    """
+    positions = jnp.asarray(positions)
+    n = int(positions.shape[0])
     if n < 1:
         raise ValueError("need at least one particle")
     per = -(-n // ndev)
@@ -1038,10 +1073,9 @@ def _split_for_mesh(positions, ndev, *extra):
     total = ndev * per
 
     def pad(a, fill):
-        a = np.asarray(a)
-        out = np.full((total,) + a.shape[1:], fill, dtype=a.dtype)
-        out[:n] = a
-        return out
+        a = jnp.asarray(a)
+        tail = jnp.full((total - n,) + a.shape[1:], fill, dtype=a.dtype)
+        return jnp.concatenate([a, tail])
 
     return counts, pad(positions, 0.0), tuple(pad(a, f) for a, f in extra)
 
@@ -1144,6 +1178,15 @@ def distributed_pair_counts(
     DistributedPairCounts
         Counts, the overflow flag (read it), per-stage flags and per-device
         counters.
+
+    Notes
+    -----
+    Differentiable with respect to ``positions`` and ``weights`` (and traceable:
+    it may sit inside ``jit``, ``grad`` or ``lax.scan``). The gradient is that of
+    the fixed-topology statistic: the tree, walk and halo are rebuilt from the
+    current positions on every call, but carry no cotangent. With the default
+    :func:`exact_acceptance` it equals the single-device gradient to round-off.
+    ``edges``, ``sharpness`` and ``eps`` must be concrete (they set the cut).
     """
     require_x64("distributed statistics (Morton codes, global ids)")
     mesh = _resolve_mesh(mesh, None)
@@ -1156,11 +1199,12 @@ def distributed_pair_counts(
     )
     _check_reach(box, r_hi, "r_hi")
     acc = acceptance if acceptance is not None else exact_acceptance()
-    pos_np = np.asarray(positions)
-    n = pos_np.shape[0]
-    w = np.ones((n,), pos_np.dtype) if weights is None else np.asarray(weights)
+    pos_in = jnp.asarray(positions)
+    n = int(pos_in.shape[0])
+    dtype = pos_in.dtype
+    w = jnp.ones((n,), dtype) if weights is None else jnp.asarray(weights).astype(dtype)
     counts, pos_f, (w_f, gid_f) = _split_for_mesh(
-        pos_np, ndev, (w.astype(pos_np.dtype), 0.0), (np.arange(n), -1)
+        pos_in, ndev, (w, 0.0), (np.arange(n, dtype=np.int64), -1)
     )
     has_bounds = bounds is not None
     lo_b, hi_b = (
@@ -1181,10 +1225,9 @@ def distributed_pair_counts(
         int(e.shape[0]) - 1,
         has_bounds,
     )
-    dtype = pos_np.dtype
     out = prog(
-        jnp.asarray(pos_f),
-        jnp.asarray(w_f),
+        pos_f,
+        w_f,
         jnp.asarray(gid_f, jnp.int64),
         jnp.asarray(counts),
         jnp.asarray(e, dtype),
@@ -1697,6 +1740,17 @@ def distributed_knn(
         ``distances`` reordered to the INPUT order of the queries (``(Q, k)``,
         or ``(N, k)`` without ``queries``), ``gid`` the matching input ids,
         the CDF and the diagnostics.
+
+    Notes
+    -----
+    Differentiable with respect to ``positions`` and ``queries`` (and
+    traceable). The neighbour indices are topology, recomputed from the current
+    positions on every call but carrying no cotangent; the distances are
+    recomputed from the live positions at those indices, so a gradient reaches
+    both the query and each of its neighbours, on whichever device owns it. An
+    ``inf`` entry (no neighbour within ``r_max``) has no gradient: mask it
+    before using it in a loss. The hard CDF is piecewise constant (zero
+    gradient); pass ``sharpness`` for a differentiable one.
     """
     require_x64("distributed statistics (Morton codes, global ids)")
     mesh = _resolve_mesh(mesh, None)
@@ -1704,21 +1758,22 @@ def distributed_knn(
     cfg = config.resolved()
     box = normalize_box_size(box_size, 3)
     _check_reach(box, r_max, "r_max")
-    data = np.asarray(positions)
-    nd = data.shape[0]
+    data = jnp.asarray(positions)
+    nd = int(data.shape[0])
     if queries is None:
         pts = data
         q = np.ones((nd,), bool)
         dflag = np.ones((nd,), bool)
-        gid = np.arange(nd)
+        gid = np.arange(nd, dtype=np.int64)
         n_out = nd
     else:
-        qq = np.asarray(queries, dtype=data.dtype)
-        pts = np.concatenate([data, qq])
-        q = np.concatenate([np.zeros(nd, bool), np.ones(qq.shape[0], bool)])
+        qq = jnp.asarray(queries).astype(data.dtype)
+        nq = int(qq.shape[0])
+        pts = jnp.concatenate([data, qq])
+        q = np.concatenate([np.zeros(nd, bool), np.ones(nq, bool)])
         dflag = ~q
-        gid = np.concatenate([np.full(nd, -1), np.arange(qq.shape[0])])
-        n_out = qq.shape[0]
+        gid = np.concatenate([np.full(nd, -1, np.int64), np.arange(nq, dtype=np.int64)])
+        n_out = nq
     flags = np.stack([q, dflag], axis=1).astype(np.int32)
     counts, pos_f, (flags_f, gid_f) = _split_for_mesh(pts, ndev, (flags, 0), (gid, -1))
     has_grid = r_grid is not None
@@ -1743,7 +1798,7 @@ def distributed_knn(
     )
     rg = jnp.asarray(r_grid if has_grid else np.ones(1), dtype)
     dist, out_gid, cdf, overflow, fl, st = prog(
-        jnp.asarray(pos_f),
+        pos_f,
         jnp.asarray(flags_f),
         jnp.asarray(gid_f, jnp.int64),
         jnp.asarray(counts),
@@ -1752,13 +1807,15 @@ def distributed_knn(
         jnp.asarray(lo_b, dtype),
         jnp.asarray(hi_b, dtype),
     )
-    dist_np = np.asarray(dist)
-    gid_np = np.asarray(out_gid)
-    keep = gid_np >= 0
-    result = np.full((n_out, int(k)), np.inf, dtype=dist_np.dtype)
-    result[gid_np[keep]] = dist_np[keep]
+    # back to the input order on the device (a scatter, so it differentiates);
+    # padding and non-query rows aim one past the end and are dropped. The ids
+    # stay int64: past 2^31 particles an INDEX_DTYPE (int32) cast would wrap.
+    rows = jnp.where(out_gid >= 0, out_gid, n_out).astype(jnp.int64)
+    result = (
+        jnp.full((n_out, int(k)), jnp.inf, dist.dtype).at[rows].set(dist, mode="drop")
+    )
     return DistributedKNN(
-        distances=jnp.asarray(result),
+        distances=result,
         gid=jnp.arange(n_out),
         cdf=cdf if has_grid else None,
         overflow=overflow,

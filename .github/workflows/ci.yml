@@ -178,6 +178,7 @@ jobs:
           - shard: stats
             paths: >-
               tests/distributed/test_distributed_stats.py
+              tests/distributed/test_distributed_stats_grad.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75
