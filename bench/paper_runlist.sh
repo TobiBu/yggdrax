@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Yggdrax I, Phase 2: the GPU run list.
+# Yggdrax I, Phase 2: the GPU run list (paper v1).
+#
+# SUPERSEDED for paper v2 by bench/paper_v2_runlist.py (README: bench/paper_v2_runlist.md),
+# which runs every single-GPU arm v2 quotes at jax 0.11.2 with one provenance record.
+# Kept for the v1 SVGD/corrfunc JSONs it regenerates.
 #
 # Reruns every JSON a figure or a sentence of the paper quotes a *time* from,
 # keeps every JSON that carries only accuracy, and adds the two new

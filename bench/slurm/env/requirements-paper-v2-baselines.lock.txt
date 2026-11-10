@@ -1,0 +1,24 @@
+# Paper v2 competitor baselines (bench/baselines/, bench/corrfunc/ of B2). OPTIONAL:
+# each arm skips itself, with the reason in its JSON, when its package is missing.
+# install_paper_v2_extras.sh installs every group on its own, so one that fails to
+# build does not block the others. Same resolution as requirements-paper-v2-extras.
+#
+# kNN forward (bench/baselines/knn_forward.py)
+jaxkd==0.1.2            # pure JAX k-d tree (github.com/dodgebc/jaxkd); runs on CPU too
+jztree==1.1.0           # JZ-Tree, Stücker et al., arXiv:2604.05885
+jztree-cu12==1.1.0      # its CUDA 12 FFI kernels (manylinux wheel, GPU only)
+# kernel sums (bench/baselines/kernel_sums.py). sdists: keopscore JIT-compiles its
+# kernels at first use, with nvrtc on GPU (needs the CUDA headers: CUDA_PATH or
+# /usr/local/cuda) and g++ on CPU. Kernels are cached in $KEOPS_CACHE_FOLDER.
+keopscore==2.3
+pykeops==2.3
+pybind11==3.1.0
+# B2's xi_box.py (TreeCorr arm)
+TreeCorr==5.1.4
+LSSTDESC.Coord==1.3.1
+future==1.0.0
+PyYAML==6.0.3
+setuptools==84.2.1
+# Not pinned here, installed by hand if wanted (the arms skip without them):
+#   Corrfunc==2.5.3  B2's Corrfunc arm; source build (gcc, GSL): pip install Corrfunc==2.5.3
+#   jaxkd-cuda       jaxkd's CUDA extension (CMake + nvcc), see github.com/dodgebc/jaxkd-cuda
