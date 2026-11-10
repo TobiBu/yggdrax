@@ -1,0 +1,23 @@
+# Paper v2 single-GPU run list (bench/paper_v2_runlist.py): what the benches need
+# on top of requirements-jax0112-cuda12.lock.txt. REQUIRED for the run list.
+#
+#   autocvd     the org rule on the shared A100 server: every row picks free cards
+#   matplotlib  the A5 benches and the B3 forecast write their figures
+#
+# Resolved 2026-11-10 for CPython 3.12, manylinux x86_64, together with the base
+# lock (whose pins it leaves unchanged):
+#
+#   pip install --dry-run --ignore-installed --python-version 3.12 --only-binary=:all: \
+#     --platform manylinux_2_28_x86_64 --platform manylinux_2_27_x86_64 \
+#     --platform manylinux_2_24_x86_64 --platform manylinux_2_17_x86_64 \
+#     --platform manylinux2014_x86_64 --report lock.json \
+#     -r requirements-jax0112-cuda12.lock.txt -r <this file> -r <baselines file>
+autocvd==0.2.1
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.68.0
+kiwisolver==1.5.1
+matplotlib==3.11.2
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
