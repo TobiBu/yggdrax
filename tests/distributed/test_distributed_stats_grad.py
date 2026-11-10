@@ -651,3 +651,66 @@ def test_unknown_exchange_is_refused():
         DistributedStatsConfig(
             capacity=16, halo_capacity=16, exchange="ragged"
         ).resolved()
+
+
+# ---------------------------------------------------------------------------
+# coincident points: r = 0 must not poison the gradient with 0 * inf = NaN
+# ---------------------------------------------------------------------------
+
+
+def _safe_r(r2, mask):
+    """``|delta|`` with distance 0 and gradient 0 at coincidence (the reference)."""
+    pos = mask & (r2 > 0)
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, r2, 1.0)), jnp.where(mask, 0.0, 1.0))
+
+
+@pytest.mark.parametrize("ndev", sorted({1, _MULTI}))
+def test_queries_on_data_points_give_a_finite_knn_gradient(ndev):
+    """A query exactly on a data point: its first neighbour is at r = 0."""
+    _mesh(ndev)
+    data, queries = _cdf_case()
+    queries = queries.at[:16].set(data[::40][:16])  # exact copies, several devices
+    idx, ok = _brute_nbrs(data, queries, self_exclude=False)
+    coef = jnp.asarray(np.random.default_rng(4).normal(size=(queries.shape[0], _K)))
+
+    def brute(d, q):
+        delta = d[idx] - q[:, None, :]
+        delta = delta - _L * jnp.round(delta / _L)
+        r = _safe_r(jnp.sum(delta * delta, axis=-1), jnp.asarray(ok))
+        return _dist_loss(jnp.where(ok, r, jnp.inf), coef)
+
+    def dist(d, q):
+        return _dist_loss(_knn_dist(d, ndev, queries=q).distances, coef)
+
+    out = _knn_dist(data, ndev, queries=queries)
+    assert np.all(np.asarray(out.distances)[:16, 0] == 0.0)
+    v_b, (gd_b, gq_b) = jax.value_and_grad(brute, argnums=(0, 1))(data, queries)
+    v, (gd, gq) = jax.value_and_grad(dist, argnums=(0, 1))(data, queries)
+    assert np.all(np.isfinite(gd)) and np.all(np.isfinite(gq))
+    np.testing.assert_allclose(float(v), float(v_b), rtol=1e-12)
+    assert _rel(gd, gd_b) < _TOL and _rel(gq, gq_b) < _TOL
+
+
+@pytest.mark.parametrize("ndev", sorted({1, _MULTI}))
+def test_coincident_particles_give_a_finite_pair_count_gradient(ndev):
+    """Duplicated particles: a valid pair at r = 0, below the first bin."""
+    _mesh(ndev)
+    pts = np.asarray(_PTS["faces_corners"](_N))
+    pts[1:_N:50] = pts[0:_N:50][: len(pts[1:_N:50])]  # exact duplicates
+    p, w = jnp.asarray(pts), jnp.ones((_N,))
+    lo, hi = soft_window_cutoffs(_EDGES, _SHARP, _EPS)
+
+    def brute(x):
+        d = x[:, None, :] - x[None, :, :]
+        d = d - _L * jnp.round(d / _L)
+        iu = jnp.triu(jnp.ones((_N, _N), bool), k=1)
+        r = _safe_r(jnp.sum(d * d, axis=-1), iu)
+        inside = iu & (r >= lo) & (r < hi)
+        win = soft_window(r, jnp.asarray(_EDGES), _SHARP)
+        return _xi_loss_of(jnp.einsum("ij,ijb->b", jnp.where(inside, 1.0, 0.0), win))
+
+    v_b, g_b = jax.value_and_grad(brute)(p)
+    v, g = jax.value_and_grad(lambda x: _xi_loss_of(_xi_dist(x, w, ndev).counts))(p)
+    assert np.all(np.isfinite(g))
+    np.testing.assert_allclose(float(v), float(v_b), rtol=1e-12)
+    assert _rel(g, g_b) < _TOL
