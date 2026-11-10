@@ -52,7 +52,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="window_eps values of the sweep (--eps stays the RR cut)",
     )
     p.add_argument(
-        "--thetas", type=float, nargs="+", default=[0.8, 0.6, 0.4, 0.3, 0.2, 0.1, 0.05]
+        "--thetas",
+        type=float,
+        nargs="+",
+        default=[0.8, 0.6, 0.5, 0.4, 0.3],
+        help="opening angles (theta 0.3 already costs ~12x the window rule at N=3e4)",
     )
     p.add_argument(
         "--smooth-band",
@@ -60,7 +64,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
         default=0.0,
         help="also run every point with the smooth rule at this beta (> 1)",
     )
-    p.add_argument("--targets", type=float, nargs="+", default=[1e-2, 1e-3, 1e-4, 1e-6])
+    p.add_argument(
+        "--targets",
+        type=float,
+        nargs="+",
+        default=[1e-2, 1e-3, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12],
+    )
     p.add_argument("--no-grad", action="store_true", help="skip value+grad timing")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args(argv)
@@ -223,7 +232,7 @@ def _plot(payload, path) -> None:
                 ]
                 if not pts:
                     continue
-                pts.sort(key=lambda r: r[key]["median_s"])
+                pts.sort(key=lambda r: -r["rel_err"])
                 ax.plot(
                     [r[key]["median_s"] for r in pts],
                     [max(r["rel_err"], 1e-16) for r in pts],
@@ -234,7 +243,9 @@ def _plot(payload, path) -> None:
                 )
             ax.set_xscale("log")
             ax.set_yscale("log")
-            ax.set_xlabel(f"{key.replace('_', '+')} time [s]")
+            ax.set_xlabel(
+                ("forward" if key == "forward" else "value+grad") + " time [s]"
+            )
             ax.set_ylabel("max per-bin |DD / DD_exact - 1|")
             ax.set_title(f"{kind}, N = {payload['rows'][0]['n']}")
             ax.legend(fontsize=7)
@@ -243,11 +254,35 @@ def _plot(payload, path) -> None:
     print(f"# wrote {path}")
 
 
+def _print_matched(payload) -> None:
+    for m in payload["matched_forward"] + payload["matched_value_and_grad"]:
+        cells = []
+        for fam in ("window", "geometric"):
+            best = m.get(fam)
+            cells.append(
+                f"{best['label']} {best['seconds']:.4f} s" if best else f"{fam} -"
+            )
+        ratio = m.get("geometric_over_window")
+        print(
+            f"{m['catalogue']:8s} {m['time']:15s} target {m['target']:.0e}: "
+            + "  |  ".join(cells)
+            + (f"  ratio {ratio:.2f}" if ratio else ""),
+            flush=True,
+        )
+
+
 def main(argv=None) -> None:
     args = _parse_args(argv)
     if args.replot:
         with open(args.replot) as f:
             payload = json.load(f)
+        # recompute the matched tables at this run's --targets
+        rows = payload["rows"]
+        families = sorted({r["family"] for r in rows})
+        for key in ("forward", "value_and_grad"):
+            payload[f"matched_{key}"] = _matched(rows, args.targets, families, key)
+        common.write_json(args.replot, payload)
+        _print_matched(payload)
         _plot(payload, args.fig or args.replot.replace(".json", ".png"))
         return
     common.select_device(args)
@@ -297,20 +332,7 @@ def main(argv=None) -> None:
             ),
         }
         common.write_json(out, payload)
-    for m in payload["matched_forward"] + payload["matched_value_and_grad"]:
-        cells = []
-        for fam in ("window", "geometric"):
-            best = m.get(fam)
-            cells.append(
-                f"{best['label']} {best['seconds']:.4f} s" if best else f"{fam} -"
-            )
-        ratio = m.get("geometric_over_window")
-        print(
-            f"{m['catalogue']:8s} {m['time']:15s} target {m['target']:.0e}: "
-            + "  |  ".join(cells)
-            + (f"  ratio {ratio:.2f}" if ratio else ""),
-            flush=True,
-        )
+    _print_matched(payload)
     try:
         _plot(payload, fig)
     except ImportError as exc:  # matplotlib missing
