@@ -631,6 +631,19 @@ def _composed(
 # ---------------------------------------------------------------------------
 
 
+def _distance(r2: Array, mask: Array) -> Array:
+    """``sqrt(r2)`` where ``mask``, with a zero gradient at ``r2 = 0``.
+
+    A plain ``sqrt`` has an infinite derivative at 0, so two coincident particles
+    (or a query on a data point) would give ``0 * inf = NaN`` in the gradient
+    even when the loss does not depend on that distance. Coincident pairs get
+    distance 0 and gradient 0 (a subgradient of ``|delta|``); masked entries
+    get 1. Values are unchanged everywhere.
+    """
+    pos = mask & (r2 > 0)
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, r2, 1.0)), jnp.where(mask, 0.0, 1.0))
+
+
 def soft_window(r: Array, edges: Array, sharpness: Any, log: bool = True) -> Array:
     """Soft bin membership ``sigmoid(s (u - a_b)) - sigmoid(s (u - b_b))``.
 
@@ -1389,8 +1402,9 @@ def _block_pair_sums(
     delta = minimum_image(xb[:, None, :, :] - xa[:, :, None, :], box)
     r2 = jnp.sum(delta * delta, axis=-1)
     valid = ma[:, :, None] & mb[:, None, :] & extra
-    # masked pairs (self, padding, duplicates) never reach the sqrt at r = 0
-    r = jnp.sqrt(jnp.where(valid, r2, 1.0))
+    # masked pairs (self, padding, duplicates) get r = 1; coincident valid pairs
+    # get r = 0 with a zero gradient
+    r = _distance(r2, valid)
     inside = valid & (r >= lo) & (r < hi)
     c = 0.5 * (oa[:, :, None] + ob[:, None, :])
     pw = jnp.where(inside, wa[:, :, None] * wb[:, None, :] * c, 0.0)
@@ -2122,7 +2136,7 @@ def _knn_body(
     has = nbr >= 0
     delta = minimum_image(xs[jnp.where(has, nbr, 0)] - xs[:, None, :], box)
     r2 = jnp.where(has, jnp.sum(delta * delta, axis=-1), 1.0)
-    d_sorted = jnp.where(has, jnp.sqrt(r2), jnp.inf)
+    d_sorted = jnp.where(has, _distance(r2, has), jnp.inf)
     # back to partitioned local rows: sorted slot -> combined row -> local row
     comb_row = perm[t.order]
     local_rows = jnp.where(live_s & (comb_row < cap), comb_row, as_index(cap))
