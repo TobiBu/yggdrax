@@ -80,6 +80,24 @@ is blended like acceptance. What remains discontinuous is a change of leaf
 membership (a particle crossing a cell face), whose jump is bounded by the far
 error of the pairs involved. See ``docs/differentiating_a_tree_code.md``.
 
+Periodic box (``box_size=L``). Every separation is the minimum-image one: the
+near field through :func:`yggdrax.periodic.minimum_image`, the far monopole at
+the minimum image of the centre-of-mass displacement, and every acceptance hook
+on the minimum-image centre distance ``d``, which the hooks recompute from the
+node centres. The walk itself runs without ``box_size``, so its periodic guard
+(far only if ``d + r_a + r_b < L/2``) is not applied. A radial count does not
+need it: through any image, a particle pair's minimum-image separation lies in
+``[d - s, d + s]`` (``s = r_a + r_b``), and so does the minimum image of the COM
+displacement. That interval is all the window rule's bound uses, and it is the
+geometric rule's monopole interval too. The guard would instead send every
+node pair beyond ``L/2`` (about half of all pairs in a cube) to exact leaf
+pairs. Positions are wrapped into the box and the cell tree is built on it.
+With ``membership`` each live position is taken at its image nearest its
+membership position, so a face crossing does not restructure the tree. Keep
+the windows' reach (``r_max`` plus the ``window_eps`` tail) below ``L/2`` for
+the result to be the usual periodic statistic; the analytic ``RR`` of
+:func:`yggdrax.applications.point_process.natural_estimator_rr` assumes it.
+
 Differentiability. The topology -- Morton codes, leaf ranges, the pair lists --
 is built from ``stop_gradient(positions)`` and carries no gradient. The counts
 are then a smooth function of the positions *given* that topology: gradients
@@ -121,8 +139,8 @@ include a rebuild, this module replaces:
   half of :func:`traced_soft_pair_counts`, which reads the walk's flat
   canonical lists directly, so no halving of symmetric lists is needed;
 * ``estimator.soft_pair_counts`` -- the eager build-then-accumulate wrapper;
-* the per-step host rebuild in ``inference_demo.recover_parameter`` -- see
-  ``inference_demo.recover_parameter_traced``.
+* the per-step host rebuild of the former ``inference_demo`` module, whose
+  parameter recovery is now :mod:`yggdrax.applications.point_process`.
 
 ``estimator._accumulate_block_pairs`` (the chunked, checkpointed near-field
 reduction) is shared, not superseded. The old path still supports the
@@ -132,6 +150,7 @@ reduction) is shared, not superseded. The old path still supports the
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Sequence
 from typing import Literal, NamedTuple
 
@@ -141,6 +160,7 @@ import numpy as np
 from jaxtyping import Array
 
 from yggdrax import MACType
+from yggdrax._interactions_impl import _compute_mac_ok
 from yggdrax._tree_impl import build_static_cells_tree
 from yggdrax.bounds import infer_bounds
 from yggdrax.geometry import compute_tree_geometry
@@ -148,6 +168,12 @@ from yggdrax.interactions import (
     MutualWalkResult,
     dual_tree_walk_mutual,
     mutual_walk_inputs,
+)
+from yggdrax.periodic import (
+    BoxSize,
+    minimum_image,
+    normalize_box_size,
+    wrap_positions,
 )
 
 from .binning import soft_bin_weights
@@ -440,6 +466,93 @@ _SMOOTH_PREDICATES = {
 }
 
 
+# --------------------------------------------------------------------------
+# periodic box
+# --------------------------------------------------------------------------
+
+
+def _make_geometric_accept(mac_type: MACType):
+    """The walk's own opening-angle test as a ``pair_accept`` hook.
+
+    ``data`` is ``theta``. Used only in a periodic box, where the hook has to
+    see the minimum-image distance (:func:`_min_image_hook`); the non-periodic
+    geometric rule keeps the walk's built-in test.
+    """
+
+    def accept(data, a, b, dist_sq, radius_a, radius_b):
+        theta = data
+        return _compute_mac_ok(
+            mac_type=mac_type,
+            theta_sq=theta * theta,
+            dist_sq=dist_sq,
+            extent_target=radius_a,
+            extent_source=radius_b,
+            valid_pairs=jnp.ones(dist_sq.shape, dtype=bool),
+            different_nodes=a != b,
+        )
+
+    return accept
+
+
+_GEOMETRIC_ACCEPT = {m: _make_geometric_accept(m) for m in ("bh", "dehnen", "engblom")}
+
+
+@functools.lru_cache(maxsize=None)
+def _min_image_hook(hook, box: tuple[float, ...]):
+    """``hook`` evaluated on the minimum-image centre distance in ``box``.
+
+    The wrapped hook takes ``data = (inner_data, centers)``, recomputes the
+    squared centre distance through :func:`yggdrax.periodic.minimum_image` and
+    calls ``hook(inner_data, a, b, dist_sq_mi, radius_a, radius_b)``. Cached,
+    so the same ``(hook, box)`` gives the same callable and the walk's static
+    arguments hash equal across calls.
+
+    The walk is run *without* its own ``box_size`` on purpose: its periodic
+    guard refuses far acceptance unless ``d + r_a + r_b < L/2``, which a
+    radial pair count does not need (see the module docstring, "Periodic
+    box") and which would force every node pair beyond ``L/2`` -- about half
+    of all pairs in a cube -- down to exact leaf pairs under the geometric
+    rule.
+    """
+
+    def wrapped(data, a, b, dist_sq, radius_a, radius_b):
+        del dist_sq
+        inner, centers = data
+        delta = minimum_image(centers[b] - centers[a], box)
+        return hook(inner, a, b, jnp.sum(delta * delta, axis=-1), radius_a, radius_b)
+
+    return wrapped
+
+
+def _periodic_positions(
+    positions: Array, membership: Array | None, box: tuple[float, ...]
+) -> tuple[Array, Array | None]:
+    """``(positions, membership)`` as a periodic evaluation uses them.
+
+    Without ``membership`` the positions are wrapped into ``[0, L)``; the wrap
+    has a unit Jacobian. With it, ``membership`` is wrapped (no gradient) and
+    each live position is moved to its image nearest its membership position,
+    so a leaf's particles stay together when one crosses a face during a
+    trajectory (a wrap would throw it to the far side and blow up its leaf's
+    bounding sphere). Live positions may then lie slightly outside the box;
+    every distance below is minimum-image, so that is harmless.
+    """
+    if membership is None:
+        return wrap_positions(positions, box), None
+    home = wrap_positions(jax.lax.stop_gradient(membership), box)
+    return home + minimum_image(positions - home, box), home
+
+
+def _resolve_box(
+    box_size: BoxSize | None, positions: Array, bounds
+) -> tuple[float, ...] | None:
+    """Normalised periodic box, rejecting ``bounds`` given alongside it."""
+    box = normalize_box_size(box_size, int(jnp.shape(positions)[-1]))
+    if box is not None and bounds is not None:
+        raise ValueError("pass either bounds or box_size, not both")
+    return box
+
+
 def _smooth_params(config: "TracedPairCountConfig", dtype, edges, sharpness, log):
     """The ``params`` of :func:`_blend_fractions` for ``config``, no gradient."""
     log_beta = jnp.log(jnp.asarray(config.smooth_band, dtype=dtype))
@@ -498,11 +611,11 @@ def _node_geometry(tables, ranges: Array, nodes: Array) -> tuple[Array, Array]:
     return center, jnp.linalg.norm(half, axis=-1)
 
 
-def _pair_fractions(kind, log, params, tables, ranges, a, b):
+def _pair_fractions(kind, log, params, tables, ranges, a, b, box=None):
     """Differentiable ``(sigma, kappa)`` of node pairs ``(a, b)``."""
     ca, ra = _node_geometry(tables, ranges, a)
     cb, rb = _node_geometry(tables, ranges, b)
-    delta = cb - ca
+    delta = minimum_image(cb - ca, box)
     return _blend_fractions(kind, log, params, jnp.sum(delta * delta, axis=-1), ra, rb)
 
 
@@ -542,6 +655,7 @@ def _build_topology(
     sharpness: float | Array | None = None,
     log: bool = True,
     membership: Array | None = None,
+    box: tuple[float, ...] | None = None,
 ) -> _Topology:
     """Rebuild the tree and run the mutual walk, all traceable, no gradient.
 
@@ -550,16 +664,18 @@ def _build_topology(
     and ``log`` are needed (and only read) by ``acceptance="window"``.
     ``membership`` (default ``positions``) are the positions the tree's leaf
     partition is built from; the node geometry and the walk always use
-    ``positions``.
+    ``positions``. With a periodic ``box`` (a normalised tuple) both arrive
+    already through :func:`_periodic_positions`; the tree is built on the box
+    and every acceptance hook sees minimum-image centre distances.
     """
     pos = jax.lax.stop_gradient(positions)
     build_pos = pos if membership is None else jax.lax.stop_gradient(membership)
-    box = _resolve_bounds(build_pos, bounds)
     masses = jnp.ones(pos.shape[0], dtype=pos.dtype)
     tree, pos_sorted, _, _, leaf_overflow, num_leaves = build_static_cells_tree(
         build_pos,
         masses,
-        box,
+        bounds=None if box is not None else _resolve_bounds(build_pos, bounds),
+        box_size=box,
         leaf_size=config.leaf_size,
         leaf_capacity=config.leaf_capacity,
         return_reordered=True,
@@ -574,6 +690,12 @@ def _build_topology(
     w = mutual_walk_inputs(
         tree, geometry, mac_type=config.mac_type, mask_empty_nodes=True
     )
+    # Every branch picks the walk's centres, radii and hooks; one call below.
+    accept = discard = band = None
+    data = None
+    band_cap = 0
+    centers = jnp.asarray(geometry.center)
+    walk_mac = None
     if config.smooth:
         if config.acceptance not in ("window", "geometric"):
             raise ValueError(f"unknown acceptance {config.acceptance!r}")
@@ -586,40 +708,19 @@ def _build_topology(
         # two splits: a jump. The node COUNT is piecewise constant at fixed
         # leaf membership, so the split order is too. The hooks read the true
         # radii from ``data``.
-        counts = jnp.maximum(
+        radii = jnp.maximum(
             tree.node_ranges[:, 1] - tree.node_ranges[:, 0] + 1, 0
         ).astype(pos.dtype)
-        walk = dual_tree_walk_mutual(
-            w.left_child_full,
-            w.right_child_full,
-            jnp.asarray(geometry.center),
-            counts,
-            config.theta,
-            w.root,
-            max_pair_queue=config.max_pair_queue,
-            far_cap=config.far_cap,
-            near_cap=config.near_cap,
-            node_active=w.node_active,
-            pair_accept=accept,
-            pair_discard=discard,
-            pair_band=band,
-            band_cap=max(1, int(config.band_cap)),
-            pair_accept_data=(params, node_radius),
-        )
+        data = (params, node_radius)
+        band_cap = max(1, int(config.band_cap))
     elif config.acceptance == "geometric":
-        walk = dual_tree_walk_mutual(
-            w.left_child_full,
-            w.right_child_full,
-            w.centers,
-            w.radii,
-            config.theta,
-            w.root,
-            max_pair_queue=config.max_pair_queue,
-            far_cap=config.far_cap,
-            near_cap=config.near_cap,
-            mac_type=config.mac_type,
-            node_active=w.node_active,
-        )
+        centers = w.centers
+        radii = w.radii
+        if box is None:
+            walk_mac = config.mac_type
+        else:
+            accept = _GEOMETRIC_ACCEPT[config.mac_type]
+            data = jnp.asarray(config.theta, dtype=pos.dtype)
     elif config.acceptance == "window":
         if edges is None or sharpness is None:
             raise ValueError('acceptance="window" needs edges and sharpness')
@@ -634,23 +735,33 @@ def _build_topology(
         # Bounding spheres about the box centres, NOT the MAC's (possibly
         # scaled, depth-padded) extents: the rule needs every particle
         # separation of a pair inside [d - s, d + s].
-        walk = dual_tree_walk_mutual(
-            w.left_child_full,
-            w.right_child_full,
-            jnp.asarray(geometry.center),
-            jnp.asarray(geometry.radius, dtype=pos.dtype),
-            config.theta,
-            w.root,
-            max_pair_queue=config.max_pair_queue,
-            far_cap=config.far_cap,
-            near_cap=config.near_cap,
-            node_active=w.node_active,
-            pair_accept=accept,
-            pair_discard=discard,
-            pair_accept_data=data,
-        )
+        radii = jnp.asarray(geometry.radius, dtype=pos.dtype)
     else:
         raise ValueError(f"unknown acceptance {config.acceptance!r}")
+    if box is not None:
+        accept, discard, band = (
+            None if hook is None else _min_image_hook(hook, box)
+            for hook in (accept, discard, band)
+        )
+        data = (data, centers)
+    walk = dual_tree_walk_mutual(
+        w.left_child_full,
+        w.right_child_full,
+        centers,
+        radii,
+        config.theta,
+        w.root,
+        max_pair_queue=config.max_pair_queue,
+        far_cap=config.far_cap,
+        near_cap=config.near_cap,
+        mac_type=walk_mac,
+        node_active=w.node_active,
+        pair_accept=accept,
+        pair_discard=discard,
+        pair_band=band,
+        band_cap=band_cap,
+        pair_accept_data=data,
+    )
     return _Topology(
         order=tree.particle_indices,
         node_ranges=tree.node_ranges,
@@ -670,6 +781,7 @@ def traced_soft_pair_counts(
     log: bool = True,
     bounds: tuple[Array, Array] | None = None,
     membership: Array | None = None,
+    box_size: BoxSize | None = None,
 ) -> TracedPairCounts:
     """Soft pair counts ``sum_{i<j} w_k(r_ij)``, rebuilding the tree inside.
 
@@ -698,15 +810,35 @@ def traced_soft_pair_counts(
             smooth rule the counts are then continuous in ``positions`` along
             the whole of it, because a particle crossing a cell face no longer
             restructures the tree. Must lie inside ``bounds`` when given.
+        box_size: Optional periodic box ``[0, L)^3``: a float (cube) or one
+            length per dimension. Static (a Python value). Every separation is
+            then the minimum-image one, the tree is built on the box (the
+            positions are wrapped; any coordinates are accepted) and
+            ``bounds`` must be ``None``. With ``membership``, each live
+            position is taken at its image nearest its membership position, so
+            a particle crossing a face does not restructure the tree either.
+            Keep the largest separation the windows reach below ``L / 2`` (see
+            the module docstring, "Periodic box"). ``None`` (default) is the
+            open-boundary estimator, unchanged.
 
     Returns:
         A :class:`TracedPairCounts`. ``counts`` has shape ``(nbins,)``; read
         ``overflow`` before trusting it.
     """
+    box = _resolve_box(box_size, positions, bounds)
+    if box is not None:
+        positions, membership = _periodic_positions(positions, membership, box)
     topo = _build_topology(
-        positions, config, bounds, edges, sharpness, log, membership=membership
+        positions,
+        config,
+        bounds,
+        edges,
+        sharpness,
+        log,
+        membership=membership,
+        box=box,
     )
-    return _accumulate(positions, edges, config, topo, sharpness, log)
+    return _accumulate(positions, edges, config, topo, sharpness, log, box=box)
 
 
 def _accumulate(
@@ -716,12 +848,15 @@ def _accumulate(
     topo: _Topology,
     sharpness: float | Array,
     log: bool,
+    box: tuple[float, ...] | None = None,
 ) -> TracedPairCounts:
     """The differentiable half: soft counts of ``positions`` over ``topo``.
 
     Split from the build so a caller can hold a topology fixed (the benches in
     ``bench/differentiability`` evaluate a step's end point on the start
-    point's topology to separate the smooth change from the switch).
+    point's topology to separate the smooth change from the switch). With a
+    periodic ``box``, ``positions`` are the ones :func:`_periodic_positions`
+    returned for the build, and every separation is minimum-image.
     """
     walk = topo.walk
     dtype = positions.dtype
@@ -760,6 +895,7 @@ def _accumulate(
         nbins,
         triu,
         int(config.near_chunk),
+        box_size=box,
     )
 
     # near leaf pairs: canonical (a < b), each once, -1 padded
@@ -772,7 +908,7 @@ def _accumulate(
     fb = jnp.where(far_live, walk.far_b, 0)
     if config.smooth:
         near_factor, far_factor = _smooth_weights(
-            walk, config, edges, sharpness, log, pos_sorted, ranges, fa, fb
+            walk, config, edges, sharpness, log, pos_sorted, ranges, fa, fb, box
         )
         near_weight = jnp.where(near_live, near_factor, 0.0)
     else:
@@ -790,6 +926,7 @@ def _accumulate(
         None,
         int(config.near_chunk),
         row_weight=near_weight,
+        box_size=box,
     )
 
     # far node pairs: monopole at the centres of mass, each once
@@ -806,7 +943,12 @@ def _accumulate(
 
     com_a, cnt_a = com_and_count(fa)
     com_b, cnt_b = com_and_count(fb)
-    d_far = jnp.sqrt(jnp.sum((com_a - com_b) ** 2, axis=-1) + 1e-30)
+    # Periodic: the minimum image of the COM displacement. It may differ from
+    # the image some particle pairs of the node pair use, but every one of
+    # those separations lies in the same [d - s, d + s] as this one, which is
+    # all the window rule's bound needs (module docstring, "Periodic box").
+    delta_far = minimum_image(com_a - com_b, box)
+    d_far = jnp.sqrt(jnp.sum(delta_far * delta_far, axis=-1) + 1e-30)
     w_far = soft_bin_weights(d_far, edges, sharpness, log=log)  # (far_cap, nbins)
     pair_weight = jnp.where(far_live, cnt_a * cnt_b, 0.0)
     if far_factor is not None:
@@ -850,6 +992,7 @@ def _smooth_weights(
     ranges: Array,
     fa: Array,
     fb: Array,
+    box: tuple[float, ...] | None = None,
 ) -> tuple[Array, Array]:
     """Blend weights of the smooth rule: ``(near_factor, far_factor)``.
 
@@ -879,7 +1022,7 @@ def _smooth_weights(
     band_live = jnp.arange(cap) < jnp.minimum(walk.band_count, cap)
     ba = jnp.where(band_live, walk.band_a, 0)
     bb = jnp.where(band_live, walk.band_b, 0)
-    b_sigma, b_kappa = _pair_fractions(kind, log, params, tables, ranges, ba, bb)
+    b_sigma, b_kappa = _pair_fractions(kind, log, params, tables, ranges, ba, bb, box)
     b_factor = b_kappa * (1.0 - b_sigma * walk.band_accepted.astype(dtype))
     band_prod = _ancestry_products(
         jnp.where(band_live, b_factor, 1.0),
@@ -890,7 +1033,7 @@ def _smooth_weights(
         has = parent >= 0
         return jnp.where(has, band_prod[jnp.where(has, parent, 0)], 1.0)
 
-    f_sigma, f_kappa = _pair_fractions(kind, log, params, tables, ranges, fa, fb)
+    f_sigma, f_kappa = _pair_fractions(kind, log, params, tables, ranges, fa, fb, box)
     return hang(walk.near_parent), f_sigma * f_kappa * hang(walk.far_parent)
 
 
@@ -912,6 +1055,7 @@ def plan_traced_pair_counts(
     leaf_size: int = 16,
     mac_type: MACType = "dehnen",
     bounds: tuple[Array, Array] | None = None,
+    box_size: BoxSize | None = None,
     near_chunk: int = _DEFAULT_NEAR_CHUNK,
     leaf_slack: float = 1.25,
     list_slack: float = 1.5,
@@ -949,6 +1093,8 @@ def plan_traced_pair_counts(
         mac_type: Geometric acceptance criterion.
         bounds: Fixed Morton domain, as for :func:`traced_soft_pair_counts`.
             Pass the same value to both.
+        box_size: Periodic box, as for :func:`traced_soft_pair_counts`. Pass
+            the same value to both.
         near_chunk: Near-field chunk size stored in the config.
         leaf_slack: Multiplier on the probed live-leaf count.
         list_slack: Multiplier on the probed wavefront peak and list lengths.
@@ -981,14 +1127,17 @@ def plan_traced_pair_counts(
     need_leaves = need_queue = need_far = need_near = need_band = 1
     for pos in catalogues:
         n = int(pos.shape[0])
-        box = _resolve_bounds(pos, bounds)
+        periodic = _resolve_box(box_size, pos, bounds)
+        if periodic is not None:
+            pos, _ = _periodic_positions(pos, None, periodic)
         # --- live leaves: the count is taken before the cut, so one probe at
         # any capacity gives the exact need. ---
         cap0 = max(64, 4 * (-(-n // leaf)))
         out = build_static_cells_tree(
             pos,
             jnp.ones(n, pos.dtype),
-            box,
+            bounds=None if periodic is not None else _resolve_bounds(pos, bounds),
+            box_size=periodic,
             leaf_size=leaf,
             leaf_capacity=cap0,
             return_num_leaves=True,
@@ -1016,7 +1165,7 @@ def plan_traced_pair_counts(
             )
             walk = jax.jit(
                 lambda p, c=cfg: _build_topology(
-                    p, c, bounds, edges, sharpness, log
+                    p, c, bounds, edges, sharpness, log, box=periodic
                 ).walk
             )(pos)
             qo, fo, no = (

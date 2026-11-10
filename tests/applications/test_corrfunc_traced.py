@@ -386,25 +386,3 @@ def test_planner_covers_a_batch_and_reports_needs(wide_config):
         assert int(res.far_count) <= wide_config.far_cap
         assert int(res.near_count) <= wide_config.near_cap
         assert int(res.peak_wavefront) <= wide_config.max_pair_queue
-
-
-def test_traced_inference_demo_moves_toward_truth():
-    pytest.importorskip("optax")
-    from yggdrax.applications.corrfunc.inference_demo import (
-        make_cluster_model,
-        recover_parameter_traced,
-    )
-
-    model = make_cluster_model(jax.random.PRNGKey(0), n=300, num_centers=6)
-    res = recover_parameter_traced(
-        model,
-        make_log_edges(0.01, 0.5, 8),
-        a_true=0.5,
-        a_init=0.1,
-        leaf_size=_LEAF,
-        num_steps=25,
-        probe_a=(0.0, 0.5, 0.99),
-    )
-    assert len(res.a_history) == 26
-    assert abs(res.a_final - 0.5) < abs(0.1 - 0.5)
-    assert res.loss_history[-1] < res.loss_history[0]

@@ -13,8 +13,9 @@ Modules:
   box: cluster size ``sigma`` and radial-profile shape ``beta``.
 * ``analytic``   -- the Thomas ``xi(r)`` (Poisson and fixed counts), analytic
   soft ``RR`` of a periodic box, soft-window averages.
-* ``statistics`` -- pluggable data vectors: ``xi`` (natural estimator) and soft
-  kNN-CDFs on :mod:`yggdrax.distributed.stats`.
+* ``statistics`` -- pluggable data vectors: ``xi`` (natural estimator, on
+  :mod:`yggdrax.distributed.stats` or the traced single-device estimator) and
+  soft kNN-CDFs on :mod:`yggdrax.distributed.stats`.
 * ``inference``  -- Jacobians, finite differences, ensembles, Fisher forecasts,
   Levenberg–Marquardt fits.
 
@@ -58,6 +59,7 @@ from .statistics import (
     concat_statistics,
     make_knn_cdf_statistic,
     make_xi_statistic,
+    natural_estimator_rr,
     query_grid,
 )
 
@@ -81,6 +83,7 @@ __all__ = [
     "hartlap_factor",
     "make_knn_cdf_statistic",
     "make_xi_statistic",
+    "natural_estimator_rr",
     "profile_norm",
     "profile_xi_fixed_counts_mc",
     "query_grid",
