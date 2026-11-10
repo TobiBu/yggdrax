@@ -160,6 +160,33 @@ def _compute_leaf_bounds_from_morton(tree: object) -> tuple[Array, Array]:
     return mins, maxs
 
 
+def _same_bits(a: Array, b: Array) -> Array:
+    """Elementwise: ``a`` and ``b`` have the same bit pattern (``-0.0 != 0.0``)."""
+    uint = jnp.dtype(f"uint{8 * jnp.dtype(a.dtype).itemsize}")
+    return lax.bitcast_convert_type(a, uint) == lax.bitcast_convert_type(b, uint)
+
+
+def _gather_inherited_bounds(
+    stopped: Array, source_leaf: Array, leaf_bounds: Array, num_internal: int
+) -> Array:
+    """Internal-node bounds as the live bounds of the leaves they came from.
+
+    ``stopped`` holds the upward pass's merged values (no tangents) and
+    ``source_leaf`` the leaf each one was taken from, per axis (``-1`` for an
+    internal node no level reached, which keeps its stopped value: zero). The
+    gather returns the same values bit for bit, and its derivative is the
+    subgradient of the min/max: the extremal leaf's own bound gets it all (the
+    first child on an exact tie).
+    """
+    # the node arrays' dtype, as the old ``.at[...].set`` cast it (the Morton
+    # shortcut computes leaf bounds in the bounds' dtype)
+    leaf_bounds = jnp.asarray(leaf_bounds).astype(stopped.dtype)
+    internal_src = source_leaf[:num_internal]
+    gathered = jnp.take_along_axis(leaf_bounds, jnp.maximum(internal_src, 0), axis=0)
+    internal = jnp.where(internal_src >= 0, gathered, stopped[:num_internal])
+    return jnp.concatenate([internal, leaf_bounds], axis=0)
+
+
 @jaxtyped(typechecker=beartype)
 def compute_tree_geometry(
     tree: object,
@@ -193,6 +220,15 @@ def compute_tree_geometry(
     -------
     TreeGeometry
         Named tuple containing node centers, half-extents, and bounding radii.
+
+    Notes
+    -----
+    Differentiable in ``positions_sorted`` (and ``particle_radius``) in forward
+    and reverse mode, eagerly and under ``jax.jit``, for a fixed topology. Each
+    internal node's bound is the bound of one of its leaves, per axis; the
+    upward pass picks that leaf without gradients and gathers its live bound,
+    so the derivative is the min/max subgradient (all of it to the extremal
+    leaf; on an exact tie, to the first child).
     """
 
     _validate_inputs(tree, positions_sorted)
@@ -238,10 +274,28 @@ def compute_tree_geometry(
         leaf_min, leaf_max = _leaf_bounds_from_ranges(None)
 
     dim = positions_sorted.shape[1]
-    mins = jnp.zeros((num_nodes, dim), dtype=positions_sorted.dtype)
-    maxs = jnp.zeros((num_nodes, dim), dtype=positions_sorted.dtype)
-    mins = mins.at[num_internal:].set(leaf_min)
-    maxs = maxs.at[num_internal:].set(leaf_max)
+    num_leaves = num_nodes - num_internal
+    # The upward pass decides WHICH leaf bound each internal node inherits (a
+    # combinatorial choice, made on stopped values) and then gathers that bound
+    # from the live leaf bounds -- see _gather_inherited_bounds. The loop below
+    # therefore carries no tangents, which is what lets reverse mode through it:
+    # its trip count is traced under jit, and JAX cannot transpose such a loop.
+    # One array per node row: the ``dim`` minima, then the ``dim`` maxima, so a
+    # level reads each child row once.
+    dtype = positions_sorted.dtype
+    leaf_bounds = jnp.concatenate(
+        [jnp.asarray(leaf_min).astype(dtype), jnp.asarray(leaf_max).astype(dtype)],
+        axis=1,
+    )
+    bounds = jnp.zeros((num_nodes, 2 * dim), dtype=dtype)
+    bounds = bounds.at[num_internal:].set(lax.stop_gradient(leaf_bounds))
+    # per node and column: the leaf whose bound the node holds (-1: none yet)
+    leaf_ids = jnp.broadcast_to(
+        jnp.arange(num_leaves, dtype=jnp.int32)[:, None], (num_leaves, 2 * dim)
+    )
+    source = jnp.full((num_nodes, 2 * dim), -1, dtype=jnp.int32)
+    source = source.at[num_internal:].set(leaf_ids)
+    is_min_column = jnp.arange(2 * dim) < dim
 
     left_child = jnp.asarray(tree.left_child, dtype=INDEX_DTYPE)
     right_child = jnp.asarray(tree.right_child, dtype=INDEX_DTYPE)
@@ -292,30 +346,45 @@ def compute_tree_geometry(
         internal_depth = node_depth[:num_internal]
 
         def _upward_body(rev_idx, state):
-            mins_s, maxs_s = state
+            bounds_s, source_s = state
             # rev_idx 0 -> deepest internal level, …
             level = max_depth - as_index(1) - as_index(rev_idx)
 
             # Mask: which internal nodes sit at this level?
-            at_level = internal_depth == level
+            at_level = (internal_depth == level)[:, None]
 
             # Merge children bounds (computed for ALL internal nodes but
             # only applied where at_level is True).
-            child_min = jnp.minimum(mins_s[left_child], mins_s[right_child])
-            child_max = jnp.maximum(maxs_s[left_child], maxs_s[right_child])
+            left_b, right_b = bounds_s[left_child], bounds_s[right_child]
+            merged = jnp.where(
+                is_min_column,
+                jnp.minimum(left_b, right_b),
+                jnp.maximum(left_b, right_b),
+            )
+            # The merged value IS one of the two children's (bit for bit, signed
+            # zeros included): record which, by its bits.
+            merged_source = jnp.where(
+                _same_bits(merged, left_b),
+                source_s[left_child],
+                source_s[right_child],
+            )
 
-            mins_s = mins_s.at[:num_internal].set(
-                jnp.where(at_level[:, None], child_min, mins_s[:num_internal])
-            )
-            maxs_s = maxs_s.at[:num_internal].set(
-                jnp.where(at_level[:, None], child_max, maxs_s[:num_internal])
-            )
-            return mins_s, maxs_s
+            def _apply(full, new):
+                return full.at[:num_internal].set(
+                    jnp.where(at_level, new, full[:num_internal])
+                )
+
+            return _apply(bounds_s, merged), _apply(source_s, merged_source)
 
         # fori_loop accepts traced bounds; extra iterations where no node
         # matches a negative level are harmless no-ops.
         num_internal_levels = jnp.maximum(max_depth, as_index(0))
-        mins, maxs = lax.fori_loop(0, num_internal_levels, _upward_body, (mins, maxs))
+        bounds, source = lax.fori_loop(
+            0, num_internal_levels, _upward_body, (bounds, source)
+        )
+
+    bounds = _gather_inherited_bounds(bounds, source, leaf_bounds, num_internal)
+    mins, maxs = bounds[:, :dim], bounds[:, dim:]
 
     centers = 0.5 * (mins + maxs)
     half_extents = 0.5 * (maxs - mins)
