@@ -730,6 +730,105 @@ def test_query_neighbors_periodic(backend, box):
     np.testing.assert_allclose(np.sort(got, axis=1), want, atol=1e-12)
 
 
+def _pinned_queries(box, rng) -> np.ndarray:
+    """Queries exactly on the corners, edges and faces of the box, and just inside."""
+    L = np.broadcast_to(np.asarray(box, np.float64), (3,))
+    top = np.nextafter(L, 0.0)  # the largest coordinate inside [0, L)
+    corners = np.array(np.meshgrid(*[[0.0, t] for t in top])).reshape(3, -1).T
+    edges, faces = [], []
+    for axis in range(3):
+        for a in (0.0, 1.0):
+            for b in (0.0, 1.0):
+                e = rng.uniform(0.0, 1.0, (3, 3)) * L
+                others = [i for i in range(3) if i != axis]
+                e[:, others[0]] = a * top[others[0]]
+                e[:, others[1]] = b * top[others[1]]
+                edges.append(e)
+            f = rng.uniform(0.0, 1.0, (4, 3)) * L
+            f[:, axis] = a * top[axis]
+            faces.append(f)
+    near = rng.uniform(0.0, 1e-4, (16, 3)) * L
+    near[8:] = top - near[8:]
+    return np.concatenate([corners, *edges, *faces, near])
+
+
+@pytest.mark.parametrize("box", [1.0, (1.0, 2.0, 0.5)])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("leaf_size,k", [(8, 1), (8, 16), (32, 8), (32, 32)])
+def test_query_neighbors_periodic_tree_pinned_queries(box, dtype, leaf_size, k):
+    """The pruned periodic walk (box-ordered, box-pruned) is exact at the faces.
+
+    Larger N than test_query_neighbors_periodic, so the tree has many levels and
+    the far-child ordering and the minimum-image box bound decide what is
+    visited; queries sit exactly on corners, edges and faces.
+    """
+    rng = np.random.default_rng(31)
+    pts = np.asarray(
+        wrap_positions(jnp.asarray(_box_points(3000, box, seed=30)), box)
+    ).astype(dtype)
+    queries = np.concatenate([_pinned_queries(box, rng), pts[:64]]).astype(dtype)
+    tree = build_kdtree(jnp.asarray(pts), leaf_size=leaf_size)
+    idx, dist = query_neighbors(
+        tree, jnp.asarray(queries), k=k, backend="tree", box_size=box
+    )
+    L = np.broadcast_to(np.asarray(box, np.float64), (3,))
+    p64, q64 = pts.astype(np.float64), queries.astype(np.float64)
+    d = q64[:, None, :] - p64[None, :, :]
+    d -= L * np.round(d / L)
+    r = np.sqrt(np.sum(d * d, axis=-1))
+    want = np.sort(r, axis=1)[:, :k]
+    tol = 1e-12 if dtype == np.float64 else 2e-6
+    np.testing.assert_allclose(np.asarray(dist, np.float64), want, atol=tol)
+    got = np.take_along_axis(r, np.asarray(idx), axis=1)
+    np.testing.assert_allclose(np.sort(got, axis=1), want, atol=tol)
+    # the dense backend is the brute force on the same tree: identical sets
+    idx_d, _ = query_neighbors(
+        tree, jnp.asarray(queries), k=k, backend="dense", box_size=box
+    )
+    if dtype == np.float64:
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(idx), axis=1), np.sort(np.asarray(idx_d), axis=1)
+        )
+
+
+def test_query_neighbors_periodic_tree_exclude_self_at_corners():
+    box = (1.0, 1.5, 0.75)
+    pts = np.asarray(wrap_positions(jnp.asarray(_box_points(2000, box, seed=32)), box))
+    tree = build_kdtree(jnp.asarray(pts), leaf_size=16)
+    idx, dist = query_neighbors(
+        tree, jnp.asarray(pts), k=8, exclude_self=True, backend="tree", box_size=box
+    )
+    L = np.asarray(box)
+    d = pts[:, None, :] - pts[None, :, :]
+    d -= L * np.round(d / L)
+    r = np.sqrt(np.sum(d * d, axis=-1))
+    np.fill_diagonal(r, np.inf)
+    np.testing.assert_allclose(np.asarray(dist), np.sort(r, axis=1)[:, :8], atol=1e-12)
+    assert not np.any(np.asarray(idx) == np.arange(len(pts))[:, None])
+
+
+@pytest.mark.parametrize("box", [1.0, (1.0, 2.0, 0.5)])
+def test_count_neighbors_periodic_tree_pinned_queries(box):
+    rng = np.random.default_rng(33)
+    pts = np.asarray(wrap_positions(jnp.asarray(_box_points(3000, box, seed=34)), box))
+    queries = np.concatenate([_pinned_queries(box, rng), pts[:64]])
+    tree = build_kdtree(jnp.asarray(pts), leaf_size=16)
+    L = np.broadcast_to(np.asarray(box, np.float64), (3,))
+    radii = np.asarray([0.005, 0.02, 0.08, 0.2]) * float(np.min(L))
+    got = count_neighbors(
+        tree,
+        jnp.asarray(queries),
+        radius=jnp.asarray(radii),
+        backend="tree",
+        box_size=box,
+    )
+    d = queries[:, None, :] - pts[None, :, :]
+    d -= L * np.round(d / L)
+    r = np.sqrt(np.sum(d * d, axis=-1))
+    want = (r[:, :, None] <= radii[None, None, :]).sum(axis=1)
+    np.testing.assert_array_equal(np.asarray(got), want)
+
+
 def test_query_neighbors_periodic_rejects_points_outside_box():
     tree = build_kdtree(jnp.asarray(_box_points(64, 1.0, seed=13)), leaf_size=8)
     with pytest.raises(ValueError, match="inside"):

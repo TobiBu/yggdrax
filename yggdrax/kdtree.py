@@ -1133,6 +1133,38 @@ def _query_neighbors_tiled(
     return best_idx, jnp.sqrt(best_d2)
 
 
+def _periodic_box_gap_sq(query: Array, lo: Array, hi: Array, box: Array) -> Array:
+    """Squared minimum-image distance from ``query`` to the box ``[lo, hi]``.
+
+    Every point of a KD node lies in its bounding box, so this is a lower bound
+    on the node's minimum-image distances. Both the query and the box lie in
+    ``[0, L)``: along each axis the gap is 0 inside ``[lo, hi]``, else the
+    shorter of the direct gap and the gap across the box face.
+
+    Parameters
+    ----------
+    query
+        Query position in ``[0, L)^d``, shape ``(d,)``.
+    lo
+        Lower corner of the node's bounding box, shape ``(d,)``.
+    hi
+        Upper corner of the node's bounding box, shape ``(d,)``.
+    box
+        Box lengths ``L``, shape ``(d,)``.
+
+    Returns
+    -------
+    Array
+        The squared distance, a scalar.
+    """
+    below = lo - query
+    above = query - hi
+    direct = jnp.maximum(jnp.maximum(below, above), 0.0)
+    across = jnp.where(below > 0, query + box - hi, lo + box - query)
+    gap = jnp.where(direct > 0, jnp.minimum(direct, across), 0.0)
+    return jnp.sum(gap * gap)
+
+
 def _topk_merge(
     best_d2: Array, best_idx: Array, cand_d2: Array, cand_idx: Array
 ) -> tuple[Array, Array]:
@@ -1226,6 +1258,8 @@ def _query_neighbors_tree(
     leaf_point_ids = jnp.asarray(tree.leaf_point_ids, dtype=jnp.int32)
     leaf_valid = jnp.asarray(tree.leaf_valid_mask, dtype=jnp.bool_)
     node_to_leaf = jnp.asarray(tree.node_to_leaf, dtype=jnp.int32)
+    bbox_min = jnp.asarray(tree.bbox_min, dtype=queries_arr.dtype)
+    bbox_max = jnp.asarray(tree.bbox_max, dtype=queries_arr.dtype)
     num_nodes = int(tree.node_start.shape[0])
     n_queries = int(queries_arr.shape[0])
     num_points = tree.num_points
@@ -1292,6 +1326,23 @@ def _query_neighbors_tree(
                 operand=None,
             )
 
+            def _periodic_child_order(node: Array) -> tuple[Array, Array, Array]:
+                assert box is not None  # only on the periodic path
+                left, right = 2 * node + 1, 2 * node + 2
+
+                def gap_sq(child: Array) -> Array:
+                    safe = jnp.clip(child, 0, num_nodes - 1)
+                    g = _periodic_box_gap_sq(query, bbox_min[safe], bbox_max[safe], box)
+                    return jnp.where(child < num_nodes, g, jnp.inf)
+
+                g_left, g_right = gap_sq(left), gap_sq(right)
+                right_first = g_right < g_left
+                return (
+                    jnp.where(right_first, right, left),
+                    jnp.where(right_first, left, right),
+                    jnp.where(right_first, g_left, g_right),
+                )
+
             def next_for_cluster(_):
                 return parent
 
@@ -1302,20 +1353,24 @@ def _query_neighbors_tree(
                     split_dim_raw,
                     jnp.asarray(0, dtype=jnp.int32),
                 )
-                split_distance = query[split_dim] - points[indices[current], split_dim]
-                near_side = jnp.asarray(split_distance > 0, dtype=jnp.int32)
-                near_child = 2 * current + 1 + near_side
-                far_child = 2 * current + 2 - near_side
                 if box is None:
-                    gap = split_distance
+                    split_distance = (
+                        query[split_dim] - points[indices[current], split_dim]
+                    )
+                    near_side = jnp.asarray(split_distance > 0, dtype=jnp.int32)
+                    near_child = 2 * current + 1 + near_side
+                    far_child = 2 * current + 2 - near_side
+                    far_in_range = (split_distance * split_distance) <= radius_state
                 else:
-                    # Points and queries lie in [0, L): the far side is also
-                    # reached across the box face behind the query, at least
-                    # L - q (far side below the plane) or q (above) away.
-                    q_k = query[split_dim]
-                    wrap_gap = jnp.where(split_distance > 0, box[split_dim] - q_k, q_k)
-                    gap = jnp.minimum(jnp.abs(split_distance), wrap_gap)
-                far_in_range = (gap * gap) <= radius_state
+                    # Periodic: the side of the split plane says nothing about
+                    # which child is nearer once the far side can be reached
+                    # across a face, and a 1-D plane gap does not shrink with
+                    # depth, so a query near a corner used to walk the whole
+                    # tree (and, under vmap, every query waited for it). Order
+                    # the children and prune by the minimum-image distance to
+                    # their bounding boxes instead.
+                    near_child, far_child, far_gap_sq = _periodic_child_order(current)
+                    far_in_range = far_gap_sq <= radius_state
                 return jax.lax.select(
                     (previous == near_child)
                     | ((previous == parent) & (near_child >= num_nodes)),
@@ -1598,6 +1653,8 @@ def _count_neighbors_tree(
     use_self_mask = bool((not include_self) and (n_queries == num_points))
     query_ids = jnp.arange(n_queries, dtype=jnp.int32)
     box = None if box_size is None else jnp.asarray(box_size, dtype=queries_arr.dtype)
+    bbox_min = jnp.asarray(tree.bbox_min, dtype=queries_arr.dtype)
+    bbox_max = jnp.asarray(tree.bbox_max, dtype=queries_arr.dtype)
 
     def image(delta: Array) -> Array:
         return delta if box_size is None else minimum_image(delta, box_size)
@@ -1665,14 +1722,17 @@ def _count_neighbors_tree(
                 near_child = 2 * current + 1 + near_side
                 far_child = 2 * current + 2 - near_side
                 if box is None:
-                    gap = split_distance
+                    far_gap_sq = split_distance * split_distance
                 else:
-                    # as in _query_neighbors_tree: the far side is also reached
-                    # across the box face behind the query
-                    q_k = query[split_dim]
-                    wrap_gap = jnp.where(split_distance > 0, box[split_dim] - q_k, q_k)
-                    gap = jnp.minimum(jnp.abs(split_distance), wrap_gap)
-                far_in_range = (gap * gap) <= radius_sq_max
+                    # as in _query_neighbors_tree: the minimum-image distance to
+                    # the far child's bounding box (a 1-D wrap gap does not
+                    # shrink with depth); the radius is fixed, so the visiting
+                    # order does not matter here
+                    safe_far = jnp.clip(far_child, 0, num_nodes - 1)
+                    far_gap_sq = _periodic_box_gap_sq(
+                        query, bbox_min[safe_far], bbox_max[safe_far], box
+                    )
+                far_in_range = far_gap_sq <= radius_sq_max
                 return jax.lax.select(
                     (previous == near_child)
                     | ((previous == parent) & (near_child >= num_nodes)),
