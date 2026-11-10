@@ -73,6 +73,12 @@ def add_problem_args(p) -> None:
     p.add_argument("--eps", type=float, default=1e-6, help="window_eps and RR cut")
     p.add_argument("--leaf-size", type=int, default=32)
     p.add_argument(
+        "--sub-block",
+        type=int,
+        default=None,
+        help="culled near-field sub-block width (0 = dense; default: planner's)",
+    )
+    p.add_argument(
         "--catalogues",
         nargs="+",
         default=["uniform", "thomas"],
