@@ -394,3 +394,23 @@ def test_vmap_over_catalogues_matches_a_loop():
         batch
     )
     assert bool(jnp.all(jnp.isfinite(grads)))
+
+
+@pytest.mark.parametrize("case", sorted(_CATALOGUES))
+def test_sub_blocks_cull_across_faces(case):
+    """The culled near field (minimum-image box gaps) equals the dense one."""
+    pos = _CATALOGUES[case](seed=14, n=1000)
+    culled = _plan(pos, _NARROW, leaf_size=32)
+    assert culled.sub_block == 8
+    dense = _plan(pos, _NARROW, leaf_size=32, sub_block=0)
+    res_c = _traced(pos, _NARROW, culled)
+    res_d = _traced(pos, _NARROW, dense)
+    assert not bool(res_c.overflow)
+    # most sub-block pairs of the near leaf pairs are out of reach
+    assert int(res_c.sub_count) < 0.5 * int(res_d.near_count) * 16
+    np.testing.assert_allclose(res_c.counts, res_d.counts, rtol=1e-12)
+    assert _max_rel_err(res_c.counts, _brute(pos, _NARROW)) < _TOL
+    g_c = jax.grad(lambda p: _loss(_traced(p, _NARROW, culled).counts))(pos)
+    g_ref = jax.grad(lambda p: _loss(_brute(p, _NARROW)))(pos)
+    scale = float(jnp.abs(g_ref).max())
+    np.testing.assert_allclose(g_c, g_ref, rtol=1e-5, atol=1e-6 * scale)

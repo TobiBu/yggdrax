@@ -101,6 +101,7 @@ def _traced_arm(pos, args, edges, ref, rr) -> dict:
         window_eps=args.eps,
         leaf_size=args.leaf_size,
         box_size=args.box,
+        sub_block=args.sub_block,
     )
     plan_s = time.perf_counter() - t0
     stat = make_xi_statistic(
@@ -139,12 +140,15 @@ def _traced_arm(pos, args, edges, ref, rr) -> dict:
             "far_cap": cfg.far_cap,
             "near_cap": cfg.near_cap,
             "window_eps": cfg.window_eps,
+            "sub_block": cfg.sub_block,
+            "sub_pair_cap": cfg.sub_pair_cap,
         },
         "walk": {
             "num_leaves": int(diag.num_leaves),
             "far_count": int(diag.far_count),
             "near_count": int(diag.near_count),
             "peak_wavefront": int(diag.peak_wavefront),
+            "sub_count": int(diag.sub_count),
         },
     }
     if pos.shape[0] <= args.grad_max_n:

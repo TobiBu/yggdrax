@@ -124,6 +124,7 @@ def _run_point(pos, args, edges, ref, kw) -> dict:
             sharpness=args.sharpness,
             leaf_size=args.leaf_size,
             box_size=args.box,
+            sub_block=args.sub_block,
             **kw,
         )
     except RuntimeError as exc:
@@ -152,7 +153,9 @@ def _run_point(pos, args, edges, ref, kw) -> dict:
             "near_count": int(diag.near_count),
             "band_count": int(diag.band_count),
             "peak_wavefront": int(diag.peak_wavefront),
+            "sub_count": int(diag.sub_count),
         },
+        "sub_block": cfg.sub_block,
     }
     if not args.no_grad:
         rr = jax.lax.stop_gradient(jnp.asarray(ref["soft"]) + 1.0)
