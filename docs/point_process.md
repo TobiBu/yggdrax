@@ -112,9 +112,14 @@ ensembles, Fisher forecasts and fits see nothing else. Two are provided:
   statistic, so `r_max` defaults to where the jump is below `1e-6` on the whole
   grid.
 
-`concat_statistics` stacks data vectors. The traced single-device ξ with the
-bin-aware acceptance (A2/A4a) and the `knn_stats` application (B1) are not on
-main yet. Each drops in as one more `Statistic` builder.
+`concat_statistics` stacks data vectors. `make_xi_statistic(...,
+backend="traced", traced_config=...)` computes the same ξ from the traced
+single-device estimator with the bin-aware window rule (or the geometric rule,
+hard or smooth), periodic via `box_size`. Plan its config with
+`plan_traced_pair_counts(..., box_size=L)`. Its `DD` keeps the window tail
+beyond the hard cut (at most `eps` per pair), so it matches the distributed ξ to
+about `eps`; a test checks values and Jacobians. Both backends share the `RR`
+of `natural_estimator_rr`.
 
 The `overflow` flag must be read. Every routine returns it, and the bench raises
 on it.
@@ -160,8 +165,8 @@ runs every lane to the slowest lane's trip count.
 
 ## Recovery on independent realisations
 
-The old `corrfunc/inference_demo.py` generated its target from the same draws it
-fitted with. Its recovery was a fixed point by construction. Here each trial
+The old `corrfunc/inference_demo.py` (since removed) generated its target from
+the same draws it fitted with. Its recovery was a fixed point by construction. Here each trial
 draws a target realisation `B` at `theta_true` and model draws `A_1..A_m` from
 disjoint seeds, then fits `theta` by minimising
 `chi^2 = (S_B - mean_i S_{A_i}(theta))^T h C^-1 (...)`.

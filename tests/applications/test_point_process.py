@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from yggdrax.applications.corrfunc.traced import plan_traced_pair_counts
 from yggdrax.applications.point_process import (
     child_offsets,
     concat_statistics,
@@ -33,6 +34,7 @@ from yggdrax.applications.point_process import (
     hartlap_factor,
     make_knn_cdf_statistic,
     make_xi_statistic,
+    natural_estimator_rr,
     profile_norm,
     profile_xi_fixed_counts_mc,
     query_grid,
@@ -233,6 +235,50 @@ def test_reverse_mode_gradient_equals_forward_jacobian(setup):
     g = jax.jit(jax.grad(loss))(theta)
     v, jac, _ = jax.jit(lambda t: statistic_jacobian(setup.both, t, d, L))(theta)
     np.testing.assert_allclose(g, (2.0 * w * v) @ jac, rtol=1e-9)
+
+
+@pytest.mark.parametrize("smooth_band", [1.0, 2.0], ids=["hard", "smooth"])
+def test_traced_backend_matches_the_distributed_one(setup, smooth_band):
+    """``backend="traced"`` (window rule, one device) = the distributed ``xi``.
+
+    The two ``DD`` differ only by the window mass beyond the hard cut (at most
+    ``eps`` per pair), so values and Jacobians agree to ~``eps``.
+    """
+    theta = jnp.asarray([SIGMA, 1.2])
+    d = draw_thomas(jax.random.PRNGKey(7), P, M)
+    probes = [thomas_positions(theta * f, d, L) for f in (0.9, 1.0, 1.1)]
+    cfg = plan_traced_pair_counts(
+        probes,
+        edges=jnp.asarray(EDGES),
+        sharpness=XI_S,
+        window_eps=EPS,
+        smooth_band=smooth_band,
+        box_size=L,
+    )
+    traced = make_xi_statistic(
+        EDGES,
+        box_size=L,
+        n_points=N,
+        sharpness=XI_S,
+        eps=EPS,
+        backend="traced",
+        traced_config=cfg,
+    )
+    assert traced.labels == setup.xi.labels
+    run = jax.jit(lambda s, t: statistic_jacobian(s, t, d, L), static_argnums=0)
+    v_t, j_t, o_t = run(traced, theta)
+    v_d, j_d, o_d = run(setup.xi, theta)
+    assert not bool(o_t) and not bool(o_d)
+    rr = natural_estimator_rr(EDGES, box_size=L, n_points=N, sharpness=XI_S, eps=EPS)
+    np.testing.assert_allclose((v_t + 1.0) * rr, (v_d + 1.0) * rr, rtol=1e-5)
+    np.testing.assert_allclose(
+        j_t, j_d, rtol=1e-4, atol=1e-6 * float(jnp.abs(j_d).max())
+    )
+
+
+def test_traced_backend_needs_a_config():
+    with pytest.raises(ValueError, match="traced_config"):
+        make_xi_statistic(EDGES, box_size=L, n_points=N, backend="traced")
 
 
 # ---------------------------------------------------------------------------

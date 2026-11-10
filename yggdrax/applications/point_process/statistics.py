@@ -3,20 +3,24 @@
 A statistic is a :class:`Statistic`: a function ``positions -> (values,
 overflow)`` plus a label per value. Everything downstream (Jacobians, Fisher
 forecasts, fits) sees only that function, so another estimator drops in by
-writing one more builder. Two are provided, both on
-:mod:`yggdrax.distributed.stats` (any number of devices, 1 included; periodic):
+writing one more builder. Two are provided (periodic box):
 
 * :func:`make_xi_statistic`: ``xi`` from the natural estimator ``DD/RR - 1``
-  with soft binned ``DD`` (:func:`~yggdrax.distributed.stats.distributed_pair_counts`)
-  and the analytic soft ``RR`` of the periodic box
-  (:func:`~.analytic.analytic_rr`).
+  with soft binned ``DD`` and the analytic soft ``RR`` of the periodic box
+  (:func:`natural_estimator_rr`). ``DD`` comes from
+  :func:`~yggdrax.distributed.stats.distributed_pair_counts` (any number of
+  devices, 1 included; ``backend="distributed"``) or from the single-device
+  traced estimator with the bin-aware window rule
+  (:func:`~yggdrax.applications.corrfunc.traced.traced_soft_pair_counts`,
+  ``backend="traced"``), which also takes the smooth acceptance rule and
+  ``membership=``.
 * :func:`make_knn_cdf_statistic`: soft kNN-CDFs of volume-filling query points
   (:func:`~yggdrax.distributed.stats.distributed_knn`), the fraction of queries
   whose ``k``-th nearest data point lies within ``r``.
 
-Swapping in later estimators (the traced single-device ``xi`` with a bin-aware
-acceptance rule, or the ``knn_stats`` application) means wrapping them in a
-:class:`Statistic` with the same contract; nothing else changes.
+Swapping in later estimators (the ``knn_stats`` application, say) means
+wrapping them in a :class:`Statistic` with the same contract; nothing else
+changes.
 
 The ``overflow`` flag is the pipeline's "a static capacity was too small"
 signal. It must be read: a truncated halo or walk loses pairs silently.
@@ -25,13 +29,17 @@ signal. It must be read: a truncated halo or walk loses pairs silently.
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, NamedTuple, Optional, Sequence
+from typing import Any, Callable, Literal, NamedTuple, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array
 
+from yggdrax.applications.corrfunc.traced import (
+    TracedPairCountConfig,
+    traced_soft_pair_counts,
+)
 from yggdrax.distributed.stats import (
     DistributedStatsConfig,
     distributed_knn,
@@ -46,6 +54,7 @@ __all__ = [
     "concat_statistics",
     "make_knn_cdf_statistic",
     "make_xi_statistic",
+    "natural_estimator_rr",
     "query_grid",
 ]
 
@@ -78,6 +87,64 @@ def _default_config(n_rows: int, mesh: Optional[jax.sharding.Mesh], **kw):
     return DistributedStatsConfig.for_problem(max(1, -(-n_rows // ndev)), **kw)
 
 
+def natural_estimator_rr(
+    edges: Sequence[float] | np.ndarray,
+    *,
+    box_size: float,
+    n_points: int,
+    sharpness: float,
+    eps: float = 1e-6,
+    log: bool = True,
+) -> np.ndarray:
+    """Analytic soft ``RR`` of the natural estimator in a periodic cube.
+
+    ``RR_b = N(N-1)/2 * V_b / L^3`` with ``V_b`` the soft shell volume of bin
+    ``b`` over the hard cut ``(r_lo, r_hi)`` =
+    :func:`~yggdrax.distributed.stats.soft_window_cutoffs` ``(edges, sharpness,
+    eps)`` (:func:`~.analytic.analytic_rr`). Exact for uniform points while the
+    cut stays below ``L/2``, where the minimum-image separation of two uniform
+    points is uniform in the ball.
+
+    The distributed ``DD`` drops pairs outside the cut exactly; the traced one
+    drops only pairs whose window is at most ``window_eps`` and sums the rest.
+    The two differ by the window mass beyond the cut, at most ``eps`` per pair
+    and in practice a relative ``O(eps / sharpness)`` per bin, so one ``RR``
+    serves both.
+
+    Parameters
+    ----------
+    edges:
+        ``(nbins + 1,)`` increasing bin edges.
+    box_size:
+        Periodic box length ``L``.
+    n_points:
+        Points per catalogue.
+    sharpness:
+        Soft-window sharpness (in ``ln r`` when ``log``).
+    eps:
+        Window value at the hard cut.
+    log:
+        Windows in ``ln r``.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(nbins,)`` expected soft pair counts.
+
+    Raises
+    ------
+    ValueError
+        If the hard cut reaches ``L/2``.
+    """
+    e = np.asarray(edges, dtype=np.float64)
+    r_cut = soft_window_cutoffs(e, sharpness, eps, log)
+    if r_cut[1] >= 0.5 * box_size:
+        raise ValueError(
+            f"the hard cut r_hi = {r_cut[1]:.4g} reaches L/2; raise sharpness or eps"
+        )
+    return analytic_rr(e, sharpness, r_cut, n_points, box_size**3, log)
+
+
 def make_xi_statistic(
     edges: Sequence[float] | np.ndarray,
     *,
@@ -87,6 +154,8 @@ def make_xi_statistic(
     eps: float = 1e-6,
     config: Optional[DistributedStatsConfig] = None,
     mesh: Optional[jax.sharding.Mesh] = None,
+    backend: Literal["distributed", "traced"] = "distributed",
+    traced_config: Optional[TracedPairCountConfig] = None,
 ) -> Statistic:
     """``xi`` in soft log bins from the natural estimator with analytic ``RR``.
 
@@ -104,10 +173,23 @@ def make_xi_statistic(
         Window value at the hard cut (:func:`~yggdrax.distributed.stats.soft_window_cutoffs`);
         the cut's upper end must stay below ``L/2``.
     config:
-        Capacities; default
+        Capacities of ``backend="distributed"``; default
         :meth:`~yggdrax.distributed.stats.DistributedStatsConfig.for_problem`.
     mesh:
-        Device mesh; default all devices.
+        Device mesh of ``backend="distributed"``; default all devices.
+    backend:
+        ``"distributed"`` (default): ``DD`` from
+        :func:`~yggdrax.distributed.stats.distributed_pair_counts`.
+        ``"traced"``: ``DD`` from
+        :func:`~yggdrax.applications.corrfunc.traced.traced_soft_pair_counts`
+        on one device with ``box_size``, whose acceptance rule (window or
+        geometric, hard or smooth) is ``traced_config``'s.
+    traced_config:
+        Required by ``backend="traced"``: plan it with
+        :func:`~yggdrax.applications.corrfunc.traced.plan_traced_pair_counts`
+        ``(..., edges=edges, sharpness=sharpness, box_size=box_size)`` on
+        catalogues that bracket the ones the statistic will see, ideally with
+        ``window_eps=eps``.
 
     Returns
     -------
@@ -117,28 +199,47 @@ def make_xi_statistic(
     Raises
     ------
     ValueError
-        If the hard cut reaches ``L/2``.
+        If the hard cut reaches ``L/2``, the backend is unknown, or
+        ``backend="traced"`` has no ``traced_config``.
     """
     e = np.asarray(edges, dtype=np.float64)
-    r_cut = soft_window_cutoffs(e, sharpness, eps)
-    if r_cut[1] >= 0.5 * box_size:
-        raise ValueError(
-            f"the hard cut r_hi = {r_cut[1]:.4g} reaches L/2; raise sharpness or eps"
-        )
-    rr = analytic_rr(e, sharpness, r_cut, n_points, box_size**3)
-    cfg = config if config is not None else _default_config(n_points, mesh)
+    rr = natural_estimator_rr(
+        e, box_size=box_size, n_points=n_points, sharpness=sharpness, eps=eps
+    )
+    if backend == "distributed":
+        cfg = config if config is not None else _default_config(n_points, mesh)
 
-    def fn(positions: Array) -> tuple[Array, Array]:
-        res = distributed_pair_counts(
-            positions,
-            e,
-            box_size=box_size,
-            config=cfg,
-            sharpness=sharpness,
-            eps=eps,
-            mesh=mesh,
-        )
-        return res.counts / jnp.asarray(rr, res.counts.dtype) - 1.0, res.overflow
+        def fn(positions: Array) -> tuple[Array, Array]:
+            res = distributed_pair_counts(
+                positions,
+                e,
+                box_size=box_size,
+                config=cfg,
+                sharpness=sharpness,
+                eps=eps,
+                mesh=mesh,
+            )
+            return res.counts / jnp.asarray(rr, res.counts.dtype) - 1.0, res.overflow
+
+    elif backend == "traced":
+        if traced_config is None:
+            raise ValueError(
+                'backend="traced" needs traced_config (plan_traced_pair_counts)'
+            )
+        tcfg = traced_config
+
+        def fn(positions: Array) -> tuple[Array, Array]:
+            res = traced_soft_pair_counts(
+                positions,
+                jnp.asarray(e, positions.dtype),
+                tcfg,
+                sharpness=sharpness,
+                box_size=box_size,
+            )
+            return res.counts / jnp.asarray(rr, res.counts.dtype) - 1.0, res.overflow
+
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
 
     centres = np.sqrt(e[:-1] * e[1:])
     return Statistic(fn=fn, labels=tuple(f"xi(r={c:.4g})" for c in centres))
