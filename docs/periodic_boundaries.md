@@ -110,6 +110,42 @@ For a two-point count up to `r_max` (2PCF, kNN-CDF), set
 the dual walk this needs sphere MAC extents (`dehnen` or `engblom`); with `bh`
 the floor is measured on box half-extents.
 
+## Radial pair counts without the guard (traced ξ)
+
+`traced_soft_pair_counts(..., box_size=L)`
+(`yggdrax.applications.corrfunc.traced`) runs the mutual walk *without* the
+walk's own `box_size` and applies the minimum image inside its acceptance hooks
+instead (they recompute `d` from the node centres). It therefore has no far-pair
+guard. A radial statistic does not need one:
+
+- Take nodes `A`, `B` with minimum-image centre distance `d` and bounding radii
+  `r_a`, `r_b`, and let `s = r_a + r_b`. Through image `k` of the centres, a
+  particle pair's displacement is `Δc_k + δ` with `|δ| ≤ s`.
+- Its minimum-image length is at least `min_k |Δc_k| - s = d - s`. Through the
+  centres' minimum image, it is at most `d + s`.
+- So every particle pair's minimum-image separation lies in `[d - s, d + s]`,
+  whichever image it uses. So does the minimum image of the centre-of-mass
+  displacement the far term is evaluated at.
+
+The window rule bounds the far error by the window's variation over exactly that
+interval, and the geometric rule's monopole error is over that interval too. The
+guard only matters for vector interactions, where the direction (the image)
+enters.
+
+It also costs a lot here. In a cube about half of all pairs have `d > L/2`, and
+the guard would send every one of them to exact leaf pairs. The window rule
+mostly prunes them first; the geometric rule has no pruning. Without the guard
+the periodic walk does about the work of the open-boundary one; a test pins
+this.
+
+The traced estimator wraps the positions, so any coordinates are accepted, and
+builds the cell tree on the box. With `membership=x0` it takes each live
+position at its image nearest `x0`. A particle crossing a face during an HMC
+trajectory or a line search then stays in its leaf instead of jumping to the far
+side, and with the smooth rule the counts stay continuous through the crossing.
+The natural estimator on top of it is
+`point_process.make_xi_statistic(..., backend="traced")`.
+
 ## kNN and radius counts
 
 `kdtree.query_neighbors(tree, queries, k=..., box_size=L)` returns

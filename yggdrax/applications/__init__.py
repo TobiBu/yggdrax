@@ -20,8 +20,7 @@ Sub-packages:
   parameter gradients, Fisher forecasts and recovery on independent
   realisations.
 
-Two modules (:mod:`yggdrax.applications.svgd.bandwidth_learning` and
-:mod:`yggdrax.applications.corrfunc.inference_demo`) fit parameters with
-``optax``, which is not a core runtime dependency; install ``yggdrax[applications]``
-to use them.
+One module (:mod:`yggdrax.applications.svgd.bandwidth_learning`) fits
+parameters with ``optax``, which is not a core runtime dependency; install
+``yggdrax[applications]`` to use it.
 """

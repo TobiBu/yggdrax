@@ -45,6 +45,7 @@ from yggdrax import (
     compute_tree_geometry,
 )
 from yggdrax.applications.corrfunc.binning import soft_bin_weights
+from yggdrax.periodic import minimum_image
 
 # Default number of leaf pairs processed per chunk in the near-field reduction.
 # The near field materialises a (chunk, max_leaf, max_leaf, nbins) soft-weight
@@ -171,17 +172,21 @@ def _leaf_blocks(pos_sorted: Array, topo: PairTopology) -> Array:
     return pos_sorted[topo.leaf_slots]
 
 
-def _pairwise_dist(a: Array, b: Array) -> Array:
+def _pairwise_dist(
+    a: Array, b: Array, box_size: tuple[float, ...] | None = None
+) -> Array:
     """Euclidean distances between blocks ``a`` and ``b`` over last-but-one axis.
 
     Args:
         a: Array ``(..., m, 3)``.
         b: Array ``(..., p, 3)``.
+        box_size: Optional periodic box (normalised tuple): the distances are
+            then minimum-image. ``None`` (default) is the plain distance.
 
     Returns:
         Distances ``(..., m, p)``.
     """
-    d = a[..., :, None, :] - b[..., None, :, :]
+    d = minimum_image(a[..., :, None, :] - b[..., None, :, :], box_size)
     return jnp.sqrt(jnp.sum(d * d, axis=-1) + 1e-30)
 
 
@@ -197,6 +202,7 @@ def _accumulate_block_pairs(
     triu: Array | None,
     chunk_size: int,
     row_weight: Array | None = None,
+    box_size: tuple[float, ...] | None = None,
 ) -> Array:
     """Chunked, differentiable reduction of soft-bin weights over leaf pairs.
 
@@ -230,6 +236,9 @@ def _accumulate_block_pairs(
             mask for the ``-1``-padded slots of a fixed-capacity pair list. None
             weights every pair 1 (and leaves the reduction bit-identical to the
             form without the argument).
+        box_size: Optional periodic box, a normalised tuple of lengths
+            (:func:`yggdrax.periodic.normalize_box_size`): separations are then
+            minimum-image. None (default) leaves the reduction unchanged.
 
     Returns:
         Per-bin accumulated soft counts, shape ``(nbins,)``.
@@ -245,7 +254,7 @@ def _accumulate_block_pairs(
         src = blocks[sr]
         tgt_mask = leaf_mask[tr]  # (m, max_leaf)
         src_mask = leaf_mask[sr]
-        r = _pairwise_dist(tgt, src)  # (m, max_leaf, max_leaf)
+        r = _pairwise_dist(tgt, src, box_size)  # (m, max_leaf, max_leaf)
         w = soft_bin_weights(r, edges, sharpness, log=log)  # (m, ml, ml, nbins)
         pair_mask = tgt_mask[:, :, None] * src_mask[:, None, :]  # (m, ml, ml)
         if triu is not None:

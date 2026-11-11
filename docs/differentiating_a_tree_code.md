@@ -388,9 +388,12 @@ Untested here:
 
 - **GPU.** The engine change, the sparse-table geometry (`O(N log N)` memory,
   about 1 GB at N = 1e6 in float64) and the benches at large N.
-- **Periodic boxes.** `traced.py` has no `box_size` yet. The band hook
-  respects the walk's periodic guard (a guarded pair is not emitted far, and
-  `band_accepted` records it), but the smooth rule is not wired to a box.
+- **Periodic boxes** are supported (`traced_soft_pair_counts(box_size=L)`, for
+  every rule, hard and smooth, and with `membership=`). The hooks apply the
+  minimum image themselves, so the walk's periodic guard is not in play
+  (`docs/periodic_boundaries.md`, "Radial pair counts without the guard").
+  The tests check values and gradients against the minimum-image brute force;
+  the benches here ran in an open box.
 - **The distributed driver.** `yggdrax/distributed` does not use the smooth
   rule.
 - **Float32.** All runs are float64.

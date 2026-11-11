@@ -38,10 +38,10 @@ jobs:
       - name: Install package + dev tools
         # Both extras. `paper` carries the bench dependencies (scipy, matplotlib,
         # nbformat) that the bench smoke tests import; `applications` carries
-        # optax, which yggdrax/applications/{svgd/bandwidth_learning,
-        # corrfunc/inference_demo} import and basedpyright type-checks. `paper`
-        # happens to pull optax in too, but naming the extra that actually
-        # declares it is what keeps this correct if the two ever diverge.
+        # optax, which yggdrax/applications/svgd/bandwidth_learning imports and
+        # basedpyright type-checks. `paper` happens to pull optax in too, but
+        # naming the extra that actually declares it is what keeps this correct
+        # if the two ever diverge.
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,paper,applications]"
@@ -198,8 +198,7 @@ jobs:
           cache: pip
       - name: Install package + dev tools
         # The `applications` extra carries optax, which
-        # yggdrax/applications/{svgd/bandwidth_learning,corrfunc/inference_demo}
-        # import. Without it basedpyright cannot resolve the import and the
+        # yggdrax/applications/svgd/bandwidth_learning imports. Without it basedpyright cannot resolve the import and the
         # type-check step fails before the tests ever run.
         run: |
           python -m pip install --upgrade pip

@@ -367,6 +367,7 @@ def test_vmap_with_per_catalogue_bounds(wide_config):
         ("max_pair_queue", "queue_overflow"),
         ("far_cap", "far_overflow"),
         ("near_cap", "near_overflow"),
+        ("sub_pair_cap", "sub_overflow"),
     ],
 )
 def test_too_small_capacity_raises_its_overflow_flag(wide_config, field, flag):
@@ -388,23 +389,54 @@ def test_planner_covers_a_batch_and_reports_needs(wide_config):
         assert int(res.peak_wavefront) <= wide_config.max_pair_queue
 
 
-def test_traced_inference_demo_moves_toward_truth():
-    pytest.importorskip("optax")
-    from yggdrax.applications.corrfunc.inference_demo import (
-        make_cluster_model,
-        recover_parameter_traced,
-    )
+# --------------------------------------------------------------------------
+# culled sub-block near field (sub_block > 0, the planner's default)
+# --------------------------------------------------------------------------
 
-    model = make_cluster_model(jax.random.PRNGKey(0), n=300, num_centers=6)
-    res = recover_parameter_traced(
-        model,
-        make_log_edges(0.01, 0.5, 8),
-        a_true=0.5,
-        a_init=0.1,
-        leaf_size=_LEAF,
-        num_steps=25,
-        probe_a=(0.0, 0.5, 0.99),
+
+def test_planner_turns_sub_blocks_on_where_they_apply():
+    pos = _catalog()
+    assert _plan(pos, leaf_size=16).sub_block == 8
+    assert _plan(pos, leaf_size=32).sub_block == 8
+    assert _plan(pos, leaf_size=8).sub_block == 0
+    # the culling reads the windows' reach, so a geometric plan without edges
+    # keeps the dense near field
+    cfg = plan_traced_pair_counts(pos, acceptance="geometric", leaf_size=16)
+    assert cfg.sub_block == 0
+    with pytest.raises(ValueError, match="sub_block"):
+        _plan(pos, leaf_size=16, sub_block=3)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"acceptance": "window"},
+        {"acceptance": "geometric", "theta": 0.6},
+        {"acceptance": "window", "smooth_band": 2.0},
+        {"acceptance": "geometric", "theta": 0.6, "smooth_band": 2.0},
+    ],
+    ids=["window", "geometric", "window-smooth", "geometric-smooth"],
+)
+@pytest.mark.parametrize("leaf_size", [16, 32])
+def test_sub_blocks_reproduce_the_dense_near_field(rule, leaf_size):
+    """Culling drops only particle pairs whose windows are all below 1e-15."""
+    pos = _clustered(seed=2, n=600)
+    dense = _plan(pos, leaf_size=leaf_size, sub_block=0, **rule)
+    culled = dataclasses.replace(
+        dense,
+        sub_block=8,
+        sub_pair_cap=_plan(pos, leaf_size=leaf_size, sub_block=8, **rule).sub_pair_cap,
     )
-    assert len(res.a_history) == 26
-    assert abs(res.a_final - 0.5) < abs(0.1 - 0.5)
-    assert res.loss_history[-1] < res.loss_history[0]
+    res_d = _traced(pos, dense)
+    res_c = _traced(pos, culled)
+    assert not bool(res_c.overflow)
+    assert 0 < int(res_c.sub_count) < int(res_d.near_count) * (leaf_size // 8) ** 2
+    np.testing.assert_allclose(res_c.counts, res_d.counts, rtol=1e-12)
+
+    def g(cfg):
+        return jax.jit(jax.grad(lambda p: _loss(_traced(p, cfg).counts)))(pos)
+
+    g_d, g_c = g(dense), g(culled)
+    np.testing.assert_allclose(
+        g_c, g_d, rtol=1e-10, atol=1e-12 * float(jnp.abs(g_d).max())
+    )
