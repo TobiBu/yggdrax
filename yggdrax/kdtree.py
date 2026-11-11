@@ -1328,11 +1328,14 @@ def _query_neighbors_tree(
 
             def _periodic_child_order(node: Array) -> tuple[Array, Array, Array]:
                 assert box is not None  # only on the periodic path
+                periodic_box: Array = box  # narrowed for the closure below
                 left, right = 2 * node + 1, 2 * node + 2
 
                 def gap_sq(child: Array) -> Array:
                     safe = jnp.clip(child, 0, num_nodes - 1)
-                    g = _periodic_box_gap_sq(query, bbox_min[safe], bbox_max[safe], box)
+                    g = _periodic_box_gap_sq(
+                        query, bbox_min[safe], bbox_max[safe], periodic_box
+                    )
                     return jnp.where(child < num_nodes, g, jnp.inf)
 
                 g_left, g_right = gap_sq(left), gap_sq(right)
