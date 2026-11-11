@@ -165,8 +165,8 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `b2_xi_box` | B2 | **slot**: periodic ξ, traced vs distributed vs TreeCorr vs Corrfunc | 30 min | skipped |
 | `b2_acceptance_rules` | B2 | **slot**: window ε vs geometric θ at matched accuracy | 15 min | skipped |
 | `b3_forecast` | B3 | point-process Fisher forecast + recovery, N = 32768 (GPU command of `docs/point_process.md`) | 60 min | 117 s |
-| `b4_positions_1e6` | B4 | **slot**: move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 Adam steps, + gradient check | 40 min (guess) | – |
-| `b4_positions_1e7` | B4 | **slot**: the same at N = 1e7, 100 steps (cost per step) | 40 min (guess) | – |
+| `b4_positions_1e6` | B4 | **slot**: move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 L-BFGS steps (step cap 0.25 l), + gradient check | 50 min (guess) | – |
+| `b4_positions_1e7` | B4 | **slot**: the same at N = 1e7, 100 steps (cost per step) | 50 min (guess) | – |
 | `c2_grad_memory_g1` | C2 | distributed ξ/kNN forward vs value+grad memory and time, N = 2^20, 1 GPU | 10 min | 56 s |
 | `c2_grad_memory_g2` | C2 | the same on 2 GPUs (optional) | 10 min | 76 s |
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
@@ -277,6 +277,14 @@ python bench/paper_v2_runlist.py --rows '^b4_' --allow-new-commit
 The box grows with N at fixed density (L = 3.2 at 1e6, 6.9 at 1e7), so the
 cost per particle per step is fixed. The 1e7 row runs 100 steps only: it
 measures the cost per step and memory, not convergence.
+
+Both rows use L-BFGS with every particle's step capped at 0.25 l (the bench
+default since `claude/b4-positions` 2dd8de9). On the CPU comparison at N = 3e4
+(`bench/positions/results/optimiser_comparison/`) it reaches a loss of 1e-3
+in half the loss-and-gradient evaluations Adam needs and ends below the
+independent-realisation level, where Adam levels off. A step costs about 1.3
+evaluations (the line search's), so expect about 1.3x the time per step of an
+Adam step.
 
 ## Locally (CPU)
 
