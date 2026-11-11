@@ -232,6 +232,39 @@ def _rows() -> list[Row]:
             est_gpu_min=60,
             note="N = 32768; CPU reference at N = 2048 is bench/point_process/results",
         ),
+        # -- B4: move particles until ξ and kNN-CDF match a target. SLOT: the bench
+        #    is on claude/b4-positions (yggdrax main PR), not merged yet; the rows
+        #    run once bench/positions/optimise.py exists. ------------------------------
+        Row(
+            "b4_positions_1e6",
+            "B4",
+            "positions.optimise_positions: traced ξ (window rule, membership "
+            "frozen per epoch) + kNN-CDF (kdtree search per epoch), Adam",
+            ("{py}", "bench/positions/optimise.py", *a5, "--num-particles",
+             "1000000", "--num-steps", "600", "--rebuild-every", "10",
+             "--gradcheck", "--out", "{case}/positions_1e6.json", "--fig",
+             "{case}/positions_1e6.png"),
+            smoke=("--num-particles", "2048", "--num-steps", "10",
+                   "--rebuild-every", "5", "--timing-reps", "1"),
+            requires="bench/positions/optimise.py",
+            est_gpu_min=40,
+            note="B4 SLOT; est. time is a guess from CPU (3 s/step at N = 3e4)",
+        ),
+        Row(
+            "b4_positions_1e7",
+            "B4",
+            "the same at N = 1e7 (L = 6.9 at fixed density): cost per step and "
+            "the start of the loss trajectory",
+            ("{py}", "bench/positions/optimise.py", *a5, "--num-particles",
+             "10000000", "--num-steps", "100", "--rebuild-every", "10",
+             "--timing-reps", "2", "--out", "{case}/positions_1e7.json",
+             "--fig", "{case}/positions_1e7.png"),
+            smoke=("--num-particles", "4096", "--num-steps", "10",
+                   "--rebuild-every", "5", "--timing-reps", "1"),
+            requires="bench/positions/optimise.py",
+            est_gpu_min=40,
+            note="B4 SLOT; float64 memory at 1e7 untested, may OOM on 40 GB",
+        ),
         # -- C2: gradient memory of the distributed statistics, 1/2/4 GPUs ------------
         Row(
             "c2_grad_memory_g1",
