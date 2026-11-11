@@ -179,6 +179,7 @@ jobs:
               tests/distributed/test_distributed_stats.py
               tests/distributed/test_distributed_stats_grad.py
               tests/distributed/test_distributed_stats_exchange.py
+              tests/distributed/test_distributed_stats_subblock.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75

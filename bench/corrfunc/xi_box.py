@@ -9,7 +9,8 @@ For each catalogue (uniform, Thomas process) and size ``N``, in a periodic box:
   ``traced_soft_pair_counts(box_size=L)`` with the bin-aware window rule;
   forward time and value+grad time of ``L = Σ_b ξ_b²``;
 * **yggdrax distributed** (``--arms distributed``): the same ξ from
-  ``distributed_pair_counts`` on one device (exact acceptance, hard cut);
+  ``distributed_pair_counts`` on one device (exact acceptance, hard cut, the
+  culled near field at ``--sub-block``; 0 sums whole leaf blocks);
 * **TreeCorr** (``--arms treecorr``): ``NNCorrelation(metric="Periodic")`` at its
   default ``bin_slop`` and at ``bin_slop=0``;
 * **Corrfunc** (``--arms corrfunc``): ``theory.DD(periodic=True, boxsize=L)``;
@@ -188,6 +189,7 @@ def _distributed_arm(pos, args, edges, ref, rr) -> dict:
             reach=r_hi,
             leaf_size=args.leaf_size,
             clustering=clustering,
+            **({} if args.sub_block is None else {"sub_block": args.sub_block}),
         )
         stat = make_xi_statistic(
             edges,
@@ -217,6 +219,12 @@ def _distributed_arm(pos, args, edges, ref, rr) -> dict:
         "forward": t_fwd,
         "overflow": bool(overflow),
         "clustering_factor": clustering,
+        "config": {
+            "leaf_size": cfg.leaf_size,
+            "sub_block": cfg.sub_block,
+            "sub_pair_cap": cfg.sub_pair_cap,
+            "near_cap": cfg.near_cap,
+        },
         "xi": np.asarray(xi).tolist(),
         "dd": ((np.asarray(xi) + 1.0) * rr).tolist(),
     }

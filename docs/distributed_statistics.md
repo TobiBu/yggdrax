@@ -214,6 +214,37 @@ halves the cross-pair arithmetic but needs the same halo. The gradient would
 still be right, since C2 differentiates through the halo import (below), but the
 ½ weighting keeps both owners' work identical and the far monopole closed-form.
 
+**The culled near field (`sub_block`).** The walk keeps a leaf pair when the
+two bounding spheres come within `r_hi` of each other. Leaves are wider than
+the reach and a quarter to half full, so a dense `leaf × leaf` block of such a
+pair holds few particle pairs inside the cut (about 1 % of the slots in the
+traced path's profile, B2). With `sub_block = B` (default 8 for leaf sizes of
+16 or more that 8 divides):
+
+1. each leaf's sorted slots are cut into runs of `B` (Morton order, so a run is
+   spatially compact), each with its particles' bounding box;
+2. every walk pair `(a, b)` expands into its `k²` sub-block pairs
+   (`k = leaf_size / B`), and every leaf with itself into the `k (k + 1) / 2`
+   with `u ≤ v` (a diagonal `u = v` block counts its upper triangle);
+3. a sub-block pair is dropped when one side is empty or the minimum-image gap
+   of the two boxes, `|mi(c_b − c_a)| − (h_a + h_b)` per axis floored at 0, is at
+   least `r_hi`. That gap bounds every particle separation from below, and the
+   cut is hard, so nothing inside it is lost: the result is the dense path's to
+   round-off. The threshold is padded by a few ulps of the coordinates, so
+   rounding can only keep a pair;
+4. the survivors are compacted, in order, into `sub_pair_cap` slots by a scan
+   over chunks of 2048 candidate leaf pairs, so no `candidates × k²` array is
+   ever live, and summed as dense `B × B` blocks by the same checkpointed,
+   empty-chunk-skipping scan as before (`chunk · k²` blocks per step, the same
+   live intermediate as `chunk` leaf blocks).
+
+The topology (boxes, cull, compaction) is integer and `stop_gradient` data; the
+values are the live positions gathered through the sub-block slots, so the
+gradient, including the `r = 0` guard of `_distance`, is the dense path's.
+`sub_block = 0` gives the dense C1 path. The flag is `sub_overflow` and the
+per-device counter `sub_pairs`. Speed and memory: *The culled near field:
+speed and memory* below.
+
 **Pluggable acceptance.** `PairAcceptance(accept, discard, data)` uses the
 signature of `dual_tree_walk_mutual`'s `pair_accept`:
 `f(data, a, b, dist_sq, radius_a, radius_b) -> bool mask`. `accept` marks far
@@ -299,6 +330,7 @@ Everything is statically shaped. `DistributedStatsConfig` holds every capacity:
 | `send_leaf_capacity`, `send_capacity` | deduplicated leaves / particles a device sends | `send_overflow` |
 | `halo_capacity` | particles a device receives | `halo_overflow` |
 | `max_pair_queue`, `far_cap`, `near_cap` | the combined walk | `walk_overflow` |
+| `sub_pair_cap` | ξ's culled sub-block pairs (`sub_block > 0`) | `sub_overflow` |
 
 The result carries each flag `psum`-reduced over devices (true if any device
 overflowed), plus an `overflow` OR of all of them. **They must be read.** A
@@ -348,7 +380,8 @@ The model treats each domain as a cube. The symbols:
 | `summary_capacity` | `2 · leaf_capacity / M` (a cut cell holds more than `M / 2` leaves on average) |
 | `summary_neighbors` | `1.5 ((2 ⌈h_s / l⌉ + 1)³ − 1)`, `h_s = r + 2 R_c + 2 r_l`: the 3×3×3 stencil, ×1.5 for ragged domains |
 | `summary_send/recv_capacity` | `1.5 c · shell(h_s) / l³ · summary_capacity` |
-| `near_cap = max_pair_queue` | `0.75 c · (capacity / m) · ν`, `ν = n̄ (4π/3)(r + r_l)³ / m`: the leaves within reach of a leaf. The walk emits 0.59–0.69 of `leaves · ν` (measured). |
+| `near_cap = max_pair_queue` | `0.3 c (1 + x/2) · (capacity / m) · ν · m^0.3`, `ν = n̄ (4π/3)(r + 1.75 r_l)³ / m`, `x = min(1, shell(r + r_l) / l³)` (0 on one device): the leaves within reach of a leaf. An own-own pair is emitted once and an own-halo pair on both owners, hence `1 + x/2` for surface-dominated domains (about 1.09 at 8.4e6 per device). Fit to the measured near pairs at leaf 16, 32 and 64; C1–C3's `0.75 c (capacity / m) ν` with `(r + r_l)³` held at leaf 16 (0.96 at most) but overflowed at leaf 32 (1.38) and 64 (1.76). |
+| `sub_pair_cap` (ξ, `sub_block = B`) | `1.1 c · (capacity / m_s) · n̄ V_s / m_s`: a sub-block of `m_s = m' / ⌈m' / B⌉` particles, `m' = 1.5 m`, side `a = (m_s / n̄)^(1/3)`, pairs with the sub-blocks whose centres lie in the Steiner volume `V_s = (2a)³ + 6 (2a)² r + 3π (2a) r² + (4π/3) r³` of a box of side `2a` grown by `r`. |
 | `export_near_cap` | `c (1 + r / R_c)³ · halo / m`: each shipped leaf is named by the receiver cells within reach of it |
 | `export_queue` | `summary_recv_capacity + export_near_cap` (the walk is seeded with every received row) |
 | `send_capacity`, `send_leaf_capacity` | `1.5 · halo`, `2 · halo / m` |
@@ -369,10 +402,33 @@ on 1, 2 and 8 fake devices). Every ratio is below 1:
 | summary cells / capacity | 0.48 | | sent / send_capacity | 0.49 |
 | summary_recv / capacity | 0.48 | | peak_wavefront / max_pair_queue | 0.54 |
 
+The near-field rows were refit for the culled near field, whose point is that
+larger leaves become cheap. Uniform points at `clustering = 1` and clustered
+ones at 4, ξ reach 2.8 and 4 spacings, 4096 and 16384 per device on 1, 2, 4 and
+8 fake devices, leaf 16, 32 and 64 with `sub_block = 8`:
+
+| counter / capacity | leaf 16 | leaf 32 | leaf 64 |
+|---|---|---|---|
+| near_pairs / near_cap (uniform) | 0.66 | 0.72 | 0.74 |
+| sub_pairs / sub_pair_cap (uniform) | 0.67 | 0.48 | 0.70 |
+| near_pairs / near_cap (clustered) | 0.17 | 0.16 | 0.17 |
+| sub_pairs / sub_pair_cap (clustered) | 0.23 | 0.15 | 0.20 |
+
+In a strongly clustered field the culled list grows a little faster than the
+walk: 80 % of 16384 points in 6 blobs on 8 devices at `clustering = 4` needs
+1.84 × `sub_pair_cap` against 1.04 × `near_cap`. `scaling.py` grows
+`sub_pair_cap` on `sub_overflow` and refits it from `sub_pairs` under
+`--tighten`.
+
+The same sweep shows `halo_overflow` and `export_overflow` on 2 devices at
+4096 per device (and on 4 at leaf 64), with the old and the new near-field
+model alike: the halo and export rows are calibrated at leaf 16 and are not
+changed here.
+
 The per-device counters each run returns are what to recalibrate with on the
 GPUs: `particles`, `halo`, `sent`, `export_pairs`, `export_wavefront`,
 `near_pairs`, `peak_wavefront`, `leaves_local`, `leaves`, `summary_cells`,
-`summary_sent`, `summary_recv` and `summary_dests`. `scaling.py` records them
+`summary_sent`, `summary_recv`, `summary_dests` and (ξ) `sub_pairs`. `scaling.py` records them
 next to the capacities, and on an overflow it grows the stage that overflowed
 and reruns.
 
@@ -409,6 +465,50 @@ Two consequences:
   exchange that GPUs use (jax ≥ 0.9.1) does not have it, and XLA:CPU cannot
   compile the native op, so CPU plans of the GPU path come from small device
   counts with the large-mesh capacities.
+
+### The culled near field: speed and memory
+
+**Speed.** `bench/corrfunc/xi_box.py --arms distributed`, CPU (M-series, 10
+cores), one device, f64, periodic unit box, 10 log bins over [0.004, 0.04],
+s = 100, eps = 1e-6, N = 1e5, median of 3. The errors against the exact soft
+counts (9.4e-8 uniform, 8.8e-8 Thomas: the eps cut) are identical in every row.
+
+| leaf, `sub_block` | uniform fwd / v+g (s) | Thomas fwd / v+g (s) |
+|---|---|---|
+| 32, dense (C1) | 4.17 / 10.06 | 5.99 / 19.81 |
+| 16, 8 | 2.06 / 3.47 | 1.99 / 4.92 |
+| 32, 8 (bench default) | 1.03 / 1.98 | 1.18 / 3.11 |
+| 32, 4 | 0.78 / 1.23 | 1.38 / 2.17 |
+| 64, 8 | 0.83 / 1.54 | 0.96 / 2.23 |
+
+At N = 1e4 (leaf 32, B = 8): uniform 0.21 → 0.059 s forward, 0.43 → 0.10 s
+value+grad. The traced path (`traced_soft_pair_counts`, B2) takes 1.66 / 2.84 s
+uniform and 1.73 / 3.04 s Thomas on the same problem.
+
+**Memory.** Culling by itself does not shrink the walk: a stored near leaf pair
+(its `max_pair_queue` slot and its `near_cap` slot) still costs 245–285 B in the
+compiled plan, and each culled sub-block pair adds 8 B (two indices; the
+compaction scan keeps no per-pair temporaries). What it changes is the price of
+a large leaf. Near leaf pairs per particle fall about as `m^-1.3` with the leaf
+occupancy `m` (measured at 4 spacings: about 25 at leaf 16, 10 at 32, 4.5 at
+64), while the culled sub-block pairs per particle stay about the same (12–26).
+A dense 64-leaf block costs 16× a 16-leaf one, a culled one does not. XLA's
+plans for ξ, float32, 8.4e6 per device (CPU compile on 2 devices, `for_box` at
+3.4 spacings, clustering 1.5):
+
+| leaf, `sub_block` | forward | value+grad | per particle |
+|---|---|---|---|
+| 16, dense | 93.3 GB | 96.4 GB | 11.1 kB |
+| 16, 8 | 96.4 GB | 99.3 GB | 11.5 kB |
+| 32, 8 | 41.2 GB | 43.4 GB | 4.9 kB |
+| 64, 8 | 20.3 GB | 22.5 GB | 2.4 kB |
+| 64, dense | 18.2 GB | 20.7 GB | 2.2 kB |
+
+(The leaf-16 rows use the refit `near_cap`, 40 slots per particle; C1–C3's model
+gave 34 and the 77 GB above.) Leaf 64 with `sub_block = 8` needs about a fifth
+of leaf 16's memory per particle and is about as fast as the fastest culled
+configuration on CPU (leaf 32, B = 4), so it is the one to use for the C3/C4
+runs (`scaling.py --leaf-size 64`; the default leaf size is still 16).
 
 ## Periodic treatment
 
@@ -696,7 +796,11 @@ devices:
   | kNN, k = 8 | ~2e7 | ~400 GPUs |
 
   So 2048³ on 128 GPUs (6.7e7 per device) does not fit for either payload. For
-  ξ the model even clamps `near_cap` to int32. Options:
+  ξ the model even clamps `near_cap` to int32. The culled near field moves the
+  ξ row: at leaf 64 with `sub_block = 8` the plan is 2.4 kB per particle
+  instead of 11 kB (*The culled near field: speed and memory*), so about 1.5e7
+  per A100-40GB and about 600 GPUs for 2048³; 128 GPUs is still out of reach.
+  Options:
   - more devices (1024 on JUWELS gives 8.4e6 per device);
   - a smaller reach in spacings;
   - the A4a window rule, which turns most pairs into far pairs;
