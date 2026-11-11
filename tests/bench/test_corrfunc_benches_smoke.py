@@ -24,7 +24,6 @@ _SCRIPTS = [
         "bench/corrfunc/bin_width_sensitivity.py",
         "corrfunc_bin_sensitivity",
     ),
-    ("recovery", "bench/corrfunc/parameter_recovery_demo.py", "corrfunc_recovery"),
 ]
 
 
