@@ -59,8 +59,9 @@ docs = [
   "myst-parser>=2.0",
 ]
 # Optional dependencies of yggdrax/applications/. Only the parameter-fitting
-# module svgd.bandwidth_learning needs them; the estimators and samplers
-# themselves are jax-only, so the core runtime stays lean.
+# modules svgd.bandwidth_learning and positions (its loop) need them; the
+# estimators and samplers themselves are jax-only, so the core runtime stays
+# lean.
 applications = [
   "optax>=0.2.0",
 ]
@@ -74,6 +75,7 @@ packages = [
   "yggdrax.applications.corrfunc",
   "yggdrax.applications.knn_stats",
   "yggdrax.applications.point_process",
+  "yggdrax.applications.positions",
   "yggdrax.applications.svgd",
 ]
 
