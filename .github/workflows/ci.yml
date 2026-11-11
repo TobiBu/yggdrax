@@ -13,9 +13,11 @@ concurrency:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    # a passing job takes 26-37 min; without a limit a compile that never
-    # finishes holds the runner for GitHub's 6 h maximum
-    timeout-minutes: 75
+    # The 3.13 leg runs the full suite: 57-73 min by 2026-11 (tests/applications
+    # ~28, tests/unit ~15, tests/distributed ~12), and over 75 on a slow runner.
+    # Without a limit a compile that never finishes holds the runner for
+    # GitHub's 6 h maximum.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +91,9 @@ jobs:
 
       - name: Upload coverage XML artifact
         if: matrix.python-version == '3.13'
+        # The report is kept for reading only; the coverage gate ran in pytest.
+        # An artifact-service outage (2026-11-11) must not fail a passing suite.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: coverage-xml-py${{ matrix.python-version }}
