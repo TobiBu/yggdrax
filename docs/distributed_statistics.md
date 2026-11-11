@@ -39,6 +39,8 @@ input shard (any rows) ──wrap──► sfc_partition ──► local shard (
                                                         │
   combined set [local live ; halo live] ─► cell tree ─► dual_tree_walk_mutual
                 (min-image, periodic far guard, pluggable acceptance, ownership pruning)
+                (walk_chunks = K > 1: walk to a frontier, then K seeded sub-walks,
+                 each one's pairs evaluated before the next runs)
                                                         │
           ξ: within-leaf + near leaf pairs + far monopoles, weighted by ownership ─► psum
           kNN: near-list edges streamed, segmented top-k merge ─► per-particle
@@ -78,7 +80,8 @@ Step by step:
    pruned when it cannot contain a (query, data) pair. The walk also prunes it
    when its separation range `[d - s, d + s]` (with `s = r_a + r_b`, the bounding
    radii) lies outside `[r_lo, r_hi)`. On top of that runs the payload's
-   pluggable acceptance (below).
+   pluggable acceptance (below). With `walk_chunks > 1` the walk is streamed
+   (*The streamed walk*, below), so its lists are never held at once.
 6. **Reduce.** ξ: per-bin partial sums are `psum`med. kNN: distances stay
    sharded with their global ids, and a CDF reduction on a radius grid is
    `psum`med.
@@ -302,7 +305,9 @@ the correct `1[r_k ≤ r] = 0` for every `r ≤ r_max`.
   `(leaf, leaf)` distance block gives a per-query top-k. A segmented associative
   scan merges the edges of one query leaf within a chunk, and the segment's last
   edge merges into the running best. The work is proportional to the edges. No
-  per-leaf candidate capacity exists, so none can overflow.
+  per-leaf candidate capacity exists, so none can overflow. The leaves' own
+  edges are merged first, then each sub-walk's when the walk is streamed: a
+  top-k merge does not depend on the order.
 - **Values:** the search returns neighbour *indices* (topology). The distances
   are then recomputed from the live positions by a gather and the minimum image.
 
@@ -329,8 +334,15 @@ Everything is statically shaped. `DistributedStatsConfig` holds every capacity:
 | `export_queue`, `export_near_cap` | export walk wavefront / (cell, leaf) list | `export_overflow` |
 | `send_leaf_capacity`, `send_capacity` | deduplicated leaves / particles a device sends | `send_overflow` |
 | `halo_capacity` | particles a device receives | `halo_overflow` |
-| `max_pair_queue`, `far_cap`, `near_cap` | the combined walk | `walk_overflow` |
-| `sub_pair_cap` | ξ's culled sub-block pairs (`sub_block > 0`) | `sub_overflow` |
+| `max_pair_queue`, `far_cap`, `near_cap` | the combined walk (one sub-walk when `walk_chunks > 1`) | `walk_overflow` |
+| `sub_pair_cap` | ξ's culled sub-block pairs of one walk (`sub_block > 0`) | `sub_overflow` |
+
+`walk_chunks` and `walk_frontier` set how the walk is streamed and cannot
+overflow: the first walk's frontier is at most `4 · walk_frontier` pairs, its
+queue's size. The walk counters are per walk where a capacity is: `near_pairs`,
+`peak_wavefront` and (ξ) `sub_pairs` are the largest over the sub-walks, which is
+what `near_cap`, `max_pair_queue` and `sub_pair_cap` must hold;
+`near_pairs_total` sums them, and `walk_frontier` is the frontier's size.
 
 The result carries each flag `psum`-reduced over devices (true if any device
 overflowed), plus an `overflow` OR of all of them. **They must be read.** A
@@ -382,6 +394,7 @@ The model treats each domain as a cube. The symbols:
 | `summary_send/recv_capacity` | `1.5 c · shell(h_s) / l³ · summary_capacity` |
 | `near_cap = max_pair_queue` | `0.3 c (1 + x/2) · (capacity / m) · ν · m^0.3`, `ν = n̄ (4π/3)(r + 1.75 r_l)³ / m`, `x = min(1, shell(r + r_l) / l³)` (0 on one device): the leaves within reach of a leaf. An own-own pair is emitted once and an own-halo pair on both owners, hence `1 + x/2` for surface-dominated domains (about 1.09 at 8.4e6 per device). Fit to the measured near pairs at leaf 16, 32 and 64; C1–C3's `0.75 c (capacity / m) ν` with `(r + r_l)³` held at leaf 16 (0.96 at most) but overflowed at leaf 32 (1.38) and 64 (1.76). |
 | `sub_pair_cap` (ξ, `sub_block = B`) | `1.1 c · (capacity / m_s) · n̄ V_s / m_s`: a sub-block of `m_s = m' / ⌈m' / B⌉` particles, `m' = 1.5 m`, side `a = (m_s / n̄)^(1/3)`, pairs with the sub-blocks whose centres lie in the Steiner volume `V_s = (2a)³ + 6 (2a)² r + 3π (2a) r² + (4π/3) r³` of a box of side `2a` grown by `r`. |
+| `walk_chunks` (`K`) | the smallest power of two that leaves each sub-walk at most `walk_pairs` (default 2²²) near leaf pairs, and at most `near / (16384 c)` (so the first walk's frontier queue, at most `4 · 256 K` pairs, stays below a sixteenth of the near pairs the model expects without its safety factor `c`); then `near_cap = max_pair_queue` and `sub_pair_cap` are `1.5 / K` of the totals above (the largest sub-walk measured 1.1–1.3× the mean; *The streamed walk*). `model["near_pairs_total"]` and `model["sub_pairs_total"]` keep the totals. |
 | `export_near_cap` | `c (1 + r / R_c)³ · halo / m`: each shipped leaf is named by the receiver cells within reach of it |
 | `export_queue` | `summary_recv_capacity + export_near_cap` (the walk is seeded with every received row) |
 | `send_capacity`, `send_leaf_capacity` | `1.5 · halo`, `2 · halo / m` |
@@ -509,6 +522,183 @@ gave 34 and the 77 GB above.) Leaf 64 with `sub_block = 8` needs about a fifth
 of leaf 16's memory per particle and is about as fast as the fastest culled
 configuration on CPU (leaf 32, B = 4), so it is the one to use for the C3/C4
 runs (`scaling.py --leaf-size 64`; the default leaf size is still 16).
+
+### The streamed walk (C4)
+
+**Where the memory went.** At leaf 64 with `sub_block = 8` the plan above was
+still 2.4 kB per particle, about 1.5e7 particles per A100-40GB, and 2048³ would
+have needed some 600 GPUs. Varying one capacity at a time in XLA's plan (ξ,
+float32, 8.4e6 per device) shows what it was:
+
+| buffer | per slot |
+|---|---|
+| walk wavefront, `max_pair_queue` | 263 B |
+| near list, `near_cap` | 8 B |
+| culled sub-block list, `sub_pair_cap` | 8 B |
+
+The near field itself was already a checkpointed scan; the walk was not. Its
+breadth-first wavefront holds about as many node pairs at its peak as there
+are near leaf pairs, and each round's refinement temporaries cost 263 B per
+pair. The queue was 17.5 of the 21.3 GB at 8.4e6 per device, and 156 GB of
+plan at 6.7e7 per device. Under it lay a floor that also grew with the leaf
+size: `(leaf_capacity, leaf_size, 3)` padded gathers of positions, 4.9 GB each
+at 6.7e7 per device, because the leaves are a quarter full. They came from
+`compute_tree_geometry`'s leaf bounds (both trees), from the sub-block boxes,
+and from the `(leaves, leaf_size)` slot tables.
+
+**Streaming the walk.** `walk_chunks = K > 1` (both payloads) walks in two
+phases:
+
+1. a first walk stops before the first round whose live wavefront exceeds
+   `walk_frontier` pairs (default `256 K`) and returns that wavefront, the
+   FRONTIER (`dual_tree_walk_mutual(stop_wavefront=)`, a core option);
+2. the frontier is dealt out to `K` sub-walks, each seeded with its pairs
+   (`seed_a`, `seed_b`, `seed_count`), and a `lax.scan` runs them one at a
+   time. Each one's near list is culled and summed (ξ) or merged into the
+   running top-k (kNN) before the next one runs.
+
+Every pair a walk emits is a deterministic function of the pair it descends
+from, so the first walk's lists and the sub-walks' together are exactly the
+single walk's: the same leaf pairs, and the same far pairs under any acceptance
+rule. So the result is the single walk's to summation order (the tests:
+1e-15 relative for values and gradients, kNN distances bit-identical). The
+walk's capacities become per sub-walk, so its memory is `1 / K` of the single
+walk's.
+
+The sub-walks must be balanced, since every one of them has to fit the per-walk
+capacities. The frontier is sorted by an estimated cost, the node pair's
+(query × data) particle product, and dealt in snake order: round `r` gives one
+pair to each sub-walk, `0 … K−1` for even `r` and `K−1 … 0` for odd `r`. So every
+sub-walk gets one of the `K` costliest pairs, one of the next `K`, and so on.
+The largest sub-walk's near pairs over the mean, 131072 points per device on 2
+devices, leaf 64, `K = 16`:
+
+| frontier (`walk_frontier`) | uniform, dealt in queue order | uniform, by cost | clustered, queue order | clustered, by cost |
+|---|---|---|---|---|
+| 1024 (`64 K`) | 1.48 | 1.21 | 1.41 | 1.38 |
+| 4096 (`256 K`, default) | 1.56 | 1.11 | 1.47 | 1.27 |
+| 16384 (`1024 K`) | 1.18 | 1.15 | 1.11 | 1.14 |
+
+(Clustered: 60 % of the points in blobs, one per 512 points, at clustering 4.)
+More seeds per sub-walk average their costs out; the cost order matters most
+when there are few. `for_box` sizes the sub-walks at 1.5 × the mean
+(*Sizing*), and keeps the first walk's frontier queue (at most `4 · 256 K`
+pairs) below a sixteenth of the near pairs, well below the walk's peak
+wavefront (about half of them). A first walk that stops close to its peak has
+done much of the work itself, past one sub-walk's capacities: at 16384
+clustered points per device on 4 devices, a frontier of a third of the near
+pairs left the first walk 10 × a sub-walk's share. The model's near pairs carry
+the clustering safety factor, which can overstate the walk several times, so
+the bound uses the model divided by `clustering`.
+
+The leaves' own pairs (ξ) are culled separately, in steps of
+`sub_pair_cap / (k (k + 1) / 2)` leaves, which cannot overflow.
+
+Under reverse mode each sub-walk is rematerialised (`jax.checkpoint` on the scan
+step, which holds the seeds and the running sums, not a sub-walk's lists). No
+`lax.cond` skips an empty sub-walk in the differentiated scan: a `cond` whose
+branches close over the particles gets a dense cotangent of them (see *Memory:
+the near field is rematerialised*). A sub-walk with no seed stops at once.
+
+**The floor.** The padded gathers are now reductions over the particles:
+
+- `compute_tree_geometry` reduces a leaf's particles by `segment_min` /
+  `segment_max` whenever the padded gather would hold more rows than there are
+  particles. A slot's leaf comes from marking each leaf's first slot and
+  carrying the mark forward with a running maximum. The values, and the
+  derivatives at ties, are those of the padded path
+  (`tests/unit/test_tree_geometry_segment_bounds.py`).
+- The sub-block boxes are segment reductions too, computed once per call (they
+  were recomputed per culled list).
+- Leaf and sub-block slots are computed per chunk from each leaf's first slot
+  and occupancy.
+- Without far pairs (`exact_acceptance`) the far-field node sums (four `float64`
+  prefix sums over the rows) are not built.
+- kNN: the CDF's soft step is evaluated one radius at a time
+  (`lax.map`, rematerialised). The `(rows, k, radii)` step array it replaces
+  was fused in the forward but held several times in reverse mode: 37 GB per
+  copy at 6.7e7 rows, k = 8 and 16 radii.
+
+**Memory.** XLA's compiled temp per device, float32, leaf 64, `sub_block = 8`,
+`for_box` at 3.4 spacings and clustering 1.5, CPU compile on 2 devices with
+the capacities of the device count in the heading
+(`bench/distributed/walk_stream.py --plan-only`):
+
+ξ, 6.7e7 per device (2048³ on 128 devices):
+
+| `walk_chunks` | per-walk `near_cap` | forward | value+grad |
+|---|---|---|---|
+| main (#126) | 4.9e8 | 156 GB | – |
+| 1 | 4.9e8 | 152 GB | 168 GB |
+| 16 | 4.6e7 | 18.2 GB | 36.0 GB |
+| 64 | 1.2e7 | 16.9 GB | 31.0 GB |
+| 128 (`for_box` default) | 5.8e6 | 16.7 GB | 30.9 GB |
+| 256 | 2.9e6 | 16.5 GB | 30.1 GB |
+
+ξ, 8.4e6 per device (2048³ on 1024 devices):
+
+| `walk_chunks` | forward | value+grad |
+|---|---|---|
+| main (#126) | 21.3 GB | 22.5 GB |
+| 1 | 20.6 GB | 23.1 GB |
+| 8 | 4.18 GB | 7.82 GB |
+| 16 (`for_box` default) | 2.59 GB | 5.22 GB |
+| 32 | 2.48 GB | 4.79 GB |
+
+kNN, k = 8, `r_max` = 3 spacings, soft CDF on 16 radii, adaptive reach, 6.7e7
+per device (128 devices; value+grad is with respect to the positions, through
+the CDF):
+
+| `walk_chunks` | forward | value+grad |
+|---|---|---|
+| 1 | 150 GB | 164 GB |
+| 64 | 29.9 GB | 50.5 GB |
+| 128 | 29.6 GB | 50.4 GB |
+| 256 | 29.5 GB | 50.4 GB |
+
+(Before the per-radius CDF the value+grad plans were 236 GB at `K = 1` and 185 GB
+at `K = 16` to 256.) kNN keeps more per particle than ξ: the `(rows, k)` best
+distances and indices of both passes, and the `(rows, k, 3)` neighbour gather
+of the distance recompute (8.7 GB at 9e7 combined rows).
+
+Once the sub-walks are small, the walk is a small part of the plan. The rest, about 245 B
+per particle forward and 460 B value+grad for ξ, is the pipeline: the
+partition's and the halo's sorts and buffers, the trees, and the copies the
+reverse pass of the exchanges and gathers needs. Removing the near field
+altogether (single walk, 64k-slot lists) leaves 2.36 / 4.24 GB at 8.4e6 per
+device against 2.48 / 4.79 GB streamed with `K = 32`. These CPU plans use the `buf` exchange,
+whose all-gathers of the send buffers (several GB at 6.7e7 per device) the
+GPU's native exchange does not have, so they are upper bounds for a GPU.
+
+**Time.** CPU (M-series, 10 cores, shared with another job at a load of about
+300, so read these as rough ratios), ξ float32, 131072 uniform points per device
+on 2 fake devices, leaf 64, `sub_block = 8`, median of 3
+(`walk_stream.py --n-per-device 131072 --ndev 2`):
+
+| | forward | value+grad |
+|---|---|---|
+| main (#126), single walk | 15.8 s | 28.7 s |
+| `walk_chunks = 1` | 10.1 s | 19.1 s |
+| `walk_chunks = 16` | 12.6 s | 28.7 s |
+| `walk_chunks = 64` | 17.9 s | 38.2 s |
+
+The single walk is faster than main's because the culling now visits only a
+walk's live near pairs (main scanned the whole capacity-padded list, about 4 ×
+the live pairs under `for_box`'s model) and the sub-block boxes are built once.
+Streamed, each sub-walk has fixed costs (its rounds, its culling and chunk
+scans), and value+grad recomputes every sub-walk and its culling in the
+reverse pass: that is the price of not storing their lists. Here a sub-walk
+holds 4600 near pairs at `K = 64`; at 6.7e7 per device and `K = 128` it holds a
+few million, and
+the fixed costs are small next to its work. The counts and gradients agree
+with the single walk to 1e-5 relative in float32 (summation order) and 1e-15
+in float64 (tests).
+
+**Default.** `for_box` streams once the model's near pairs exceed `walk_pairs =
+2²²` per sub-walk: `K = 128` at 6.7e7 per device (2048³ on 128 GPUs), `K = 16`
+at 8.4e6, and the single walk below about 5e5 per device. Four times as many
+sub-walks shrink either plan by under 5 % while the fixed costs grow with `K`;
+`--walk-chunks` in `scaling.py` (or `walk_chunks=` to `for_box`) overrides it.
 
 ## Periodic treatment
 
@@ -660,6 +850,16 @@ nbins)` windows: O(near pairs × leaf² × bins). The chunk function is wrapped 
 `jax.checkpoint`, so the reverse pass stores only its integer inputs and
 recomputes the windows. The forward is unchanged.
 
+A chunk with no live pair is skipped by a `lax.cond`. Reverse mode gives a
+`cond` a dense cotangent for every array its branches close over, so a branch
+that gathers from the particles itself costs a full `(particles, 3)` pass per
+chunk: 400 chunks over 1e7 particles took 1.9 s against 0.01 s on CPU, and at
+the C4 sizes, with about 10⁵ chunks per device, that would be most of a
+gradient's time. The gathers therefore run outside the `cond` (`_scan_chunks(...,
+gather=)`), which sees only the chunk's rows; the gather's transpose then
+scatters into the scan's cotangent in place. The levels above the chunks (the
+sub-walks, the leaves' own pairs) close over the particles and take no `cond`.
+
 Measured as XLA's compiled per-device temp for ξ at N = 8192 on 4 CPU devices,
 fp64, leaf 16, 8 bins:
 
@@ -786,26 +986,20 @@ devices:
   (`bench/slurm/stats_scaling_*`). The native ragged all-to-all, `jax.distributed` under SLURM,
   the GPU memory numbers and the sizing model at 10⁷–10⁸ per device are
   untested.
-- The walk's memory sets the flagship's size. Every near leaf pair is
-  materialised, at about 312 B per pair (wavefront slot plus near-list slot).
-  The CPU plans give these estimates per A100-40GB:
+- The walk's memory no longer sets the flagship's size (*The streamed walk*).
+  From the CPU plans (upper bounds: they carry the `buf` exchange), per
+  A100-40GB with about 38 GB usable:
 
-  | payload | particles per GPU | 2048³ needs |
-  |---|---|---|
-  | ξ, 3.4 spacings | ~5e6 | ~1500 GPUs |
-  | kNN, k = 8 | ~2e7 | ~400 GPUs |
+  | payload | per particle | particles per GPU | 2048³ needs |
+  |---|---|---|---|
+  | ξ forward | 249 B | ~1.5e8 | ~60 GPUs |
+  | ξ value+grad | 461 B | ~8e7 | ~105 GPUs |
+  | kNN forward | 441 B | ~8.5e7 | ~100 GPUs |
+  | kNN value+grad | 753 B | ~5e7 | ~170 GPUs |
 
-  So 2048³ on 128 GPUs (6.7e7 per device) does not fit for either payload. For
-  ξ the model even clamps `near_cap` to int32. The culled near field moves the
-  ξ row: at leaf 64 with `sub_block = 8` the plan is 2.4 kB per particle
-  instead of 11 kB (*The culled near field: speed and memory*), so about 1.5e7
-  per A100-40GB and about 600 GPUs for 2048³; 128 GPUs is still out of reach.
-  Options:
-  - more devices (1024 on JUWELS gives 8.4e6 per device);
-  - a smaller reach in spacings;
-  - the A4a window rule, which turns most pairs into far pairs;
-  - streaming the near field out of the walk round by round, so the queue never
-    holds every pair.
-
-  The memory-ceiling runs (`bench/slurm/README.md`, step 3) measure where the
+  So 2048³ on 128 GPUs (6.7e7 per device, `walk_chunks = 128`) plans at
+  16.7 GB (ξ forward), 30.9 GB (ξ value+grad) and 29.6 GB (kNN forward); kNN
+  value+grad (50 GB) does not fit there. JAX preallocates 75 % of a GPU by
+  default: `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` is needed above 30 GB. The GPU
+  plan and the runtime peak are not measured yet. The memory-ceiling runs (`bench/slurm/README.md`, step 3) measure where the
   limit is.

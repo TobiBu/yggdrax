@@ -336,3 +336,84 @@ def test_seed_validation():
             seed_a=jnp.asarray([root] * 4),
             seed_b=jnp.asarray([root] * 4),
         )
+
+
+# ---------------------------------------------------------------------------
+# stop_wavefront: a walk streamed as a frontier plus seeded sub-walks
+# ---------------------------------------------------------------------------
+
+
+def _all_pairs(*results):
+    """The far and near pairs of several walks, each pair asserted emitted once."""
+    far, near = [], []
+    for res in results:
+        assert not (
+            bool(res.far_overflow)
+            or bool(res.near_overflow)
+            or bool(res.queue_overflow)
+        )
+        nf, nn = int(res.far_count), int(res.near_count)
+        far += list(zip(np.asarray(res.far_a)[:nf].tolist(), res.far_b[:nf].tolist()))
+        near += list(
+            zip(np.asarray(res.near_a)[:nn].tolist(), res.near_b[:nn].tolist())
+        )
+    assert len(set(far)) == len(far) and len(set(near)) == len(near)
+    return set(far), set(near)
+
+
+@pytest.mark.parametrize("stop,groups", [(1, 1), (16, 3), (64, 7), (200, 64)])
+def test_stop_wavefront_frontier_and_seeded_walks_reproduce_the_walk(stop, groups):
+    """Frontier + its pairs re-seeded in any grouping == the single walk, exactly."""
+    _topo, left, right, com, radii, root = _one_tree()
+    whole = _walk(left, right, com, radii, root)
+    assert whole.queue_a is None and whole.queue_size is None
+    first = _walk(left, right, com, radii, root, stop_wavefront=stop)
+    size = int(first.queue_size)
+    assert stop < size <= 4 * stop
+    qa, qb = np.asarray(first.queue_a), np.asarray(first.queue_b)
+    assert np.all(qa[:size] >= 0) and np.all(qa[:size] <= qb[:size])
+    assert np.all(qa[size:] == -1) and np.all(qb[size:] == -1)
+    # the frontier is unprocessed: the first walk emitted fewer pairs
+    assert int(first.near_count) < int(whole.near_count)
+    # deal the frontier out round-robin, as the distributed driver does
+    subs = []
+    width = -(-size // groups)
+    for g in range(groups):
+        sa = np.full(width, -1, np.int32)
+        sb = np.full(width, -1, np.int32)
+        take = np.arange(g, size, groups)
+        sa[: take.size], sb[: take.size] = qa[take], qb[take]
+        subs.append(
+            _walk(
+                left,
+                right,
+                com,
+                radii,
+                root,
+                seed_a=jnp.asarray(sa),
+                seed_b=jnp.asarray(sb),
+                seed_count=jnp.asarray(take.size, jnp.int32),
+            )
+        )
+    assert _all_pairs(first, *subs) == _pairs(whole)
+
+
+def test_stop_wavefront_above_the_peak_finishes_the_walk():
+    _topo, left, right, com, radii, root = _one_tree()
+    whole = _walk(left, right, com, radii, root)
+    res = _walk(
+        left,
+        right,
+        com,
+        radii,
+        root,
+        stop_wavefront=int(whole.peak_wavefront),
+    )
+    assert int(res.queue_size) == 0
+    assert _pairs(res) == _pairs(whole)
+
+
+def test_stop_wavefront_needs_the_flat_backend():
+    _topo, left, right, com, radii, root = _one_tree(n=300)
+    with pytest.raises(ValueError, match="stop_wavefront"):
+        _walk(left, right, com, radii, root, stop_wavefront=8, backend="pallas")
