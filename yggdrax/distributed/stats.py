@@ -124,6 +124,24 @@ class DistributedStatsConfig:
         Partition samples per device (:func:`sfc_partition`).
     chunk:
         Leaf pairs (or query leaves) evaluated per step of the near-field scan.
+        With ``sub_block`` the scan takes ``chunk * (leaf_size / sub_block)**2``
+        sub-block pairs per step, the same live intermediate.
+    sub_block:
+        ξ only. Width ``B`` of the culled near field: each leaf's sorted slots
+        are cut into runs of ``B`` (Morton-ordered, hence compact), every leaf
+        pair the walk keeps (and every leaf with itself) is expanded into its
+        sub-block pairs, the pairs whose minimum-image bounding-box gap is at
+        least ``r_hi`` -- no particle pair of them is inside the cut -- are
+        dropped, and the rest are summed as dense ``B x B`` blocks. Exact (the
+        cut is hard). Must divide ``leaf_size``; ``0`` evaluates whole
+        ``leaf_size x leaf_size`` blocks (the C1 path). Default 8 when
+        ``leaf_size`` is a multiple of 8 and at least 16, else 0.
+    sub_pair_cap:
+        ξ with ``sub_block`` only: the culled sub-block pair list (``sub_pairs``
+        counts what a run needs; ``sub_overflow`` flags more). Default
+        ``near_cap * k**2 + halo_leaf_capacity * k (k + 1) / 2`` with
+        ``k = leaf_size / sub_block``, which cannot overflow but is large;
+        :meth:`for_box` sizes it from the geometry.
     exchange:
         Implementation of the partition and halo exchanges: ``"auto"``,
         ``"buf"`` or ``"native"``
@@ -172,6 +190,8 @@ class DistributedStatsConfig:
     first_pass_reach_factor: float = 2.0
     num_samples: int = 64
     chunk: int = 256
+    sub_block: Optional[int] = None
+    sub_pair_cap: Optional[int] = None
     exchange: str = "auto"
     summary_exchange: str = "neighbors"
     summary_coarse_depth: int = 4
@@ -201,14 +221,29 @@ class DistributedStatsConfig:
                 f"summary_coarse_depth must be in [0, 10]; got {self.summary_coarse_depth}"
             )
         leaf_cap = self.leaf_capacity or self.capacity
+        halo_leaf_cap = self.halo_leaf_capacity or (self.capacity + self.halo_capacity)
+        ls = int(self.leaf_size)
+        sub = _default_sub_block(ls) if self.sub_block is None else int(self.sub_block)
+        if sub < 0 or (sub and ls % sub):
+            raise ValueError(
+                f"sub_block must be 0 or divide leaf_size {ls}; got {self.sub_block}"
+            )
+        sub_cap = 0
+        if sub:
+            k = ls // sub
+            sub_cap = self.sub_pair_cap or (
+                int(self.near_cap) * k * k + int(halo_leaf_cap) * k * (k + 1) // 2
+            )
+            sub_cap = min(int(sub_cap), int(jnp.iinfo(INDEX_DTYPE).max))
         return replace(
             self,
             leaf_capacity=leaf_cap,
-            halo_leaf_capacity=self.halo_leaf_capacity
-            or (self.capacity + self.halo_capacity),
+            halo_leaf_capacity=halo_leaf_cap,
             summary_capacity=self.summary_capacity or leaf_cap,
             send_leaf_capacity=self.send_leaf_capacity or self.export_near_cap,
             send_capacity=self.send_capacity or 2 * self.halo_capacity,
+            sub_block=sub,
+            sub_pair_cap=sub_cap,
         )
 
     @classmethod
@@ -308,6 +343,7 @@ class DistributedStatsConfig:
             "summary_coarse_depth",
             "num_samples",
             "imbalance",
+            "sub_block",
         )
         model = {k: kwargs.pop(k) for k in model_keys if k in kwargs}
         est = estimate_capacities(
@@ -322,6 +358,11 @@ class DistributedStatsConfig:
         fields = dict(est["config"])
         fields.update(kwargs)
         return cls(**fields).resolved()
+
+
+def _default_sub_block(leaf_size: int) -> int:
+    """8 for leaves of 16 or more slots that 8 divides, else 0 (no culling)."""
+    return 8 if (leaf_size % 8 == 0 and leaf_size >= 16) else 0
 
 
 def _pow2_ceil(x: float) -> int:
@@ -343,6 +384,7 @@ def estimate_capacities(
     summary_coarse_depth: int = 4,
     num_samples: Optional[int] = None,
     imbalance: Optional[float] = None,
+    sub_block: Optional[int] = None,
 ) -> dict:
     """Every capacity of the pipeline from N, the box, the reach and the leaf size.
 
@@ -389,6 +431,9 @@ def estimate_capacities(
         ``0.41 sqrt(ndev) / num_samples`` of a domain, one sigma.
     imbalance:
         Partition capacity over the mean; default 4 sigma of that error plus 2 %.
+    sub_block:
+        ξ's culled near field (:class:`DistributedStatsConfig`); default 8 for
+        leaves of 16 or more that 8 divides. Sets ``sub_pair_cap``.
 
     Returns
     -------
@@ -453,11 +498,38 @@ def estimate_capacities(
     rows = max(16, min(neighbors * summary_cap, int(math.ceil(1.5 * cell_rows))))
 
     # the walk over [local ; halo]: an owned leaf pairs with the leaves whose
-    # sphere gap is below the reach; the walk emits each unordered pair once,
-    # 0.59-0.69 of ``leaves * nu`` measured (uniform, 1-8 devices)
+    # sphere gap is below the reach. The walk emits an own-own pair once and
+    # an own-halo pair on both owners, so small (surface-dominated) domains
+    # need up to twice the per-leaf count: the factor 1 + x / 2, x the halo
+    # shell over the domain (at most 1). Fit to the measured near pairs
+    # (uniform, 1-8 devices, leaf 16/32/64, 2.8-4 spacings): near / particle
+    # = A (1 + x / 2)(reach + 1.75 r_l)^3 / m^1.7 holds the largest ratio within
+    # 1 % across leaf sizes at A = 0.22; A = 0.3 here (largest ratio 0.74).
+    # The C1-C3 form 0.75 (reach + r_l)^3 / m^2 reached 0.96 at leaf 16 and
+    # overflowed at leaf 32 (1.38) and 64 (1.76).
     leaves_own = capacity / m_leaf
-    nu = nbar * fourpi3 * (reach + r_leaf) ** 3 / m_leaf
-    near = max(1 << 12, int(math.ceil(0.75 * c * leaves_own * nu)))
+    nu = nbar * fourpi3 * (reach + 1.75 * r_leaf) ** 3 / m_leaf
+    x_surf = 0.0 if ndev == 1 else min(1.0, shell(reach + r_leaf) / v_dom)
+    near = 0.3 * c * (1.0 + 0.5 * x_surf) * leaves_own * nu * m_leaf**0.3
+    near = max(1 << 12, int(math.ceil(near)))
+
+    # ξ's culled near field: an own sub-block (a run of B slots) pairs with the
+    # sub-blocks whose box gap is below the reach, i.e. whose centres lie in the
+    # box of side 2 a_s grown by the reach (Steiner volume), counted per own
+    # sub-block like the walk lists. A filled sub-block holds m_s particles out
+    # of an effective 1.5 m per leaf. Measured as the walk above (B = 8), the
+    # largest count over this capacity is 0.67 at leaf 16, 0.48 at 32 and 0.70
+    # at 64 (uniform, clustering 1).
+    sub_block = _default_sub_block(leaf_size) if sub_block is None else int(sub_block)
+    sub_cap, nu_sub = 0, 0.0
+    if sub_block:
+        m_eff = 1.5 * m_leaf
+        m_sub = m_eff / max(1, math.ceil(m_eff / sub_block))
+        a2 = 2.0 * (m_sub / nbar) ** (1.0 / 3.0)
+        v_sub = a2**3 + 6.0 * a2 * a2 * reach + 3.0 * math.pi * a2 * reach**2
+        v_sub += fourpi3 * reach**3
+        nu_sub = nbar * v_sub / m_sub
+        sub_cap = max(1 << 12, int(math.ceil(1.1 * c * capacity / m_sub * nu_sub)))
 
     # export: a shipped leaf is named by every receiver cell within reach of it
     halo_leaves = halo / m_leaf
@@ -485,6 +557,8 @@ def estimate_capacities(
         near_cap=near,
         far_cap=1 << 12,
         num_samples=s,
+        sub_block=sub_block,
+        sub_pair_cap=sub_cap,
     )
     # every capacity is an index range (INDEX_DTYPE, int32 by default)
     limit = int(jnp.iinfo(INDEX_DTYPE).max)
@@ -510,6 +584,7 @@ def estimate_capacities(
         imbalance=imb,
         neighbor_leaves=nu,
         export_refs_per_leaf=refs,
+        neighbor_sub_blocks=nu_sub,
     )
     return dict(config=config, model=model)
 
@@ -1412,6 +1487,112 @@ def _block_pair_sums(
     return jnp.einsum("cij,cijb->b", pw, win)
 
 
+# leaf pairs expanded and culled per step of the sub-block compaction scan
+_CULL_ROWS = 2048
+
+
+def _culled_sub_pairs(
+    xs: Array,
+    slots: Array,
+    smask: Array,
+    pair_a: Array,
+    pair_b: Array,
+    pair_ok: Array,
+    sub_block: int,
+    cap: int,
+    reach: float,
+    box: Optional[tuple[float, ...]],
+) -> tuple[Array, Array, Array]:
+    """Sub-block pairs of the candidate leaf pairs that can hold a pair in reach.
+
+    Each leaf's ``leaf_size`` sorted slots are cut into ``k = leaf_size / B``
+    runs of ``B`` consecutive slots; sub-block ``u`` of leaf ``l`` is row
+    ``l k + u`` of ``slots.reshape(-1, B)``. A candidate ``(a, b)`` with
+    ``a != b`` expands into its ``k^2`` sub-block pairs, a self pair
+    ``(a, a)`` into the ``k (k + 1) / 2`` with ``u <= v`` (``u == v`` is a
+    diagonal block, summed over its upper triangle). Per axis, the
+    minimum-image gap of two bounding boxes, ``|mi(c_b - c_a)| - (h_a + h_b)``
+    floored at 0, is a lower bound on every particle separation between them;
+    a pair whose gap reaches ``reach`` has no particle pair inside the cut
+    and is dropped, as is one with an empty side. The survivors are compacted,
+    in order, into ``cap`` slots by a scan over chunks of candidates, so no
+    ``candidates x k^2`` array is ever live. Topology only: no gradient.
+
+    Returns
+    -------
+    tuple of Array
+        ``(rows_a, rows_b, count)``: sub-block rows (0 past ``count``) and the
+        number of pairs needed (``int64``; more than ``cap`` is an overflow).
+    """
+    b = int(sub_block)
+    nl, leaf = slots.shape
+    k = leaf // b
+    dim = xs.shape[-1]
+    pos = jax.lax.stop_gradient(xs)[slots].reshape(nl * k, b, dim)
+    occ = smask.reshape(nl * k, b)[..., None]
+    big = jnp.asarray(jnp.finfo(pos.dtype).max, pos.dtype)
+    lo = jnp.min(jnp.where(occ, pos, big), axis=1)
+    hi = jnp.max(jnp.where(occ, pos, -big), axis=1)
+    filled = jnp.any(occ[..., 0], axis=-1)
+    center = jnp.where(filled[:, None], 0.5 * (lo + hi), 0.0)
+    half = jnp.where(filled[:, None], 0.5 * (hi - lo), 0.0)
+    # every float above is a rounding of the exact box; pad the threshold by a
+    # few ulps of the coordinates so rounding can only keep a pair, never drop
+    # one the dense path counts
+    scale = jnp.max(jnp.where(filled[:, None], jnp.maximum(-lo, hi), 0.0))
+    slack = 16.0 * jnp.finfo(pos.dtype).eps * scale + 1e-6 * float(reach)
+    r2 = (float(reach) + slack) ** 2
+
+    idx = INDEX_DTYPE
+    uu = jnp.repeat(jnp.arange(k, dtype=idx), k)
+    vv = jnp.tile(jnp.arange(k, dtype=idx), k)
+    upper = uu <= vv
+
+    n_rows = int(pair_a.shape[0])
+    step = max(1, min(_CULL_ROWS, n_rows))
+    n_steps = -(-n_rows // step)
+    pad = n_steps * step - n_rows
+
+    def prep(a):
+        a = jnp.asarray(a)
+        if pad:
+            a = jnp.concatenate([a, jnp.zeros((pad,), a.dtype)])
+        return a.reshape(n_steps, step)
+
+    def body(carry, x):
+        offset, out_a, out_b = carry
+        a, bb, ok = x
+        ia = a[:, None] * k + uu[None, :]
+        ib = bb[:, None] * k + vv[None, :]
+        gap = jnp.maximum(
+            jnp.abs(minimum_image(center[ib] - center[ia], box))
+            - (half[ia] + half[ib]),
+            0.0,
+        )
+        keep = (
+            ok[:, None]
+            & ((a != bb)[:, None] | upper[None, :])
+            & filled[ia]
+            & filled[ib]
+            & (jnp.sum(gap * gap, axis=-1) < r2)
+        ).reshape(-1)
+        order = offset + jnp.cumsum(keep.astype(jnp.int64)) - 1
+        target = jnp.where(keep & (order < cap), order, cap)
+        out_a = out_a.at[target].set(ia.reshape(-1), mode="drop")
+        out_b = out_b.at[target].set(ib.reshape(-1), mode="drop")
+        return (offset + jnp.sum(keep.astype(jnp.int64)), out_a, out_b), None
+
+    init = (
+        jnp.zeros((), jnp.int64),
+        jnp.zeros((cap,), idx),
+        jnp.zeros((cap,), idx),
+    )
+    (count, rows_a, rows_b), _ = jax.lax.scan(
+        body, init, (prep(pair_a), prep(pair_b), prep(pair_ok))
+    )
+    return rows_a, rows_b, count
+
+
 def pair_counts_shard(
     positions: Array,
     weights: Array,
@@ -1578,29 +1759,90 @@ def _pair_counts_body(
         )
 
     num_leaves = slots.shape[0]
-    triu = jnp.triu(jnp.ones((ls, ls), bool), k=1)[None]
     leaf_ids = jnp.arange(num_leaves, dtype=INDEX_DTYPE)
     leaf_ok = t.active[ni:] & (cq[ni:] > 0)
-    within = _scan_chunks(
-        lambda a, ok: pairs(a, a, ok, triu),
-        num_leaves,
-        cfg.chunk,
-        zero,
-        leaf_ids,
-        leaf_ok,
-        live=leaf_ok,
-    )
     near_ok = walk.near_a >= 0
-    near = _scan_chunks(
-        lambda a, b, ok: pairs(a, b, ok, True),
-        int(walk.near_a.shape[0]),
-        cfg.chunk,
-        zero,
-        jnp.where(near_ok, walk.near_a - ni, 0),
-        jnp.where(near_ok, walk.near_b - ni, 0),
-        near_ok,
-        live=near_ok,
-    )
+    near_t = jnp.where(near_ok, walk.near_a - ni, 0)
+    near_s = jnp.where(near_ok, walk.near_b - ni, 0)
+    sub = int(cfg.sub_block)
+    if sub:
+        # culled near field: the walk's leaf pairs and every leaf with itself,
+        # as the B x B sub-block pairs that can hold a pair inside the cut
+        k = ls // sub
+        cap = max(1, int(cfg.sub_pair_cap))
+        rows_a, rows_b, sub_count = _culled_sub_pairs(
+            xs,
+            slots,
+            smask,
+            jnp.concatenate([near_t, leaf_ids]),
+            jnp.concatenate([near_s, leaf_ids]),
+            jnp.concatenate([near_ok, leaf_ok]),
+            sub,
+            cap,
+            r_hi,
+            box,
+        )
+        sub_ok = jnp.arange(cap, dtype=jnp.int64) < sub_count
+        sub_slots = slots.reshape(-1, sub)
+        sub_mask = smask.reshape(-1, sub)
+        sub_triu = jnp.triu(jnp.ones((sub, sub), bool), k=1)[None]
+
+        def sub_pairs(ra, rb, ok):
+            sa, sb = sub_slots[ra], sub_slots[rb]
+            # a diagonal block (a self pair's u == v) is its own upper triangle
+            extra = jnp.where((ra == rb)[:, None, None], sub_triu, True)
+            return _block_pair_sums(
+                xs[sa],
+                ws[sa],
+                os_[sa],
+                sub_mask[ra] & ok[:, None],
+                xs[sb],
+                ws[sb],
+                os_[sb],
+                sub_mask[rb],
+                extra,
+                edges,
+                sharpness,
+                log,
+                r_lo,
+                r_hi,
+                box,
+            )
+
+        within = zero
+        near = _scan_chunks(
+            sub_pairs,
+            cap,
+            cfg.chunk * k * k,
+            zero,
+            rows_a,
+            rows_b,
+            sub_ok,
+            live=sub_ok,
+        )
+    else:
+        sub_count = jnp.zeros((), jnp.int64)
+        cap = 0
+        triu = jnp.triu(jnp.ones((ls, ls), bool), k=1)[None]
+        within = _scan_chunks(
+            lambda a, ok: pairs(a, a, ok, triu),
+            num_leaves,
+            cfg.chunk,
+            zero,
+            leaf_ids,
+            leaf_ok,
+            live=leaf_ok,
+        )
+        near = _scan_chunks(
+            lambda a, b, ok: pairs(a, b, ok, True),
+            int(walk.near_a.shape[0]),
+            cfg.chunk,
+            zero,
+            near_t,
+            near_s,
+            near_ok,
+            live=near_ok,
+        )
 
     # far pairs: closed-form monopole of the ownership weights at the centroids
     acc_dtype = jnp.float64
@@ -1632,6 +1874,7 @@ def _pair_counts_body(
         send_overflow=_any(halo.diag["send_overflow"]),
         halo_overflow=_any(halo.diag["halo_overflow"]),
         walk_overflow=_any(walk_over),
+        sub_overflow=_any(sub_count > cap) if sub else jnp.asarray(False),
     )
     overflow = functools.reduce(lambda a, b: a | b, flags_out.values())
     stats = dict(
@@ -1649,6 +1892,7 @@ def _pair_counts_body(
         near_pairs=walk.near_count[None],
         far_pairs=walk.far_count[None],
         peak_wavefront=walk.peak_wavefront[None],
+        sub_pairs=sub_count[None],
     )
     return DistributedPairCounts(
         counts=counts, overflow=overflow, flags=flags_out, stats=stats
