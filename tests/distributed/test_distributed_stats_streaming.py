@@ -27,6 +27,7 @@ devices where they exist:
 from __future__ import annotations
 
 import dataclasses
+import gc
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +35,7 @@ import numpy as np
 import pytest
 
 from yggdrax.distributed import device_count, make_mesh
+from yggdrax.distributed import stats as _stats
 from yggdrax.distributed.stats import (
     DistributedStatsConfig,
     distributed_knn,
@@ -42,6 +44,25 @@ from yggdrax.distributed.stats import (
     soft_window,
     soft_window_cutoffs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _free_compiled_programs():
+    """Drop each test's compiled programs once it has run.
+
+    Every test compiles its own walk configurations, and the per-configuration
+    program caches (``_pair_count_program``, ``_knn_program``) plus jax's own keep
+    them all. Kept, they reach 7.6 GB by the end of this file on 4 fake devices
+    (macOS). On CI's 16 GB runner, run after the other stats files in one
+    process (10 GB on macOS), XLA's compiler aborted, most likely for lack of
+    memory. Cleared after each test, the peak is 3.5 GB.
+    """
+    yield
+    _stats._pair_count_program.cache_clear()
+    _stats._knn_program.cache_clear()
+    jax.clear_caches()
+    gc.collect()
+
 
 _NDEVS = [d for d in (1, 2, 4, 8) if d <= device_count()]
 _MULTI = max(_NDEVS)
