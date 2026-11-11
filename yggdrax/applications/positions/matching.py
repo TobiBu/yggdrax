@@ -47,6 +47,26 @@ fixed:
 So ``rebuild_every`` trades the kNN search (and the membership refresh)
 against staleness. ``rebuild_every=1`` is a fresh search every step.
 
+Optimiser
+---------
+Any ``optax`` transformation works; :func:`lbfgs_positions` is the one to use.
+On a Thomas target at ``N = 3e4`` it reaches a given loss in about half the
+loss evaluations Adam needs down to ``1e-3``, and goes on past the loss of an
+independent target realisation where Adam levels off. Its parts:
+
+* the line search's accepted value and gradient are reused as the next step's
+  (``reuse_linesearch_value``), so a step costs about 1.3 evaluations, not
+  2.2;
+* :func:`cap_displacement` clips each particle's step (``0.25 l`` per step
+  bounds the moves to about ``l`` per epoch of 10, against ``5 l`` uncapped,
+  at nearly the uncapped rate; ``0.1 l`` is slower);
+* the curvature memory is kept across refreshes: clearing it
+  (``reset_on_refresh``) leaves the loss 3-9 times higher at a matched number
+  of evaluations, and a refresh every step converges no better per evaluation
+  than every 10;
+* a trial point whose traced walk overflows has an infinite loss, so the line
+  search rejects it.
+
 Capacities
 ----------
 The traced ξ has static capacities (``TracedPairCountConfig``), planned by
@@ -88,7 +108,9 @@ __all__ = [
     "MatchStatistics",
     "OptimiseResult",
     "PositionMatcher",
+    "cap_displacement",
     "default_spec",
+    "lbfgs_positions",
     "optimise_positions",
 ]
 
@@ -579,6 +601,30 @@ class PositionMatcher:
         terms = self.loss_from_statistics(self.statistics(positions, state))
         return terms.loss, terms
 
+    def knn_term(self, positions: Array, state: MatchState) -> Array:
+        """``L_knn`` alone (unweighted): cheap, no ξ walk.
+
+        Parameters
+        ----------
+        positions:
+            ``(N, 3)`` catalogue.
+        state:
+            From :meth:`refresh`.
+
+        Returns
+        -------
+        Array
+            Scalar ``L_knn``.
+        """
+        r_grid = jnp.asarray(self.spec.knn_r_grid, positions.dtype)
+        cdf = jnp.stack(
+            [
+                soft_cdf_from_log_distances(lr, r_grid, self.spec.knn_sharpness)
+                for lr in self._log_r(positions, state)
+            ]
+        )
+        return jnp.mean((cdf - self.target.cdf) ** 2)
+
     def stale_fraction(self, positions: Array, old: MatchState, new: MatchState):
         """Fraction of ``(query, k)`` whose ``r_k`` the old candidates got wrong.
 
@@ -650,7 +696,9 @@ class OptimiseResult(NamedTuple):
         ``(N, 3)`` final catalogue, wrapped into ``[0, L)``.
     history:
         One record per step: ``step``, ``loss``, ``xi``, ``knn`` (evaluated at
-        the step's start positions).
+        the step's start positions) and ``evals``, the loss-and-gradient
+        evaluations the step made (one for a plain step; the line search's
+        trials for L-BFGS, plus the step's own unless it was reused).
     epochs:
         One record per epoch: ``first_step``, ``seconds``, ``stale_fraction``
         (of the previous epoch's candidates at this epoch's start),
@@ -672,31 +720,172 @@ class OptimiseResult(NamedTuple):
     matcher: PositionMatcher
 
 
-def _make_epoch(matcher: PositionMatcher, optimizer: Any, rebuild_every: int):
+def cap_displacement(max_step: float, per_particle: bool = True) -> Any:
+    """An ``optax`` transform capping how far any particle moves in a step.
+
+    Particle ``i``'s 3-vector ``u_i`` is scaled by ``min(1, max_step /
+    |u_i|)``: a particle proposed to move further is moved ``max_step`` along
+    its own direction, the others are untouched. Chained before a line search
+    whose ``max_learning_rate`` is 1 it caps every particle's step at
+    ``max_step``, which keeps the frozen leaf partition and kNN candidates of
+    an epoch (:meth:`PositionMatcher.refresh`) close to the live positions.
+
+    ``per_particle=False`` scales the whole update by the one factor of its
+    largest row instead (the direction is kept exactly). On this loss that
+    stalls L-BFGS: the gradient is dominated by a few particles, one of them
+    sets the factor, and every other particle barely moves.
+
+    Parameters
+    ----------
+    max_step:
+        Largest displacement of any particle per step (box units).
+    per_particle:
+        Clip each particle (default) or scale the update uniformly.
+
+    Returns
+    -------
+    optax.GradientTransformation
+        Stateless.
+    """
+    import optax
+
+    def init_fn(params):
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None):
+        del params
+        tiny = jnp.finfo(updates.dtype).tiny
+        if per_particle:
+            norm = jnp.sqrt(jnp.sum(updates * updates, axis=-1, keepdims=True))
+        else:
+            norm = jnp.sqrt(jnp.max(jnp.sum(updates * updates, axis=-1)))
+        scale = jnp.minimum(1.0, max_step / jnp.maximum(norm, tiny))
+        return updates * scale.astype(updates.dtype), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def lbfgs_positions(
+    *,
+    max_step: Optional[float] = None,
+    per_particle: bool = True,
+    memory_size: int = 10,
+    max_linesearch_steps: int = 20,
+) -> Any:
+    """``optax`` L-BFGS for positions, optionally with a displacement cap.
+
+    ``scale_by_lbfgs``, then :func:`cap_displacement` when ``max_step`` is
+    set, then a zoom line search starting at step 1 (``max_learning_rate=1``
+    with the cap, so the accepted step never exceeds it).
+
+    Parameters
+    ----------
+    max_step:
+        Per-particle displacement cap per step, or ``None``: optax's
+        ``lbfgs`` unchanged.
+    per_particle:
+        See :func:`cap_displacement`.
+    memory_size:
+        Curvature pairs kept.
+    max_linesearch_steps:
+        Line-search trials per step.
+
+    Returns
+    -------
+    optax.GradientTransformationExtraArgs
+        Needs ``value``, ``grad`` and ``value_fn`` at every update.
+    """
+    import optax
+
+    if max_step is None:
+        return optax.lbfgs(
+            memory_size=memory_size,
+            linesearch=optax.scale_by_zoom_linesearch(
+                max_linesearch_steps=max_linesearch_steps,
+                initial_guess_strategy="one",
+            ),
+        )
+    return optax.chain(
+        optax.scale_by_lbfgs(memory_size=memory_size),
+        optax.scale(-1.0),
+        cap_displacement(max_step, per_particle),
+        optax.scale_by_zoom_linesearch(
+            max_linesearch_steps=max_linesearch_steps,
+            max_learning_rate=1.0,
+            initial_guess_strategy="one",
+        ),
+    )
+
+
+def _tree_find(tree: Any, name: str) -> Any:
+    """The first attribute ``name`` in a (nested) optax state, or ``None``."""
+    stack = [tree]
+    while stack:
+        node = stack.pop(0)
+        if hasattr(node, "_fields"):
+            if name in node._fields:
+                return getattr(node, name)
+            stack.extend(getattr(node, f) for f in node._fields)
+        elif isinstance(node, (tuple, list)):
+            stack.extend(node)
+    return None
+
+
+def _make_epoch(
+    matcher: PositionMatcher,
+    optimizer: Any,
+    rebuild_every: int,
+    reuse_linesearch_value: bool,
+):
     """The jitted epoch: refresh, then ``rebuild_every`` optimiser steps."""
     import optax
+
+    spec = matcher.spec
 
     def epoch(pos, opt_state, prev_state):
         state = matcher.refresh(pos)
         stale = matcher.stale_fraction(pos, prev_state, state)
         value_and_grad = jax.value_and_grad(matcher.loss, has_aux=True)
 
-        def body(carry, _):
-            x, s = carry
+        def value_fn(y):
+            # A trial point whose traced walk overflows has a truncated loss;
+            # infinity makes a line search reject it.
+            value, terms = matcher.loss(y, state)
+            return jnp.where(terms.overflow, jnp.inf, value)
+
+        def fresh(x, s):
+            del s
             (value, terms), grad = value_and_grad(x, state)
+            return value, grad, terms.knn, terms.overflow, jnp.asarray(1, jnp.int32)
+
+        def reused(x, s):
+            # The line search's last trial is the accepted point: its value and
+            # gradient on this epoch's frozen state are in the optimiser state.
+            value = _tree_find(s, "value").astype(x.dtype)
+            grad = _tree_find(s, "grad").astype(x.dtype)
+            knn = matcher.knn_term(x, state)
+            return value, grad, knn, jnp.asarray(False), jnp.asarray(0, jnp.int32)
+
+        def body(carry, i):
+            x, s = carry
+            if reuse_linesearch_value:
+                value, grad, l_knn, ovf, own = jax.lax.cond(i == 0, fresh, reused, x, s)
+            else:
+                value, grad, l_knn, ovf, own = fresh(x, s)
+            l_xi = (value - spec.knn_weight * l_knn) / spec.xi_weight
             updates, s = optimizer.update(
-                grad,
-                s,
-                x,
-                value=value,
-                grad=grad,
-                value_fn=lambda y: matcher.loss(y, state)[0],
+                grad, s, x, value=value, grad=grad, value_fn=value_fn
+            )
+            ls = _tree_find(s, "num_linesearch_steps")
+            evals = own + (
+                jnp.asarray(0, jnp.int32) if ls is None else ls.astype(jnp.int32)
             )
             x = optax.apply_updates(x, updates)
-            return (x, s), (value, terms.xi, terms.knn, terms.overflow)
+            return (x, s), (value, l_xi, l_knn, ovf, evals)
 
-        (pos_end, opt_state), (loss, l_xi, l_knn, ovf) = jax.lax.scan(
-            body, (pos, opt_state), None, length=rebuild_every
+        (pos_end, opt_state), (loss, l_xi, l_knn, ovf, evals) = jax.lax.scan(
+            body, (pos, opt_state), jnp.arange(rebuild_every)
         )
         disp = pos_end - pos
         max_disp = jnp.sqrt(jnp.max(jnp.sum(disp * disp, axis=1)))
@@ -710,6 +899,7 @@ def _make_epoch(matcher: PositionMatcher, optimizer: Any, rebuild_every: int):
             jnp.any(ovf),
             stale,
             max_disp,
+            evals,
         )
 
     return epoch
@@ -723,6 +913,8 @@ def optimise_positions(
     num_steps: int,
     rebuild_every: int = 10,
     max_replans: int = 4,
+    reset_on_refresh: bool = False,
+    reuse_linesearch_value: Optional[bool] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> OptimiseResult:
     """Descend on the matching loss with respect to every particle coordinate.
@@ -740,7 +932,8 @@ def optimise_positions(
         ``(N, 3)`` start catalogue.
     optimizer:
         An ``optax`` gradient transformation, e.g. ``optax.adam(lr)`` or
-        ``optax.lbfgs()``; it gets ``value``, ``grad`` and ``value_fn``.
+        :func:`lbfgs_positions`; it gets ``value``, ``grad`` and ``value_fn``
+        (which is infinite where the traced walk overflows).
     num_steps:
         Steps; rounded up to a multiple of ``rebuild_every``.
     rebuild_every:
@@ -748,6 +941,13 @@ def optimise_positions(
         refreshed once per epoch (see the module docstring).
     max_replans:
         Re-plans of the traced capacities allowed over the run.
+    reset_on_refresh:
+        Re-initialise the optimiser state at every epoch, so an L-BFGS
+        memory never mixes curvature pairs from two frozen states.
+    reuse_linesearch_value:
+        Take each step's loss and gradient from the line search's accepted
+        trial (all but an epoch's first step), saving one evaluation per
+        step. ``None``: when the optimiser state carries a line search.
     log:
         Optional line logger (``print``).
 
@@ -767,6 +967,10 @@ def optimise_positions(
     num_epochs = -(-int(num_steps) // k)
     pos = jnp.asarray(initial)
     opt_state = optimizer.init(pos)
+    if reuse_linesearch_value is None:
+        reuse_linesearch_value = (
+            _tree_find(opt_state, "num_linesearch_steps") is not None
+        )
     prev_state = jax.jit(matcher.refresh)(pos)
 
     compile_s = 0.0
@@ -788,7 +992,8 @@ def optimise_positions(
         )
         if sig not in cache:
             t0 = time.perf_counter()
-            cache[sig] = jax.jit(_make_epoch(m, optimizer, k)).lower(*args).compile()
+            fn = _make_epoch(m, optimizer, k, bool(reuse_linesearch_value))
+            cache[sig] = jax.jit(fn).lower(*args).compile()
             compile_s += time.perf_counter() - t0
         return cache[sig](*args)
 
@@ -798,11 +1003,13 @@ def optimise_positions(
     run_s = 0.0
     e = 0
     while e < num_epochs:
+        if reset_on_refresh and e > 0:
+            opt_state = optimizer.init(pos)
         c0, t0 = compile_s, time.perf_counter()
         out = run_epoch(matcher, pos, opt_state, prev_state)
         jax.block_until_ready(out)
         dt = time.perf_counter() - t0 - (compile_s - c0)
-        pos_end, opt_end, state, loss, l_xi, l_knn, ovf, stale, max_disp = out
+        pos_end, opt_end, state, loss, l_xi, l_knn, ovf, stale, max_disp, evals = out
         if bool(ovf):
             if replans >= max_replans:
                 raise RuntimeError(
@@ -814,7 +1021,7 @@ def optimise_positions(
                 log(f"epoch {e}: overflow, re-planned ({replans}) and repeating")
             continue
         run_s += dt
-        loss_h, xi_h, knn_h = (np.asarray(a) for a in (loss, l_xi, l_knn))
+        loss_h, xi_h, knn_h, ev_h = (np.asarray(a) for a in (loss, l_xi, l_knn, evals))
         for i in range(k):
             history.append(
                 {
@@ -822,6 +1029,7 @@ def optimise_positions(
                     "loss": float(loss_h[i]),
                     "xi": float(xi_h[i]),
                     "knn": float(knn_h[i]),
+                    "evals": int(ev_h[i]),
                 }
             )
         epochs.append(
@@ -837,7 +1045,7 @@ def optimise_positions(
             log(
                 f"step {e * k:6d}  loss {loss_h[0]:.4e}  xi {xi_h[0]:.3e}  "
                 f"knn {knn_h[0]:.3e}  stale {float(stale):.2e}  "
-                f"{dt / k * 1e3:.1f} ms/step"
+                f"evals/step {ev_h.mean():.2f}  {dt / k * 1e3:.1f} ms/step"
             )
         pos, opt_state, prev_state = pos_end, opt_end, state
         e += 1

@@ -14,7 +14,9 @@ from yggdrax.applications.positions.matching import (
     MatchStatistics,
     OptimiseResult,
     PositionMatcher,
+    cap_displacement,
     default_spec,
+    lbfgs_positions,
     optimise_positions,
 )
 
@@ -25,6 +27,8 @@ __all__ = [
     "MatchStatistics",
     "OptimiseResult",
     "PositionMatcher",
+    "cap_displacement",
     "default_spec",
+    "lbfgs_positions",
     "optimise_positions",
 ]

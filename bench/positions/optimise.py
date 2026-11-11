@@ -3,9 +3,18 @@
 Every coordinate of an ``N``-particle catalogue is a parameter. The loss
 compares the catalogue's ξ (traced soft pair counts, window rule, minimum
 image) and kNN-CDFs (random and data queries) with a target catalogue's; an
-``optax`` optimiser (Adam or L-BFGS) descends on it with gradients through both
-tree estimators. The kNN search and the ξ leaf partition are refreshed every
+``optax`` optimiser descends on it with gradients through both tree
+estimators. The kNN search and the ξ leaf partition are refreshed every
 ``--rebuild-every`` steps (:mod:`yggdrax.applications.positions.matching`).
+
+Optimiser (``--optimizer``): ``lbfgs`` (default) is
+:func:`~yggdrax.applications.positions.lbfgs_positions` with every particle's
+step capped at ``--lbfgs-max-step`` (``0.25 l``), the line search's value and
+gradient reused, the memory kept across refreshes; ``adam`` is Adam at
+``--learning-rate`` (in ``l``) with cosine decay; ``hybrid`` is Adam for
+``--switch-step`` steps, then L-BFGS. Every step records its loss-and-gradient
+evaluations (the line search's trials included), the unit to compare
+optimisers in: ξ's value and gradient is most of a step's cost.
 
 The box grows with ``N`` at fixed number density ``--density``
 (``L = (N / density)^(1/3)``), so every length -- the target's cluster size,
@@ -105,7 +114,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar=("XI", "KNN"),
         help="loss weights; default 1 / each term at the start",
     )
-    p.add_argument("--optimizer", choices=["adam", "lbfgs"], default="adam")
+    p.add_argument(
+        "--optimizer",
+        choices=["adam", "lbfgs", "hybrid"],
+        default="lbfgs",
+        help="hybrid: Adam for --switch-step steps, then L-BFGS",
+    )
     p.add_argument(
         "--learning-rate", type=float, default=0.05, help="Adam, in units of l"
     )
@@ -113,9 +127,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--final-lr-fraction",
         type=float,
         default=0.1,
-        help="Adam: cosine decay to this fraction (1 = constant)",
+        help="Adam: cosine decay over --num-steps to this fraction (1 = constant)",
+    )
+    p.add_argument(
+        "--switch-step", type=int, default=450, help="hybrid: Adam steps first"
+    )
+    p.add_argument(
+        "--lbfgs-max-step",
+        type=float,
+        default=0.25,
+        help="L-BFGS: per-particle step cap in units of l (<= 0: no cap)",
+    )
+    p.add_argument("--lbfgs-memory", type=int, default=10)
+    p.add_argument(
+        "--lbfgs-reset",
+        action="store_true",
+        help="L-BFGS: clear the memory at every refresh",
+    )
+    p.add_argument(
+        "--lbfgs-plain",
+        action="store_true",
+        help="L-BFGS as optax.lbfgs(): no cap, no value reuse (for comparison)",
+    )
+    p.add_argument(
+        "--lbfgs-rebuild-every",
+        type=int,
+        default=None,
+        help="L-BFGS phase's epoch length (default --rebuild-every)",
     )
     p.add_argument("--num-steps", type=int, default=600)
+    p.add_argument("--max-replans", type=int, default=4)
     p.add_argument("--rebuild-every", type=int, default=10)
     p.add_argument("--timing-reps", type=int, default=5)
     p.add_argument("--gradcheck", action="store_true")
@@ -413,6 +454,118 @@ def time_parts(matcher: Any, positions: Any, reps: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# optimiser
+# --------------------------------------------------------------------------
+
+
+def run_optimiser(
+    args: argparse.Namespace,
+    matcher: Any,
+    init: Any,
+    ell: float,
+    log: Callable[[str], None],
+) -> Any:
+    """Run Adam, L-BFGS, or Adam then L-BFGS (``hybrid``).
+
+    Adam: step ``--learning-rate`` (in ``l``), cosine-decayed over
+    ``--num-steps`` (the hybrid's Adam phase follows the same schedule and stops
+    at ``--switch-step``). L-BFGS: :func:`lbfgs_positions` with the step cap
+    ``--lbfgs-max-step`` (in ``l``), its line search's last value and gradient
+    reused, the memory optionally cleared at every refresh; ``--lbfgs-plain``
+    is ``optax.lbfgs()`` as is.
+
+    Parameters
+    ----------
+    args:
+        Parsed command line.
+    matcher:
+        The matcher.
+    init:
+        Start catalogue.
+    ell:
+        Mean spacing.
+    log:
+        Line logger.
+
+    Returns
+    -------
+    OptimiseResult
+        The run; a hybrid's history and epochs are the two phases joined, its
+        timings their step-weighted mean.
+    """
+    import optax
+
+    from yggdrax.applications.positions import lbfgs_positions, optimise_positions
+
+    k = args.rebuild_every
+    steps = -(-args.num_steps // k) * k
+
+    def adam(num):
+        lr0 = args.learning_rate * ell
+        sched = (
+            lr0
+            if args.final_lr_fraction >= 1.0
+            else optax.cosine_decay_schedule(lr0, steps, alpha=args.final_lr_fraction)
+        )
+        return optimise_positions(
+            matcher,
+            init,
+            optax.adam(sched),
+            num_steps=num,
+            rebuild_every=k,
+            max_replans=args.max_replans,
+            log=log,
+        )
+
+    def lbfgs(m, start, num):
+        kl = args.lbfgs_rebuild_every or k
+        if args.lbfgs_plain:
+            opt = optax.lbfgs(memory_size=args.lbfgs_memory)
+        else:
+            cap = args.lbfgs_max_step * ell if args.lbfgs_max_step > 0 else None
+            opt = lbfgs_positions(max_step=cap, memory_size=args.lbfgs_memory)
+        return optimise_positions(
+            m,
+            start,
+            opt,
+            num_steps=num,
+            rebuild_every=kl,
+            reset_on_refresh=args.lbfgs_reset,
+            reuse_linesearch_value=not args.lbfgs_plain,
+            max_replans=args.max_replans,
+            log=log,
+        )
+
+    if args.optimizer == "adam":
+        return adam(steps)
+    if args.optimizer == "lbfgs":
+        return lbfgs(matcher, init, steps)
+    first = adam(args.switch_step)
+    log(f"hybrid: switching to L-BFGS at step {len(first.history)}")
+    second = lbfgs(first.matcher, first.positions, steps - len(first.history))
+    offset = len(first.history)
+    history = [{**h, "phase": "adam"} for h in first.history] + [
+        {**h, "step": h["step"] + offset, "phase": "lbfgs"} for h in second.history
+    ]
+    epochs = first.epochs + [
+        {
+            **e,
+            "first_step": e["first_step"] + offset,
+            "replans": e["replans"] + first.epochs[-1]["replans"],
+        }
+        for e in second.epochs
+    ]
+    n1, n2 = len(first.history), len(second.history)
+    return second._replace(
+        history=history,
+        epochs=epochs,
+        compile_seconds=first.compile_seconds + second.compile_seconds,
+        seconds_per_step=(first.seconds_per_step * n1 + second.seconds_per_step * n2)
+        / (n1 + n2),
+    )
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -447,7 +600,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     import numpy as np
     import optax
 
-    from yggdrax.applications.positions import PositionMatcher, optimise_positions
+    from yggdrax.applications.positions import PositionMatcher
 
     def log(msg: str) -> None:
         print(msg, flush=True)
@@ -497,27 +650,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     t_init = m.loss_from_statistics(s_init)
     log(f"setup {setup_s:.1f} s; weights xi {w_xi:.3g}, knn {w_knn:.3g}")
 
-    if args.optimizer == "adam":
-        lr0 = args.learning_rate * ell
-        k = args.rebuild_every
-        steps = -(-args.num_steps // k) * k
-        sched = (
-            lr0
-            if args.final_lr_fraction >= 1.0
-            else optax.cosine_decay_schedule(lr0, steps, alpha=args.final_lr_fraction)
-        )
-        opt = optax.adam(sched)
-    else:
-        opt = optax.lbfgs(memory_size=10)
-
-    res = optimise_positions(
-        m,
-        prob["init"],
-        opt,
-        num_steps=args.num_steps,
-        rebuild_every=args.rebuild_every,
-        log=log,
-    )
+    res = run_optimiser(args, m, prob["init"], ell, log)
     m = res.matcher
     s_final = fresh(res.positions)
     t_final = m.loss_from_statistics(s_final)
@@ -580,6 +713,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "setup_s": setup_s,
             "compile_s": res.compile_seconds,
             "seconds_per_step": res.seconds_per_step,
+            "evaluations": int(sum(h["evals"] for h in res.history)),
+            "refreshes": len(res.epochs),
             "replans": res.epochs[-1]["replans"] if res.epochs else 0,
             "step_parts": parts,
             "summary": summary,

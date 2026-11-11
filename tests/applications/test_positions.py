@@ -19,6 +19,8 @@ from yggdrax.applications.point_process import draw_thomas, thomas_positions
 from yggdrax.applications.positions import (
     MatchSpec,
     PositionMatcher,
+    cap_displacement,
+    lbfgs_positions,
     optimise_positions,
 )
 from yggdrax.applications.positions.reference import dense_statistics
@@ -148,6 +150,97 @@ def test_lbfgs_reduces_the_loss(problem):
     assert losses[-1] < losses[0]
 
 
+def test_cap_displacement_clips_each_particle_and_keeps_the_rest():
+    """Rows above the cap shrink onto it along their own direction."""
+    u = jax.random.normal(jax.random.PRNGKey(4), (200, 3)) * 0.05
+    cap = 0.04
+    out, _ = cap_displacement(cap).update(u, cap_displacement(cap).init(u))
+    n_in, n_out = jnp.linalg.norm(u, axis=1), jnp.linalg.norm(out, axis=1)
+    assert float(jnp.max(n_out)) <= cap * (1 + 1e-12)
+    small = n_in <= cap
+    assert bool(jnp.any(small)) and bool(jnp.any(~small))
+    np.testing.assert_allclose(out[small], u[small])
+    cos = jnp.sum(out * u, axis=1) / (n_in * n_out)
+    np.testing.assert_allclose(cos, 1.0, atol=1e-12)
+
+
+def test_capped_lbfgs_never_moves_a_particle_further_than_the_cap(problem):
+    m, k, cap = problem["m"], 3, 0.004
+    res = optimise_positions(
+        m,
+        problem["init"],
+        lbfgs_positions(max_step=cap),
+        num_steps=6,
+        rebuild_every=k,
+    )
+    assert max(e["max_displacement"] for e in res.epochs) <= k * cap * (1 + 1e-9)
+    losses = [h["loss"] for h in res.history]
+    assert losses[-1] < losses[0]
+
+
+def test_reusing_the_line_search_value_only_saves_evaluations(problem):
+    """Same trajectory; one evaluation fewer on every step but an epoch's first."""
+    m, k = problem["m"], 3
+    runs = [
+        optimise_positions(
+            m,
+            problem["init"],
+            lbfgs_positions(max_step=0.004),
+            num_steps=6,
+            rebuild_every=k,
+            reuse_linesearch_value=reuse,
+        )
+        for reuse in (False, True)
+    ]
+    plain, reused = (r.history for r in runs)
+    np.testing.assert_allclose(
+        [h["loss"] for h in reused], [h["loss"] for h in plain], rtol=1e-10
+    )
+    np.testing.assert_allclose(
+        [h["xi"] for h in reused], [h["xi"] for h in plain], rtol=1e-8
+    )
+    saved = [a["evals"] - b["evals"] for a, b in zip(plain, reused)]
+    assert saved == [0 if i % k == 0 else 1 for i in range(len(plain))]
+    np.testing.assert_allclose(runs[0].positions, runs[1].positions, atol=1e-12)
+
+
+def test_evaluations_are_counted(problem):
+    """Adam: one per step. L-BFGS: its own plus every line-search trial."""
+    m = problem["m"]
+    adam = optimise_positions(
+        m, problem["init"], optax.adam(0.004), num_steps=4, rebuild_every=2
+    )
+    assert [h["evals"] for h in adam.history] == [1, 1, 1, 1]
+    lb = optimise_positions(
+        m,
+        problem["init"],
+        optax.lbfgs(),
+        num_steps=4,
+        rebuild_every=2,
+        reuse_linesearch_value=False,
+    )
+    assert all(h["evals"] >= 2 for h in lb.history)
+
+
+def test_reset_on_refresh_reinitialises_the_optimiser(problem):
+    """A schedule that only moves on the state's first step: once, or per epoch."""
+    m, k = problem["m"], 2
+    opt = optax.sgd(lambda count: jnp.where(count == 0, 1e-3, 0.0))
+    moved = {}
+    for reset in (False, True):
+        res = optimise_positions(
+            m,
+            problem["init"],
+            opt,
+            num_steps=3 * k,
+            rebuild_every=k,
+            reset_on_refresh=reset,
+        )
+        moved[reset] = [e["max_displacement"] > 0 for e in res.epochs]
+    assert moved[False] == [True, False, False]
+    assert moved[True] == [True, True, True]
+
+
 def test_an_overflow_replans_and_repeats_the_epoch(problem):
     m = problem["m"]
     tiny = m.with_traced_config(replace(m.traced_config, near_cap=8))
@@ -157,6 +250,23 @@ def test_an_overflow_replans_and_repeats_the_epoch(problem):
     assert res.epochs[0]["replans"] >= 1
     assert res.matcher.traced_config.near_cap > 8
     assert len(res.history) == 4
+
+
+def test_an_overflowing_line_search_trial_is_rejected(problem):
+    """Under L-BFGS too: every kept step is finite and ran on full capacities."""
+    m = problem["m"]
+    tiny = m.with_traced_config(replace(m.traced_config, near_cap=8))
+    res = optimise_positions(
+        tiny,
+        problem["init"],
+        lbfgs_positions(max_step=0.004),
+        num_steps=4,
+        rebuild_every=2,
+    )
+    assert res.epochs[0]["replans"] >= 1
+    assert all(np.isfinite(h["loss"]) for h in res.history)
+    fresh = res.matcher.fresh_statistics(res.positions)
+    assert not bool(fresh.overflow)
 
 
 def test_build_validates_its_inputs(problem):
@@ -190,6 +300,23 @@ def test_bench_smoke(tmp_path, monkeypatch):
     )
     assert payload["seconds_per_step"] > 0
     assert (tmp_path / "smoke.npz").exists()
+    out2 = tmp_path / "hybrid.json"
+    mod.main(
+        [
+            "--smoke",
+            "--out",
+            str(out2),
+            "--no-fig",
+            "--optimizer",
+            "hybrid",
+            "--switch-step",
+            "10",
+        ]
+    )
+    hybrid = json.loads(out2.read_text())
+    assert len(hybrid["history"]) == 20
+    assert [h["phase"] for h in hybrid["history"]][9:11] == ["adam", "lbfgs"]
+    assert hybrid["evaluations"] >= 20
     if importlib.util.find_spec("matplotlib") is not None:
         png = tmp_path / "smoke.png"
         mod.main(["--replot", str(out), "--fig", str(png)])
