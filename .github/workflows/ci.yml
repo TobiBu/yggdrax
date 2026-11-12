@@ -13,9 +13,11 @@ concurrency:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    # a passing job takes 26-37 min; without a limit a compile that never
-    # finishes holds the runner for GitHub's 6 h maximum
-    timeout-minutes: 75
+    # The 3.13 leg runs the full suite: 57-73 min by 2026-11 (tests/applications
+    # ~28, tests/unit ~15, tests/distributed ~12), and over 75 on a slow runner.
+    # Without a limit a compile that never finishes holds the runner for
+    # GitHub's 6 h maximum.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -92,6 +94,9 @@ jobs:
 
       - name: Upload coverage XML artifact
         if: matrix.python-version == '3.13'
+        # The report is kept for reading only; the coverage gate ran in pytest.
+        # An artifact-service outage (2026-11-11) must not fail a passing suite.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: coverage-xml-py${{ matrix.python-version }}
@@ -182,6 +187,13 @@ jobs:
               tests/distributed/test_distributed_stats.py
               tests/distributed/test_distributed_stats_grad.py
               tests/distributed/test_distributed_stats_exchange.py
+              tests/distributed/test_distributed_stats_subblock.py
+          # A shard of its own: in one process with the files above it peaked at
+          # 10 GB on macOS, and XLA's compiler aborted on the 16 GB runner,
+          # most likely for lack of memory.
+          - shard: streaming
+            paths: >-
+              tests/distributed/test_distributed_stats_streaming.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75

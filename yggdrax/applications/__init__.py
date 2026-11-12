@@ -19,8 +19,12 @@ Sub-packages:
   forward model composed with the distributed xi / kNN-CDF statistics:
   parameter gradients, Fisher forecasts and recovery on independent
   realisations.
+* :mod:`yggdrax.applications.positions` -- move every particle of a periodic
+  catalogue until its traced ξ and kNN-CDFs match a target's, with gradients
+  through both tree estimators.
 
-One module (:mod:`yggdrax.applications.svgd.bandwidth_learning`) fits
-parameters with ``optax``, which is not a core runtime dependency; install
-``yggdrax[applications]`` to use it.
+Two modules fit parameters with ``optax``, which is not a core runtime
+dependency: :mod:`yggdrax.applications.svgd.bandwidth_learning` and the
+optimisation loop of :mod:`yggdrax.applications.positions` (imported when it
+runs); install ``yggdrax[applications]`` to use them.
 """

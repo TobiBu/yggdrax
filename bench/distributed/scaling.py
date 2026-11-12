@@ -115,6 +115,24 @@ def _parse(argv=None):
     p.add_argument("--leaf-size", type=int, default=16)
     p.add_argument("--clustering", type=float, default=None, help="sizing factor")
     p.add_argument("--chunk", type=int, default=256)
+    p.add_argument(
+        "--sub-block",
+        type=int,
+        default=None,
+        help="ξ culled near-field sub-block (0 = dense leaf blocks; default: config's)",
+    )
+    p.add_argument(
+        "--walk-chunks",
+        type=int,
+        default=None,
+        help="sub-walks the walk is streamed in (default: for_box's choice)",
+    )
+    p.add_argument(
+        "--walk-pairs",
+        type=float,
+        default=None,
+        help="near leaf pairs per sub-walk for_box aims at (default 2**22)",
+    )
     p.add_argument("--exchange", choices=["auto", "buf", "native"], default="auto")
     p.add_argument(
         "--summary-exchange", choices=["neighbors", "all_gather"], default="neighbors"
@@ -296,6 +314,7 @@ _GROW = {
         1.5,
     ),
     "walk_overflow": (("near_cap", "max_pair_queue", "far_cap"), 2.0),
+    "sub_overflow": (("sub_pair_cap",), 2.0),
 }
 
 
@@ -334,6 +353,8 @@ def _tighten(cfg, st, f, payload):
         near_cap=walk,
         max_pair_queue=walk,
     )
+    if payload == "xi" and fields.get("sub_block") and "sub_pairs" in st:
+        fields["sub_pair_cap"] = cap(st["sub_pairs"], 1 << 10)
     if cfg.summary_exchange == "neighbors":
         rows = cap(list(st["summary_sent"]) + list(st["summary_recv"]))
         fields.update(
@@ -347,8 +368,10 @@ def _tighten(cfg, st, f, payload):
         )
     if payload == "knn":
         # the local first pass walks the local tree with the same capacities
+        # (per sub-walk when the walk is streamed)
+        chunks = max(1, int(cfg.walk_chunks))
         fields["near_cap"] = fields["max_pair_queue"] = max(
-            walk, cap(st["leaves_local"]) * 8
+            walk, -(-cap(st["leaves_local"]) * 8 // chunks)
         )
     ndev = len(st["particles"])
     if fields.get("summary_neighbors") is not None:
@@ -649,6 +672,11 @@ def _run(args) -> list:
         )
 
     results = []
+    stream_kw = {}
+    if args.walk_chunks is not None:
+        stream_kw["walk_chunks"] = int(args.walk_chunks)
+    if args.walk_pairs is not None:
+        stream_kw["walk_pairs"] = int(args.walk_pairs)
     for payload in [s.strip() for s in args.payload.split(",") if s.strip()]:
         reach = r_hi if payload == "xi" else r_max
         est = S.estimate_capacities(
@@ -658,6 +686,7 @@ def _run(args) -> list:
             reach=reach,
             leaf_size=args.leaf_size,
             clustering=clustering,
+            **stream_kw,
         )
         over = json.loads(args.config_json) if args.config_json else {}
         cfg = S.DistributedStatsConfig.for_box(
@@ -670,6 +699,8 @@ def _run(args) -> list:
             chunk=args.chunk,
             exchange=args.exchange,
             summary_exchange=args.summary_exchange,
+            **({} if args.sub_block is None else {"sub_block": args.sub_block}),
+            **stream_kw,
         )
         if over:  # explicit fields win over the sizing
             cfg = dataclasses.replace(cfg, **over).resolved()

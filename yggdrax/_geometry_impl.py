@@ -79,7 +79,35 @@ def _compute_leaf_bounds(
         inf_mins = jnp.full((num_leaves, dim), jnp.inf, dtype=dtype)
         neg_inf_maxs = jnp.full((num_leaves, dim), -jnp.inf, dtype=dtype)
         return inf_mins, neg_inf_maxs
+    if num_leaves * max_count > num_particles:
+        # The padded gather below would hold more rows than there are particles
+        # (a capacity-padded tree's leaves are mostly part-full: about 5x at leaf
+        # 64), times four arrays. Reduce over the particles by leaf instead.
+        return _segment_leaf_bounds(
+            positions_sorted,
+            leaf_starts,
+            jnp.minimum(leaf_counts, as_index(max_count)),
+            particle_radius=particle_radius,
+        )
+    return _padded_leaf_bounds(
+        positions_sorted,
+        leaf_starts,
+        leaf_counts,
+        max_count,
+        particle_radius=particle_radius,
+    )
 
+
+def _padded_leaf_bounds(
+    positions_sorted: Array,
+    leaf_starts: Array,
+    leaf_counts: Array,
+    max_count: int,
+    *,
+    particle_radius: Array | None = None,
+) -> tuple[Array, Array]:
+    """``_compute_leaf_bounds`` by a ``(leaves, max_count)`` padded gather."""
+    dtype = positions_sorted.dtype
     # Build a (num_leaves, max_count) index array and a validity mask.
     offsets = jnp.arange(max_count, dtype=INDEX_DTYPE)[None, :]  # (1, M)
     indices = leaf_starts[:, None] + offsets  # (L, M)
@@ -111,6 +139,57 @@ def _compute_leaf_bounds(
     maxs = jnp.where(valid[:, :, None], highs, -big)
     mins = jnp.min(mins, axis=1)  # (L, 3)
     maxs = jnp.max(maxs, axis=1)  # (L, 3)
+    return mins, maxs
+
+
+def _segment_leaf_bounds(
+    positions_sorted: Array,
+    leaf_starts: Array,
+    leaf_counts: Array,
+    *,
+    particle_radius: Array | None = None,
+) -> tuple[Array, Array]:
+    """``_compute_leaf_bounds`` by segment min/max over the particles.
+
+    Each non-empty leaf is the run ``[start, start + count)`` of sorted rows; a
+    row's leaf is found by marking each run's first row and carrying the mark
+    forward with a running maximum. Rows outside every run are dropped. Memory
+    is O(particles + leaves) where the padded gather is O(leaves x leaf cap).
+    The values are the same min/max over the same particles, and so are the
+    derivatives (``segment_min`` splits a tie like ``jnp.min``). Empty leaves
+    get the padded path's ``+/- finfo.max``.
+    """
+    dtype = positions_sorted.dtype
+    num_leaves = int(leaf_starts.shape[0])
+    n = int(positions_sorted.shape[0])
+    idx = INDEX_DTYPE
+    starts = jnp.asarray(leaf_starts, idx)
+    counts = jnp.maximum(jnp.asarray(leaf_counts, idx), as_index(0))
+    has = counts > 0
+    first = jnp.where(has & (starts >= 0), starts, as_index(n))
+    mark = jnp.full((n,), -1, idx).at[first].set(first, mode="drop")
+    owner = (
+        jnp.full((n,), num_leaves, idx)
+        .at[first]
+        .set(jnp.arange(num_leaves, dtype=idx), mode="drop")
+    )
+    at = lax.cummax(mark)
+    leaf = jnp.where(at >= 0, owner[jnp.maximum(at, 0)], as_index(num_leaves))
+    offset = jnp.arange(n, dtype=idx) - at
+    inside = (at >= 0) & (offset < counts[jnp.clip(leaf, 0, max(num_leaves - 1, 0))])
+    seg = jnp.where(inside, leaf, as_index(num_leaves))
+
+    lows = positions_sorted
+    highs = positions_sorted
+    if particle_radius is not None:
+        radius = jnp.asarray(particle_radius, dtype=dtype)[:, None]
+        lows = positions_sorted - radius
+        highs = positions_sorted + radius
+    big = jnp.finfo(dtype).max
+    mins = jax.ops.segment_min(lows, seg, num_segments=num_leaves)
+    maxs = jax.ops.segment_max(highs, seg, num_segments=num_leaves)
+    mins = jnp.where(has[:, None], mins, big)
+    maxs = jnp.where(has[:, None], maxs, -big)
     return mins, maxs
 
 
