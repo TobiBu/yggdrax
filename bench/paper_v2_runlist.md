@@ -165,6 +165,8 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `b2_xi_box` | B2 | **slot**: periodic ξ, traced vs distributed vs TreeCorr vs Corrfunc | 30 min | skipped |
 | `b2_acceptance_rules` | B2 | **slot**: window ε vs geometric θ at matched accuracy | 15 min | skipped |
 | `b3_forecast` | B3 | point-process Fisher forecast + recovery, N = 32768 (GPU command of `docs/point_process.md`) | 60 min | 117 s |
+| `b4_positions_1e6` | B4 | **slot**: move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 L-BFGS steps (step cap 0.25 l), + gradient check | 50 min (guess) | – |
+| `b4_positions_1e7` | B4 | **slot**: the same at N = 1e7, 100 steps (cost per step) | 50 min (guess) | – |
 | `c2_grad_memory_g1` | C2 | distributed ξ/kNN forward vs value+grad memory and time, N = 2^20, 1 GPU | 10 min | 56 s |
 | `c2_grad_memory_g2` | C2 | the same on 2 GPUs (optional) | 10 min | 76 s |
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
@@ -186,6 +188,7 @@ The whole CPU smoke takes about 12 min on the laptop (compile-bound; most rows s
 | `b1_*` | `knn_cdf_{open,periodic}.json` | §5 kNN-CDF showcase |
 | `b2_*` | `xi_box.json`, `acceptance_rules.json` | §5 ξ showcase |
 | `b3_forecast` | `results.json` + 4 figures | §5 end-to-end forecast |
+| `b4_*` | `positions_1e{6,7}.json` + `.npz` + `.png` | §5 matching positions to ξ and kNN-CDF (B4) |
 | `c2_*` | `grad_memory_g{1,2,4}.json`, `junit.xml` | §4 gradient memory, the native-exchange check |
 | `base_*` | `knn_forward_*.json`, `kernel_sums_*.json` | §4 "the cost of pure JAX" |
 
@@ -259,6 +262,29 @@ they print `skip b2_...: bench/corrfunc/xi_box.py not on this branch`.
   Each B2 JSON then records its own commit, and the summary warns about the
   second commit instead of failing.
 - **B2 owner:** check the GPU sizes in the two rows (`_rows()` in the driver).
+
+## B4 slot
+
+The B4 bench (`bench/positions/optimise.py`) is on `claude/b4-positions`, for a
+PR to main; it reaches this branch when main is merged in. Until then the rows
+`b4_positions_1e6` and `b4_positions_1e7` print `skip b4_...: ... not on this
+branch`. If it arrives after the run, run only those rows:
+
+```bash
+python bench/paper_v2_runlist.py --rows '^b4_' --allow-new-commit
+```
+
+The box grows with N at fixed density (L = 3.2 at 1e6, 6.9 at 1e7), so the
+cost per particle per step is fixed. The 1e7 row runs 100 steps only: it
+measures the cost per step and memory, not convergence.
+
+Both rows use L-BFGS with every particle's step capped at 0.25 l (the bench
+default since `claude/b4-positions` 2dd8de9). On the CPU comparison at N = 3e4
+(`bench/positions/results/optimiser_comparison/`) it reaches a loss of 1e-3
+in half the loss-and-gradient evaluations Adam needs and ends below the
+independent-realisation level, where Adam levels off. A step costs about 1.3
+evaluations (the line search's), so expect about 1.3x the time per step of an
+Adam step.
 
 ## Locally (CPU)
 
