@@ -5324,6 +5324,13 @@ class MutualWalkResult(NamedTuple):
     band_accepted: Optional[Array] = None
     band_count: Optional[Array] = None
     band_overflow: Optional[Array] = None
+    # Frontier outputs, set only by a walk given ``stop_wavefront`` (``None``
+    # otherwise): the queued node pairs the walk did not process, canonical
+    # (``a <= b``) and ``-1``-padded to ``max_pair_queue``, and how many lead.
+    # See :func:`dual_tree_walk_mutual`.
+    queue_a: Optional[Array] = None
+    queue_b: Optional[Array] = None
+    queue_size: Optional[Array] = None
 
 
 # Width ladder of the flat mutual walk (Tier 3 of the tree-walk plan, 2026-09-11).
@@ -5658,6 +5665,7 @@ def _dual_tree_walk_mutual_flat(
     pair_discard: Optional[Callable[..., Array]] = None,
     pair_band: Optional[Callable[..., Array]] = None,
     band_cap: int = 0,
+    stop_wavefront: Optional[int] = None,
 ) -> MutualWalkResult:
     """The flat (XLA) backend of :func:`dual_tree_walk_mutual`; same arguments."""
     idx = jnp.asarray(left_child_full).dtype
@@ -5954,6 +5962,10 @@ def _dual_tree_walk_mutual_flat(
         ok = (size > 0) & (~far_over) & (~near_over) & (~wf_over)
         if banded:
             ok = ok & (~state[14:][8])
+        if stop_wavefront is not None:
+            # stop BEFORE a round that would process more than this many pairs:
+            # the queue then holds the frontier, every pair of it unprocessed
+            ok = ok & (size <= ix(stop_wavefront))
         return ok
 
     def run_rung(state, width, lower=None, upper=None):
@@ -5989,6 +6001,14 @@ def _dual_tree_walk_mutual_flat(
         final = lax.while_loop(healthy, make_round(max_pair_queue), state)
     # the band carry, past the 14 base slots (empty without ``pair_band``)
     band_final: tuple[Array, ...] = tuple(final)[14:]
+    frontier: dict[str, Array] = {}
+    if stop_wavefront is not None:
+        live_q = jnp.arange(max_pair_queue, dtype=idx) < final[2]
+        frontier = dict(
+            queue_a=jnp.where(live_q, final[0], index_neg1),
+            queue_b=jnp.where(live_q, final[1], index_neg1),
+            queue_size=final[2],
+        )
     return MutualWalkResult(
         far_a=final[3],
         far_b=final[4],
@@ -6015,6 +6035,7 @@ def _dual_tree_walk_mutual_flat(
             if banded
             else {}
         ),
+        **frontier,
     )
 
 
@@ -6045,6 +6066,7 @@ def dual_tree_walk_mutual(
     band_cap: int = 0,
     backend: MutualWalkBackend = "flat",
     pallas_interpret: bool = False,
+    stop_wavefront: Optional[int] = None,
 ) -> MutualWalkResult:
     """Symmetric dual-tree walk emitting each unordered node pair once.
 
@@ -6221,6 +6243,20 @@ def dual_tree_walk_mutual(
         Run the Pallas backend in Pallas interpret mode (CPU semantics, slow;
         for tests on machines without a suitable GPU). With ``backend="auto"``
         it also selects the Pallas backend where it would otherwise fall back.
+    stop_wavefront:
+        Stop before the first round whose live wavefront holds more than this
+        many pairs, and return that wavefront -- the FRONTIER -- in
+        ``queue_a`` / ``queue_b`` / ``queue_size``. ``None`` (default) walks to
+        the end and leaves those fields ``None``. Every pair the walk emits is a
+        deterministic function of the pair it descends from, so the far and
+        near lists of this walk, together with those of walks seeded with the
+        frontier's pairs (``seed_a``, ``seed_b``, ``seed_count``, in any
+        grouping), are exactly the lists of the walk without the stop -- the
+        same pairs, emitted once each. That is how a caller streams a walk whose
+        lists would not fit at once: the frontier is at most
+        ``4 * stop_wavefront`` pairs (a round pushes at most four children per
+        pair), and each seeded walk needs capacities for its own share only.
+        Flat backend only. Static.
 
     Returns
     -------
@@ -6241,6 +6277,8 @@ def dual_tree_walk_mutual(
     TypeError
         If the Pallas backend is selected with a traced ``theta``.
     """
+    if stop_wavefront is not None and backend == "pallas":
+        raise ValueError("stop_wavefront needs backend='flat' (or 'auto')")
     resolved = _resolve_mutual_walk_backend(
         backend,
         mac_type=mac_type,
@@ -6250,6 +6288,8 @@ def dual_tree_walk_mutual(
         pair_discard=pair_discard,
         pair_band=pair_band,
     )
+    if stop_wavefront is not None:
+        resolved = "flat"
     if resolved == "flat":
         return _dual_tree_walk_mutual_flat(
             left_child_full,
@@ -6275,6 +6315,7 @@ def dual_tree_walk_mutual(
             pair_discard=pair_discard,
             pair_band=pair_band,
             band_cap=int(band_cap),
+            stop_wavefront=None if stop_wavefront is None else int(stop_wavefront),
         )
     try:
         theta_value = float(theta)

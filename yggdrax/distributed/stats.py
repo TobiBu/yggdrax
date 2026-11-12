@@ -115,7 +115,27 @@ class DistributedStatsConfig:
         Particles a device sends, summed over destinations. Default
         ``2 * halo_capacity``.
     max_pair_queue, far_cap, near_cap:
-        The walk over ``[local ; halo]``.
+        The walk over ``[local ; halo]``. With ``walk_chunks > 1`` these are the
+        capacities of ONE streamed sub-walk.
+    walk_chunks:
+        Number of sub-walks the walk over ``[local ; halo]`` is streamed in
+        (both payloads). ``1`` (default) walks once and holds every near leaf
+        pair, and the walk's wavefront, at once: about 270 B per pair in XLA's
+        plan, which is what limited the particles per device. With ``K > 1`` a
+        first walk stops at a frontier of more than ``walk_frontier`` node pairs
+        (``dual_tree_walk_mutual(stop_wavefront=)``), the frontier is dealt out
+        to ``K`` sub-walks (sorted by estimated cost and dealt in snake order,
+        which balances them), and each sub-walk's pairs are evaluated and summed (ξ: a
+        ``lax.scan`` whose step is rematerialised; kNN: merged into the running
+        top-k) before the next one runs. The leaf pairs are exactly those of
+        the single walk, so the result is the same to summation order; the
+        walk's memory is ``1 / K`` of it.
+    walk_frontier:
+        Frontier size of the first walk when ``walk_chunks > 1`` (it holds at
+        most four times this many pairs). Default ``256 * walk_chunks``, so each
+        sub-walk starts from 256 to 1024 seeds, enough for their costs to even
+        out. It must stay well below the walk's peak wavefront (about half the
+        near pairs), or the first walk does most of the work itself.
     first_pass_reach_factor:
         kNN only: in the local first pass a node looks this many of its own
         bounding radii beyond its sphere. Larger finds more first-pass bounds
@@ -137,11 +157,13 @@ class DistributedStatsConfig:
         ``leaf_size x leaf_size`` blocks (the C1 path). Default 8 when
         ``leaf_size`` is a multiple of 8 and at least 16, else 0.
     sub_pair_cap:
-        ξ with ``sub_block`` only: the culled sub-block pair list (``sub_pairs``
-        counts what a run needs; ``sub_overflow`` flags more). Default
-        ``near_cap * k**2 + halo_leaf_capacity * k (k + 1) / 2`` with
-        ``k = leaf_size / sub_block``, which cannot overflow but is large;
-        :meth:`for_box` sizes it from the geometry.
+        ξ with ``sub_block`` only: the culled sub-block pair list of one walk
+        (``sub_pairs`` counts what the largest one needs; ``sub_overflow``
+        flags more). Default ``near_cap * k**2`` with ``k = leaf_size /
+        sub_block``, which cannot overflow but is large; :meth:`for_box` sizes
+        it from the geometry. The leaves' own pairs are culled separately, in
+        steps of ``sub_pair_cap // (k (k + 1) / 2)`` leaves, which cannot
+        overflow.
     exchange:
         Implementation of the partition and halo exchanges: ``"auto"``,
         ``"buf"`` or ``"native"``
@@ -192,6 +214,8 @@ class DistributedStatsConfig:
     chunk: int = 256
     sub_block: Optional[int] = None
     sub_pair_cap: Optional[int] = None
+    walk_chunks: int = 1
+    walk_frontier: Optional[int] = None
     exchange: str = "auto"
     summary_exchange: str = "neighbors"
     summary_coarse_depth: int = 4
@@ -231,10 +255,22 @@ class DistributedStatsConfig:
         sub_cap = 0
         if sub:
             k = ls // sub
-            sub_cap = self.sub_pair_cap or (
-                int(self.near_cap) * k * k + int(halo_leaf_cap) * k * (k + 1) // 2
-            )
+            sub_cap = self.sub_pair_cap or int(self.near_cap) * k * k
+            sub_cap = max(k * (k + 1) // 2, int(sub_cap))
             sub_cap = min(int(sub_cap), int(jnp.iinfo(INDEX_DTYPE).max))
+        chunks = int(self.walk_chunks)
+        if chunks < 1:
+            raise ValueError(f"walk_chunks must be >= 1; got {self.walk_chunks}")
+        frontier = 0
+        if chunks > 1:
+            frontier = int(self.walk_frontier or 256 * chunks)
+            seeds = -(-4 * frontier // chunks)
+            if frontier < chunks or int(self.max_pair_queue) < seeds:
+                raise ValueError(
+                    f"walk_frontier = {frontier} must be >= walk_chunks = {chunks}, "
+                    f"and max_pair_queue = {self.max_pair_queue} must hold a "
+                    f"sub-walk's {seeds} seeds"
+                )
         return replace(
             self,
             leaf_capacity=leaf_cap,
@@ -244,6 +280,8 @@ class DistributedStatsConfig:
             send_capacity=self.send_capacity or 2 * self.halo_capacity,
             sub_block=sub,
             sub_pair_cap=sub_cap,
+            walk_chunks=chunks,
+            walk_frontier=frontier,
         )
 
     @classmethod
@@ -344,6 +382,8 @@ class DistributedStatsConfig:
             "num_samples",
             "imbalance",
             "sub_block",
+            "walk_chunks",
+            "walk_pairs",
         )
         model = {k: kwargs.pop(k) for k in model_keys if k in kwargs}
         est = estimate_capacities(
@@ -385,6 +425,8 @@ def estimate_capacities(
     num_samples: Optional[int] = None,
     imbalance: Optional[float] = None,
     sub_block: Optional[int] = None,
+    walk_chunks: Optional[int] = None,
+    walk_pairs: int = 1 << 22,
 ) -> dict:
     """Every capacity of the pipeline from N, the box, the reach and the leaf size.
 
@@ -434,6 +476,19 @@ def estimate_capacities(
     sub_block:
         ξ's culled near field (:class:`DistributedStatsConfig`); default 8 for
         leaves of 16 or more that 8 divides. Sets ``sub_pair_cap``.
+    walk_chunks:
+        Sub-walks the walk is streamed in (:class:`DistributedStatsConfig`).
+        Default: the smallest power of two that leaves each sub-walk at most
+        ``walk_pairs`` near leaf pairs (1, the single walk, below that).
+    walk_pairs:
+        Near leaf pairs per sub-walk the default ``walk_chunks`` aims at. The
+        default 2**22 gives 16 sub-walks at 8.4e6 particles per device and 128
+        at 6.7e7 (ξ at leaf 64), within 5 % of the plan with 4 x more sub-walks
+        each time; more sub-walks only add fixed costs per walk. The default
+        ``walk_chunks`` is also held to ``near / (16384 clustering)``, so the
+        first walk's frontier queue (at most ``4 * 256 walk_chunks`` pairs)
+        stays below a sixteenth of the near pairs the model expects without
+        its safety factor, well below the walk's peak.
 
     Returns
     -------
@@ -537,6 +592,31 @@ def estimate_capacities(
     export_near = max(1 << 12, int(math.ceil(c * refs * halo_leaves)))
     send_leaf = max(1 << 10, int(math.ceil(2.0 * halo_leaves)))
 
+    # streamed walk: K sub-walks, each dealt every K-th pair of the frontier, so
+    # each holds about 1 / K of the lists; ``walk_slack`` covers their spread
+    # (design note, *The streamed walk*)
+    near_total, sub_total = near, sub_cap
+    chunks = (
+        int(walk_chunks)
+        if walk_chunks is not None
+        else (1 if near <= walk_pairs else _pow2_ceil(near / float(walk_pairs)))
+    )
+    if walk_chunks is None and chunks > 1:
+        # the first walk's frontier queue (up to 4 x 256 K pairs) must stay well
+        # below the walk's peak wavefront (about half the near pairs): a first
+        # walk that stops near its peak has done much of the work itself, past
+        # one sub-walk's capacities. Measured against the model without its
+        # clustering safety factor, which can overstate the walk by c times
+        floor_near = near / max(c, 1.0)
+        chunks = max(
+            1, min(chunks, 1 << int(math.log2(max(1.0, floor_near / 16384.0))))
+        )
+    walk_slack = 1.5
+    if chunks > 1:
+        near = max(1 << 12, int(math.ceil(walk_slack * near / chunks)))
+        if sub_block:
+            sub_cap = max(1 << 12, int(math.ceil(walk_slack * sub_cap / chunks)))
+
     config = dict(
         capacity=capacity,
         halo_capacity=halo,
@@ -559,6 +639,7 @@ def estimate_capacities(
         num_samples=s,
         sub_block=sub_block,
         sub_pair_cap=sub_cap,
+        walk_chunks=chunks,
     )
     # every capacity is an index range (INDEX_DTYPE, int32 by default)
     limit = int(jnp.iinfo(INDEX_DTYPE).max)
@@ -585,6 +666,9 @@ def estimate_capacities(
         neighbor_leaves=nu,
         export_refs_per_leaf=refs,
         neighbor_sub_blocks=nu_sub,
+        near_pairs_total=near_total,
+        sub_pairs_total=sub_total,
+        walk_slack=walk_slack if chunks > 1 else 1.0,
     )
     return dict(config=config, model=model)
 
@@ -871,14 +955,50 @@ def _node_sums(t: _Tree, values_sorted: Array) -> Array:
     return prefix[stop] - prefix[start]
 
 
-def _leaf_slots(t: _Tree, n: int, leaf_size: int) -> tuple[Array, Array]:
-    """``(num_leaves, leaf_size)`` sorted slots of each leaf and their validity."""
+def _leaf_runs(t: _Tree, leaf_size: int) -> tuple[Array, Array]:
+    """``(num_leaves,)`` first sorted slot and occupancy of each leaf."""
     lr = t.ranges[t.num_internal :]
     start = lr[:, 0]
-    length = jnp.clip(lr[:, 1] - start + 1, 0, leaf_size)
-    ramp = jnp.arange(leaf_size, dtype=start.dtype)
-    slots = jnp.clip(start[:, None] + ramp[None, :], 0, max(n - 1, 0))
-    return slots, ramp[None, :] < length[:, None]
+    return start, jnp.clip(lr[:, 1] - start + 1, 0, leaf_size)
+
+
+def _run_slots(start, length, live_s, rows, offset, width: int, n: int):
+    """Sorted slots and validity of ``width`` slots from ``start[rows] + offset``.
+
+    ``offset`` is per row (or scalar); a slot is valid below the leaf's
+    ``length`` and live. Computed per chunk, so no ``(leaves, leaf_size)`` array
+    is ever live.
+    """
+    ramp = jnp.arange(width, dtype=start.dtype)
+    off = jnp.asarray(offset, start.dtype)
+    if off.ndim:
+        off = off[:, None]
+    pos = off + ramp[None, :]
+    slots = jnp.clip(start[rows][:, None] + pos, 0, max(n - 1, 0))
+    mask = (pos < length[rows][:, None]) & live_s[slots]
+    return slots, mask
+
+
+def _slot_leaves(start: Array, length: Array, n: int) -> tuple[Array, Array]:
+    """Per sorted slot: its leaf (``num_leaves`` where none) and its offset in it.
+
+    A leaf is a run of slots; each non-empty one marks its first slot, and a
+    running maximum carries the mark forward. O(slots + leaves) memory.
+    """
+    nl = int(start.shape[0])
+    idx = start.dtype
+    has = length > 0
+    first = jnp.where(has, start, as_index(n))
+    mark = jnp.full((n,), -1, idx).at[first].set(first, mode="drop")
+    owner = (
+        jnp.full((n,), nl, idx).at[first].set(jnp.arange(nl, dtype=idx), mode="drop")
+    )
+    at = jax.lax.cummax(mark)
+    slot = jnp.arange(n, dtype=idx)
+    leaf = jnp.where(at >= 0, owner[jnp.maximum(at, 0)], as_index(nl))
+    off = slot - at
+    inside = (at >= 0) & (off < length[jnp.clip(leaf, 0, max(nl - 1, 0))])
+    return jnp.where(inside, leaf, as_index(nl)), off
 
 
 def _node_max(t: _Tree, values_sorted: Array, n: int, leaf_size: int) -> Array:
@@ -889,8 +1009,12 @@ def _node_max(t: _Tree, values_sorted: Array, n: int, leaf_size: int) -> Array:
     most the tree height). Topology data only: no gradient is wanted here.
     """
     values_sorted = jax.lax.stop_gradient(values_sorted)
-    slots, mask = _leaf_slots(t, n, leaf_size)
-    leaf_vals = jnp.max(jnp.where(mask, values_sorted[slots], 0.0), axis=1)
+    start, length = _leaf_runs(t, leaf_size)
+    nl = int(start.shape[0])
+    leaf, _off = _slot_leaves(start, length, n)
+    leaf_vals = jnp.maximum(
+        jax.ops.segment_max(values_sorted, leaf, num_segments=nl), 0.0
+    )
     nodes = int(t.ranges.shape[0])
     vals = jnp.zeros((nodes,), values_sorted.dtype).at[t.num_internal :].set(leaf_vals)
     parent = jnp.where(t.parent >= 0, t.parent, as_index(nodes))
@@ -904,10 +1028,25 @@ def _node_max(t: _Tree, values_sorted: Array, n: int, leaf_size: int) -> Array:
     return vals
 
 
-def _walk(t: _Tree, box, acceptance: PairAcceptance, cq, cd, r_lo, reach, cfg):
+def _walk(
+    t: _Tree,
+    box,
+    acceptance: PairAcceptance,
+    cq,
+    cd,
+    r_lo,
+    reach,
+    cfg,
+    *,
+    queue: Optional[int] = None,
+    stop: Optional[int] = None,
+    seeds: Optional[tuple[Array, Array, Array]] = None,
+):
     """The mutual walk over one cell tree with the composed rule.
 
-    ``reach`` is a scalar or a ``(nodes,)`` per-node query reach.
+    ``reach`` is a scalar or a ``(nodes,)`` per-node query reach. ``queue``
+    overrides ``cfg.max_pair_queue``; ``stop`` is the walk's ``stop_wavefront``;
+    ``seeds`` = ``(seed_a, seed_b, seed_count)`` replaces the root pair.
     """
     accept, discard = _composed(acceptance.accept, acceptance.discard)
     dtype = t.center.dtype
@@ -919,6 +1058,9 @@ def _walk(t: _Tree, box, acceptance: PairAcceptance, cq, cd, r_lo, reach, cfg):
         jnp.asarray(r_lo, dtype),
         jnp.broadcast_to(jnp.asarray(reach, dtype), (nodes,)),
     )
+    seed_kw: dict[str, Any] = {}
+    if seeds is not None:
+        seed_kw = dict(seed_a=seeds[0], seed_b=seeds[1], seed_count=seeds[2])
     return dual_tree_walk_mutual(
         t.left,
         t.right,
@@ -926,7 +1068,7 @@ def _walk(t: _Tree, box, acceptance: PairAcceptance, cq, cd, r_lo, reach, cfg):
         t.radius,
         0.0,
         t.root,
-        max_pair_queue=int(cfg.max_pair_queue),
+        max_pair_queue=int(cfg.max_pair_queue if queue is None else queue),
         far_cap=int(cfg.far_cap),
         near_cap=int(cfg.near_cap),
         node_active=t.active,
@@ -935,7 +1077,135 @@ def _walk(t: _Tree, box, acceptance: PairAcceptance, cq, cd, r_lo, reach, cfg):
         pair_accept=accept,
         pair_discard=discard,
         pair_accept_data=data,
+        stop_wavefront=stop,
+        **seed_kw,
     )
+
+
+def _walk_diag0() -> dict:
+    """Empty diagnostics of a (streamed) walk: see :func:`_walk_fold`."""
+    return dict(
+        near_total=jnp.zeros((), jnp.int64),
+        far_total=jnp.zeros((), jnp.int64),
+        near_max=jnp.zeros((), jnp.int64),
+        peak_max=jnp.zeros((), jnp.int64),
+        sub_max=jnp.zeros((), jnp.int64),
+        overflow=jnp.asarray(False),
+        frontier=jnp.zeros((), jnp.int64),
+    )
+
+
+def _walk_diag(d: dict, walk, sub_count=None) -> dict:
+    """``d`` updated with one walk's counters (and its culled sub-pair count)."""
+    near = walk.near_count.astype(jnp.int64)
+    out = dict(
+        d,
+        near_total=d["near_total"] + near,
+        far_total=d["far_total"] + walk.far_count.astype(jnp.int64),
+        near_max=jnp.maximum(d["near_max"], near),
+        peak_max=jnp.maximum(d["peak_max"], walk.peak_wavefront.astype(jnp.int64)),
+        overflow=d["overflow"]
+        | walk.near_overflow
+        | walk.far_overflow
+        | walk.queue_overflow,
+    )
+    if sub_count is not None:
+        out["sub_max"] = jnp.maximum(d["sub_max"], sub_count.astype(jnp.int64))
+    return out
+
+
+def _walk_fold(
+    t: _Tree,
+    box,
+    acceptance: PairAcceptance,
+    cq,
+    cd,
+    r_lo,
+    reach,
+    cfg,
+    step: Callable[[Any, Any], Any],
+    carry,
+    *,
+    remat: bool,
+):
+    """Fold ``step(walk, carry)`` over the walk, streamed in ``cfg.walk_chunks``.
+
+    With one chunk this is ``step(walk, carry)`` of the single walk. With ``K``
+    chunks a first walk stops at its frontier (more than ``cfg.walk_frontier``
+    pairs, :func:`~yggdrax.interactions.dual_tree_walk_mutual`'s
+    ``stop_wavefront``) and is folded in; then a ``lax.scan`` over ``K``
+    sub-walks, each seeded with its share of the frontier (dealt by estimated
+    cost, below), folds in each one. Their far and near pairs together are exactly the single
+    walk's. With ``remat`` the scan step is rematerialised in the reverse
+    pass (``jax.checkpoint``): its residuals are the seeds and the carry, not a
+    sub-walk's lists, so a gradient holds one sub-walk at a time too; without
+    it a sub-walk with no seed is skipped (``lax.cond``). Topology: the walks
+    carry no gradient.
+
+    ``carry`` must hold the diagnostics (:func:`_walk_diag0`) at ``carry[1]``;
+    ``frontier`` is set here, and ``peak_max`` leaves out the first walk, whose
+    queue is ``4 * walk_frontier`` and cannot overflow.
+    """
+    chunks = int(cfg.walk_chunks)
+    if chunks <= 1:
+        return step(_walk(t, box, acceptance, cq, cd, r_lo, reach, cfg), carry)
+    idx = INDEX_DTYPE
+    frontier = int(cfg.walk_frontier)
+    q1 = 4 * frontier
+    first = _walk(t, box, acceptance, cq, cd, r_lo, reach, cfg, queue=q1, stop=frontier)
+    peak0 = carry[1]["peak_max"]
+    carry = step(first, carry)
+    assert first.queue_a is not None and first.queue_b is not None
+    assert first.queue_size is not None
+    size = first.queue_size.astype(idx)
+    # the first walk's queue is its own (4 x frontier); ``peak_max`` reports
+    # what one sub-walk's ``max_pair_queue`` must hold, ``frontier`` the rest
+    diag = dict(carry[1], frontier=size.astype(jnp.int64), peak_max=peak0)
+    carry = (carry[0], diag) + tuple(carry[2:])
+    # deal the frontier by estimated cost: sorted heaviest first, in snake
+    # order (round r gives one pair to each sub-walk, 0..K-1 for even r and
+    # K-1..0 for odd r), so every sub-walk gets one of the K heaviest pairs, one
+    # of the next K, ... The cost of a node pair is its (query x data) particle
+    # product. In queue order (Morton order of the parents) a clustered field's
+    # dense blobs land in a few sub-walks (design note, *The streamed walk*)
+    width = -(-q1 // chunks)
+    qa = first.queue_a.astype(idx)
+    qb = first.queue_b.astype(idx)
+    live = jnp.arange(q1, dtype=idx) < size
+    sa_, sb_ = jnp.maximum(qa, 0), jnp.maximum(qb, 0)
+    fq = cq.astype(jnp.float64)
+    fd = cd.astype(jnp.float64)
+    cost = fq[sa_] * fd[sb_] + jnp.where(qa != qb, fq[sb_] * fd[sa_], 0.0)
+    order = jnp.argsort(jnp.where(live, -cost, jnp.inf), stable=True)
+    pos = jnp.arange(q1, dtype=idx)
+    rnd = pos // as_index(chunks)
+    col = pos % as_index(chunks)
+    walk_of = jnp.where(rnd % 2 == 0, col, as_index(chunks - 1) - col)
+    row = jnp.where(live, walk_of, as_index(chunks))  # dead slots are dropped
+    seed_a = jnp.full((chunks, width), -1, idx).at[row, rnd].set(qa[order], mode="drop")
+    seed_b = jnp.full((chunks, width), -1, idx).at[row, rnd].set(qb[order], mode="drop")
+    # each sub-walk's live seeds are a prefix of its row (its rounds in order)
+    seed_n = jnp.sum((seed_a >= 0).astype(idx), axis=1)
+
+    def run(c, sa, sb, sn):
+        w = _walk(t, box, acceptance, cq, cd, r_lo, reach, cfg, seeds=(sa, sb, sn))
+        return step(w, c)
+
+    if remat:
+        # no skip here: the step closes over the particles, and a ``cond`` would
+        # give each sub-walk a dense cotangent of them (``_scan_chunks``); a
+        # sub-walk without seeds stops at once and its lists are empty
+        one = jax.checkpoint(run, prevent_cse=False)
+    else:
+
+        def one(c, sa, sb, sn):
+            return jax.lax.cond(sn > 0, lambda c: run(c, sa, sb, sn), lambda c: c, c)
+
+    def body(c, x):
+        return one(c, *x), None
+
+    carry, _ = jax.lax.scan(body, carry, (seed_a, seed_b, seed_n))
+    return carry
 
 
 def _partition(pos, weights, flags, gid, count, ndev, box, bounds, cfg):
@@ -1389,7 +1659,7 @@ def _any(x: Array) -> Array:
     return jax.lax.psum(jnp.asarray(x, jnp.int32), AXIS_NAME) > 0
 
 
-def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays, live=None):
+def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays, live=None, gather=None):
     """``acc + sum fn(chunk of arrays)`` over ``n_items`` rows, ``chunk`` at a time.
 
     ``fn`` is rematerialised (``jax.checkpoint``) in the reverse pass: a chunk's
@@ -1401,6 +1671,14 @@ def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays, live=None):
     with none is skipped by a ``lax.cond`` (``fn`` must give zero on such rows).
     The lists are capacity-padded, so this makes the cost follow the live pairs,
     not the capacity. ``cond`` differentiates, so the gradient skips them too.
+
+    ``gather`` (with ``live``): ``fn(*gather(*chunk))``, with the gather OUTSIDE
+    the ``cond``. Reverse mode gives a ``cond`` a dense cotangent for every
+    array its branches close over, so a branch that gathers from the particles
+    itself costs a full ``(particles, 3)`` pass, and a buffer, per chunk (400
+    chunks over 1e7 particles: 1.9 s against 0.01 s, CPU). Gathered outside,
+    the ``cond`` sees only the chunk's rows, and the gather's transpose
+    scatters into the scan's cotangent in place.
     """
     chunk = max(1, min(int(chunk), max(n_items, 1)))
     n_chunks = -(-n_items // chunk)
@@ -1429,7 +1707,8 @@ def _scan_chunks(fn, n_items: int, chunk: int, acc0, *arrays, live=None):
     # chunk's windows again (290 MB against 28 MB measured)
     @functools.partial(jax.checkpoint, prevent_cse=False)
     def step_skip(go, *args):
-        return jax.lax.cond(go, lambda a: fn(*a), lambda a: jnp.zeros_like(acc0), args)
+        ops = args if gather is None else gather(*args)
+        return jax.lax.cond(go, lambda a: fn(*a), lambda a: jnp.zeros_like(acc0), ops)
 
     def body_skip(acc, x):
         go, args = x
@@ -1491,49 +1770,47 @@ def _block_pair_sums(
 _CULL_ROWS = 2048
 
 
-def _culled_sub_pairs(
+class _SubBoxes(NamedTuple):
+    """Bounding boxes of the sub-blocks: row ``l k + u`` is run ``u`` of leaf ``l``."""
+
+    center: Array  # (num_leaves k, 3)
+    half: Array
+    filled: Array  # (num_leaves k,) bool
+    r2: Array  # squared culling reach, padded by rounding slack
+    k: int
+
+
+def _sub_block_boxes(
     xs: Array,
-    slots: Array,
-    smask: Array,
-    pair_a: Array,
-    pair_b: Array,
-    pair_ok: Array,
+    start: Array,
+    length: Array,
+    live_s: Array,
+    leaf_size: int,
     sub_block: int,
-    cap: int,
     reach: float,
-    box: Optional[tuple[float, ...]],
-) -> tuple[Array, Array, Array]:
-    """Sub-block pairs of the candidate leaf pairs that can hold a pair in reach.
+) -> _SubBoxes:
+    """Boxes of the ``B``-slot runs of every leaf, by segment min/max over slots.
 
     Each leaf's ``leaf_size`` sorted slots are cut into ``k = leaf_size / B``
     runs of ``B`` consecutive slots; sub-block ``u`` of leaf ``l`` is row
-    ``l k + u`` of ``slots.reshape(-1, B)``. A candidate ``(a, b)`` with
-    ``a != b`` expands into its ``k^2`` sub-block pairs, a self pair
-    ``(a, a)`` into the ``k (k + 1) / 2`` with ``u <= v`` (``u == v`` is a
-    diagonal block, summed over its upper triangle). Per axis, the
-    minimum-image gap of two bounding boxes, ``|mi(c_b - c_a)| - (h_a + h_b)``
-    floored at 0, is a lower bound on every particle separation between them;
-    a pair whose gap reaches ``reach`` has no particle pair inside the cut
-    and is dropped, as is one with an empty side. The survivors are compacted,
-    in order, into ``cap`` slots by a scan over chunks of candidates, so no
-    ``candidates x k^2`` array is ever live. Topology only: no gradient.
-
-    Returns
-    -------
-    tuple of Array
-        ``(rows_a, rows_b, count)``: sub-block rows (0 past ``count``) and the
-        number of pairs needed (``int64``; more than ``cap`` is an overflow).
+    ``l k + u``. The boxes are reduced over the live slots directly, so the
+    memory is O(slots + leaves k), not ``(leaves, leaf_size, 3)``. Topology
+    only: no gradient.
     """
     b = int(sub_block)
-    nl, leaf = slots.shape
-    k = leaf // b
-    dim = xs.shape[-1]
-    pos = jax.lax.stop_gradient(xs)[slots].reshape(nl * k, b, dim)
-    occ = smask.reshape(nl * k, b)[..., None]
+    k = int(leaf_size) // b
+    n, dim = xs.shape
+    nl = int(start.shape[0])
+    leaf, off = _slot_leaves(start, length, n)
+    ok = live_s & (leaf < nl)
+    seg = jnp.where(ok, leaf * as_index(k) + off // as_index(b), as_index(nl * k))
+    pos = jax.lax.stop_gradient(xs)
     big = jnp.asarray(jnp.finfo(pos.dtype).max, pos.dtype)
-    lo = jnp.min(jnp.where(occ, pos, big), axis=1)
-    hi = jnp.max(jnp.where(occ, pos, -big), axis=1)
-    filled = jnp.any(occ[..., 0], axis=-1)
+    lo = jax.ops.segment_min(jnp.where(ok[:, None], pos, big), seg, num_segments=nl * k)
+    hi = jax.ops.segment_max(
+        jnp.where(ok[:, None], pos, -big), seg, num_segments=nl * k
+    )
+    filled = lo[:, 0] <= hi[:, 0]
     center = jnp.where(filled[:, None], 0.5 * (lo + hi), 0.0)
     half = jnp.where(filled[:, None], 0.5 * (hi - lo), 0.0)
     # every float above is a rounding of the exact box; pad the threshold by a
@@ -1542,7 +1819,42 @@ def _culled_sub_pairs(
     scale = jnp.max(jnp.where(filled[:, None], jnp.maximum(-lo, hi), 0.0))
     slack = 16.0 * jnp.finfo(pos.dtype).eps * scale + 1e-6 * float(reach)
     r2 = (float(reach) + slack) ** 2
+    del dim
+    return _SubBoxes(center=center, half=half, filled=filled, r2=r2, k=k)
 
+
+def _culled_sub_pairs(
+    boxes: _SubBoxes,
+    pair_a: Array,
+    pair_b: Array,
+    pair_ok: Array,
+    cap: int,
+    box: Optional[tuple[float, ...]],
+    rows_live: Optional[Array] = None,
+) -> tuple[Array, Array, Array]:
+    """Sub-block pairs of the candidate leaf pairs that can hold a pair in reach.
+
+    A candidate ``(a, b)`` with ``a != b`` expands into its ``k^2`` sub-block
+    pairs, a self pair ``(a, a)`` into the ``k (k + 1) / 2`` with ``u <= v``
+    (``u == v`` is a diagonal block, summed over its upper triangle). Per axis,
+    the minimum-image gap of two bounding boxes, ``|mi(c_b - c_a)| - (h_a +
+    h_b)`` floored at 0, is a lower bound on every particle separation between
+    them; a pair whose gap reaches the reach has no particle pair inside the
+    cut and is dropped, as is one with an empty side. The survivors are
+    compacted, in order, into ``cap`` slots by a scan over chunks of
+    candidates, so no ``candidates x k^2`` array is ever live. Topology only: no
+    gradient. ``rows_live`` (traced) bounds the candidates that can be live, a
+    walk's near count: only those rows' steps run (a ``while_loop``), where the
+    capacity-padded list would otherwise be scanned whole.
+
+    Returns
+    -------
+    tuple of Array
+        ``(rows_a, rows_b, count)``: sub-block rows (0 past ``count``) and the
+        number of pairs needed (``int64``; more than ``cap`` is an overflow).
+    """
+    k = boxes.k
+    center, half, filled = boxes.center, boxes.half, boxes.filled
     idx = INDEX_DTYPE
     uu = jnp.repeat(jnp.arange(k, dtype=idx), k)
     vv = jnp.tile(jnp.arange(k, dtype=idx), k)
@@ -1574,7 +1886,7 @@ def _culled_sub_pairs(
             & ((a != bb)[:, None] | upper[None, :])
             & filled[ia]
             & filled[ib]
-            & (jnp.sum(gap * gap, axis=-1) < r2)
+            & (jnp.sum(gap * gap, axis=-1) < boxes.r2)
         ).reshape(-1)
         order = offset + jnp.cumsum(keep.astype(jnp.int64)) - 1
         target = jnp.where(keep & (order < cap), order, cap)
@@ -1587,8 +1899,19 @@ def _culled_sub_pairs(
         jnp.zeros((cap,), idx),
         jnp.zeros((cap,), idx),
     )
-    (count, rows_a, rows_b), _ = jax.lax.scan(
-        body, init, (prep(pair_a), prep(pair_b), prep(pair_ok))
+    xs = (prep(pair_a), prep(pair_b), prep(pair_ok))
+    if rows_live is None:
+        (count, rows_a, rows_b), _ = jax.lax.scan(body, init, xs)
+        return rows_a, rows_b, count
+    n_live = (jnp.asarray(rows_live, jnp.int64) + (step - 1)) // step
+
+    def live_step(state):
+        i, carry = state
+        carry, _ = body(carry, tuple(x[i] for x in xs))
+        return i + 1, carry
+
+    _, (count, rows_a, rows_b) = jax.lax.while_loop(
+        lambda st: st[0] < jnp.minimum(n_live, n_steps), live_step, (jnp.int64(0), init)
     )
     return rows_a, rows_b, count
 
@@ -1721,25 +2044,19 @@ def _pair_counts_body(
     fd = jnp.where(live_s, c_flags[t.order, _DATA], 0)
     cq = _node_sums(t, fq.astype(INDEX_DTYPE))
     cd = _node_sums(t, fd.astype(INDEX_DTYPE))
-    walk = _walk(t, box, acc, cq, cd, r_lo, r_hi, cfg)
-
     ls = int(cfg.leaf_size)
     ni = t.num_internal
-    slots, smask = _leaf_slots(t, n, ls)
-    smask = smask & live_s[slots]
+    lstart, llen = _leaf_runs(t, ls)
     os_ = fq.astype(dtype)
     nb = int(jnp.shape(edges)[0]) - 1
     edges = jnp.asarray(edges, dtype)
     zero = jnp.zeros((nb,), dtype)
 
-    def blocks(leaf):
-        sl = slots[leaf]
-        return xs[sl], ws[sl], os_[sl], smask[leaf]
+    def take(sa, ma, sb, mb, extra):
+        """A chunk's operands: gathered outside the ``cond`` (``_scan_chunks``)."""
+        return (xs[sa], ws[sa], os_[sa], ma, xs[sb], ws[sb], os_[sb], mb, extra)
 
-    def pairs(ta, tb, ok, extra):
-        xa, wa, oa, ma = blocks(ta)
-        xb, wb, ob, mb = blocks(tb)
-        ma = ma & ok[:, None]
+    def sums(xa, wa, oa, ma, xb, wb, ob, mb, extra):
         return _block_pair_sums(
             xa,
             wa,
@@ -1758,113 +2075,154 @@ def _pair_counts_body(
             box,
         )
 
-    num_leaves = slots.shape[0]
+    num_leaves = int(lstart.shape[0])
     leaf_ids = jnp.arange(num_leaves, dtype=INDEX_DTYPE)
     leaf_ok = t.active[ni:] & (cq[ni:] > 0)
-    near_ok = walk.near_a >= 0
-    near_t = jnp.where(near_ok, walk.near_a - ni, 0)
-    near_s = jnp.where(near_ok, walk.near_b - ni, 0)
     sub = int(cfg.sub_block)
+    cap = max(1, int(cfg.sub_pair_cap)) if sub else 0
+    near_sum: Callable[[Array, Array, Array, Array], tuple[Array, Any]]
     if sub:
         # culled near field: the walk's leaf pairs and every leaf with itself,
         # as the B x B sub-block pairs that can hold a pair inside the cut
         k = ls // sub
-        cap = max(1, int(cfg.sub_pair_cap))
-        rows_a, rows_b, sub_count = _culled_sub_pairs(
-            xs,
-            slots,
-            smask,
-            jnp.concatenate([near_t, leaf_ids]),
-            jnp.concatenate([near_s, leaf_ids]),
-            jnp.concatenate([near_ok, leaf_ok]),
-            sub,
-            cap,
-            r_hi,
-            box,
-        )
-        sub_ok = jnp.arange(cap, dtype=jnp.int64) < sub_count
-        sub_slots = slots.reshape(-1, sub)
-        sub_mask = smask.reshape(-1, sub)
+        boxes = _sub_block_boxes(xs, lstart, llen, live_s, ls, sub, r_hi)
         sub_triu = jnp.triu(jnp.ones((sub, sub), bool), k=1)[None]
+        kk = as_index(k)
 
-        def sub_pairs(ra, rb, ok):
-            sa, sb = sub_slots[ra], sub_slots[rb]
+        def sub_take(ra, rb, ok):
+            la, ua = ra // kk, ra % kk
+            lb, ub = rb // kk, rb % kk
+            sa, ma = _run_slots(lstart, llen, live_s, la, ua * sub, sub, n)
+            sb, mb = _run_slots(lstart, llen, live_s, lb, ub * sub, sub, n)
             # a diagonal block (a self pair's u == v) is its own upper triangle
             extra = jnp.where((ra == rb)[:, None, None], sub_triu, True)
-            return _block_pair_sums(
-                xs[sa],
-                ws[sa],
-                os_[sa],
-                sub_mask[ra] & ok[:, None],
-                xs[sb],
-                ws[sb],
-                os_[sb],
-                sub_mask[rb],
-                extra,
-                edges,
-                sharpness,
-                log,
-                r_lo,
-                r_hi,
-                box,
-            )
+            return take(sa, ma & ok[:, None], sb, mb, extra)
 
-        within = zero
-        near = _scan_chunks(
-            sub_pairs,
-            cap,
-            cfg.chunk * k * k,
-            zero,
-            rows_a,
-            rows_b,
-            sub_ok,
-            live=sub_ok,
-        )
-    else:
-        sub_count = jnp.zeros((), jnp.int64)
-        cap = 0
-        triu = jnp.triu(jnp.ones((ls, ls), bool), k=1)[None]
+        def culled(pa, pb, pok, rows_cap, rows_live=None):
+            rows_a, rows_b, count = _culled_sub_pairs(
+                boxes, pa, pb, pok, rows_cap, box, rows_live
+            )
+            ok = jnp.arange(rows_cap, dtype=jnp.int64) < count
+            out = _scan_chunks(
+                sums,
+                rows_cap,
+                cfg.chunk * k * k,
+                zero,
+                rows_a,
+                rows_b,
+                ok,
+                live=ok,
+                gather=sub_take,
+            )
+            return out, count
+
+        # each leaf with itself, in steps that cannot overflow their list (no
+        # skip: a step's body closes over the particles, see ``_scan_chunks``)
+        tri = k * (k + 1) // 2
+        per_step = max(1, cap // tri)
         within = _scan_chunks(
-            lambda a, ok: pairs(a, a, ok, triu),
+            lambda a, ok: culled(a, a, ok, a.shape[0] * tri)[0],
+            num_leaves,
+            per_step,
+            zero,
+            leaf_ids,
+            leaf_ok,
+        )
+
+        def culled_near(na, nb_, nok, n_near):
+            return culled(na, nb_, nok, cap, n_near)
+
+        near_sum = culled_near
+
+    else:
+        triu = jnp.triu(jnp.ones((ls, ls), bool), k=1)[None]
+
+        def leaf_take(ta, tb, ok, extra):
+            sa, ma = _run_slots(lstart, llen, live_s, ta, 0, ls, n)
+            sb, mb = _run_slots(lstart, llen, live_s, tb, 0, ls, n)
+            return take(sa, ma & ok[:, None], sb, mb, extra)
+
+        within = _scan_chunks(
+            sums,
             num_leaves,
             cfg.chunk,
             zero,
             leaf_ids,
             leaf_ok,
             live=leaf_ok,
-        )
-        near = _scan_chunks(
-            lambda a, b, ok: pairs(a, b, ok, True),
-            int(walk.near_a.shape[0]),
-            cfg.chunk,
-            zero,
-            near_t,
-            near_s,
-            near_ok,
-            live=near_ok,
+            gather=lambda a, ok: leaf_take(a, a, ok, triu),
         )
 
-    # far pairs: closed-form monopole of the ownership weights at the centroids
-    acc_dtype = jnp.float64
-    cnt = _node_sums(t, live_s.astype(INDEX_DTYPE)).astype(acc_dtype)
-    w_tot = _node_sums(t, ws.astype(acc_dtype))
-    w_own = _node_sums(t, (ws * os_).astype(acc_dtype))
-    centroid = _node_sums(t, jnp.where(live_s[:, None], xs, 0.0).astype(acc_dtype))
-    centroid = (centroid / jnp.maximum(cnt, 1.0)[:, None]).astype(dtype)
-    far_ok = walk.far_a >= 0
-    fa = jnp.where(far_ok, walk.far_a, 0)
-    fb = jnp.where(far_ok, walk.far_b, 0)
-    d_far = minimum_image(centroid[fb] - centroid[fa], box)
-    r_far = jnp.sqrt(jnp.where(far_ok, jnp.sum(d_far * d_far, axis=-1), 1.0))
-    pw_far = 0.5 * (w_own[fa] * w_tot[fb] + w_tot[fa] * w_own[fb])
-    pw_far = jnp.where(far_ok & (r_far >= r_lo) & (r_far < r_hi), pw_far, 0.0)
-    far = jnp.einsum(
-        "p,pb->b", pw_far.astype(dtype), soft_window(r_far, edges, sharpness, log)
+        def dense_near(na, nb_, nok, n_near):
+            del n_near
+            out = _scan_chunks(
+                sums,
+                int(na.shape[0]),
+                cfg.chunk,
+                zero,
+                na,
+                nb_,
+                nok,
+                live=nok,
+                gather=lambda a, b, ok: leaf_take(a, b, ok, True),
+            )
+            return out, None
+
+        near_sum = dense_near
+
+    far_sum: Optional[Callable[[Any], Array]] = None
+    if acc.accept is not None:
+        # far pairs: closed-form monopole of the ownership weights at the
+        # centroids (no far pair is ever accepted under exact acceptance)
+        acc_dtype = jnp.float64
+        cnt = _node_sums(t, live_s.astype(INDEX_DTYPE)).astype(acc_dtype)
+        w_tot = _node_sums(t, ws.astype(acc_dtype))
+        w_own = _node_sums(t, (ws * os_).astype(acc_dtype))
+        centroid = _node_sums(t, jnp.where(live_s[:, None], xs, 0.0).astype(acc_dtype))
+        centroid = (centroid / jnp.maximum(cnt, 1.0)[:, None]).astype(dtype)
+
+        def far_monopoles(walk):
+            far_ok = walk.far_a >= 0
+            fa = jnp.where(far_ok, walk.far_a, 0)
+            fb = jnp.where(far_ok, walk.far_b, 0)
+            d_far = minimum_image(centroid[fb] - centroid[fa], box)
+            r_far = jnp.sqrt(jnp.where(far_ok, jnp.sum(d_far * d_far, axis=-1), 1.0))
+            pw_far = 0.5 * (w_own[fa] * w_tot[fb] + w_tot[fa] * w_own[fb])
+            pw_far = jnp.where(far_ok & (r_far >= r_lo) & (r_far < r_hi), pw_far, 0.0)
+            return jnp.einsum(
+                "p,pb->b",
+                pw_far.astype(dtype),
+                soft_window(r_far, edges, sharpness, log),
+            )
+
+        far_sum = far_monopoles
+
+    def step(walk, carry):
+        total, diag = carry
+        near_ok = walk.near_a >= 0
+        na = jnp.where(near_ok, walk.near_a - ni, 0)
+        nb_ = jnp.where(near_ok, walk.near_b - ni, 0)
+        value, sub_count = near_sum(na, nb_, near_ok, walk.near_count)
+        if far_sum is not None:
+            value = value + far_sum(walk)
+        return total + value, _walk_diag(diag, walk, sub_count)
+
+    near, wd = _walk_fold(
+        t,
+        box,
+        acc,
+        cq,
+        cd,
+        r_lo,
+        r_hi,
+        cfg,
+        step,
+        (zero, _walk_diag0()),
+        remat=True,
     )
-
+    far = zero
     local = within + near + far
     counts = jax.lax.psum(local, AXIS_NAME)
-    walk_over = walk.near_overflow | walk.far_overflow | walk.queue_overflow
     flags_out = dict(
         partition_overflow=_any(part_over),
         leaf_overflow=_any(t_loc.overflow | t.overflow),
@@ -1873,8 +2231,8 @@ def _pair_counts_body(
         export_overflow=_any(halo.diag["export_overflow"]),
         send_overflow=_any(halo.diag["send_overflow"]),
         halo_overflow=_any(halo.diag["halo_overflow"]),
-        walk_overflow=_any(walk_over),
-        sub_overflow=_any(sub_count > cap) if sub else jnp.asarray(False),
+        walk_overflow=_any(wd["overflow"]),
+        sub_overflow=_any(wd["sub_max"] > cap) if sub else jnp.asarray(False),
     )
     overflow = functools.reduce(lambda a, b: a | b, flags_out.values())
     stats = dict(
@@ -1889,10 +2247,12 @@ def _pair_counts_body(
         summary_dests=halo.diag["summary_dests"][None],
         leaves_local=_live_leaves(t_loc)[None],
         leaves=_live_leaves(t)[None],
-        near_pairs=walk.near_count[None],
-        far_pairs=walk.far_count[None],
-        peak_wavefront=walk.peak_wavefront[None],
-        sub_pairs=sub_count[None],
+        near_pairs=wd["near_max"][None],
+        near_pairs_total=wd["near_total"][None],
+        far_pairs=wd["far_total"][None],
+        walk_frontier=wd["frontier"][None],
+        peak_wavefront=wd["peak_max"][None],
+        sub_pairs=wd["sub_max"][None],
     )
     return DistributedPairCounts(
         counts=counts, overflow=overflow, flags=flags_out, stats=stats
@@ -2138,7 +2498,9 @@ def _knn_on_tree(t: _Tree, xs, fq, fd, live_s, n, k, r_max, box, cfg, node_reach
     ``cfg.chunk``: each edge's ``(leaf, leaf)`` block gives a per-query top-k, a
     segmented associative scan merges the edges of one query leaf inside the
     chunk, and the segment's last edge merges into the running best. Work is
-    proportional to the edges; nothing is padded to the busiest leaf.
+    proportional to the edges; nothing is padded to the busiest leaf. The
+    leaves' own edges are merged first, then each (sub-)walk's
+    (:func:`_walk_fold`): a top-k merge does not depend on the order.
 
     ``node_reach`` (per node, optional; default ``r_max``) bounds how far a
     node's queries look. Exact when every node's reach covers each of its
@@ -2148,8 +2510,9 @@ def _knn_on_tree(t: _Tree, xs, fq, fd, live_s, n, k, r_max, box, cfg, node_reach
     Returns
     -------
     tuple
-        ``(nbr, d2, walk_overflow, walk)``: ``(n, k)`` neighbour sorted slots
-        (``-1`` where none) and squared distances (``inf``) per sorted slot.
+        ``(nbr, d2, walk_overflow, diag)``: ``(n, k)`` neighbour sorted slots
+        (``-1`` where none) and squared distances (``inf``) per sorted slot,
+        and the walk's diagnostics (:func:`_walk_diag0`).
     """
     dtype = xs.dtype
     ls = int(cfg.leaf_size)
@@ -2158,101 +2521,125 @@ def _knn_on_tree(t: _Tree, xs, fq, fd, live_s, n, k, r_max, box, cfg, node_reach
     cd = _node_sums(t, fd.astype(INDEX_DTYPE))
     if node_reach is None:
         node_reach = r_max
-    walk = _walk(t, box, exact_acceptance(), cq, cd, 0.0, node_reach, cfg)
-    slots, smask = _leaf_slots(t, n, ls)
-    smask = smask & live_s[slots]
-    nl = slots.shape[0]
-
-    near_ok = walk.near_a >= 0
-    na = jnp.where(near_ok, walk.near_a - ni, 0)
-    nb_ = jnp.where(near_ok, walk.near_b - ni, 0)
-    leaves = jnp.arange(nl, dtype=INDEX_DTYPE)
-    tgt = jnp.concatenate([na, nb_, leaves])
-    src = jnp.concatenate([nb_, na, leaves])
-    ok = jnp.concatenate([near_ok, near_ok, t.active[ni:]])
-    ok = ok & (cq[ni + tgt] > 0) & (cd[ni + src] > 0)
-    key = jnp.where(ok, tgt, as_index(nl))
-    order = jnp.argsort(key, stable=True)
-    e_tgt = key[order]
-    e_src = src[order]
-    n_edges = jnp.sum(ok.astype(INDEX_DTYPE))
-    E = int(e_tgt.shape[0])
-    C = max(1, min(int(cfg.chunk), E))
-    pad = (-E) % C
-    e_tgt = jnp.concatenate([e_tgt, jnp.full((pad,), nl, e_tgt.dtype)])
-    e_src = jnp.concatenate([e_src, jnp.zeros((pad,), e_src.dtype)])
-    # one past the last real edge; the sentinel ``nl`` never matches a leaf
-    e_next = jnp.concatenate([e_tgt[1:], jnp.full((1,), nl, e_tgt.dtype)])
+    lstart, llen = _leaf_runs(t, ls)
+    nl = int(lstart.shape[0])
 
     r2max = jnp.asarray(r_max, dtype) ** 2
     inf = jnp.asarray(jnp.inf, dtype)
     kk = min(int(k), ls)
+
+    def merge_edges(tgt, src, ok, bv, bi):
+        """Merge the top-k of every edge ``(tgt, src)`` with ``ok`` into the best."""
+        key = jnp.where(ok, tgt, as_index(nl))
+        order = jnp.argsort(key, stable=True)
+        e_tgt = key[order]
+        e_src = src[order]
+        n_edges = jnp.sum(ok.astype(INDEX_DTYPE))
+        E = int(e_tgt.shape[0])
+        C = max(1, min(int(cfg.chunk), E))
+        pad = (-E) % C
+        e_tgt = jnp.concatenate([e_tgt, jnp.full((pad,), nl, e_tgt.dtype)])
+        e_src = jnp.concatenate([e_src, jnp.zeros((pad,), e_src.dtype)])
+        # one past the last real edge; the sentinel ``nl`` never matches a leaf
+        e_next = jnp.concatenate([e_tgt[1:], jnp.full((1,), nl, e_tgt.dtype)])
+
+        def chunk_body(state):
+            c, bv, bi = state
+            start = c * C
+            ct = jax.lax.dynamic_slice(e_tgt, (start,), (C,))
+            cs = jax.lax.dynamic_slice(e_src, (start,), (C,))
+            cn = jax.lax.dynamic_slice(e_next, (start,), (C,))
+            live_e = ct < nl
+            tl = jnp.where(live_e, ct, 0)
+            q_sl, q_m = _run_slots(lstart, llen, live_s, tl, 0, ls, n)
+            s_sl, s_m = _run_slots(lstart, llen, live_s, cs, 0, ls, n)
+            q_ok = q_m & (fq[q_sl] > 0) & live_e[:, None]
+            s_ok = s_m & (fd[s_sl] > 0)
+            delta = minimum_image(
+                xs[s_sl][:, None, :, :] - xs[q_sl][:, :, None, :], box
+            )
+            r2 = jnp.sum(delta * delta, axis=-1)  # (C, ls, ls)
+            good = (
+                q_ok[:, :, None]
+                & s_ok[:, None, :]
+                & (s_sl[:, None, :] != q_sl[:, :, None])
+                & (r2 <= r2max)
+            )
+            r2 = jnp.where(good, r2, inf)
+            neg, pos = jax.lax.top_k(-r2, kk)
+            v = -neg
+            i = jnp.where(
+                jnp.isfinite(v),
+                jnp.take_along_axis(
+                    jnp.broadcast_to(s_sl[:, None, :], r2.shape), pos, axis=-1
+                ),
+                -1,
+            )
+            if kk < k:
+                v = jnp.concatenate(
+                    [v, jnp.full(v.shape[:-1] + (k - kk,), inf, dtype)], -1
+                )
+                i = jnp.concatenate(
+                    [i, jnp.full(i.shape[:-1] + (k - kk,), -1, i.dtype)], -1
+                )
+            # segmented merge of the edges that share a query leaf (contiguous)
+            first = jnp.concatenate([jnp.ones((1,), bool), ct[1:] != ct[:-1]])
+
+            def op(x, y):
+                fx, vx, ix = x
+                fy, vy, iy = y
+                mv, mi = _merge_topk(vx, ix, vy, iy, k)
+                fy3 = fy[:, None, None]
+                return fx | fy, jnp.where(fy3, vy, mv), jnp.where(fy3, iy, mi)
+
+            _, sv, si = jax.lax.associative_scan(op, (first, v, i))
+            last = live_e & ((ct != cn) | (jnp.arange(C) == C - 1))
+            rows = jnp.where(last[:, None] & q_m, q_sl, as_index(n))
+            mv, mi = _merge_topk(bv[rows], bi[rows], sv, si, k)
+            bv = bv.at[rows].set(mv, mode="drop")
+            bi = bi.at[rows].set(mi, mode="drop")
+            # the dropped row ``n`` is the scratch row: keep it clean
+            bv = bv.at[n].set(inf)
+            bi = bi.at[n].set(-1)
+            return c + 1, bv, bi
+
+        n_chunks = (n_edges + as_index(C) - 1) // as_index(C)
+        _, bv, bi = jax.lax.while_loop(
+            lambda st: st[0] < n_chunks, chunk_body, (as_index(0), bv, bi)
+        )
+        return bv, bi
+
     best_v = jnp.full((n + 1, k), inf, dtype)
     best_i = jnp.full((n + 1, k), -1, INDEX_DTYPE)
-    q_ok_all = smask & (fq[slots] > 0)
-    d_ok_all = smask & (fd[slots] > 0)
+    leaves = jnp.arange(nl, dtype=INDEX_DTYPE)
+    self_ok = t.active[ni:] & (cq[ni:] > 0) & (cd[ni:] > 0)
+    best_v, best_i = merge_edges(leaves, leaves, self_ok, best_v, best_i)
 
-    def chunk_body(state):
-        c, bv, bi = state
-        start = c * C
-        ct = jax.lax.dynamic_slice(e_tgt, (start,), (C,))
-        cs = jax.lax.dynamic_slice(e_src, (start,), (C,))
-        cn = jax.lax.dynamic_slice(e_next, (start,), (C,))
-        live_e = ct < nl
-        tl = jnp.where(live_e, ct, 0)
-        q_sl, s_sl = slots[tl], slots[cs]
-        q_ok = q_ok_all[tl] & live_e[:, None]
-        s_ok = d_ok_all[cs]
-        delta = minimum_image(xs[s_sl][:, None, :, :] - xs[q_sl][:, :, None, :], box)
-        r2 = jnp.sum(delta * delta, axis=-1)  # (C, ls, ls)
-        good = (
-            q_ok[:, :, None]
-            & s_ok[:, None, :]
-            & (s_sl[:, None, :] != q_sl[:, :, None])
-            & (r2 <= r2max)
-        )
-        r2 = jnp.where(good, r2, inf)
-        neg, pos = jax.lax.top_k(-r2, kk)
-        v = -neg
-        i = jnp.where(
-            jnp.isfinite(v),
-            jnp.take_along_axis(
-                jnp.broadcast_to(s_sl[:, None, :], r2.shape), pos, axis=-1
-            ),
-            -1,
-        )
-        if kk < k:
-            v = jnp.concatenate([v, jnp.full(v.shape[:-1] + (k - kk,), inf, dtype)], -1)
-            i = jnp.concatenate(
-                [i, jnp.full(i.shape[:-1] + (k - kk,), -1, i.dtype)], -1
-            )
-        # segmented merge of the edges that share a query leaf (contiguous)
-        first = jnp.concatenate([jnp.ones((1,), bool), ct[1:] != ct[:-1]])
+    def step(walk, carry):
+        (bv, bi), diag = carry
+        near_ok = walk.near_a >= 0
+        na = jnp.where(near_ok, walk.near_a - ni, 0)
+        nb_ = jnp.where(near_ok, walk.near_b - ni, 0)
+        tgt = jnp.concatenate([na, nb_])
+        src = jnp.concatenate([nb_, na])
+        ok = jnp.concatenate([near_ok, near_ok])
+        ok = ok & (cq[ni + tgt] > 0) & (cd[ni + src] > 0)
+        return merge_edges(tgt, src, ok, bv, bi), _walk_diag(diag, walk)
 
-        def op(x, y):
-            fx, vx, ix = x
-            fy, vy, iy = y
-            mv, mi = _merge_topk(vx, ix, vy, iy, k)
-            fy3 = fy[:, None, None]
-            return fx | fy, jnp.where(fy3, vy, mv), jnp.where(fy3, iy, mi)
-
-        _, sv, si = jax.lax.associative_scan(op, (first, v, i))
-        last = live_e & ((ct != cn) | (jnp.arange(C) == C - 1))
-        rows = jnp.where(last[:, None] & smask[tl], q_sl, as_index(n))
-        mv, mi = _merge_topk(bv[rows], bi[rows], sv, si, k)
-        bv = bv.at[rows].set(mv, mode="drop")
-        bi = bi.at[rows].set(mi, mode="drop")
-        # the dropped row ``n`` is the scratch row: keep it clean
-        bv = bv.at[n].set(inf)
-        bi = bi.at[n].set(-1)
-        return c + 1, bv, bi
-
-    n_chunks = (n_edges + as_index(C) - 1) // as_index(C)
-    _, best_v, best_i = jax.lax.while_loop(
-        lambda st: st[0] < n_chunks, chunk_body, (as_index(0), best_v, best_i)
+    (best_v, best_i), diag = _walk_fold(
+        t,
+        box,
+        exact_acceptance(),
+        cq,
+        cd,
+        0.0,
+        node_reach,
+        cfg,
+        step,
+        ((best_v, best_i), _walk_diag0()),
+        remat=False,
     )
-    walk_over = walk.near_overflow | walk.far_overflow | walk.queue_overflow
-    return best_i[:n], best_v[:n], walk_over, walk
+    return best_i[:n], best_v[:n], diag["overflow"], diag
 
 
 def _cell_max(t: _Tree, cut, values_sorted, n):
@@ -2373,7 +2760,7 @@ def _knn_body(
         )
     else:
         node_reach = None
-    nbr, _d2, w_over, walk = _knn_on_tree(
+    nbr, _d2, w_over, wd = _knn_on_tree(
         t, jax.lax.stop_gradient(xs), fq, fd, live_s, n, k, r_max, box, cfg, node_reach
     )
     # values from the live positions at the frozen neighbour indices
@@ -2394,14 +2781,32 @@ def _knn_body(
     cdf = None
     if r_grid is not None:
         rg = jnp.asarray(r_grid, dtype)
-        safe_d = jnp.where(jnp.isfinite(dist), dist, 2.0 * jnp.max(rg) + 1.0)
-        if sharpness is None:
-            step = (safe_d[:, :, None] <= rg[None, None, :]).astype(dtype)
-        else:
-            step = jax.nn.sigmoid(
-                sharpness * (jnp.log(rg)[None, None, :] - jnp.log(safe_d)[:, :, None])
-            )
-        num = jnp.sum(jnp.where(is_q[:, None, None], step, 0.0), axis=0)
+
+        # one radius at a time, rematerialised: a (rows, k, grid) step array is
+        # 37 GB at 6.7e7 rows, k = 8, 16 radii, and reverse mode would hold
+        # several; per radius only (rows, k) arrays are ever live
+        def cdf_numerator(dist, rg, sharpness):
+            safe_d = jnp.where(jnp.isfinite(dist), dist, 2.0 * jnp.max(rg) + 1.0)
+            q = is_q[:, None]
+
+            if sharpness is None:
+
+                def hard(r):
+                    hit = jnp.where(q & (safe_d <= r), 1.0, 0.0).astype(dtype)
+                    return jnp.sum(hit, axis=0)
+
+                return jax.lax.map(hard, rg).T
+            log_d = jnp.log(safe_d)
+
+            @functools.partial(jax.checkpoint, prevent_cse=False)
+            def soft(r):
+                step = jax.nn.sigmoid(sharpness * (jnp.log(r) - log_d))
+                return jnp.sum(jnp.where(q, step, 0.0), axis=0)
+
+            # (radii, k) -> (k, radii), the rank-by-radius layout of the CDF
+            return jax.lax.map(soft, rg).T
+
+        num = cdf_numerator(dist, rg, sharpness)
         num = jax.lax.psum(num, AXIS_NAME)
         nq = jax.lax.psum(jnp.sum(is_q.astype(dtype)), AXIS_NAME)
         cdf = num / jnp.maximum(nq, 1.0)
@@ -2431,8 +2836,10 @@ def _knn_body(
         summary_dests=halo.diag["summary_dests"][None],
         leaves_local=_live_leaves(t_loc)[None],
         leaves=_live_leaves(t)[None],
-        near_pairs=walk.near_count[None],
-        peak_wavefront=walk.peak_wavefront[None],
+        near_pairs=wd["near_max"][None],
+        near_pairs_total=wd["near_total"][None],
+        walk_frontier=wd["frontier"][None],
+        peak_wavefront=wd["peak_max"][None],
     )
     return dist, out_gid, cdf, overflow, flags_out, stats
 

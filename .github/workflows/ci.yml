@@ -185,6 +185,12 @@ jobs:
               tests/distributed/test_distributed_stats_grad.py
               tests/distributed/test_distributed_stats_exchange.py
               tests/distributed/test_distributed_stats_subblock.py
+          # A shard of its own: in one process with the files above it peaked at
+          # 10 GB on macOS, and XLA's compiler aborted on the 16 GB runner,
+          # most likely for lack of memory.
+          - shard: streaming
+            paths: >-
+              tests/distributed/test_distributed_stats_streaming.py
     name: distributed-tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 75
