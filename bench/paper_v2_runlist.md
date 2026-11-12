@@ -18,9 +18,8 @@ HoreKa/JUWELS) is separate: see `bench/slurm/README.md`. The v1 list
 Run them on the A100 server, from a checkout of the paper branch
 (`paper/differentiable-applications`), at its repository root.
 
-**0. The code.** It is best to start after B2 (`claude/b2-xi`) is merged into the
-paper branch: then its two rows run at the same commit as the rest (see
-"B2 slot" below).
+**0. The code.** The paper branch has every bench the list runs, B2 (#122) and
+B4 (#127) included, so all rows run at one commit.
 
 ```bash
 git fetch origin && git checkout paper/differentiable-applications && git pull
@@ -162,11 +161,11 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `a5_hmc_energy` | A5 | leapfrog \|ΔH\| per rule, N = 8000 | 30 min | 50 s |
 | `b1_knn_cdf_open` | B1 | kNN-CDF fwd + value+grad, N = 1e3–1e7, brute force to 1e5 | 20 min | 9 s |
 | `b1_knn_cdf_periodic` | B1 | the same, periodic unit box | 30 min | 21 s |
-| `b2_xi_box` | B2 | **slot**: periodic ξ, traced vs distributed vs TreeCorr vs Corrfunc | 30 min | skipped |
-| `b2_acceptance_rules` | B2 | **slot**: window ε vs geometric θ at matched accuracy | 15 min | skipped |
+| `b2_xi_box` | B2 | periodic ξ, traced vs distributed vs TreeCorr vs Corrfunc | 30 min | 32 s |
+| `b2_acceptance_rules` | B2 | window ε vs geometric θ at matched accuracy | 15 min | 286 s |
 | `b3_forecast` | B3 | point-process Fisher forecast + recovery, N = 32768 (GPU command of `docs/point_process.md`) | 60 min | 117 s |
-| `b4_positions_1e6` | B4 | **slot**: move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 L-BFGS steps (step cap 0.25 l), + gradient check | 50 min (guess) | – |
-| `b4_positions_1e7` | B4 | **slot**: the same at N = 1e7, 100 steps (cost per step) | 50 min (guess) | – |
+| `b4_positions_1e6` | B4 | move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 L-BFGS steps (step cap 0.25 l), + gradient check | 50 min (guess) | 111 s |
+| `b4_positions_1e7` | B4 | the same at N = 1e7, 100 steps (cost per step) | 50 min (guess) | 44 s |
 | `c2_grad_memory_g1` | C2 | distributed ξ/kNN forward vs value+grad memory and time, N = 2^20, 1 GPU | 10 min | 56 s |
 | `c2_grad_memory_g2` | C2 | the same on 2 GPUs (optional) | 10 min | 76 s |
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
@@ -176,7 +175,7 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `base_kernel_sums_uniform` | baseline | soft pair counts: yggdrax traced vs KeOps vs dense JAX, N = 1e4–1e6 | 25 min | 26 s |
 | `base_kernel_sums_clustered` | baseline | the same on a clustered catalogue | 25 min | 32 s |
 
-The whole CPU smoke takes about 12 min on the laptop (compile-bound; most rows spend their time in XLA compilation, not in the sizes).
+The whole CPU smoke takes about 20 min on the laptop (compile-bound; most rows spend their time in XLA compilation, not in the sizes).
 
 ### Where the paper reads it
 
@@ -244,42 +243,22 @@ fixed while the brute forces grow as N². On CPU (N = 1000, 2000), KeOps agrees
 with dense JAX autodiff to 1e-11 in the counts and 3e-15 in the gradient, and
 the tree to 2e-10 and 7e-9.
 
-## B2 slot
+## B2 rows
 
-The B2 benches (`bench/corrfunc/xi_box.py`, `acceptance_rules.py`) are on
-`claude/b2-xi`, which is not merged yet. Their rows `b2_xi_box` and
-`b2_acceptance_rules` are already in the list, with the command line taken
-from that branch (06c953a), and run as soon as the files exist. Until then
-they print `skip b2_...: bench/corrfunc/xi_box.py not on this branch`.
+The B2 benches (`bench/corrfunc/xi_box.py`, `acceptance_rules.py`) came in with
+#122. B2 owner: check the GPU sizes in the two rows (`_rows()` in the driver).
+The CPU reference results are in `bench/corrfunc/results/xi_box_cpu.json` and
+`acceptance_rules_*_cpu.json`.
 
-- **If B2 merges before the run:** nothing to do.
-- **If it merges after:** pull, then run only those rows:
+## B4 rows
 
-  ```bash
-  python bench/paper_v2_runlist.py --rows '^b2_' --allow-new-commit
-  ```
-
-  Each B2 JSON then records its own commit, and the summary warns about the
-  second commit instead of failing.
-- **B2 owner:** check the GPU sizes in the two rows (`_rows()` in the driver).
-
-## B4 slot
-
-The B4 bench (`bench/positions/optimise.py`) is on `claude/b4-positions`, for a
-PR to main; it reaches this branch when main is merged in. Until then the rows
-`b4_positions_1e6` and `b4_positions_1e7` print `skip b4_...: ... not on this
-branch`. If it arrives after the run, run only those rows:
-
-```bash
-python bench/paper_v2_runlist.py --rows '^b4_' --allow-new-commit
-```
-
+The B4 bench (`bench/positions/optimise.py`) came in with #127.
 The box grows with N at fixed density (L = 3.2 at 1e6, 6.9 at 1e7), so the
 cost per particle per step is fixed. The 1e7 row runs 100 steps only: it
 measures the cost per step and memory, not convergence.
 
 Both rows use L-BFGS with every particle's step capped at 0.25 l (the bench
-default since `claude/b4-positions` 2dd8de9). On the CPU comparison at N = 3e4
+default since #127). On the CPU comparison at N = 3e4
 (`bench/positions/results/optimiser_comparison/`) it reaches a loss of 1e-3
 in half the loss-and-gradient evaluations Adam needs and ends below the
 independent-realisation level, where Adam levels off. A step costs about 1.3

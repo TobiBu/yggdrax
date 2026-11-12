@@ -187,9 +187,7 @@ def _rows() -> list[Row]:
             smoke=("--sizes", "1000", "4000", *tiny, "--brute-force-max-n", "4000"),
             est_gpu_min=30,
         ),
-        # -- B2: periodic xi showcase. SLOT: the benches live on claude/b2-xi
-        #    (06c953a), not merged yet; the rows run once the files exist. CLI
-        #    taken from that branch; the B2 owner should confirm the GPU sizes. ------
+        # -- B2: periodic xi showcase (benches from #122 via main). -------------------
         Row(
             "b2_xi_box",
             "B2",
@@ -201,7 +199,6 @@ def _rows() -> list[Row]:
             smoke=("--sizes", "2000", "--repeats", "1"),
             requires="bench/corrfunc/xi_box.py",
             est_gpu_min=30,
-            note="B2 SLOT: activates when claude/b2-xi is merged",
         ),
         Row(
             "b2_acceptance_rules",
@@ -212,7 +209,6 @@ def _rows() -> list[Row]:
             smoke=("--n", "3000"),
             requires="bench/corrfunc/acceptance_rules.py",
             est_gpu_min=15,
-            note="B2 SLOT: activates when claude/b2-xi is merged",
         ),
         # -- B3: point-process forward model, Fisher forecast (docs/point_process.md)
         Row(
@@ -232,9 +228,8 @@ def _rows() -> list[Row]:
             est_gpu_min=60,
             note="N = 32768; CPU reference at N = 2048 is bench/point_process/results",
         ),
-        # -- B4: move particles until ξ and kNN-CDF match a target. SLOT: the bench
-        #    is on claude/b4-positions (yggdrax main PR), not merged yet; the rows
-        #    run once bench/positions/optimise.py exists. ------------------------------
+        # -- B4: move particles until ξ and kNN-CDF match a target (bench from #127
+        #    via main). ----------------------------------------------------------------
         Row(
             "b4_positions_1e6",
             "B4",
@@ -250,7 +245,7 @@ def _rows() -> list[Row]:
                    "--rebuild-every", "5", "--timing-reps", "1"),
             requires="bench/positions/optimise.py",
             est_gpu_min=50,
-            note="B4 SLOT; est. time is a guess from CPU (L-BFGS: ~1.3 loss+grad "
+            note="est. time is a guess from CPU (L-BFGS: ~1.3 loss+grad "
             "evaluations per step, 2.6 s each at N = 3e4)",
         ),
         Row(
@@ -267,7 +262,7 @@ def _rows() -> list[Row]:
                    "--rebuild-every", "5", "--timing-reps", "1"),
             requires="bench/positions/optimise.py",
             est_gpu_min=50,
-            note="B4 SLOT; float64 memory at 1e7 untested, may OOM on 40 GB",
+            note="float64 memory at 1e7 untested, may OOM on 40 GB",
         ),
         # -- C2: gradient memory of the distributed statistics, 1/2/4 GPUs ------------
         Row(
