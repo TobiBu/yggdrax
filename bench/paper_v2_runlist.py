@@ -311,6 +311,64 @@ def _rows() -> list[Row]:
             est_gpu_min=3,
             note="opt-in upstream check; needs >= 2 GPUs",
         ),
+        # -- C4: the streamed walk at the flagship's per-device size, on 2 GPUs.
+        #    Capacities are sized for 2048^3 on 128 devices; the 2 cards each hold
+        #    one such domain at the flagship density (walk_stream.py, run_box).
+        #    The CPU plans (#129) these check: K = 128, xi fwd 16.7 GB, xi v+g
+        #    30.9 GB, kNN fwd 29.6 GB, kNN v+g 50.4 GB (upper bounds: buf exchange).
+        *(
+            Row(
+                f"c4_walk_plan_{payload}",
+                "C4",
+                f"{dist}; streamed walk, {payload}: XLA plan per device on the "
+                "GPU (native exchange), compile only",
+                ("{py}", "bench/distributed/walk_stream.py", *a5, "--payload",
+                 payload, "--n-per-device", "6.7e7", "--ndev", "2",
+                 "--ndev-model", "128", "--chunks", "64,128,256", "--plan-only",
+                 "--out", f"{{case}}/walk_plan_{payload}.json"),
+                smoke=("--n-per-device", "8192", "--ndev-model", "16",
+                       "--chunks", "1,4"),
+                ngpu=2,
+                optional=True,
+                est_gpu_min=15,
+                note="compile only; compare with the CPU plans of #129",
+            )
+            for payload in ("xi", "knn")
+        ),
+        Row(
+            "c4_walk_run_xi",
+            "C4",
+            f"{dist}; streamed walk, xi forward and value+grad at the C4 size",
+            ("{py}", "bench/distributed/walk_stream.py", *a5, "--payload", "xi",
+             "--n-per-device", "6.7e7", "--ndev", "2", "--ndev-model", "128",
+             "--chunks", "128,256", "--repeats", "3", "--out",
+             "{case}/walk_run_xi.json"),
+            smoke=("--n-per-device", "8192", "--ndev-model", "16", "--chunks",
+                   "1,4", "--repeats", "1"),
+            ngpu=2,
+            optional=True,
+            env=(("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95"),),
+            est_gpu_min=30,
+            note="runtime peak vs plan; K = 256 against 128: overhead and "
+            "agreement (max_rel_dev)",
+        ),
+        Row(
+            "c4_walk_run_knn",
+            "C4",
+            f"{dist}; streamed walk, kNN forward at the C4 size",
+            ("{py}", "bench/distributed/walk_stream.py", *a5, "--payload", "knn",
+             "--modes", "forward", "--n-per-device", "6.7e7", "--ndev", "2",
+             "--ndev-model", "128", "--chunks", "128,256", "--repeats", "3",
+             "--out", "{case}/walk_run_knn.json"),
+            smoke=("--n-per-device", "8192", "--ndev-model", "16", "--chunks",
+                   "1,4", "--repeats", "1"),
+            ngpu=2,
+            optional=True,
+            env=(("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95"),),
+            est_gpu_min=30,
+            note="kNN value+grad plans at 50 GB on the CPU: c4_walk_plan_knn "
+            "says whether the GPU plan fits",
+        ),
         # -- competitor baselines (new) -------------------------------------------------
         Row(
             "base_knn_open",

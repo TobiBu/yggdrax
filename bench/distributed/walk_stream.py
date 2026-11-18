@@ -12,12 +12,26 @@ For one problem (particles per device, devices, leaf size) and each
   uniform points, the overflow flags, and the largest relative deviation of the
   counts and gradients from the first entry of ``--chunks`` (put 1 first);
 * the per-walk capacities and the counters (near pairs per walk and in total,
-  the frontier, sub-block pairs).
+  the frontier, sub-block pairs);
+* on a GPU, ``runtime_peak_bytes``: each device's ``peak_bytes_in_use`` after
+  the mode's runs. JAX cannot reset the peak, so it is the process's running
+  maximum; a row's first mode at its first ``walk_chunks`` is the clean number.
 
 ``--plan-only`` compiles from shapes alone (no data), so it reaches the C4 sizes
 (6.7e7 per device) on a laptop. The CPU plan uses the ``buf`` exchange, whose
 all-gathers of the send buffers the GPU's native exchange does not have, so it
 is an upper bound for a GPU.
+
+**Fewer devices than modelled.** The capacities are always sized for
+``--ndev-model`` devices in the unit box. When fewer devices run
+(``--ndev < --ndev-model``), the points go into a periodic box of side
+``(ndev / ndev_model)^(1/3)``: each device then holds a domain of the modelled
+size at the modelled density, so the walk sees the flagship's pairs, not a
+64-times sparser field. The side is recorded as ``run_box``.
+
+GPU selection happens before JAX starts: ``--platform gpu --gpu-select free``
+waits for idle cards via ``autocvd`` (the org rule); an already set
+``CUDA_VISIBLE_DEVICES`` is kept.
 
 Examples::
 
@@ -28,6 +42,11 @@ Examples::
     # CPU timing, 2 fake devices
     python bench/distributed/walk_stream.py --n-per-device 131072 --ndev 2 \\
         --chunks 1,4,16,64 --out bench/results/walk_stream_cpu.json
+
+    # two A100s, each holding one C4 device's domain
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 python bench/distributed/walk_stream.py \\
+        --platform gpu --gpu-select free --n-per-device 6.7e7 --ndev 2 \\
+        --ndev-model 128 --chunks 128,256 --out walk_stream_c4_2xA100.json
 """
 
 from __future__ import annotations
@@ -69,18 +88,51 @@ def _parse(argv=None):
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--platform", choices=["cpu", "gpu"], default="cpu")
+    p.add_argument(
+        "--gpu-select", choices=["free", "least-used", "none"], default="free"
+    )
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
 
+def _select_gpus(args) -> None:
+    """Pin free GPUs before JAX initialises CUDA (org rule: autocvd)."""
+    if args.platform != "gpu" or args.gpu_select == "none":
+        return
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        print("# CUDA_VISIBLE_DEVICES already set; not selecting", file=sys.stderr)
+        return
+    from autocvd import autocvd  # site tool: sets CUDA_VISIBLE_DEVICES
+
+    picked = autocvd(num_gpus=args.ndev, least_used=args.gpu_select == "least-used")
+    print(f"# autocvd selected GPU(s): {picked}", file=sys.stderr, flush=True)
+
+
+def _peaks(devices) -> list:
+    """Each device's ``peak_bytes_in_use`` (-1 where the backend has no stats)."""
+    out = []
+    for dev in devices:
+        try:
+            st = dev.memory_stats() or {}
+        except Exception:  # CPU has no allocator stats
+            st = {}
+        out.append(int(st.get("peak_bytes_in_use", -1)))
+    return out
+
+
 def main(argv=None) -> int:
     args = _parse(argv)
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    flags = os.environ.get("XLA_FLAGS", "")
-    if "device_count" not in flags:
-        os.environ["XLA_FLAGS"] = (
-            f"{flags} --xla_force_host_platform_device_count={args.ndev}".strip()
-        )
+    if args.platform == "cpu":
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+        flags = os.environ.get("XLA_FLAGS", "")
+        if "device_count" not in flags:
+            os.environ["XLA_FLAGS"] = (
+                f"{flags} --xla_force_host_platform_device_count={args.ndev}".strip()
+            )
+    else:
+        _select_gpus(args)
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     if _REPO not in sys.path:
         sys.path.insert(0, _REPO)
     import jax
@@ -94,9 +146,18 @@ def main(argv=None) -> int:
 
     ndev = int(args.ndev)
     ndev_model = int(args.ndev_model or ndev)
+    if args.platform == "gpu" and jax.default_backend() != "gpu":
+        raise SystemExit(f"--platform gpu but JAX runs on {jax.default_backend()}")
+    if len(jax.devices()) < ndev:
+        raise SystemExit(f"--ndev {ndev} but JAX sees {len(jax.devices())} devices")
+    if ndev > ndev_model:
+        raise SystemExit(f"--ndev {ndev} exceeds --ndev-model {ndev_model}")
     npd = float(args.n_per_device)
     dtype = jnp.dtype(args.dtype)
+    # Capacities are sized for ndev_model devices in the unit box; the points
+    # run in the box that gives each of the ndev devices one such domain.
     box = 1.0
+    run_box = box * (ndev / ndev_model) ** (1.0 / 3.0)
     spacing = box / (npd * ndev_model) ** (1.0 / 3.0)
     e0, e1 = (float(v) for v in args.edges.split(","))
     edges = np.geomspace(e0 * spacing, e1 * spacing, args.nbins + 1)
@@ -121,7 +182,7 @@ def main(argv=None) -> int:
                     r_max=r_max,
                     ndev=ndev,
                     config=cfg,
-                    box_size=box,
+                    box_size=run_box,
                     r_grid=r_grid,
                     sharpness=20.0,
                 )
@@ -135,7 +196,7 @@ def main(argv=None) -> int:
                 edges_j,
                 ndev=ndev,
                 config=cfg,
-                box_size=box,
+                box_size=run_box,
                 r_lo=float(r_lo),
                 r_hi=float(r_hi),
                 sharpness=args.sharpness,
@@ -168,7 +229,7 @@ def main(argv=None) -> int:
     data = None
     if not args.plan_only:
         rng = np.random.default_rng(args.seed)
-        x = jax.device_put(jnp.asarray(rng.uniform(0, box, (n_in, 3)), dtype), sh)
+        x = jax.device_put(jnp.asarray(rng.uniform(0, run_box, (n_in, 3)), dtype), sh)
         w = jax.device_put(jnp.asarray(rng.uniform(0.5, 1.5, n_in), dtype), sh)
         c = jax.device_put(jnp.full((ndev,), rows, jnp.int64), sh)
         data = (x, w, c)
@@ -217,7 +278,11 @@ def main(argv=None) -> int:
                     t0 = time.perf_counter()
                     jax.block_until_ready(comp(*data))
                     times.append(time.perf_counter() - t0)
-                entry.update(time_s=statistics.median(times), time_min_s=min(times))
+                entry.update(
+                    time_s=statistics.median(times),
+                    time_min_s=min(times),
+                    runtime_peak_bytes=_peaks(mesh.devices.flat),
+                )
                 if mode == "forward":
                     counts, over, st = out
                     grads = ()
@@ -248,6 +313,11 @@ def main(argv=None) -> int:
                 f"K={chunks:5d} {mode:15s} temp {entry['temp_bytes'] / 1e9:7.3f} GB "
                 f"({entry['temp_bytes_per_particle']:6.0f} B/particle)"
                 + (
+                    f"  peak {max(entry['runtime_peak_bytes']) / 1e9:7.3f} GB"
+                    if max(entry.get("runtime_peak_bytes", [-1])) > 0
+                    else ""
+                )
+                + (
                     f"  time {entry['time_s']:7.3f} s  overflow {entry['overflow']}"
                     + (
                         f"  dev {entry['max_rel_dev']:.1e}"
@@ -266,6 +336,9 @@ def main(argv=None) -> int:
         args=vars(args),
         jax=jax.__version__,
         platform=jax.devices()[0].platform,
+        device_kind=jax.devices()[0].device_kind,
+        ndev_model=ndev_model,
+        run_box=run_box,
         rows=rows_out,
     )
     if args.out:
