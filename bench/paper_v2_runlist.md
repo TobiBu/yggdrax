@@ -82,11 +82,12 @@ python bench/paper_v2_runlist.py 2>&1 | tee -a ~/yggdrax-paper-v2-runlist.log
 
 **7. Resume, and the optional rows.** Run the same command again to continue:
 rows that finished are skipped, and failed or skipped rows run again. The C2
-rows on 2 and 4 GPUs, and the native-ragged check, wait at most 10 min for
-free cards and are skipped otherwise. Rerun them when the cards are idle:
+rows on 2 and 4 GPUs, the native-ragged check and the four C4 rows (2 GPUs
+each) wait at most 10 min for free cards and are skipped otherwise. Rerun them
+when the cards are idle:
 
 ```bash
-python bench/paper_v2_runlist.py --rows '^c2_' --optional-gpu-wait 3600
+python bench/paper_v2_runlist.py --rows '^c[24]_' --optional-gpu-wait 3600
 ```
 
 **8. Check the summary.** A finished campaign prints and writes
@@ -170,6 +171,10 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `c2_grad_memory_g2` | C2 | the same on 2 GPUs (optional) | 10 min | 76 s |
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
 | `c2_native_ragged_check` | C2 | `YGGDRAX_CHECK_UPSTREAM_RAGGED_FIX=1` test, ≥ 2 GPUs (optional, GPU only) | 3 min | skipped |
+| `c4_walk_plan_xi` | C4 | streamed walk, ξ: XLA plan per device at 6.7e7 per device (2048³ on 128 GPUs), K = 64, 128, 256, compile only, 2 GPUs (optional) | 15 min | 21 s |
+| `c4_walk_plan_knn` | C4 | the same for kNN | 15 min | 28 s |
+| `c4_walk_run_xi` | C4 | ξ forward and value+grad at that size on 2 GPUs: time, runtime peak, K = 256 vs 128 (optional) | 30 min | 23 s |
+| `c4_walk_run_knn` | C4 | kNN forward at that size on 2 GPUs (optional) | 30 min | 20 s |
 | `base_knn_open` | baseline | kNN forward: yggdrax vs jaxkd, jaxkd-cuda, JZ-Tree, cKDTree; N = 1e4–3e7, k = 8, 32 | 30 min | 3 s |
 | `base_knn_periodic` | baseline | the same in a periodic box (yggdrax, JZ-Tree, cKDTree) | 30 min | 8 s |
 | `base_kernel_sums_uniform` | baseline | soft pair counts: yggdrax traced vs KeOps vs dense JAX, N = 1e4–1e6 | 25 min | 26 s |
@@ -189,7 +194,41 @@ The whole CPU smoke takes about 20 min on the laptop (compile-bound; most rows s
 | `b3_forecast` | `results.json` + 4 figures | §5 end-to-end forecast |
 | `b4_*` | `positions_1e{6,7}.json` + `.npz` + `.png` | §5 matching positions to ξ and kNN-CDF (B4) |
 | `c2_*` | `grad_memory_g{1,2,4}.json`, `junit.xml` | §4 gradient memory, the native-exchange check |
+| `c4_*` | `walk_plan_{xi,knn}.json`, `walk_run_{xi,knn}.json` | §4 flagship sizing (C4): whether 2048³ fits on 128 A100s |
 | `base_*` | `knn_forward_*.json`, `kernel_sums_*.json` | §4 "the cost of pure JAX" |
+
+## C4 rows
+
+These check, on real cards, the per-device memory plans that size the flagship
+(#129). By XLA's CPU plan, at 6.7e7 particles per device (2048³ on 128
+devices) and K = 128 sub-walks, the per-device temp is 16.7 GB for ξ forward,
+30.9 GB for ξ value+grad, 29.6 GB for kNN forward and 50.4 GB for kNN
+value+grad. The CPU plan uses the `buf` exchange, whose all-gathers the GPU's
+native exchange does not have, so the GPU numbers should come in lower.
+
+- **Plan rows** compile only, on 2 GPUs. They give the GPU's own plan, with the
+  native exchange, for K = 64, 128 and 256. They say whether kNN value+grad
+  fits on a 40 GB card after all. If it does not, the flagship needs about
+  170 GPUs for kNN value+grad, or a smaller box.
+- **Run rows** run ξ (forward and value+grad) and kNN (forward) on 2 GPUs. The
+  capacities are sized for 128 devices. The points fill a periodic box of side
+  `(2/128)^(1/3)`, so each card holds one flagship domain at the flagship
+  density, and the walk sees the flagship's pairs (`walk_stream.py`,
+  `run_box`). Each row records:
+  - the time per call;
+  - `runtime_peak_bytes`, the allocator's peak, to set against the plan. It is
+    the process's running maximum, so the clean number is the first mode at
+    K = 128;
+  - K = 256 against K = 128: the cost of more sub-walks at this size (CPU, at
+    small N: +30 to 100 %) and their agreement (`max_rel_dev`, float32
+    summation order only).
+
+  Both run rows set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, since JAX's default
+  75 % would refuse a 30 GB plan on a 40 GB card.
+
+What the rows cannot show: the native exchange among 128 devices, and the
+halo and summary traffic of a full mesh. Those come from the HoreKa `ceiling`
+runs (`bench/slurm/README.md`).
 
 ## Competitor baselines
 
