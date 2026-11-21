@@ -7,14 +7,13 @@ Times one forward k-nearest-neighbour search, tree build included, at matched
   search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX). One
   traced ``while_loop`` per query that visits one point per iteration: the CPU
   KD-tree design, which a GPU runs as divergent serial threads;
-* ``yggdrax-leafwalk``: :func:`yggdrax.distributed.stats.distributed_knn` on a
-  one-device mesh (jitted, pure JAX): a dual-tree walk that emits (query leaf,
-  source leaf) edges and a block top-k per edge, the GPU design of the C2/C4
-  rows (and of JZ-Tree). It returns sorted distances, not indices, and searches
-  within a cap ``r_max`` that :func:`_leafwalk_r_max` sets from the Poisson
-  tail of the k-th neighbour distance; the adaptive first pass sets each node's
-  actual reach, so the cap is a bound, not the work. Its check is distances
-  only, plus no ``inf`` (a neighbour past the cap) and no overflow in ANY row;
+* ``yggdrax-fast``: :func:`yggdrax.fast_knn.fast_knn`, the fast path the
+  mutual FMM runs on: cell-aligned Morton buckets, the Pallas mutual walk and
+  a Pallas leaf-block top-k (jitted, pure JAX + Pallas). Its static sizes and
+  opening angle come from :func:`~yggdrax.fast_knn.plan_fast_knn` in the first
+  (untimed) call per size, as the fast-path benches size theirs; a row whose
+  certificate or capacities fail is poisoned (NaN) and so fails the check.
+  Open boundaries only (the Pallas walk has no periodic box yet);
 * ``jaxkd``: ``jaxkd.build_and_query`` (pure JAX; Dodge, github.com/dodgebc/jaxkd);
 * ``jaxkd-cuda``: the same with ``cuda=True`` (its optional CUDA extension; GPU);
 * ``jztree``: ``jztree.knn.knn`` (JZ-Tree, Stücker et al., arXiv:2604.05885;
@@ -54,12 +53,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
-
-import numpy as np
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -73,7 +72,7 @@ from bench.differentiability._common import (  # noqa: E402
     time_callable,
 )
 
-ARMS = ("yggdrax", "yggdrax-leafwalk", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
+ARMS = ("yggdrax", "yggdrax-fast", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -87,17 +86,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     p.add_argument("--leaf-size", type=int, default=32, help="yggdrax KD leaf size")
     p.add_argument(
-        "--leafwalk-leaf-size",
-        type=int,
-        default=32,
-        help="yggdrax-leafwalk cell-tree leaf size",
-    )
-    p.add_argument(
-        "--leafwalk-tail",
-        type=float,
-        default=1e-6,
-        help="yggdrax-leafwalk: expected number of queries whose k-th neighbour "
-        "lies beyond r_max (sets r_max from the Poisson tail)",
+        "--fast-leaf-size", type=int, default=32, help="yggdrax-fast bucket size"
     )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
@@ -133,31 +122,6 @@ def _version(dist: str) -> str | None:
         return importlib.metadata.version(dist)
     except importlib.metadata.PackageNotFoundError:
         return None
-
-
-def _leafwalk_r_max(n: int, q: int, k: int, box: float, periodic: bool, tail: float):
-    """Search cap of the ``yggdrax-leafwalk`` arm for ``n`` uniform points.
-
-    The count of data points within ``r`` of a query is Poisson with mean
-    ``lam = frac * n * (4/3) pi r^3 / L^3``; the k-th neighbour lies beyond
-    ``r`` with probability ``P(Poisson(lam) < k)``. ``r_max`` is the smallest
-    radius at which the expected number of such queries, ``q`` times that, is
-    ``tail``. ``frac`` is the part of the ball inside the box: 1 periodic, 1/8
-    in an open box (a query in a corner), so open boxes get the corner's cap.
-    Periodic caps stay below ``L/2`` (the minimum image).
-    """
-    from scipy.stats import poisson
-
-    target = tail / max(q, 1)
-    lam_lo, lam_hi = float(k), float(k)
-    while poisson.cdf(k - 1, lam_hi) > target:
-        lam_hi *= 1.5
-    for _ in range(80):
-        mid = 0.5 * (lam_lo + lam_hi)
-        lam_lo, lam_hi = (mid, lam_hi) if poisson.cdf(k - 1, mid) > target else (lam_lo, mid)
-    frac = 1.0 if periodic else 0.125
-    r = (3.0 * lam_hi * box**3 / (4.0 * np.pi * n * frac)) ** (1.0 / 3.0)
-    return float(min(r, 0.499 * box)) if periodic else float(r)
 
 
 def _make_arms(
@@ -200,59 +164,43 @@ def _make_arms(
 
             fns[name] = jax.jit(ygg, static_argnums=2)
             info[name] = {"available": True, "version": _version("yggdrax")}
-        elif name == "yggdrax-leafwalk":
+        elif name == "yggdrax-fast":
+            if args.periodic:
+                skip(name, "the Pallas walk has no periodic box yet")
+                continue
             import jax.numpy as jnp
 
-            from yggdrax.distributed import make_mesh
-            from yggdrax.distributed.stats import (
-                DistributedStatsConfig,
-                distributed_knn,
-            )
+            from yggdrax.fast_knn import fast_knn, plan_fast_knn
 
-            mesh = make_mesh(1)
+            cache: dict[tuple, Any] = {}
 
-            def leafwalk(data, queries, k, _box=box):
-                n, q = int(data.shape[0]), int(queries.shape[0])
-                r_max = _leafwalk_r_max(
-                    n, q, k, args.box, args.periodic, args.leafwalk_tail
-                )
-                cfg = DistributedStatsConfig.for_box(
-                    n + q,
-                    ndev=1,
-                    box_size=args.box,
-                    reach=r_max,
-                    leaf_size=args.leafwalk_leaf_size,
-                    clustering=1.0,
-                )
-                bounds = (
-                    None
-                    if _box is not None
-                    else (np.zeros(3), np.full(3, float(args.box)))
-                )
-                res = distributed_knn(
-                    data,
-                    queries=queries,
-                    k=k,
-                    r_max=r_max,
-                    box_size=_box,
-                    bounds=bounds,
-                    config=cfg,
-                    mesh=mesh,
-                )
-                # an overflowed walk is not a result: poison every row
-                dist = jnp.where(res.overflow, jnp.nan, res.distances)
-                return dist, None
+            def fast(data, queries, k):
+                key = (data.shape, queries.shape, k)
+                if key not in cache:
+                    plan = plan_fast_knn(
+                        data, queries, k=k, leaf_size=args.fast_leaf_size
+                    )
 
-            fns[name] = jax.jit(leafwalk, static_argnums=2)
+                    def run(d, q, _plan=plan):
+                        r = fast_knn(d, q, plan=_plan)
+                        good = r.certified[:, None] & ~r.overflow
+                        return jnp.where(good, r.distances, jnp.nan), r.indices
+
+                    cache[key] = (plan, jax.jit(run))
+                    info[name].setdefault("plans", {})[f"n={key[0][0]},k={k}"] = cache[
+                        key
+                    ][0]._asdict()
+                return cache[key][1](data, queries)
+
+            fns[name] = fast
             info[name] = {
                 "available": True,
                 "version": _version("yggdrax"),
-                "walk": "distributed_knn, 1-device mesh (dual-tree leaf-pair "
-                "edges, block top-k, adaptive reach)",
-                "leaf_size": args.leafwalk_leaf_size,
-                "r_max_tail": args.leafwalk_tail,
-                "note": "distances only (no indices); exact within r_max, "
-                "checked: no inf / overflow in any row",
+                "walk": "fast_knn: cell-aligned buckets + Pallas mutual walk + "
+                "Pallas leaf top-k",
+                "leaf_size": args.fast_leaf_size,
+                "note": "plan (capacities, theta) made in the first, untimed call "
+                "per size; uncertified rows are NaN",
             }
         elif name in ("jaxkd", "jaxkd-cuda"):
             if args.periodic:
@@ -394,7 +342,7 @@ def main(argv=None) -> int:
             {
                 "bench": "baselines/knn_forward",
                 "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree'); "
-                "yggdrax-leafwalk: distributed_knn on a 1-device mesh",
+                "yggdrax-fast: yggdrax.fast_knn",
             }
         ),
         "params": vars(args),
