@@ -4,7 +4,17 @@ Times one forward k-nearest-neighbour search, tree build included, at matched
 ``N``, ``Q``, ``k`` and dtype, for every code that is installed:
 
 * ``yggdrax``: ``build_kdtree`` + ``query_neighbors(backend="tree")``, the
-  search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX);
+  search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX). One
+  traced ``while_loop`` per query that visits one point per iteration: the CPU
+  KD-tree design, which a GPU runs as divergent serial threads;
+* ``yggdrax-leafwalk``: :func:`yggdrax.distributed.stats.distributed_knn` on a
+  one-device mesh (jitted, pure JAX): a dual-tree walk that emits (query leaf,
+  source leaf) edges and a block top-k per edge, the GPU design of the C2/C4
+  rows (and of JZ-Tree). It returns sorted distances, not indices, and searches
+  within a cap ``r_max`` that :func:`_leafwalk_r_max` sets from the Poisson
+  tail of the k-th neighbour distance; the adaptive first pass sets each node's
+  actual reach, so the cap is a bound, not the work. Its check is distances
+  only, plus no ``inf`` (a neighbour past the cap) and no overflow in ANY row;
 * ``jaxkd``: ``jaxkd.build_and_query`` (pure JAX; Dodge, github.com/dodgebc/jaxkd);
 * ``jaxkd-cuda``: the same with ``cuda=True`` (its optional CUDA extension; GPU);
 * ``jztree``: ``jztree.knn.knn`` (JZ-Tree, Stücker et al., arXiv:2604.05885;
@@ -44,6 +54,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+
+import numpy as np
 import sys
 import time
 from pathlib import Path
@@ -61,7 +73,7 @@ from bench.differentiability._common import (  # noqa: E402
     time_callable,
 )
 
-ARMS = ("yggdrax", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
+ARMS = ("yggdrax", "yggdrax-leafwalk", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -74,6 +86,19 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--box", type=float, default=1.0, help="side L of the cube")
     p.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     p.add_argument("--leaf-size", type=int, default=32, help="yggdrax KD leaf size")
+    p.add_argument(
+        "--leafwalk-leaf-size",
+        type=int,
+        default=32,
+        help="yggdrax-leafwalk cell-tree leaf size",
+    )
+    p.add_argument(
+        "--leafwalk-tail",
+        type=float,
+        default=1e-6,
+        help="yggdrax-leafwalk: expected number of queries whose k-th neighbour "
+        "lies beyond r_max (sets r_max from the Poisson tail)",
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -110,6 +135,31 @@ def _version(dist: str) -> str | None:
         return None
 
 
+def _leafwalk_r_max(n: int, q: int, k: int, box: float, periodic: bool, tail: float):
+    """Search cap of the ``yggdrax-leafwalk`` arm for ``n`` uniform points.
+
+    The count of data points within ``r`` of a query is Poisson with mean
+    ``lam = frac * n * (4/3) pi r^3 / L^3``; the k-th neighbour lies beyond
+    ``r`` with probability ``P(Poisson(lam) < k)``. ``r_max`` is the smallest
+    radius at which the expected number of such queries, ``q`` times that, is
+    ``tail``. ``frac`` is the part of the ball inside the box: 1 periodic, 1/8
+    in an open box (a query in a corner), so open boxes get the corner's cap.
+    Periodic caps stay below ``L/2`` (the minimum image).
+    """
+    from scipy.stats import poisson
+
+    target = tail / max(q, 1)
+    lam_lo, lam_hi = float(k), float(k)
+    while poisson.cdf(k - 1, lam_hi) > target:
+        lam_hi *= 1.5
+    for _ in range(80):
+        mid = 0.5 * (lam_lo + lam_hi)
+        lam_lo, lam_hi = (mid, lam_hi) if poisson.cdf(k - 1, mid) > target else (lam_lo, mid)
+    frac = 1.0 if periodic else 0.125
+    r = (3.0 * lam_hi * box**3 / (4.0 * np.pi * n * frac)) ** (1.0 / 3.0)
+    return float(min(r, 0.499 * box)) if periodic else float(r)
+
+
 def _make_arms(
     args: argparse.Namespace, platform: str
 ) -> tuple[dict[str, Callable], dict[str, Any]]:
@@ -128,7 +178,6 @@ def _make_arms(
         The runnable arms, and per arm ``{available, reason, version}``.
     """
     import jax
-    import numpy as np
 
     box = args.box if args.periodic else None
     fns: dict[str, Callable] = {}
@@ -151,6 +200,60 @@ def _make_arms(
 
             fns[name] = jax.jit(ygg, static_argnums=2)
             info[name] = {"available": True, "version": _version("yggdrax")}
+        elif name == "yggdrax-leafwalk":
+            import jax.numpy as jnp
+
+            from yggdrax.distributed import make_mesh
+            from yggdrax.distributed.stats import (
+                DistributedStatsConfig,
+                distributed_knn,
+            )
+
+            mesh = make_mesh(1)
+
+            def leafwalk(data, queries, k, _box=box):
+                n, q = int(data.shape[0]), int(queries.shape[0])
+                r_max = _leafwalk_r_max(
+                    n, q, k, args.box, args.periodic, args.leafwalk_tail
+                )
+                cfg = DistributedStatsConfig.for_box(
+                    n + q,
+                    ndev=1,
+                    box_size=args.box,
+                    reach=r_max,
+                    leaf_size=args.leafwalk_leaf_size,
+                    clustering=1.0,
+                )
+                bounds = (
+                    None
+                    if _box is not None
+                    else (np.zeros(3), np.full(3, float(args.box)))
+                )
+                res = distributed_knn(
+                    data,
+                    queries=queries,
+                    k=k,
+                    r_max=r_max,
+                    box_size=_box,
+                    bounds=bounds,
+                    config=cfg,
+                    mesh=mesh,
+                )
+                # an overflowed walk is not a result: poison every row
+                dist = jnp.where(res.overflow, jnp.nan, res.distances)
+                return dist, None
+
+            fns[name] = jax.jit(leafwalk, static_argnums=2)
+            info[name] = {
+                "available": True,
+                "version": _version("yggdrax"),
+                "walk": "distributed_knn, 1-device mesh (dual-tree leaf-pair "
+                "edges, block top-k, adaptive reach)",
+                "leaf_size": args.leafwalk_leaf_size,
+                "r_max_tail": args.leafwalk_tail,
+                "note": "distances only (no indices); exact within r_max, "
+                "checked: no inf / overflow in any row",
+            }
         elif name in ("jaxkd", "jaxkd-cuda"):
             if args.periodic:
                 skip(name, "jaxkd has no periodic boundaries")
@@ -234,19 +337,29 @@ def _reference(data64, queries64, k: int, box):
     return dist.reshape(q, k), idx.reshape(q, k)
 
 
-def _agreement(dist, idx, ref_dist, ref_idx, args) -> dict[str, Any]:
-    """Compare an arm's neighbours with the reference on the check queries."""
-    import numpy as np
+def _agreement(dist, idx, ref_dist, ref_idx, args, nonfinite=0) -> dict[str, Any]:
+    """Compare an arm's neighbours with the reference on the check queries.
 
+    ``idx`` is ``None`` for an arm that returns distances only; its check is
+    the distances alone. ``nonfinite`` counts non-finite distances over ALL
+    rows (not only the checked ones); any makes the arm fail.
+    """
     dist = np.sort(np.asarray(dist, dtype=np.float64), axis=1)
-    idx = np.asarray(idx)
     rel = np.abs(dist - ref_dist) / np.maximum(ref_dist, 1e-300)
-    same_set = np.all(np.sort(idx, axis=1) == np.sort(ref_idx, axis=1), axis=1)
-    frac = float(np.mean(same_set))
     max_rel = float(np.max(rel))
-    ok = bool(max_rel <= args.check_rtol and frac >= args.check_min_index_agreement)
+    frac = None
+    if idx is not None:
+        idx = np.asarray(idx)
+        same_set = np.all(np.sort(idx, axis=1) == np.sort(ref_idx, axis=1), axis=1)
+        frac = float(np.mean(same_set))
+    ok = bool(
+        max_rel <= args.check_rtol
+        and (frac is None or frac >= args.check_min_index_agreement)
+        and nonfinite == 0
+    )
     return {
         "ok": ok,
+        "nonfinite_distances_all_rows": int(nonfinite),
         "checked_queries": int(len(ref_dist)),
         "max_rel_distance_error": max_rel,
         "index_set_agreement": frac,
@@ -271,7 +384,6 @@ def main(argv=None) -> int:
     # keep --dtype.
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
-    import numpy as np
 
     platform = jax.default_backend()
     fns, arm_info = _make_arms(args, platform)
@@ -281,7 +393,8 @@ def main(argv=None) -> int:
         "metadata": run_metadata(
             {
                 "bench": "baselines/knn_forward",
-                "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree')",
+                "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree'); "
+                "yggdrax-leafwalk: distributed_knn on a 1-device mesh",
             }
         ),
         "params": vars(args),
@@ -320,18 +433,22 @@ def main(argv=None) -> int:
                     t0 = time.perf_counter()
                     dist, idx = _block(fn(data, queries, k))
                     row["first_call_s"] = time.perf_counter() - t0
+                    dist_np = np.asarray(dist)
                     agree = _agreement(
-                        np.asarray(dist)[:nc],
-                        np.asarray(idx)[:nc],
+                        dist_np[:nc],
+                        None if idx is None else np.asarray(idx)[:nc],
                         ref_dist,
                         ref_idx,
                         args,
+                        nonfinite=int(np.sum(~np.isfinite(dist_np))),
                     )
                     row["agreement"] = agree
+                    sets = agree["index_set_agreement"]
                     print(
                         f"[knn-forward] n={n} k={k} {name}: agreement ok={agree['ok']} "
                         f"max_rel={agree['max_rel_distance_error']:.2e} "
-                        f"sets={agree['index_set_agreement']:.4f}"
+                        f"sets={'n/a' if sets is None else f'{sets:.4f}'} "
+                        f"nonfinite={agree['nonfinite_distances_all_rows']}"
                     )
                     if not agree["ok"] and not args.time_anyway:
                         row["timing"] = None

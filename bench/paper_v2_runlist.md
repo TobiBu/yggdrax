@@ -245,6 +245,15 @@ queries, so no self-match conventions), k and dtype (float32).
 
 - **yggdrax**: `build_kdtree` + `query_neighbors(backend="tree")`, the search
   B1's kNN-CDF uses.
+  It is one traced `while_loop` per query visiting one point per iteration (the
+  CPU KD-tree design), which a GPU runs as divergent serial threads.
+- **yggdrax-leafwalk**: `distributed_knn` on a one-device mesh: the static
+  cell-tree build, a dual-tree walk emitting (query leaf, source leaf) edges and
+  a block top-k per edge (the C2/C4 engine). Distances only, exact within a cap
+  `r_max` set from the Poisson tail of the k-th neighbour distance (open boxes:
+  the corner's); the check also fails on any `inf` or overflow in any row. Its
+  walk is the XLA `flat` walk: the Pallas walk takes no custom accept/discard
+  rule and no periodic box.
 - **jaxkd** 0.1.2: pure JAX. It breaks under `jax_enable_x64`: its `lax.cond`
   branches mix float32 and float64. The bench therefore traces it inside
   `jax.enable_x64(False)`, which is harmless for float32 inputs. jaxkd has no
