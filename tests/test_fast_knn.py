@@ -124,6 +124,17 @@ def test_traversal_pallas_interpret_matches_ckdtree(n, nq, k, kind):
     _assert_exact(res, data, queries, k)
 
 
+@pytest.mark.parametrize("n, nq, k", [(800, 500, 32), (900, 0, 8), (1000, 900, 16)])
+def test_traversal_clustered_matches_ckdtree(n, nq, k):
+    # two trees (separate queries) and one tree (self) on clustered points,
+    # with k == W (the direct fill) and k < W
+    rng = np.random.default_rng(29 + n + k)
+    data = _clustered(rng, n)
+    queries = None if nq == 0 else _clustered(rng, nq)
+    _, res = _run(data, queries, k, backend="pallas", interpret=True, method="traverse")
+    _assert_exact(res, data, queries, k)
+
+
 def test_walk_method_pallas_interpret_matches_ckdtree():
     rng = np.random.default_rng(17)
     data, queries, k = _uniform(rng, 800), _uniform(rng, 500), 8

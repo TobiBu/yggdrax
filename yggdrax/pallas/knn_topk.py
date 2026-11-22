@@ -21,7 +21,7 @@ CPU reference the parity tests compare against, and the fallback off Ampere.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +44,7 @@ else:
 
 __all__ = [
     "leaf_topk_pallas",
-    "leaf_topk_traverse_pallas",
+    "leaf_topk_preorder_pallas",
     "leaf_topk_xla",
     "next_pow2",
 ]
@@ -107,10 +107,33 @@ def _need(q, cx, cy, cz, cr, kt):
     return need, jnp.max(jnp.where(need, 1, 0)) > 0
 
 
+def _need_box(q, lo, hi, kt):
+    """Lanes whose k-th ball reaches the box ``[lo, hi]``, and whether any do.
+
+    Point-to-box distance, tighter than a bounding sphere around a box. Exact
+    as a bound in float32: ``lo`` and ``hi`` are actual point coordinates and
+    rounding is monotone, so it never exceeds a member point's distance. An
+    empty box (``lo = +inf``, ``hi = -inf``) is never reached.
+    """
+    zero = jnp.float32(0.0)
+    d2 = zero
+    for qc, l_, h_ in zip(q[:3], lo, hi):
+        g = jnp.maximum(jnp.maximum(l_ - qc, qc - h_), zero)
+        d2 = d2 + g * g
+    need = d2 < kt
+    return need, jnp.max(jnp.where(need, 1, 0)) > 0
+
+
 def _make_merge(
     x_ref, y_ref, z_ref, dmask_ref, slot_ref, q, *, width, kpad, exclude_self
 ):
-    """``merge(s, need, carry)``: fold source leaf ``s`` into the running top-k."""
+    """``(merge, fill)``: fold source leaf ``s`` into the running top-k.
+
+    ``merge(s, need, carry)`` inserts, one candidate per lane per step, every
+    candidate that beats the lane's current k-th distance (replacing its
+    worst). ``fill(s, need, carry)`` is the first merge into an empty top-k
+    when ``Kp == W == k``: the block becomes the top-k without a loop.
+    """
     qx, qy, qz, qv, qslot = q
     lanes = pl.dslice(0, width)
     inf = jnp.float32(_INF)
@@ -159,7 +182,29 @@ def _make_merge(
         _, _, bd, bi, kt = lax.while_loop(cond_fn, body_fn, (d2, mn, bd, bi, kt))
         return bd, bi, kt
 
-    return merge
+    def fill(s: Any, need: Any, carry: tuple) -> tuple:
+        """First merge into an EMPTY top-k with ``Kp == W == k``: the block IS
+        the top-k (no loop), unsorted, as replace-the-worst keeps it."""
+        del carry
+        sx = x_ref[s, lanes]
+        sy = y_ref[s, lanes]
+        sz = z_ref[s, lanes]
+        sv = dmask_ref[s, lanes] != 0
+        ss = slot_ref[s, lanes]
+        s0 = slot_ref[s, 0]
+        dx = sx[:, None] - qx[None, :]
+        dy = sy[:, None] - qy[None, :]
+        dz = sz[:, None] - qz[None, :]
+        d2 = dx * dx + dy * dy + dz * dz
+        ok = sv[:, None] & need[None, :]
+        if exclude_self:
+            ok = ok & (ss[:, None] != qslot[None, :])
+        bd = jnp.where(ok, d2, inf)
+        bi = jnp.where(ok, s0 + iota_s, -1)
+        kt = jnp.where(qv, jnp.max(bd, axis=0), neg)
+        return bd, bi, kt
+
+    return merge, fill
 
 
 def _sorted(best_d, best_i, *, width, kpad):
@@ -286,7 +331,7 @@ def _leaf_topk_kernel(
     q, carry = _lane_state(
         x_ref, y_ref, z_ref, qmask_ref, slot_ref, t, width=width, k=k, kpad=kpad
     )
-    merge = _make_merge(
+    merge, _ = _make_merge(
         x_ref,
         y_ref,
         z_ref,
@@ -309,112 +354,152 @@ def _leaf_topk_kernel(
     _write_sorted(out_d_ref, out_i_ref, best_d, best_i, width=width, kpad=kpad)
 
 
-def _leaf_topk_traverse_kernel(
+def _leaf_topk_preorder_kernel(
     x_ref: KernelRef,
     y_ref: KernelRef,
     z_ref: KernelRef,
     dmask_ref: KernelRef,
     qmask_ref: KernelRef,
     slot_ref: KernelRef,
-    ncx_ref: KernelRef,
-    ncy_ref: KernelRef,
-    ncz_ref: KernelRef,
-    nr_ref: KernelRef,
-    first_ref: KernelRef,
-    skip_ref: KernelRef,
-    nlo_ref: KernelRef,
-    nhi_ref: KernelRef,
+    tx_ref: KernelRef,
+    ty_ref: KernelRef,
+    tz_ref: KernelRef,
+    tq_ref: KernelRef,
+    tslot_ref: KernelRef,
+    seedc_ref: KernelRef,
+    llox_ref: KernelRef,
+    lloy_ref: KernelRef,
+    lloz_ref: KernelRef,
+    lhix_ref: KernelRef,
+    lhiy_ref: KernelRef,
+    lhiz_ref: KernelRef,
+    plox_ref: KernelRef,
+    ploy_ref: KernelRef,
+    ploz_ref: KernelRef,
+    phix_ref: KernelRef,
+    phiy_ref: KernelRef,
+    phiz_ref: KernelRef,
+    pleaf_ref: KernelRef,
+    psize_ref: KernelRef,
+    pnlo_ref: KernelRef,
+    pnhi_ref: KernelRef,
     qid_ref: KernelRef,
     out_d_ref: KernelRef,
     out_i_ref: KernelRef,
-    *maybe_stats_ref: KernelRef,
+    *,
     width: int,
     k: int,
     kpad: int,
     exclude_self: bool,
     num_leaves: int,
-    num_internal: int,
-    root: int,
     end: int,
     seed: int,
     nout: int,
+    line: int,
+    profile: str = "full",
 ) -> None:
-    """Exact top-``k`` of one target leaf by a stackless packet traversal.
+    """Exact top-``k`` of one target leaf: packet traversal in pre-order lines.
 
-    The leaf's lanes walk the tree together in pre-order: a node is entered when
-    any lane's k-th ball reaches its sphere and skipped (``skip_ref``, the next
-    pre-order node after its subtree) otherwise; a reached leaf is merged. The
-    leaves ``t - seed .. t + seed`` (Morton neighbours) are merged first, so the
-    walk starts with finite k-th distances, and are skipped by the walk.
+    The nodes are numbered in pre-order, so entering a node is ``p + 1`` and
+    skipping its subtree is ``p + size[p]``. Both mostly land a few positions
+    ahead, so the program loads a LINE of ``line`` consecutive nodes with one
+    vector load and walks inside it, reloading only when a skip leaves the
+    line: most steps then cost no memory round trip (the old walk paid one per
+    node, ~500 per program at 1e6).
 
     Parameters
     ----------
     x_ref
-        Leaf tables, as :func:`_leaf_topk_kernel`.
+        Leaf-major ``(L, W)`` coordinates, as :func:`_leaf_topk_kernel`.
     y_ref
         As ``x_ref``.
     z_ref
         As ``x_ref``.
     dmask_ref
-        As ``x_ref``.
+        ``(L, W)`` int32 data lanes.
     qmask_ref
-        As ``x_ref``.
+        ``(L, W)`` int32 query lanes.
     slot_ref
-        As ``x_ref``.
-    ncx_ref
-        ``(nodes,)`` bounding sphere of every node (radius ``-inf`` on empty
-        nodes, which are then never entered).
-    ncy_ref
-        As ``ncx_ref``.
-    ncz_ref
-        As ``ncx_ref``.
-    nr_ref
-        As ``ncx_ref``.
-    first_ref
-        ``(nodes,)`` first child of an internal node, ``-1`` on leaves.
-    skip_ref
-        ``(nodes,)`` next pre-order node after the subtree (``end`` for none).
-    nlo_ref
-        ``(nodes,)`` first and last leaf of each node's subtree: a subtree inside
-        the seed window is skipped whole.
-    nhi_ref
-        As ``nlo_ref``.
+        ``(L, W)`` int32 sorted slot of each lane.
+    tx_ref
+        ``(T, W)`` TARGET (query) block coordinates (x); the source tables
+        above again when queries are the data.
+    ty_ref
+        As ``tx_ref`` (y).
+    tz_ref
+        As ``tx_ref`` (z).
+    tq_ref
+        ``(T, W)`` int32: lane is a live query.
+    tslot_ref
+        ``(T, W)`` int32 source slot of the query itself (self-exclusion).
+    seedc_ref
+        ``(T,)`` int32 source leaf the seed window is centred on.
+    llox_ref
+        ``(L,)`` leaf box lower corner (x), for the seed window (``+inf``
+        on an empty leaf).
+    lloy_ref
+        As ``llox_ref`` (y).
+    lloz_ref
+        As ``llox_ref`` (z).
+    lhix_ref
+        ``(L,)`` leaf box upper corner (x) (``-inf`` on an empty leaf).
+    lhiy_ref
+        As ``lhix_ref`` (y).
+    lhiz_ref
+        As ``lhix_ref`` (z).
+    plox_ref
+        ``(P,)`` node box lower corner in pre-order, padded by ``line``.
+    ploy_ref
+        As ``plox_ref``.
+    ploz_ref
+        As ``plox_ref``.
+    phix_ref
+        ``(P,)`` node box upper corner in pre-order.
+    phiy_ref
+        As ``phix_ref``.
+    phiz_ref
+        As ``phix_ref``.
+    pleaf_ref
+        ``(P,)`` leaf row of a leaf node, ``-1`` for an internal one.
+    psize_ref
+        ``(P,)`` subtree size (the skip distance).
+    pnlo_ref
+        ``(P,)`` first leaf of the subtree.
+    pnhi_ref
+        ``(P,)`` last leaf of the subtree.
     qid_ref
         ``(L, W)`` int32 output row of each query lane (``-1``: not a query).
     out_d_ref
-        **Outputs** ``(Q * k,)``: each query's ascending squared distances and
-        source slots, scattered to its row.
+        **Output** ``(Q * k + tail,)`` squared distances, scattered by query.
     out_i_ref
-        As ``out_d_ref``.
-    *maybe_stats_ref
-        Optional ``(1, W)`` output of per-program counters (``debug_stats``).
+        **Output**, the matching source slots.
     width
-        As :func:`_leaf_topk_kernel`. Static.
+        ``W``. Static.
     k
-        As ``width``.
+        Neighbours. Static.
     kpad
-        As ``width``.
+        ``Kp``. Static.
     exclude_self
-        As ``width``.
+        Skip the query's own slot. Static.
     num_leaves
-        Tree layout (leaf ``l`` is node ``num_internal + l``) and the seed
-        half-width. Static.
-    num_internal
-        As ``num_leaves``.
-    root
-        As ``num_leaves``.
+        ``L``, the SOURCE leaf count. Static.
     end
-        As ``num_leaves``.
+        Number of nodes (the walk ends there). Static.
     seed
-        As ``num_leaves``.
+        Seed half-width (Morton-neighbour leaves merged first). Static.
     nout
-        ``Q * k``: live output entries; a scratch tail follows. Static.
+        ``Q * k``. Static.
+    line
+        Nodes per line load, a power of two. Static.
+    profile
+        ``"full"``; ``"seed"`` (seed window only) and ``"nomerge"`` (walk
+        without leaf merges) give WRONG results and exist to time the phases.
     """
     t = pl.program_id(0)
     q, carry = _lane_state(
-        x_ref, y_ref, z_ref, qmask_ref, slot_ref, t, width=width, k=k, kpad=kpad
+        tx_ref, ty_ref, tz_ref, tq_ref, tslot_ref, t, width=width, k=k, kpad=kpad
     )
-    merge = _make_merge(
+    merge, fill = _make_merge(
         x_ref,
         y_ref,
         z_ref,
@@ -425,51 +510,96 @@ def _leaf_topk_traverse_kernel(
         kpad=kpad,
         exclude_self=exclude_self,
     )
-    lo = jnp.maximum(t - seed, 0)
-    hi = jnp.minimum(t + seed + 1, num_leaves)
+    c0 = seedc_ref[t]
+    lo = jnp.maximum(c0 - seed, 0)
+    hi = jnp.minimum(c0 + seed + 1, num_leaves)
+    iota_b = lax.broadcasted_iota(jnp.int32, (line,), 0)
+    refs = (
+        plox_ref,
+        ploy_ref,
+        ploz_ref,
+        phix_ref,
+        phiy_ref,
+        phiz_ref,
+        pleaf_ref,
+        psize_ref,
+        pnlo_ref,
+        pnhi_ref,
+    )
+
+    def _load(n: Any) -> tuple:
+        # an index-vector gather (a dynamic-start slice of a 1-D ref does not
+        # lower); the arrays are padded by ``line`` so it never runs past
+        at = n + iota_b
+        return tuple(r[at] for r in refs)
+
+    def _pick(v: Any, sel: Any) -> Any:
+        if jnp.issubdtype(v.dtype, jnp.floating):
+            return jnp.sum(jnp.where(sel, v, jnp.zeros((), v.dtype)))
+        return jnp.sum(jnp.where(sel, v, 0), dtype=jnp.int32)
+
+    def _leaf_need(sc: Any, kt: Any) -> tuple:
+        return _need_box(
+            q,
+            (llox_ref[sc], lloy_ref[sc], lloz_ref[sc]),
+            (lhix_ref[sc], lhiy_ref[sc], lhiz_ref[sc]),
+            kt,
+        )
+
+    # 1. the seed window, centre-out (c0, c0+1, c0-1, ...): the nearest leaves
+    #    first. With Kp == W == k the centre leaf fills the empty top-k
+    #    directly, without the per-candidate loop.
+    first = jnp.int32(0)
+    if kpad == width == k:
+        need0, any0 = _leaf_need(c0, carry[2])
+        carry = lax.cond(any0, lambda c: fill(c0, need0, c), lambda c: c, carry)
+        first = jnp.int32(1)
 
     def _seed(e: Any, carry: tuple) -> tuple:
-        # centre-out: t, t+1, t-1, t+2, ... so the nearest leaves fill first
         half = (e + 1) // 2
-        s = jnp.where(e % 2 == 1, t + half, t - half)
+        s = jnp.where(e % 2 == 1, c0 + half, c0 - half)
         ok = (s >= lo) & (s < hi)
         sc = jnp.clip(s, 0, num_leaves - 1)
-        node = num_internal + sc
-        need, any_need = _need(
-            q, ncx_ref[node], ncy_ref[node], ncz_ref[node], nr_ref[node], carry[2]
-        )
+        need, any_need = _leaf_need(sc, carry[2])
         return lax.cond(ok & any_need, lambda c: merge(sc, need, c), lambda c: c, carry)
 
-    carry = lax.fori_loop(jnp.int32(0), jnp.int32(2 * seed + 1), _seed, carry)
+    carry = lax.fori_loop(first, jnp.int32(2 * seed + 1), _seed, carry)
 
+    # 2. the packet walk over the pre-order lines
     def _cond(st: tuple) -> Any:
         return st[0] < end
 
     def _body(st: tuple) -> tuple:
-        node, bd, bi, kt, nv, nm = st
-        need, any_need = _need(
-            q, ncx_ref[node], ncy_ref[node], ncz_ref[node], nr_ref[node], kt
+        node, base, lines, bd, bi, kt = st
+        reload = (node < base) | (node >= base + line)
+        base, lines = lax.cond(
+            reload,
+            lambda o: (o[0], _load(o[0])),
+            lambda o: (o[1], o[2]),
+            (node, base, lines),
         )
-        child = first_ref[node]
-        leaf = node - num_internal
+        sel = iota_b == (node - base)
+        lx, ly, lz, hx, hy, hz, leaf, size, nlo, nhi = (_pick(v, sel) for v in lines)
+        need, any_need = _need_box(q, (lx, ly, lz), (hx, hy, hz), kt)
         # a subtree wholly inside the seed window was merged already
-        inside = (nlo_ref[node] >= lo) & (nhi_ref[node] < hi)
-        any_need = any_need & ~inside
-        do_merge = any_need & (child < 0)
-        bd, bi, kt = lax.cond(
-            do_merge, lambda c: merge(leaf, need, c), lambda c: c, (bd, bi, kt)
-        )
-        nxt = jnp.where(any_need & (child >= 0), child, skip_ref[node])
-        return nxt, bd, bi, kt, nv + 1, nm + jnp.where(do_merge, 1, 0)
+        any_need = any_need & ~((nlo >= lo) & (nhi < hi))
+        is_leaf = leaf >= 0
+        if profile != "nomerge":
+            bd, bi, kt = lax.cond(
+                any_need & is_leaf,
+                lambda c: merge(jnp.maximum(leaf, 0), need, c),
+                lambda c: c,
+                (bd, bi, kt),
+            )
+        nxt = jnp.where(any_need & ~is_leaf, node + 1, node + size)
+        return nxt, base, lines, bd, bi, kt
 
-    zero = jnp.int32(0)
-    _, best_d, best_i, _, n_visit, n_merge = lax.while_loop(
-        _cond, _body, (jnp.int32(root), carry[0], carry[1], carry[2], zero, zero)
-    )
-    if maybe_stats_ref:
-        lane_i = lax.broadcasted_iota(jnp.int32, (width,), 0)
-        maybe_stats_ref[0][0, :] = jnp.where(
-            lane_i == 0, n_visit, jnp.where(lane_i == 1, n_merge, 0)
+    if profile == "seed":
+        best_d, best_i = carry[0], carry[1]
+    else:
+        zero = jnp.int32(0)
+        _, _, _, best_d, best_i, _ = lax.while_loop(
+            _cond, _body, (zero, zero, _load(zero), carry[0], carry[1], carry[2])
         )
     qid = qid_ref[t, pl.dslice(0, width)]
     _scatter_sorted(
@@ -618,98 +748,80 @@ def leaf_topk_pallas(
     return d2[..., kpad - k :], idx[..., kpad - k :]
 
 
-def leaf_topk_traverse_pallas(
+def leaf_topk_preorder_pallas(
     x: Any,
     y: Any,
     z: Any,
     dmask: Any,
     qmask: Any,
     slot: Any,
-    ncx: Any,
-    ncy: Any,
-    ncz: Any,
-    nr: Any,
-    first: Any,
-    skip: Any,
-    node_lo: Any,
-    node_hi: Any,
+    leaf_boxes: tuple,
+    preorder: tuple,
     qid: Any,
     *,
+    targets: Optional[tuple] = None,
     num_queries: int,
     k: int,
     exclude_self: bool,
-    num_internal: int,
-    root: int,
-    seed: int = 16,
+    seed: int = 8,
+    line: int = 32,
     num_warps: int | None = None,
     num_stages: int = 1,
     interpret: bool = False,
-    debug_stats: bool = False,
-) -> tuple[Any, ...]:
-    """Exact per-lane top-``k`` by a stackless packet traversal of the tree.
+    profile: str = "full",
+) -> tuple[Any, Any]:
+    """Exact per-lane top-``k`` by a line-cached pre-order packet traversal.
 
     Parameters
     ----------
     x
-        ``(L, W)`` leaf tables, as :func:`leaf_topk_pallas`.
+        ``(L, W)`` leaf-major x coordinates (``W`` a power of two).
     y
         As ``x``.
     z
         As ``x``.
     dmask
-        As ``x``.
+        ``(L, W)`` int32 data lanes.
     qmask
-        As ``x``.
+        ``(L, W)`` int32 query lanes.
     slot
-        As ``x``.
-    ncx
-        ``(nodes,)`` float32 node spheres; ``nr = -inf`` marks an empty node.
-    ncy
-        As ``ncx``.
-    ncz
-        As ``ncx``.
-    nr
-        As ``ncx``.
-    first
-        ``(nodes,)`` int32 first child (``-1`` on leaves) and pre-order skip
-        (``nodes`` past the end).
-    skip
-        As ``first``.
-    node_lo
-        ``(nodes,)`` int32 first and last leaf of each node's subtree.
-    node_hi
-        As ``node_lo``.
+        ``(L, W)`` int32 sorted slot of each lane.
+    leaf_boxes
+        ``(lox, loy, loz, hix, hiy, hiz)``, each ``(L,)``: leaf AABBs
+        (``+inf`` / ``-inf`` on an empty leaf).
+    preorder
+        ``(lox, loy, loz, hix, hiy, hiz, leaf, size, nlo, nhi)``, each ``(P,)``
+        in pre-order (node AABBs, leaf row or ``-1``, subtree size, first and
+        last leaf), NOT yet padded.
     qid
-        ``(L, W)`` int32 output row of each query lane, ``-1`` elsewhere.
+        ``(T, W)`` int32 output row of each query lane, ``-1`` elsewhere.
+    targets
+        ``(tx, ty, tz, tq, tslot, seedc)``: separate query blocks ``(T, W)``
+        and the source leaf each one's seed window is centred on ``(T,)``.
+        ``None``: the queries are the source lanes with ``qmask`` (one tree).
     num_queries
-        ``Q``, the number of output rows.
+        ``Q``.
     k
         Neighbours per query.
     exclude_self
         Skip the query's own slot.
-    num_internal
-        Leaf ``l`` is node ``num_internal + l``; the walk starts at ``root``.
-    root
-        As ``num_internal``.
     seed
-        Morton-neighbour leaves merged first on each side of the target (a
-        window of ``2 seed + 1``); the walk then skips subtrees inside it.
+        Morton-neighbour leaves merged first on each side of the target.
+    line
+        Nodes per line load (a power of two).
     num_warps
-        As :func:`leaf_topk_pallas`.
+        Triton warps per program (``None``: 1 for ``W <= 32``, else 2).
     num_stages
-        As ``num_warps``.
+        Triton pipeline stages.
     interpret
-        As ``num_warps``.
-    debug_stats
-        Also return ``(L, W)`` int32 per-program counters: lane 0 nodes tested,
-        lane 1 leaves merged by the walk (profiling only).
-
+        Run in Pallas interpret mode (CPU semantics).
+    profile
+        Phase timing only (see :func:`_leaf_topk_preorder_kernel`).
     Returns
     -------
     tuple
-        ``(d2, idx)``, each ``(Q, k)`` in query order: ascending squared
-        distances (``inf`` where fewer than ``k`` were reached) and source
-        slots (``-1`` there); ``(d2, idx, stats)`` with ``debug_stats``.
+        ``(d2, idx)``, each ``(Q, k)`` in query order, as
+        :func:`leaf_topk_pallas`.
 
     Raises
     ------
@@ -718,48 +830,71 @@ def leaf_topk_traverse_pallas(
     """
     if pl is None:  # pragma: no cover - environment-dependent
         raise RuntimeError("jax.experimental.pallas is not available")
-    num_leaves, width, kpad = _check_inputs(x, first, k)
-    nodes = int(first.shape[0])
+    num_leaves, width, kpad = _check_inputs(x, qid, k)
+    if targets is None:
+        targets = (x, y, z, qmask, slot, jnp.arange(num_leaves, dtype=jnp.int32))
+    num_targets = int(targets[0].shape[0])
+    nodes = int(preorder[0].shape[0])
     if num_warps is None:
         num_warps = 1 if width <= 32 else 2
+    line = next_pow2(line)
+    nout = int(num_queries) * int(k)
+    ntot = nout + kpad * width
+
+    def _pad(a: Any, fill: Any, dtype: Any) -> Any:
+        return jnp.concatenate([a.astype(dtype), jnp.full((line,), fill, dtype)])
+
+    lox, loy, loz, hix, hiy, hiz, pleaf, psize, pnlo, pnhi = preorder
+    padded = (
+        _pad(lox, jnp.inf, jnp.float32),
+        _pad(loy, jnp.inf, jnp.float32),
+        _pad(loz, jnp.inf, jnp.float32),
+        _pad(hix, -jnp.inf, jnp.float32),
+        _pad(hiy, -jnp.inf, jnp.float32),
+        _pad(hiz, -jnp.inf, jnp.float32),
+        _pad(pleaf, -1, jnp.int32),
+        _pad(psize, 1, jnp.int32),
+        _pad(pnlo, -1, jnp.int32),
+        _pad(pnhi, -1, jnp.int32),
+    )
 
     def _kernel(*refs: KernelRef) -> None:
-        _leaf_topk_traverse_kernel(
+        _leaf_topk_preorder_kernel(
             *refs,
             width=width,
             k=int(k),
             kpad=kpad,
             exclude_self=bool(exclude_self),
             num_leaves=num_leaves,
-            num_internal=int(num_internal),
-            root=int(root),
             end=nodes,
             seed=int(seed),
             nout=nout,
+            line=line,
+            profile=profile,
         )
 
     full2 = pl.BlockSpec((num_leaves, width), lambda t: (0, 0))
-    node1 = pl.BlockSpec((nodes,), lambda t: (0,))
-    out = pl.BlockSpec((1, kpad, width), lambda t: (t, 0, 0))
-    nout = int(num_queries) * int(k)
-    ntot = nout + kpad * width  # scratch tail for masked lanes
-    out_shape = [
-        jax.ShapeDtypeStruct((ntot,), jnp.float32),
-        jax.ShapeDtypeStruct((ntot,), jnp.int32),
-    ]
+    tgt2 = pl.BlockSpec((num_targets, width), lambda t: (0, 0))
+    tgt1 = pl.BlockSpec((num_targets,), lambda t: (0,))
+    leaf1 = pl.BlockSpec((num_leaves,), lambda t: (0,))
+    node1 = pl.BlockSpec((nodes + line,), lambda t: (0,))
     flat = pl.BlockSpec((ntot,), lambda t: (0,))
-    out_specs = [flat, flat]
-    if debug_stats:
-        out_shape.append(jax.ShapeDtypeStruct((num_leaves, width), jnp.int32))
-        out_specs.append(pl.BlockSpec((1, width), lambda t: (t, 0)))
     call = pl.pallas_call(
         _kernel,
-        out_shape=tuple(out_shape),
-        in_specs=[full2] * 6 + [node1] * 8 + [full2],
-        out_specs=tuple(out_specs),
-        grid=(num_leaves,),
+        out_shape=(
+            jax.ShapeDtypeStruct((ntot,), jnp.float32),
+            jax.ShapeDtypeStruct((ntot,), jnp.int32),
+        ),
+        in_specs=[full2] * 6
+        + [tgt2] * 5
+        + [tgt1]
+        + [leaf1] * 6
+        + [node1] * 10
+        + [tgt2],
+        out_specs=(flat, flat),
+        grid=(num_targets,),
         interpret=bool(interpret),
-        name=f"leaf_topk_traverse_w{width}_k{int(k)}",
+        name=f"leaf_topk_preorder_w{width}_k{int(k)}",
         **pallas_backend_kwargs(
             "triton",
             interpret=bool(interpret),
@@ -767,26 +902,27 @@ def leaf_topk_traverse_pallas(
             num_stages=int(num_stages),
         ),
     )
-    res = call(
+    d2, idx = call(
         x.astype(jnp.float32),
         y.astype(jnp.float32),
         z.astype(jnp.float32),
         dmask.astype(jnp.int32),
         qmask.astype(jnp.int32),
         slot.astype(jnp.int32),
-        ncx.astype(jnp.float32),
-        ncy.astype(jnp.float32),
-        ncz.astype(jnp.float32),
-        nr.astype(jnp.float32),
-        first.astype(jnp.int32),
-        skip.astype(jnp.int32),
-        node_lo.astype(jnp.int32),
-        node_hi.astype(jnp.int32),
+        targets[0].astype(jnp.float32),
+        targets[1].astype(jnp.float32),
+        targets[2].astype(jnp.float32),
+        targets[3].astype(jnp.int32),
+        targets[4].astype(jnp.int32),
+        targets[5].astype(jnp.int32),
+        *(a.astype(jnp.float32) for a in leaf_boxes),
+        *padded,
         qid.astype(jnp.int32),
     )
-    d2 = res[0][:nout].reshape(int(num_queries), int(k))
-    idx = res[1][:nout].reshape(int(num_queries), int(k))
-    return (d2, idx, res[2]) if debug_stats else (d2, idx)
+    return (
+        d2[:nout].reshape(int(num_queries), int(k)),
+        idx[:nout].reshape(int(num_queries), int(k)),
+    )
 
 
 def leaf_topk_xla(

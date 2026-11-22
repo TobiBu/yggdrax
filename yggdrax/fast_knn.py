@@ -12,14 +12,20 @@ static structure. Plain count buckets straddle Morton jumps (at 1e6 one spanned
 the box); cell leaves alone are 5-8x under-filled. A leaf is a dense ``W``-lane
 block (``W`` the next power of two).
 
-**Method "traverse" (default): packet traversal.** One Pallas program per leaf
-(:func:`~yggdrax.pallas.knn_topk.leaf_topk_traverse_pallas`). The leaf's query
-lanes first merge a window of Morton-neighbour leaves, then walk the tree
-together in pre-order with skip pointers (stackless): a node is entered when any
-lane's current k-th ball reaches its bounding sphere. A reached leaf is merged
-into each lane's running top-k (registers, query lanes on the thread axis).
-Exact by construction for any point distribution; the only static size is the
-bucket capacity, so :func:`plan_fast_knn` is one count.
+**Method "traverse" (default): packet traversal.** The data get their own
+tree -- the same buckets under a Morton-prefix (Karras) radix structure, whose
+internal nodes are compact (2.5x fewer node tests than a count-balanced
+structure) -- and separate queries their own cell-aligned blocks of ``W``, so
+every source block is all data and every target block all queries (in one
+shared tree a leaf was ~40 % of each). One Pallas program per query block
+(:func:`~yggdrax.pallas.knn_topk.leaf_topk_preorder_pallas`): its lanes merge
+a centre-out window of Morton-neighbour data leaves (with ``k == W`` the centre
+leaf fills the empty top-k directly), then walk the tree together in
+pre-order -- entering a node is ``p + 1``, skipping it ``p + size`` -- loading
+node boxes a line at a time; a node is entered when any lane's k-th ball
+reaches its box. Reached leaves merge into each lane's running top-k (query
+lanes on the thread axis, so each lane's list is in its own registers).
+Exact by construction; the only static sizes are bucket counts.
 
 **Method "walk": mutual walk + certificate.** The Pallas mutual walk (Dehnen
 MAC at ``theta``) gives every leaf a near list; the top-k runs over it
@@ -46,7 +52,12 @@ import numpy as np
 from jax import lax
 
 from ._cell_partition import MORTON_LEVELS, adaptive_cell_leaf_partition
-from ._tree_impl import RadixTree, _build_balanced_bucket_structure, _morton_sort
+from ._tree_impl import (
+    RadixTree,
+    _build_balanced_bucket_structure,
+    _build_tree_from_leaf_partitions,
+    _morton_sort,
+)
 from .dtypes import INDEX_DTYPE, as_index
 from .geometry import compute_tree_geometry
 from .interactions import dual_tree_walk_mutual, mutual_walk_inputs
@@ -54,7 +65,7 @@ from .morton import morton_encode
 from .pallas._compat import pallas_triton_supported
 from .pallas.knn_topk import (
     leaf_topk_pallas,
-    leaf_topk_traverse_pallas,
+    leaf_topk_preorder_pallas,
     leaf_topk_xla,
     next_pow2,
 )
@@ -95,6 +106,9 @@ class FastKNNPlan(NamedTuple):
     method
         ``"traverse"`` (packet traversal, exact by construction) or ``"walk"``
         (mutual walk + CSR + certificate); see :func:`fast_knn`.
+    query_capacity
+        Traversal with separate queries: static count of query blocks (the
+        data tree then holds the data alone, ``bucket_capacity`` buckets).
     """
 
     num_data: int
@@ -108,6 +122,7 @@ class FastKNNPlan(NamedTuple):
     max_sources: int
     bucket_capacity: int
     method: str = "traverse"
+    query_capacity: int = 0
 
 
 class FastKNN(NamedTuple):
@@ -175,117 +190,6 @@ def _bucket_structure(capacity: int) -> tuple:
     """
     starts = np.arange(capacity, dtype=np.int64)
     return _build_balanced_bucket_structure(starts, starts + 1)
-
-
-@functools.lru_cache(maxsize=32)
-def _preorder(capacity: int) -> tuple:
-    """First child and pre-order skip of every node of the bucket structure.
-
-    ``skip[n]`` is the node visited after ``n``'s subtree in pre-order (the
-    right sibling of the nearest ancestor-or-self that is a left child), or
-    ``nodes`` past the end. Also each node's first and last leaf. Host-side,
-    static per capacity.
-    """
-    parent, left, right = (np.asarray(a) for a in _bucket_structure(capacity)[:3])
-    nodes = int(parent.shape[0])
-    ni = int(left.shape[0])
-    first = np.concatenate([left, np.full(nodes - ni, -1)]).astype(np.int32)
-    lft = np.concatenate([left, np.full(nodes - ni, -1)])
-    rgt = np.concatenate([right, np.full(nodes - ni, -1)])
-    skip = np.full(nodes, nodes, np.int64)
-    cur = np.arange(nodes)
-    done = np.zeros(nodes, bool)
-    for _ in range(nodes.bit_length() + 2):
-        par = parent[cur]
-        top = par < 0
-        pc = np.where(top, 0, par)
-        is_left = ~done & ~top & (lft[pc] == cur)
-        skip[is_left] = rgt[pc[is_left]]
-        done |= is_left | top
-        if done.all():
-            break
-        cur = np.where(done, cur, par)
-    nr = np.asarray(_bucket_structure(capacity)[5])  # bucket units
-    return (
-        first,
-        skip.astype(np.int32),
-        int(np.argmin(parent)),
-        nr[:, 0].astype(np.int32),
-        nr[:, 1].astype(np.int32),
-    )
-
-
-@functools.lru_cache(maxsize=32)
-def _heights(capacity: int) -> tuple[np.ndarray, ...]:
-    """Internal nodes of the bucket structure grouped by subtree height.
-
-    Returns one index array per height ``1, 2, ...``: every node in a group
-    has its children in earlier groups or among the leaves, so the groups can
-    be combined bottom-up in order. Host-side, static per capacity.
-    """
-    parent, left, right = (np.asarray(a) for a in _bucket_structure(capacity)[:3])
-    nodes = int(parent.shape[0])
-    ni = int(left.shape[0])
-    height = np.zeros(nodes, np.int64)
-    # children have larger indices than parents? not guaranteed: iterate to a fixpoint
-    for _ in range(nodes.bit_length() + 2):
-        h_new = height.copy()
-        h_new[:ni] = 1 + np.maximum(height[left], height[right])
-        if np.array_equal(h_new, height):
-            break
-        height = h_new
-    return tuple(
-        np.nonzero(height[:ni] == h)[0].astype(np.int32)
-        for h in range(1, int(height[:ni].max(initial=0)) + 1)
-    )
-
-
-def _spheres(b: "_Built", t: "_Tables") -> tuple[Any, Any]:
-    """Bounding sphere of every node, from the leaf tables (no geometry pass).
-
-    Leaves: AABB centre and the exact largest point distance. Internal nodes:
-    AABB centre of the union and ``min(half-diagonal, max over children of
-    |c - c_child| + r_child)``, an upper bound on the true radius. Empty nodes
-    get centre 0 and radius ``-inf`` (never entered).
-    """
-    valid = t.slot >= 0
-    inf = jnp.asarray(jnp.inf, t.x.dtype)
-    coords = (t.x, t.y, t.z)
-    lo = jnp.stack([jnp.min(jnp.where(valid, c, inf), axis=1) for c in coords], -1)
-    hi = jnp.stack([jnp.max(jnp.where(valid, c, -inf), axis=1) for c in coords], -1)
-    has = jnp.any(valid, axis=1)
-    cen = jnp.where(has[:, None], 0.5 * (lo + hi), 0.0)
-    d2 = sum((c - cen[:, i : i + 1]) ** 2 for i, c in enumerate(coords))
-    rad = jnp.where(has, jnp.sqrt(jnp.max(jnp.where(valid, d2, 0.0), axis=1)), -inf)
-    ni = b.num_internal
-    nodes = ni + b.num_leaves
-    left = jnp.asarray(np.asarray(_bucket_structure(b.num_leaves)[1]), jnp.int32)
-    right = jnp.asarray(np.asarray(_bucket_structure(b.num_leaves)[2]), jnp.int32)
-    LO = jnp.concatenate([jnp.full((ni, 3), inf, lo.dtype), lo])
-    HI = jnp.concatenate([jnp.full((ni, 3), -inf, hi.dtype), hi])
-    C = jnp.concatenate([jnp.zeros((ni, 3), cen.dtype), cen])
-    R = jnp.concatenate([jnp.full((ni,), -inf, rad.dtype), rad])
-    for idx_np in _heights(b.num_leaves):
-        idx = jnp.asarray(idx_np)
-        lc, rc = left[idx], right[idx]
-        nlo = jnp.minimum(LO[lc], LO[rc])
-        nhi = jnp.maximum(HI[lc], HI[rc])
-        live = jnp.all(nlo <= nhi, axis=1)
-        c = jnp.where(live[:, None], 0.5 * (nlo + nhi), 0.0)
-        half = 0.5 * jnp.sqrt(jnp.sum((nhi - nlo) ** 2, axis=1))
-
-        def via(ch):
-            return jnp.where(
-                R[ch] > -inf, jnp.sqrt(jnp.sum((c - C[ch]) ** 2, axis=1)) + R[ch], -inf
-            )
-
-        r = jnp.where(live, jnp.minimum(half, jnp.maximum(via(lc), via(rc))), -inf)
-        LO = LO.at[idx].set(nlo)
-        HI = HI.at[idx].set(nhi)
-        C = C.at[idx].set(c)
-        R = R.at[idx].set(r)
-    del nodes
-    return C, R
 
 
 def _aligned_buckets(scodes: Any, width: int, leaf_size: int) -> tuple[Any, Any]:
@@ -369,6 +273,220 @@ def _build(pts: Any, leaf_size: int, capacity: int, geometry: bool = True) -> _B
     return _Built(topo, ps, inv, geom, ni, int(capacity), width, nb, nb > capacity)
 
 
+def _build_radix(
+    pts: Any, leaf_size: int, capacity: int, bounds: Optional[tuple] = None
+) -> _Built:
+    """Cell-aligned buckets under a Morton-prefix (Karras) radix structure.
+
+    Same leaves as :func:`_build`, but the internal nodes split at Morton
+    prefixes instead of balancing bucket counts, so every internal node is
+    compact (its points share a Morton cell). The packet traversal tests 2.5x
+    fewer nodes on it (1e6 uniform: 502 -> 193 at k = 8). Padding buckets get
+    the largest code, so they sit in one subtree at the right end.
+    """
+    n = int(pts.shape[0])
+    width = next_pow2(int(leaf_size))
+    if bounds is None:
+        bounds = _bounds(pts)
+    codes = morton_encode(pts, bounds)
+    perm, scodes = _morton_sort(codes)
+    flag, nb = _aligned_buckets(scodes, width, leaf_size)
+    starts = jnp.nonzero(flag, size=capacity, fill_value=n)[0].astype(INDEX_DTYPE)
+    ends = jnp.concatenate([starts[1:], jnp.full((1,), n, INDEX_DTYPE)])
+    live = starts < n
+    sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
+    leaf_codes = jnp.where(live, scodes[jnp.minimum(starts, n - 1)], sentinel)
+    topo = _build_tree_from_leaf_partitions(
+        pts,
+        jnp.ones((n,), pts.dtype),
+        perm.astype(INDEX_DTYPE),
+        scodes,
+        starts,
+        ends,
+        bounds,
+        leaf_size=width,
+        return_reordered=False,
+        workspace=None,
+        return_workspace=False,
+        leaf_codes_override=leaf_codes,
+    )
+    ps = pts[perm]
+    inv = jnp.zeros((n,), INDEX_DTYPE).at[perm].set(jnp.arange(n, dtype=INDEX_DTYPE))
+    ni = int(capacity) - 1
+    return _Built(topo, ps, inv, None, ni, int(capacity), width, nb, nb > capacity)
+
+
+class _QueryBlocks(NamedTuple):
+    x: Any
+    y: Any
+    z: Any
+    valid: Any
+    qid: Any
+    first_code: Any
+    count: Any
+
+
+def _query_blocks(
+    qpts: Any, bounds: tuple, leaf_size: int, capacity: int
+) -> _QueryBlocks:
+    """Queries in cell-aligned Morton buckets of at most ``W``: the targets.
+
+    Same partition rule as the data leaves (:func:`_aligned_buckets`), in the
+    data's Morton frame, so a block is compact and its first code locates it
+    among the data leaves (the seed window). ``capacity`` blocks, padded.
+    """
+    nq = int(qpts.shape[0])
+    width = next_pow2(int(leaf_size))
+    codes = morton_encode(qpts, bounds)
+    perm, scodes = _morton_sort(codes)
+    flag, nb = _aligned_buckets(scodes, width, leaf_size)
+    starts = jnp.nonzero(flag, size=capacity, fill_value=nq)[0].astype(INDEX_DTYPE)
+    ends = jnp.concatenate([starts[1:], jnp.full((1,), nq, INDEX_DTYPE)])
+    lane = jnp.arange(width)
+    valid = lane[None, :] < (ends - starts)[:, None]
+    slot = jnp.where(valid, starts[:, None] + lane[None, :], 0)
+    qs = qpts[perm]
+    p = qs[slot]
+    qid = jnp.where(valid, perm[slot], -1).astype(jnp.int32)
+    sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
+    first = jnp.where(starts < nq, scodes[jnp.minimum(starts, nq - 1)], sentinel)
+    return _QueryBlocks(p[..., 0], p[..., 1], p[..., 2], valid, qid, first, nb)
+
+
+def _run_traverse_two(data, queries, plan, interpret, num_warps, seed):
+    """Separate queries: a data-only tree and query-only target blocks.
+
+    In one shared tree a leaf held ~13 data and ~13 query lanes of 32, so every
+    tile ran 40 % full on both sides; here every source block is all data and
+    every target block all queries.
+    """
+    dq = jax.lax.stop_gradient(data)
+    qq = jax.lax.stop_gradient(jnp.asarray(queries, data.dtype))
+    nd, nq = int(dq.shape[0]), int(qq.shape[0])
+    bounds = _bounds(jnp.concatenate([dq, qq]))
+    b = _build_radix(dq, plan.leaf_size, plan.bucket_capacity, bounds=bounds)
+    t = _tables(b, np.ones((nd,), bool), np.zeros((nd,), bool))
+    pre, leaves = _radix_layout(b, t)
+    qb = _query_blocks(qq, bounds, plan.leaf_size, plan.query_capacity)
+    seedc = jnp.clip(
+        jnp.searchsorted(b.topo.leaf_codes, qb.first_code, side="right") - 1,
+        0,
+        b.num_leaves - 1,
+    ).astype(jnp.int32)
+    d2q, sq = leaf_topk_preorder_pallas(
+        t.x,
+        t.y,
+        t.z,
+        t.dmask,
+        t.qmask,
+        t.slot,
+        leaves,
+        pre,
+        qb.qid,
+        targets=(qb.x, qb.y, qb.z, qb.valid, jnp.full_like(qb.qid, -1), seedc),
+        num_queries=nq,
+        k=int(plan.k),
+        exclude_self=False,
+        seed=int(seed),
+        interpret=bool(interpret),
+        num_warps=num_warps,
+    )
+    rows = jnp.where(sq >= 0, b.topo.particle_indices[jnp.clip(sq, 0)], -1)
+    overflow = b.overflow | (qb.count > plan.query_capacity)
+    return d2q, rows.astype(jnp.int32), overflow, {"num_leaves": b.num_buckets}
+
+
+def _radix_layout(b: _Built, t: "_Tables") -> tuple[tuple, tuple]:
+    """Pre-order node arrays and leaf spheres of a radix-built tree (on device).
+
+    Leaf spheres: AABB centre and the exact largest point distance. Internal
+    nodes: AABB of the union (relaxed bottom-up to a fixpoint) with its
+    half-diagonal as radius. A node's leaf range ``[nlo, nhi]`` comes from the
+    same relaxation, its subtree size is ``2 (nhi - nlo + 1) - 1`` and its
+    pre-order position is ``2 nlo + (left turns on its root path)``, the latter
+    summed by pointer jumping. Returns ``(pre, leaves)`` as
+    :func:`~yggdrax.pallas.knn_topk.leaf_topk_preorder_pallas` takes them.
+    """
+    topo = b.topo
+    ni, nl = b.num_internal, b.num_leaves
+    nodes = ni + nl
+    left = topo.left_child.astype(jnp.int32)
+    right = topo.right_child.astype(jnp.int32)
+    parent = topo.parent.astype(jnp.int32)
+    valid = t.slot >= 0
+    inf = jnp.asarray(jnp.inf, t.x.dtype)
+    coords = (t.x, t.y, t.z)
+    llo = jnp.stack([jnp.min(jnp.where(valid, c, inf), axis=1) for c in coords], -1)
+    lhi = jnp.stack([jnp.max(jnp.where(valid, c, -inf), axis=1) for c in coords], -1)
+    has = jnp.any(valid, axis=1)
+    lcen = jnp.where(has[:, None], 0.5 * (llo + lhi), 0.0)
+    d2 = sum((c - lcen[:, i : i + 1]) ** 2 for i, c in enumerate(coords))
+    lrad = jnp.where(has, jnp.sqrt(jnp.max(jnp.where(valid, d2, 0.0), axis=1)), -inf)
+
+    leaf_ids = jnp.arange(nl, dtype=jnp.int32)
+    lo0 = jnp.concatenate([jnp.full((ni, 3), inf, llo.dtype), llo])
+    hi0 = jnp.concatenate([jnp.full((ni, 3), -inf, lhi.dtype), lhi])
+    a0 = jnp.concatenate([jnp.full((ni,), nl, jnp.int32), leaf_ids])
+    z0 = jnp.concatenate([jnp.full((ni,), -1, jnp.int32), leaf_ids])
+
+    def relax(st):
+        lo, hi, a, z, _ = st
+        nlo_ = jnp.minimum(lo[left], lo[right])
+        nhi_ = jnp.maximum(hi[left], hi[right])
+        na = jnp.minimum(a[left], a[right])
+        nz = jnp.maximum(z[left], z[right])
+        changed = jnp.any(na != a[:ni]) | jnp.any(nz != z[:ni])
+        return (
+            lo.at[:ni].set(nlo_),
+            hi.at[:ni].set(nhi_),
+            a.at[:ni].set(na),
+            z.at[:ni].set(nz),
+            changed,
+        )
+
+    lo, hi, nlo, nhi, _ = lax.while_loop(
+        lambda st: st[4], relax, (lo0, hi0, a0, z0, jnp.asarray(True))
+    )
+    alive = jnp.all(lo <= hi, axis=1)
+    cen = jnp.where(alive[:, None], 0.5 * (lo + hi), 0.0)
+    half = 0.5 * jnp.sqrt(jnp.sum((hi - lo) ** 2, axis=1))
+    rad = jnp.where(alive, half, -inf).at[ni:].set(lrad)
+    cen = cen.at[ni:].set(lcen)
+    rad = jnp.where(rad > -inf, rad * (1.0 + _RADIUS_REL_PAD) + _RADIUS_ABS_PAD, rad)
+
+    # left turns on the root path, by pointer jumping
+    node_ids = jnp.arange(nodes, dtype=jnp.int32)
+    is_root = parent < 0
+    par = jnp.where(is_root, node_ids, parent)
+    acc = jnp.where(is_root, 0, (left[jnp.clip(par, 0, ni - 1)] == node_ids)).astype(
+        jnp.int32
+    )
+    anc = par
+    for _ in range(int(nodes).bit_length() + 1):
+        acc = acc + jnp.where(anc == node_ids, 0, acc[anc])
+        anc = anc[anc]
+    pos = 2 * nlo + acc
+    size = 2 * (nhi - nlo + 1) - 1
+    order = jnp.zeros((nodes,), jnp.int32).at[pos].set(node_ids)
+    leaf_row = jnp.where(order >= ni, order - ni, -1)
+    lo = lo.at[ni:].set(llo)
+    hi = hi.at[ni:].set(lhi)
+    pre = (
+        lo[order, 0],
+        lo[order, 1],
+        lo[order, 2],
+        hi[order, 0],
+        hi[order, 1],
+        hi[order, 2],
+        leaf_row,
+        size[order],
+        nlo[order],
+        nhi[order],
+    )
+    leaves = (llo[:, 0], llo[:, 1], llo[:, 2], lhi[:, 0], lhi[:, 1], lhi[:, 2])
+    return pre, leaves
+
+
 def _walk(
     b: _Built, theta: float, q: int, far_cap: int, near_cap: int, backend, interpret
 ):
@@ -423,7 +541,9 @@ def _tables(b: _Built, is_data: np.ndarray, is_query: np.ndarray) -> _Tables:
         .at[jnp.where(valid, slot, npts)]
         .set(flat, mode="drop")
     )
-    if b.geom is None:  # traversal: node spheres come from _spheres instead
+    if (
+        b.geom is None
+    ):  # radix build (traversal): its node boxes come from _radix_layout
         c = jnp.zeros((nl, 3), b.ps.dtype)
         r = jnp.zeros((nl,), b.ps.dtype)
     else:
@@ -530,7 +650,7 @@ def fast_knn(
     interpret: bool = False,
     differentiable: bool = False,
     num_warps: Optional[int] = None,
-    seed: int = 16,
+    seed: int = 8,
 ) -> FastKNN:
     """Exact kNN of ``queries`` (default: ``data``, self excluded) among ``data``.
 
@@ -589,7 +709,12 @@ def fast_knn(
         exclude_self = queries is None
     pts, is_data, is_query, nq = _points(data, queries)
     kb = _resolve_backend(backend, interpret)
-    if plan.method == "traverse" and kb == "xla":
+    if plan.method == "traverse" and kb == "pallas" and queries is not None:
+        d2q, rows, overflow, stats = _run_traverse_two(
+            data, queries, plan, interpret, num_warps, seed
+        )
+        certified = jnp.ones((int(nq),), bool)
+    elif plan.method == "traverse" and kb == "xla":
         # CPU reference: exact brute force (the traversal is a GPU kernel)
         qpts = data if queries is None else jnp.asarray(queries, data.dtype)
         d2q, rows = _brute_topk(data, qpts, k, bool(exclude_self))
@@ -597,12 +722,12 @@ def fast_knn(
         overflow = jnp.asarray(False)
         stats: dict = {}
     else:
-        b = _build(
-            jax.lax.stop_gradient(pts),
-            plan.leaf_size,
-            plan.bucket_capacity,
-            geometry=plan.method != "traverse",
-        )
+        if plan.method == "traverse":
+            b = _build_radix(
+                jax.lax.stop_gradient(pts), plan.leaf_size, plan.bucket_capacity
+            )
+        else:
+            b = _build(jax.lax.stop_gradient(pts), plan.leaf_size, plan.bucket_capacity)
         t = _tables(b, is_data, is_query)
         if plan.method == "traverse":
             d2q, sq, certified, overflow, stats = _run_traverse(
@@ -649,35 +774,23 @@ def fast_knn(
 def _run_traverse(b, t, plan, separate, nq, exclude_self, interpret, num_warps, seed):
     """Packet traversal: query-ordered ``(d2, slots, certified, overflow, stats)``."""
     nd = plan.num_data
-    first, skip, root, nlo, nhi = _preorder(plan.bucket_capacity)
-    cen, rad = _spheres(b, t)
-    rad = jnp.where(
-        rad > -jnp.inf, rad * (1.0 + _RADIUS_REL_PAD) + _RADIUS_ABS_PAD, rad
-    )
+    pre, leaves = _radix_layout(b, t)
     # output row of each query lane: its index among the queries
     orig = b.topo.particle_indices[jnp.clip(t.slot, 0)]
     qid = jnp.where(t.qmask, orig - (nd if separate else 0), -1).astype(jnp.int32)
-    d2q, sq = leaf_topk_traverse_pallas(
+    d2q, sq = leaf_topk_preorder_pallas(
         t.x,
         t.y,
         t.z,
         t.dmask,
         t.qmask,
         t.slot,
-        cen[:, 0],
-        cen[:, 1],
-        cen[:, 2],
-        rad,
-        jnp.asarray(first),
-        jnp.asarray(skip),
-        jnp.asarray(nlo),
-        jnp.asarray(nhi),
+        leaves,
+        pre,
         qid,
         num_queries=nq,
         k=int(plan.k),
         exclude_self=exclude_self,
-        num_internal=b.num_internal,
-        root=root,
         seed=int(seed),
         interpret=bool(interpret),
         num_warps=num_warps,
@@ -853,6 +966,20 @@ def plan_fast_knn(
 
     capacity = int(math.ceil(1.05 * int(count_buckets(pts)))) + 8
     if method == "traverse":
+        query_capacity = 0
+        if queries is not None:
+            # two structures in one Morton frame: data buckets, query blocks
+            bounds = _bounds(pts)
+
+            @jax.jit
+            def count_in_frame(p):
+                _, sc = _morton_sort(morton_encode(p, bounds))
+                return _aligned_buckets(sc, width, leaf_size)[1]
+
+            capacity = int(math.ceil(1.05 * int(count_in_frame(data)))) + 8
+            query_capacity = (
+                int(math.ceil(1.05 * int(count_in_frame(jnp.asarray(queries))))) + 8
+            )
         return FastKNNPlan(
             num_data=nd,
             num_queries=nq,
@@ -865,6 +992,7 @@ def plan_fast_knn(
             max_sources=0,
             bucket_capacity=capacity,
             method="traverse",
+            query_capacity=query_capacity,
         )
     if method != "walk":
         raise ValueError(f"method must be 'traverse' or 'walk', got {method!r}")
