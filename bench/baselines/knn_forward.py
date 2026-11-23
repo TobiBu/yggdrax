@@ -13,7 +13,7 @@ Times one forward k-nearest-neighbour search, tree build included, at matched
   opening angle come from :func:`~yggdrax.fast_knn.plan_fast_knn` in the first
   (untimed) call per size, as the fast-path benches size theirs; a row whose
   certificate or capacities fail is poisoned (NaN) and so fails the check.
-  Open boundaries only (the Pallas walk has no periodic box yet);
+  Periodic boxes by minimum image in the kernel;
 * ``jaxkd``: ``jaxkd.build_and_query`` (pure JAX; Dodge, github.com/dodgebc/jaxkd);
 * ``jaxkd-cuda``: the same with ``cuda=True`` (its optional CUDA extension; GPU);
 * ``jztree``: ``jztree.knn.knn`` (JZ-Tree, Stücker et al., arXiv:2604.05885;
@@ -100,6 +100,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--check-min-index-agreement", type=float, default=None)
     p.add_argument("--time-anyway", action="store_true")
+    p.add_argument(
+        "--warmup-s",
+        type=float,
+        default=1.0,
+        help="before timing an arm, call it until this many seconds have passed: "
+        "an idle A100 sits at 765 of 1410 MHz and needs ~0.2 s of load to clock "
+        "up (a 20 ms call measured 35 ms on its first 4-6 calls)",
+    )
     p.add_argument("--time-budget-s", type=float, default=120.0)
     p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
@@ -165,9 +173,6 @@ def _make_arms(
             fns[name] = jax.jit(ygg, static_argnums=2)
             info[name] = {"available": True, "version": _version("yggdrax")}
         elif name == "yggdrax-fast":
-            if args.periodic:
-                skip(name, "the Pallas walk has no periodic box yet")
-                continue
             import jax.numpy as jnp
 
             from yggdrax.fast_knn import fast_knn, plan_fast_knn
@@ -178,7 +183,11 @@ def _make_arms(
                 key = (data.shape, queries.shape, k)
                 if key not in cache:
                     plan = plan_fast_knn(
-                        data, queries, k=k, leaf_size=args.fast_leaf_size
+                        data,
+                        queries,
+                        k=k,
+                        leaf_size=args.fast_leaf_size,
+                        box_size=box,
                     )
 
                     def run(d, q, _plan=plan):
@@ -412,6 +421,9 @@ def main(argv=None) -> int:
                             "first_call_s": row["first_call_s"],
                         }
                     else:
+                        t_end = time.perf_counter() + args.warmup_s
+                        while time.perf_counter() < t_end:
+                            _block(fn(data, queries, k))
                         timing = time_callable(
                             lambda: fn(data, queries, k),
                             warmup=args.warmup,

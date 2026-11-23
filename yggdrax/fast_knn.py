@@ -25,6 +25,10 @@ pre-order -- entering a node is ``p + 1``, skipping it ``p + size`` -- loading
 node boxes a line at a time; a node is entered when any lane's k-th ball
 reaches its box. Reached leaves merge into each lane's running top-k (query
 lanes on the thread axis, so each lane's list is in its own registers).
+Two merges: replace-the-worst on an unsorted list (small k, or tables in L2)
+and insertion into a sorted register list, candidates loaded and voted on in
+groups of four (k > 16). Periodic boxes: points wrapped into
+``[0, L)``, minimum-image box tests and pair distances in the kernel.
 Exact by construction; the only static sizes are bucket counts.
 
 **Method "walk": mutual walk + certificate.** The Pallas mutual walk (Dehnen
@@ -37,7 +41,7 @@ may stay uncertified at any affordable ``theta``; it is kept for comparison.
 
 Data and queries may be one set (``queries=None``: self excluded) or two; two
 sets share one tree, so only leaves holding queries are targets and only leaves
-holding data are sources. Open boundaries only so far.
+holding data are sources. Periodic boxes need the traversal.
 """
 
 from __future__ import annotations
@@ -69,6 +73,7 @@ from .pallas.knn_topk import (
     leaf_topk_xla,
     next_pow2,
 )
+from .periodic import BoxSize, minimum_image, normalize_box_size, wrap_positions
 
 __all__ = ["FastKNN", "FastKNNPlan", "fast_knn", "plan_fast_knn"]
 
@@ -76,6 +81,18 @@ __all__ = ["FastKNN", "FastKNNPlan", "fast_knn", "plan_fast_knn"]
 #: geometry's radii are the max point distance up to float32 rounding (1e-6).
 _RADIUS_REL_PAD = 1e-5
 _RADIUS_ABS_PAD = 1e-30
+
+
+def _auto_merge(k: int, num_data: int) -> str:
+    """Top-k merge picked by ``k`` (A100-40GB, uniform, Q = N, warm clocks).
+
+    ``"replace"`` wins for small k (k=8 everywhere; k=16 at 1e7: 92 vs 105 ms).
+    ``"insert"`` wins for k=32 at every size measured: 1e6 15.9 vs 19.8 ms,
+    3e6 42.2 vs 50.8, 1e7 152 vs 199, 3e7 419 vs 555 (periodic 1e6: 18.0 vs
+    25.9). ``num_data`` is unused so far; k between 17 and 31 is untested.
+    """
+    del num_data
+    return "insert" if k > 16 else "replace"
 
 
 class FastKNNPlan(NamedTuple):
@@ -109,6 +126,8 @@ class FastKNNPlan(NamedTuple):
     query_capacity
         Traversal with separate queries: static count of query blocks (the
         data tree then holds the data alone, ``bucket_capacity`` buckets).
+    box
+        Periodic box ``(Lx, Ly, Lz)``, or ``None`` for open boundaries.
     """
 
     num_data: int
@@ -123,6 +142,7 @@ class FastKNNPlan(NamedTuple):
     bucket_capacity: int
     method: str = "traverse"
     query_capacity: int = 0
+    box: Optional[tuple] = None
 
 
 class FastKNN(NamedTuple):
@@ -167,6 +187,20 @@ def _bounds(pts: Any) -> tuple[Any, Any]:
     hi = jnp.max(pts, axis=0)
     pad = 1e-4 * jnp.maximum(jnp.max(hi - lo), 1e-30)
     return lo - pad, hi + pad
+
+
+def _frame(pts: Any, box: Optional[tuple]) -> tuple[Any, Any]:
+    """Morton frame: the points' padded box, or the periodic box ``[0, L)``
+    with its upper corner ``2**-20 L`` above ``L`` (no point quantises to the
+    reserved padding code), as :func:`build_static_cells_tree` does."""
+    if box is None:
+        return _bounds(pts)
+    L = jnp.asarray(box, pts.dtype)
+    return jnp.zeros((3,), pts.dtype), L * (1.0 + 2.0**-20)
+
+
+def _wrap(x: Any, box: Optional[tuple]) -> Any:
+    return x if box is None else wrap_positions(x, box)
 
 
 class _Built(NamedTuple):
@@ -353,17 +387,17 @@ def _query_blocks(
     return _QueryBlocks(p[..., 0], p[..., 1], p[..., 2], valid, qid, first, nb)
 
 
-def _run_traverse_two(data, queries, plan, interpret, num_warps, seed):
+def _run_traverse_two(data, queries, plan, interpret, num_warps, seed, merge_impl):
     """Separate queries: a data-only tree and query-only target blocks.
 
     In one shared tree a leaf held ~13 data and ~13 query lanes of 32, so every
     tile ran 40 % full on both sides; here every source block is all data and
     every target block all queries.
     """
-    dq = jax.lax.stop_gradient(data)
-    qq = jax.lax.stop_gradient(jnp.asarray(queries, data.dtype))
+    dq = _wrap(jax.lax.stop_gradient(data), plan.box)
+    qq = _wrap(jax.lax.stop_gradient(jnp.asarray(queries, data.dtype)), plan.box)
     nd, nq = int(dq.shape[0]), int(qq.shape[0])
-    bounds = _bounds(jnp.concatenate([dq, qq]))
+    bounds = _frame(jnp.concatenate([dq, qq]), plan.box)
     b = _build_radix(dq, plan.leaf_size, plan.bucket_capacity, bounds=bounds)
     t = _tables(b, np.ones((nd,), bool), np.zeros((nd,), bool))
     pre, leaves = _radix_layout(b, t)
@@ -390,6 +424,8 @@ def _run_traverse_two(data, queries, plan, interpret, num_warps, seed):
         seed=int(seed),
         interpret=bool(interpret),
         num_warps=num_warps,
+        merge_impl=merge_impl,
+        box=plan.box,
     )
     rows = jnp.where(sq >= 0, b.topo.particle_indices[jnp.clip(sq, 0)], -1)
     overflow = b.overflow | (qb.count > plan.query_capacity)
@@ -531,7 +567,9 @@ def _tables(b: _Built, is_data: np.ndarray, is_query: np.ndarray) -> _Tables:
     lane = jnp.arange(width)
     valid = (lane[None, :] < cnt[:, None]) & (start[:, None] < npts)
     slot = jnp.where(valid, start[:, None] + lane[None, :], 0).astype(jnp.int32)
-    p = b.ps[slot]
+    # empty lanes sit at +inf: their distances are inf, so a kernel needs no
+    # data mask for them (one load less per candidate)
+    p = jnp.where(valid[..., None], b.ps[slot], jnp.inf)
     orig = b.topo.particle_indices[slot]
     dmask = valid & jnp.asarray(is_data)[orig]
     qmask = valid & jnp.asarray(is_query)[orig]
@@ -651,6 +689,7 @@ def fast_knn(
     differentiable: bool = False,
     num_warps: Optional[int] = None,
     seed: int = 8,
+    merge_impl: str = "auto",
 ) -> FastKNN:
     """Exact kNN of ``queries`` (default: ``data``, self excluded) among ``data``.
 
@@ -684,6 +723,11 @@ def fast_knn(
     seed
         Traversal only: Morton-neighbour leaves merged first on each side of a
         target leaf; the walk skips subtrees inside that window.
+    merge_impl
+        Traversal only: how a source leaf enters a lane's top-k --
+        ``"replace"`` (unsorted, replace-the-worst), ``"insert"`` (sorted
+        registers, candidates in groups of four) or ``"auto"`` (by ``k`` and
+        ``N``, see :func:`_auto_merge`).
 
     Returns
     -------
@@ -707,24 +751,35 @@ def fast_knn(
     k = int(plan.k)
     if exclude_self is None:
         exclude_self = queries is None
+    if merge_impl == "auto":
+        merge_impl = _auto_merge(k, plan.num_data)
+    if merge_impl not in ("replace", "insert"):
+        raise ValueError(f"merge_impl must be auto/replace/insert, got {merge_impl!r}")
+    box = plan.box
     pts, is_data, is_query, nq = _points(data, queries)
+    pts = _wrap(pts, box)
     kb = _resolve_backend(backend, interpret)
     if plan.method == "traverse" and kb == "pallas" and queries is not None:
         d2q, rows, overflow, stats = _run_traverse_two(
-            data, queries, plan, interpret, num_warps, seed
+            data, queries, plan, interpret, num_warps, seed, merge_impl
         )
         certified = jnp.ones((int(nq),), bool)
     elif plan.method == "traverse" and kb == "xla":
         # CPU reference: exact brute force (the traversal is a GPU kernel)
         qpts = data if queries is None else jnp.asarray(queries, data.dtype)
-        d2q, rows = _brute_topk(data, qpts, k, bool(exclude_self))
+        d2q, rows = _brute_topk(
+            _wrap(data, box), _wrap(qpts, box), k, bool(exclude_self), box=box
+        )
         certified = jnp.ones((int(nq),), bool)
         overflow = jnp.asarray(False)
         stats: dict = {}
     else:
         if plan.method == "traverse":
             b = _build_radix(
-                jax.lax.stop_gradient(pts), plan.leaf_size, plan.bucket_capacity
+                jax.lax.stop_gradient(pts),
+                plan.leaf_size,
+                plan.bucket_capacity,
+                bounds=_frame(jax.lax.stop_gradient(pts), box),
             )
         else:
             b = _build(jax.lax.stop_gradient(pts), plan.leaf_size, plan.bucket_capacity)
@@ -740,6 +795,7 @@ def fast_knn(
                 interpret,
                 num_warps,
                 seed,
+                merge_impl,
             )
         else:
             d2q, sq, certified, overflow, stats = _run_walk(
@@ -761,17 +817,16 @@ def fast_knn(
     if differentiable:
         qpts = data if queries is None else jnp.asarray(queries, data.dtype)
         nb = data[jnp.clip(rows, 0)]
-        dist = jnp.where(
-            found,
-            jnp.sqrt(jnp.sum((qpts[:, None, :] - nb) ** 2, axis=-1)),
-            jnp.inf,
-        )
+        delta = minimum_image(qpts[:, None, :] - nb, box)
+        dist = jnp.where(found, jnp.sqrt(jnp.sum(delta**2, axis=-1)), jnp.inf)
     else:
         dist = jnp.where(found, jnp.sqrt(jnp.maximum(d2q, 0.0)), jnp.inf)
     return FastKNN(rows, dist, certified, overflow, stats)
 
 
-def _run_traverse(b, t, plan, separate, nq, exclude_self, interpret, num_warps, seed):
+def _run_traverse(
+    b, t, plan, separate, nq, exclude_self, interpret, num_warps, seed, merge_impl
+):
     """Packet traversal: query-ordered ``(d2, slots, certified, overflow, stats)``."""
     nd = plan.num_data
     pre, leaves = _radix_layout(b, t)
@@ -794,6 +849,8 @@ def _run_traverse(b, t, plan, separate, nq, exclude_self, interpret, num_warps, 
         seed=int(seed),
         interpret=bool(interpret),
         num_warps=num_warps,
+        merge_impl=merge_impl,
+        box=plan.box,
     )
     return d2q, sq, jnp.ones((nq,), bool), b.overflow, {}
 
@@ -865,7 +922,14 @@ def _run_walk(
     return d2q, sq, certified, overflow, stats
 
 
-def _brute_topk(data: Any, qpts: Any, k: int, exclude_self: bool, chunk: int = 256):
+def _brute_topk(
+    data: Any,
+    qpts: Any,
+    k: int,
+    exclude_self: bool,
+    chunk: int = 256,
+    box: Optional[tuple] = None,
+):
     """Exact top-``k`` by dense distances, ``chunk`` queries at a time (CPU)."""
     nq = int(qpts.shape[0])
     nchunk = -(-nq // chunk)
@@ -877,7 +941,8 @@ def _brute_topk(data: Any, qpts: Any, k: int, exclude_self: bool, chunk: int = 2
 
     def one(args):
         qq, ii = args
-        d2 = jnp.sum((qq[:, None, :] - data[None, :, :]) ** 2, axis=-1)
+        delta = minimum_image(qq[:, None, :] - data[None, :, :], box)
+        d2 = jnp.sum(delta**2, axis=-1)
         if exclude_self:
             d2 = jnp.where(
                 ii[:, None] == jnp.arange(data.shape[0])[None, :], jnp.inf, d2
@@ -903,6 +968,7 @@ def plan_fast_knn(
     headroom: float = 1.25,
     max_theta_steps: int = 8,
     method: str = "traverse",
+    box_size: Optional[BoxSize] = None,
 ) -> FastKNNPlan:
     """Size the static capacities of :func:`fast_knn` from the points (eager).
 
@@ -936,6 +1002,9 @@ def plan_fast_knn(
     method
         ``"traverse"`` (default) or ``"walk"``; see :func:`fast_knn`. The
         traversal needs only the bucket capacity, so its plan is one count.
+    box_size
+        Periodic box (a length or one per axis): minimum-image neighbours, the
+        points wrapped into ``[0, L)``. Traversal only.
 
     Returns
     -------
@@ -954,13 +1023,19 @@ def plan_fast_knn(
     nq = 0 if queries is None else int(jnp.shape(queries)[0])
     if k < 1 or k > nd - (1 if queries is None else 0):
         raise ValueError(f"k={k} needs at least {k + (queries is None)} data points")
+    box = normalize_box_size(box_size, 3)
+    if box is not None and method != "traverse":
+        raise ValueError("a periodic box_size needs method='traverse'")
+    data = _wrap(data, box)
+    if queries is not None:
+        queries = _wrap(jnp.asarray(queries, data.dtype), box)
     pts, is_data, is_query, _ = _points(data, queries)
 
     width = next_pow2(int(leaf_size))
 
     @jax.jit
     def count_buckets(p):
-        codes = morton_encode(p, _bounds(p))
+        codes = morton_encode(p, _frame(p, box))
         _, scodes = _morton_sort(codes)
         return _aligned_buckets(scodes, width, leaf_size)[1]
 
@@ -969,7 +1044,7 @@ def plan_fast_knn(
         query_capacity = 0
         if queries is not None:
             # two structures in one Morton frame: data buckets, query blocks
-            bounds = _bounds(pts)
+            bounds = _frame(pts, box)
 
             @jax.jit
             def count_in_frame(p):
@@ -993,6 +1068,7 @@ def plan_fast_knn(
             bucket_capacity=capacity,
             method="traverse",
             query_capacity=query_capacity,
+            box=box,
         )
     if method != "walk":
         raise ValueError(f"method must be 'traverse' or 'walk', got {method!r}")

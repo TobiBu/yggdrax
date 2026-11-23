@@ -107,25 +107,160 @@ def _need(q, cx, cy, cz, cr, kt):
     return need, jnp.max(jnp.where(need, 1, 0)) > 0
 
 
-def _need_box(q, lo, hi, kt):
+def _need_box(q, lo, hi, kt, box=None):
     """Lanes whose k-th ball reaches the box ``[lo, hi]``, and whether any do.
 
     Point-to-box distance, tighter than a bounding sphere around a box. Exact
     as a bound in float32: ``lo`` and ``hi`` are actual point coordinates and
     rounding is monotone, so it never exceeds a member point's distance. An
     empty box (``lo = +inf``, ``hi = -inf``) is never reached.
+
+    With a periodic ``box`` (points, boxes and queries all in ``[0, L)``) the
+    gap on an axis is the smallest over the three images of the interval,
+    ``min(g, lo + L - q, q - hi + L)``: the minimum-image distance bound.
     """
     zero = jnp.float32(0.0)
     d2 = zero
-    for qc, l_, h_ in zip(q[:3], lo, hi):
+    for a, (qc, l_, h_) in enumerate(zip(q[:3], lo, hi)):
         g = jnp.maximum(jnp.maximum(l_ - qc, qc - h_), zero)
+        if box is not None:
+            L = jnp.float32(box[a])
+            g = jnp.minimum(g, jnp.minimum(l_ + L - qc, qc - h_ + L))
         d2 = d2 + g * g
     need = d2 < kt
     return need, jnp.max(jnp.where(need, 1, 0)) > 0
 
 
+def _image(sc: Any, qc: Any, axis: int, box: Any) -> Any:
+    """Minimum image of ``sc - qc`` for coordinates in ``[0, L)``.
+
+    The shifted coordinate is formed first -- ``(sc - L) - qc`` when ``sc`` is
+    the far one -- because ``sc - L`` is exact for ``sc`` in ``[L/2, L)``
+    (Sterbenz), while ``(sc - qc) - L`` cancels: a pair straddling a face
+    lost ~1e-4 relative distance in float32 at 1e7 points.
+    """
+    d = sc - qc
+    if box is None:
+        return d
+    # constants built in Python: the Triton lowering cannot negate a literal
+    L = jnp.float32(box[axis])
+    hp = jnp.float32(0.5 * box[axis])
+    hn = jnp.float32(-0.5 * box[axis])
+    return jnp.where(d > hp, (sc - L) - qc, jnp.where(d < hn, sc - (qc - L), d))
+
+
+def _make_insert(
+    x_ref,
+    y_ref,
+    z_ref,
+    dmask_ref,
+    slot_ref,
+    q,
+    *,
+    width,
+    k,
+    exclude_self,
+    box=None,
+    use_dmask=True,
+    unroll=4,
+):
+    """``merge(s, need, carry)`` on a SORTED top-k held as ``k`` registers.
+
+    The carry is ``(bd, bi, kt)`` with ``bd``/``bi`` tuples of ``k`` ``(W,)``
+    vectors in DESCENDING order, so the k-th distance is ``bd[0]``. Candidate
+    ``v`` enters by ``new[i] = v < bd[i+1] ? bd[i+1] : (v < bd[i] ? v : bd[i])``:
+    about five element ops per slot and no reduction, against an argmin over
+    the block, a worst-slot search and a max per insertion of replace-the-
+    worst. A candidate no lane wants (one warp vote) costs its distance only.
+    """
+    qx, qy, qz, qv, qslot = q
+    inf = jnp.float32(_INF)
+
+    def insert(v: Any, vi: Any, bd: tuple, bi: tuple) -> tuple:
+        h = [v < b for b in bd]
+        nd, ni = [], []
+        for i in range(k):
+            if i + 1 < k:
+                nd.append(jnp.where(h[i + 1], bd[i + 1], jnp.where(h[i], v, bd[i])))
+                ni.append(jnp.where(h[i + 1], bi[i + 1], jnp.where(h[i], vi, bi[i])))
+            else:
+                nd.append(jnp.where(h[i], v, bd[i]))
+                ni.append(jnp.where(h[i], vi, bi[i]))
+        return tuple(nd), tuple(ni)
+
+    def merge(s: Any, need: Any, carry: tuple) -> tuple:
+        s0 = slot_ref[s, 0]
+
+        def group(g: Any, c: tuple) -> tuple:
+            # ``unroll`` candidates at once: their loads, distances and warp
+            # votes are independent, so they overlap instead of forming one
+            # serial load -> vote -> branch chain per candidate. The votes use
+            # the k-th distance from the start of the group: stale is only
+            # larger, so a vote can say yes to a candidate the insert then
+            # leaves alone (an insert of v >= bd[0] is the identity).
+            bd, bi, kt = c
+            js = [g * unroll + u for u in range(unroll)]
+            vs, wants = [], []
+            for j in js:
+                dx = _image(x_ref[s, j], qx, 0, box)
+                dy = _image(y_ref[s, j], qy, 1, box)
+                dz = _image(z_ref[s, j], qz, 2, box)
+                d2 = dx * dx + dy * dy + dz * dz
+                ok = (need & (dmask_ref[s, j] != 0)) if use_dmask else need
+                if exclude_self:
+                    ok = ok & (qslot != s0 + j)
+                v = jnp.where(ok, d2, inf)
+                vs.append(v)
+                wants.append(jnp.max(jnp.where(v < kt, 1, 0)) > 0)
+            for j, v, want in zip(js, vs, wants):
+
+                def ins(c2: tuple, v=v, j=j) -> tuple:
+                    nd, ni = insert(v, s0 + j, c2[0], c2[1])
+                    return nd, ni, nd[0]
+
+                bd, bi, kt = lax.cond(want, ins, lambda c2: c2, (bd, bi, kt))
+            return bd, bi, kt
+
+        return lax.fori_loop(jnp.int32(0), jnp.int32(width // unroll), group, carry)
+
+    return merge
+
+
+def _insert_state(qv: Any, *, width: int, k: int) -> tuple:
+    """Empty sorted top-k: ``+inf`` on query lanes, ``-1`` elsewhere (never
+    accepts, never asks for a leaf)."""
+    fill = jnp.where(qv, jnp.float32(_INF), jnp.float32(-1.0))
+    bd = tuple(fill for _ in range(k))
+    bi = tuple(jnp.full((width,), -1, jnp.int32) for _ in range(k))
+    return bd, bi, fill
+
+
+def _scatter_insert(out_d_ref, out_i_ref, qid, bd, bi, *, width, k, nout):
+    """Store a descending register top-k ascending into rows ``qid`` of
+    ``(Q * k,)``; masked lanes go to a scratch tail past ``nout``."""
+    lane = lax.broadcasted_iota(jnp.int32, (width,), 0)
+    ok = qid >= 0
+    for r in range(k):
+        d = bd[k - 1 - r]
+        i = jnp.where(d < jnp.float32(_INF), bi[k - 1 - r], -1)
+        addr = jnp.where(ok, qid * k + r, nout + r * width + lane)
+        plgpu.store(out_d_ref.at[addr], d, mask=ok)
+        plgpu.store(out_i_ref.at[addr], i, mask=ok)
+
+
 def _make_merge(
-    x_ref, y_ref, z_ref, dmask_ref, slot_ref, q, *, width, kpad, exclude_self
+    x_ref,
+    y_ref,
+    z_ref,
+    dmask_ref,
+    slot_ref,
+    q,
+    *,
+    width,
+    kpad,
+    exclude_self,
+    box=None,
+    use_dmask=True,
 ):
     """``(merge, fill)``: fold source leaf ``s`` into the running top-k.
 
@@ -146,17 +281,17 @@ def _make_merge(
         sx = x_ref[s, lanes]
         sy = y_ref[s, lanes]
         sz = z_ref[s, lanes]
-        sv = dmask_ref[s, lanes] != 0
-        ss = slot_ref[s, lanes]
         # a leaf's lanes are consecutive sorted slots: candidate j is s0 + j
         s0 = slot_ref[s, 0]
-        dx = sx[:, None] - qx[None, :]
-        dy = sy[:, None] - qy[None, :]
-        dz = sz[:, None] - qz[None, :]
+        dx = _image(sx[:, None], qx[None, :], 0, box)
+        dy = _image(sy[:, None], qy[None, :], 1, box)
+        dz = _image(sz[:, None], qz[None, :], 2, box)
         d2 = dx * dx + dy * dy + dz * dz  # (Ws, W): candidate x query lane
-        ok = sv[:, None] & need[None, :]
+        ok = jnp.broadcast_to(need[None, :], (width, width))
+        if use_dmask:
+            ok = ok & (dmask_ref[s, lanes] != 0)[:, None]
         if exclude_self:
-            ok = ok & (ss[:, None] != qslot[None, :])
+            ok = ok & (slot_ref[s, lanes][:, None] != qslot[None, :])
         d2 = jnp.where(ok, d2, inf)
         mn = jnp.min(d2, axis=0)
 
@@ -189,16 +324,16 @@ def _make_merge(
         sx = x_ref[s, lanes]
         sy = y_ref[s, lanes]
         sz = z_ref[s, lanes]
-        sv = dmask_ref[s, lanes] != 0
-        ss = slot_ref[s, lanes]
         s0 = slot_ref[s, 0]
-        dx = sx[:, None] - qx[None, :]
-        dy = sy[:, None] - qy[None, :]
-        dz = sz[:, None] - qz[None, :]
+        dx = _image(sx[:, None], qx[None, :], 0, box)
+        dy = _image(sy[:, None], qy[None, :], 1, box)
+        dz = _image(sz[:, None], qz[None, :], 2, box)
         d2 = dx * dx + dy * dy + dz * dz
-        ok = sv[:, None] & need[None, :]
+        ok = jnp.broadcast_to(need[None, :], (width, width))
+        if use_dmask:
+            ok = ok & (dmask_ref[s, lanes] != 0)[:, None]
         if exclude_self:
-            ok = ok & (ss[:, None] != qslot[None, :])
+            ok = ok & (slot_ref[s, lanes][:, None] != qslot[None, :])
         bd = jnp.where(ok, d2, inf)
         bi = jnp.where(ok, s0 + iota_s, -1)
         kt = jnp.where(qv, jnp.max(bd, axis=0), neg)
@@ -397,6 +532,9 @@ def _leaf_topk_preorder_kernel(
     nout: int,
     line: int,
     profile: str = "full",
+    merge_impl: str = "replace",
+    box: Optional[tuple] = None,
+    unroll: int = 4,
 ) -> None:
     """Exact top-``k`` of one target leaf: packet traversal in pre-order lines.
 
@@ -494,22 +632,52 @@ def _leaf_topk_preorder_kernel(
     profile
         ``"full"``; ``"seed"`` (seed window only) and ``"nomerge"`` (walk
         without leaf merges) give WRONG results and exist to time the phases.
+    merge_impl
+        ``"replace"`` (unsorted top-k, replace-the-worst per inserted
+        candidate) or ``"insert"`` (sorted register top-k, see
+        :func:`_make_insert`). Static.
+    box
+        Periodic box ``(Lx, Ly, Lz)`` (everything in ``[0, L)``) or ``None``.
+        Static.
+    unroll
+        ``"insert"``: candidates loaded and voted on together (a power of two
+        dividing ``W``). Static.
     """
     t = pl.program_id(0)
     q, carry = _lane_state(
         tx_ref, ty_ref, tz_ref, tq_ref, tslot_ref, t, width=width, k=k, kpad=kpad
     )
-    merge, fill = _make_merge(
-        x_ref,
-        y_ref,
-        z_ref,
-        dmask_ref,
-        slot_ref,
-        q,
-        width=width,
-        kpad=kpad,
-        exclude_self=exclude_self,
-    )
+    if merge_impl == "insert":
+        merge = _make_insert(
+            x_ref,
+            y_ref,
+            z_ref,
+            dmask_ref,
+            slot_ref,
+            q,
+            width=width,
+            k=k,
+            exclude_self=exclude_self,
+            box=box,
+            use_dmask=False,
+            unroll=min(int(unroll), width),
+        )
+        fill = None
+        carry = _insert_state(q[3], width=width, k=k)
+    else:
+        merge, fill = _make_merge(
+            x_ref,
+            y_ref,
+            z_ref,
+            dmask_ref,
+            slot_ref,
+            q,
+            width=width,
+            kpad=kpad,
+            exclude_self=exclude_self,
+            box=box,
+            use_dmask=False,
+        )
     c0 = seedc_ref[t]
     lo = jnp.maximum(c0 - seed, 0)
     hi = jnp.minimum(c0 + seed + 1, num_leaves)
@@ -544,13 +712,14 @@ def _leaf_topk_preorder_kernel(
             (llox_ref[sc], lloy_ref[sc], lloz_ref[sc]),
             (lhix_ref[sc], lhiy_ref[sc], lhiz_ref[sc]),
             kt,
+            box,
         )
 
     # 1. the seed window, centre-out (c0, c0+1, c0-1, ...): the nearest leaves
     #    first. With Kp == W == k the centre leaf fills the empty top-k
     #    directly, without the per-candidate loop.
     first = jnp.int32(0)
-    if kpad == width == k:
+    if fill is not None and kpad == width == k:
         need0, any0 = _leaf_need(c0, carry[2])
         carry = lax.cond(any0, lambda c: fill(c0, need0, c), lambda c: c, carry)
         first = jnp.int32(1)
@@ -580,7 +749,7 @@ def _leaf_topk_preorder_kernel(
         )
         sel = iota_b == (node - base)
         lx, ly, lz, hx, hy, hz, leaf, size, nlo, nhi = (_pick(v, sel) for v in lines)
-        need, any_need = _need_box(q, (lx, ly, lz), (hx, hy, hz), kt)
+        need, any_need = _need_box(q, (lx, ly, lz), (hx, hy, hz), kt, box)
         # a subtree wholly inside the seed window was merged already
         any_need = any_need & ~((nlo >= lo) & (nhi < hi))
         is_leaf = leaf >= 0
@@ -602,6 +771,11 @@ def _leaf_topk_preorder_kernel(
             _cond, _body, (zero, zero, _load(zero), carry[0], carry[1], carry[2])
         )
     qid = qid_ref[t, pl.dslice(0, width)]
+    if merge_impl == "insert":
+        _scatter_insert(
+            out_d_ref, out_i_ref, qid, best_d, best_i, width=width, k=k, nout=nout
+        )
+        return
     _scatter_sorted(
         out_d_ref,
         out_i_ref,
@@ -769,6 +943,9 @@ def leaf_topk_preorder_pallas(
     num_stages: int = 1,
     interpret: bool = False,
     profile: str = "full",
+    merge_impl: str = "replace",
+    box: Optional[tuple] = None,
+    unroll: int = 4,
 ) -> tuple[Any, Any]:
     """Exact per-lane top-``k`` by a line-cached pre-order packet traversal.
 
@@ -817,6 +994,14 @@ def leaf_topk_preorder_pallas(
         Run in Pallas interpret mode (CPU semantics).
     profile
         Phase timing only (see :func:`_leaf_topk_preorder_kernel`).
+    merge_impl
+        ``"replace"`` or ``"insert"`` (see :func:`_leaf_topk_preorder_kernel`).
+    box
+        Periodic box ``(Lx, Ly, Lz)``; every coordinate and box must then lie
+        in ``[0, L)``. ``None``: open.
+    unroll
+        ``"insert"`` only: candidates per group (see
+        :func:`_leaf_topk_preorder_kernel`).
     Returns
     -------
     tuple
@@ -839,7 +1024,7 @@ def leaf_topk_preorder_pallas(
         num_warps = 1 if width <= 32 else 2
     line = next_pow2(line)
     nout = int(num_queries) * int(k)
-    ntot = nout + kpad * width
+    ntot = nout + max(kpad, int(k)) * width
 
     def _pad(a: Any, fill: Any, dtype: Any) -> Any:
         return jnp.concatenate([a.astype(dtype), jnp.full((line,), fill, dtype)])
@@ -871,6 +1056,9 @@ def leaf_topk_preorder_pallas(
             nout=nout,
             line=line,
             profile=profile,
+            merge_impl=merge_impl,
+            box=None if box is None else tuple(float(b) for b in box),
+            unroll=int(unroll),
         )
 
     full2 = pl.BlockSpec((num_leaves, width), lambda t: (0, 0))
