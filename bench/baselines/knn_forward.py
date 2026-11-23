@@ -1,27 +1,24 @@
-"""kNN forward against other codes: the cost of pure JAX (paper v2, B1 baseline).
+"""kNN forward against other codes (paper v2, B1 baseline).
 
 Times one forward k-nearest-neighbour search, tree build included, at matched
 ``N``, ``Q``, ``k`` and dtype, for every code that is installed:
 
-* ``yggdrax``: ``build_kdtree`` + ``query_neighbors(backend="tree")``, the
-  search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX). One
-  traced ``while_loop`` per query that visits one point per iteration: the CPU
-  KD-tree design, which a GPU runs as divergent serial threads;
-* ``yggdrax-fast``: :func:`yggdrax.fast_knn.fast_knn`, the fast path the
-  mutual FMM runs on: cell-aligned Morton buckets, the Pallas mutual walk and
-  a Pallas leaf-block top-k (jitted, pure JAX + Pallas). Its static sizes and
-  opening angle come from :func:`~yggdrax.fast_knn.plan_fast_knn` in the first
-  (untimed) call per size, as the fast-path benches size theirs; a row whose
-  certificate or capacities fail is poisoned (NaN) and so fails the check.
-  Periodic boxes by minimum image in the kernel;
+* ``yggdrax``: :func:`yggdrax.fast_knn.fast_knn`, the GPU kNN (jitted, JAX +
+  Pallas): cell-aligned Morton buckets under a radix structure and one Pallas
+  packet traversal per query block, top-k in registers; periodic boxes by
+  minimum image in the kernel. The search ``yggdrax.applications.knn_stats``
+  runs with ``backend="fast"``. Its static bucket counts come from
+  :func:`~yggdrax.fast_knn.plan_fast_knn` in the first (untimed) call per
+  size; a row whose buckets overflow is poisoned (NaN) and so fails the check.
+  (The traced KD-tree walk, ``query_neighbors(backend="tree")``, is not an arm:
+  it is the CPU design and ran 100-200x behind this one at 1e6-1e7.);
 * ``jaxkd``: ``jaxkd.build_and_query`` (pure JAX; Dodge, github.com/dodgebc/jaxkd);
 * ``jaxkd-cuda``: the same with ``cuda=True`` (its optional CUDA extension; GPU);
 * ``jztree``: ``jztree.knn.knn`` (JZ-Tree, Stücker et al., arXiv:2604.05885;
   CUDA FFI, so GPU only);
 * ``ckdtree``: ``scipy.spatial.cKDTree`` on the host, all cores (context only).
 
-Forward only: none of the baselines differentiates through the search, and the
-paper states the gap as the price of pure JAX, not as a race.
+Forward only: none of the baselines differentiates through the search.
 
 Exactness is checked **before** timing, at every size, against a float64
 ``cKDTree`` reference on ``--check-queries`` of the queries: an arm's sorted
@@ -72,7 +69,7 @@ from bench.differentiability._common import (  # noqa: E402
     time_callable,
 )
 
-ARMS = ("yggdrax", "yggdrax-fast", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
+ARMS = ("yggdrax", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -84,10 +81,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--periodic", action="store_true", help="minimum-image search")
     p.add_argument("--box", type=float, default=1.0, help="side L of the cube")
     p.add_argument("--dtype", choices=("float32", "float64"), default="float32")
-    p.add_argument("--leaf-size", type=int, default=32, help="yggdrax KD leaf size")
-    p.add_argument(
-        "--fast-leaf-size", type=int, default=32, help="yggdrax-fast bucket size"
-    )
+    p.add_argument("--leaf-size", type=int, default=32, help="yggdrax bucket size")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -161,18 +155,6 @@ def _make_arms(
 
     for name in args.arms:
         if name == "yggdrax":
-            from yggdrax import build_kdtree, query_neighbors
-
-            def ygg(data, queries, k, _box=box):
-                tree = build_kdtree(data, leaf_size=args.leaf_size)
-                idx, dist = query_neighbors(
-                    tree, queries, k=k, backend="tree", box_size=_box
-                )
-                return dist, idx
-
-            fns[name] = jax.jit(ygg, static_argnums=2)
-            info[name] = {"available": True, "version": _version("yggdrax")}
-        elif name == "yggdrax-fast":
             import jax.numpy as jnp
 
             from yggdrax.fast_knn import fast_knn, plan_fast_knn
@@ -186,7 +168,7 @@ def _make_arms(
                         data,
                         queries,
                         k=k,
-                        leaf_size=args.fast_leaf_size,
+                        leaf_size=args.leaf_size,
                         box_size=box,
                     )
 
@@ -205,11 +187,11 @@ def _make_arms(
             info[name] = {
                 "available": True,
                 "version": _version("yggdrax"),
-                "walk": "fast_knn: cell-aligned buckets + Pallas mutual walk + "
-                "Pallas leaf top-k",
-                "leaf_size": args.fast_leaf_size,
-                "note": "plan (capacities, theta) made in the first, untimed call "
-                "per size; uncertified rows are NaN",
+                "walk": "fast_knn: cell-aligned buckets + radix structure + "
+                "Pallas packet traversal, top-k in registers",
+                "leaf_size": args.leaf_size,
+                "note": "plan (bucket counts) made in the first, untimed call "
+                "per size; overflowed rows are NaN",
             }
         elif name in ("jaxkd", "jaxkd-cuda"):
             if args.periodic:
@@ -350,8 +332,7 @@ def main(argv=None) -> int:
         "metadata": run_metadata(
             {
                 "bench": "baselines/knn_forward",
-                "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree'); "
-                "yggdrax-fast: yggdrax.fast_knn",
+                "walk": "yggdrax: yggdrax.fast_knn (packet traversal)",
             }
         ),
         "params": vars(args),

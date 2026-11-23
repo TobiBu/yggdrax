@@ -26,7 +26,11 @@ particle is fixed along the sweep while the brute forces grow as N².
 Exactness is checked before timing, at every size that has an exact reference
 (``dense`` up to ``--dense-max-n``, else ``keops``): counts and gradient of each
 arm against the reference, with ``--exact-rtol`` for the exact arms and
-``--tree-rtol`` for the tree (the window rule's error is ≤ eps per pair). An
+``--tree-rtol`` for the tree (the window rule's error is ≤ eps per pair). Two
+exact arms sum the same ``N(N-1)/2`` float64 terms in different orders, so their
+counts agree only to the summation bound: the exact arms' tolerance is
+``max(--exact-rtol, N²/2 · eps_64)`` (KeOps vs dense measured 2.7e-10 at
+N = 1e4 and 2.7e-9 at N = 3e4, growing as N²; the bound is 1.1e-8 and 1e-7). An
 arm that fails is not timed at that size. An arm runs up to its ``--*-max-n``,
 or until it runs out of memory or its median call exceeds ``--time-budget-s``.
 
@@ -79,7 +83,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--leaf-size", type=int, default=32)
     p.add_argument("--dense-max-n", type=int, default=65_536)
     p.add_argument("--keops-max-n", type=int, default=2_000_000)
-    p.add_argument("--exact-rtol", type=float, default=1e-9)
+    p.add_argument(
+        "--exact-rtol",
+        type=float,
+        default=1e-9,
+        help="floor of the exact arms' tolerance (raised to N^2/2 * eps_64)",
+    )
     p.add_argument("--tree-rtol", type=float, default=1e-4)
     p.add_argument("--time-budget-s", type=float, default=120.0)
     p.add_argument("--runs", type=int, default=5)
@@ -319,7 +328,11 @@ def main(argv=None) -> int:
             ref = dict(checks[ref_name]) if ref_name else {}
 
         for name, f in fns.items():
-            tol = args.tree_rtol if name == "yggdrax" else args.exact_rtol
+            # exact arms: float64 summation-order bound over N^2/2 pair terms
+            exact_tol = max(
+                args.exact_rtol, 0.5 * n * n * float(np.finfo(np.float64).eps)
+            )
+            tol = args.tree_rtol if name == "yggdrax" else exact_tol
             agree: dict[str, Any] = {"reference": ref_name, "rtol": tol}
             if ref_name is None or name not in checks:
                 agree["ok"] = None

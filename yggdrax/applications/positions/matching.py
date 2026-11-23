@@ -36,7 +36,8 @@ fixed:
   crossing a cell face inside the epoch no longer restructures the tree, so
   the objective has no restructuring jumps along an epoch (relevant to a line
   search). The traced build and walk still run at every step.
-* **kNN.** The KD-tree search runs once per epoch and returns, for every query,
+* **kNN.** The kNN search (:mod:`yggdrax.fast_knn` by default,
+  ``MatchSpec.knn_backend``) runs once per epoch and returns, for every query,
   its ``k_max + candidate_margin`` nearest particles. Every step recomputes the
   live distances to those candidates, sorts them and reads the ``k``-th. This
   is the exact ``k``-th neighbour as long as the true ``k_max`` nearest stay
@@ -74,7 +75,10 @@ probing the start and the target catalogue. A catalogue on its way between
 them can need more (clustering raises the near-field pair count): every step
 reports ``overflow``, and :func:`optimise_positions` re-plans on the epoch's
 start and end positions and repeats the epoch when it fires, so no step with a
-truncated walk is kept.
+truncated walk is kept. The fast kNN's static bucket counts
+(:class:`~yggdrax.fast_knn.FastKNNPlan`, one for the random queries and one for
+the particles) are planned and re-planned on the same catalogues; a refresh
+whose search overflows them sets the same ``overflow``.
 """
 
 from __future__ import annotations
@@ -94,12 +98,13 @@ from yggdrax.applications.corrfunc.traced import (
     traced_soft_pair_counts,
 )
 from yggdrax.applications.knn_stats.estimator import (
-    hard_knn_cdf,
+    hard_cdf_from_log_distances,
     knn_indices,
     knn_log_distances,
     soft_cdf_from_log_distances,
 )
 from yggdrax.applications.point_process.statistics import natural_estimator_rr
+from yggdrax.fast_knn import FastKNNPlan, plan_fast_knn
 
 __all__ = [
     "LossTerms",
@@ -145,7 +150,10 @@ class MatchSpec:
         Extra neighbours kept per query beyond ``max(knn_ks)`` between kNN
         searches.
     kdtree_leaf_size:
-        KD-tree leaf size of the kNN search.
+        Leaf (bucket) size of the kNN search.
+    knn_backend:
+        ``"fast"`` (default): :func:`yggdrax.fast_knn.fast_knn`, planned by
+        :meth:`PositionMatcher.build`; ``"tree"``: the traced KD-tree walk.
     xi_weight:
         Weight of ``L_xi`` in the loss.
     knn_weight:
@@ -162,6 +170,7 @@ class MatchSpec:
     query_mode: QueryMode = "both"
     candidate_margin: int = 8
     kdtree_leaf_size: int = 32
+    knn_backend: Literal["fast", "tree"] = "fast"
     xi_weight: float = 1.0
     knn_weight: float = 1.0
 
@@ -194,11 +203,15 @@ class MatchState(NamedTuple):
     data_candidates:
         ``(N, C)`` candidate neighbours of each particle, itself excluded
         (zero rows without data queries).
+    knn_overflow:
+        Scalar bool: the fast search overflowed its plan (the candidates are
+        ``-1``); :meth:`PositionMatcher.statistics` reports it as overflow.
     """
 
     membership: Array
     random_candidates: Array
     data_candidates: Array
+    knn_overflow: Array
 
 
 class MatchStatistics(NamedTuple):
@@ -281,6 +294,9 @@ class PositionMatcher:
         The target catalogue's statistics.
     n_points:
         Particles per catalogue.
+    knn_plans:
+        Fast-kNN plans ``(random queries, particles)`` for ``num_candidates``
+        neighbours (``None`` where unused); required by ``knn_backend="fast"``.
     """
 
     def __init__(
@@ -291,6 +307,7 @@ class PositionMatcher:
         rr: np.ndarray,
         target: Optional[MatchStatistics],
         n_points: int,
+        knn_plans: tuple[Optional[FastKNNPlan], Optional[FastKNNPlan]] = (None, None),
     ) -> None:
         self.spec = spec
         self.traced_config = traced_config
@@ -298,6 +315,7 @@ class PositionMatcher:
         self.rr = rr
         self.n_points = int(n_points)
         self._target = target
+        self.knn_plans = knn_plans
 
     @property
     def target(self) -> MatchStatistics:
@@ -373,7 +391,8 @@ class PositionMatcher:
                 spec, [target_positions, *probes], leaf_size=leaf_size
             )
         rq = None if not spec.use_randoms else jnp.asarray(randoms)
-        matcher = cls(spec, traced_config, rq, rr, None, n)
+        knn_plans = cls.plan_knn(spec, [target_positions, *probes], rq)
+        matcher = cls(spec, traced_config, rq, rr, None, n, knn_plans)
         target = jax.jit(matcher.fresh_statistics)(target_positions)
         if bool(target.overflow):
             raise RuntimeError("the planned capacities overflow on the target")
@@ -410,6 +429,62 @@ class PositionMatcher:
             box_size=spec.box_size,
         )
 
+    @staticmethod
+    def plan_knn(
+        spec: MatchSpec,
+        catalogues: Sequence[Array],
+        randoms: Optional[Array],
+        old: tuple[Optional[FastKNNPlan], Optional[FastKNNPlan]] = (None, None),
+    ) -> tuple[Optional[FastKNNPlan], Optional[FastKNNPlan]]:
+        """Plan the fast kNN's bucket counts on ``catalogues`` (eager).
+
+        Parameters
+        ----------
+        spec:
+            The statistics (``knn_backend="tree"`` plans nothing).
+        catalogues:
+            Catalogues the plans must cover.
+        randoms:
+            The random queries, or ``None`` without them.
+        old:
+            Plans to grow: each count is the larger of the old and the new.
+
+        Returns
+        -------
+        tuple
+            ``(random-query plan, particle plan)``, ``None`` where unused.
+        """
+        if spec.knn_backend != "fast":
+            return (None, None)
+
+        def merged(plans):
+            plans = [p for p in plans if p is not None]
+            return plans[0]._replace(
+                bucket_capacity=max(p.bucket_capacity for p in plans),
+                query_capacity=max(p.query_capacity for p in plans),
+            )
+
+        def one(queries, prev):
+            return merged(
+                [prev]
+                + [
+                    plan_fast_knn(
+                        jnp.asarray(c, jnp.float32),
+                        queries,
+                        k=spec.num_candidates,
+                        leaf_size=spec.kdtree_leaf_size,
+                        box_size=spec.box_size,
+                    )
+                    for c in catalogues
+                ]
+            )
+
+        rq = None if randoms is None else jnp.asarray(randoms, jnp.float32)
+        return (
+            one(rq, old[0]) if spec.use_randoms else None,
+            one(None, old[1]) if spec.use_data else None,
+        )
+
     def with_traced_config(self, config: TracedPairCountConfig) -> "PositionMatcher":
         """The same matcher with other traced capacities.
 
@@ -424,13 +499,20 @@ class PositionMatcher:
             A copy sharing the target statistics.
         """
         return PositionMatcher(
-            self.spec, config, self.randoms, self.rr, self._target, self.n_points
+            self.spec,
+            config,
+            self.randoms,
+            self.rr,
+            self._target,
+            self.n_points,
+            self.knn_plans,
         )
 
     def replan(self, catalogues: Sequence[Array]) -> "PositionMatcher":
         """Re-plan the traced capacities to cover ``catalogues`` as well.
 
-        Each capacity is the larger of the current one and the new plan's.
+        Each capacity is the larger of the current one and the new plan's; the
+        fast kNN's bucket counts likewise.
 
         Parameters
         ----------
@@ -453,7 +535,11 @@ class PositionMatcher:
             band_cap=max(new.band_cap, old.band_cap),
             sub_pair_cap=max(new.sub_pair_cap, old.sub_pair_cap),
         )
-        return self.with_traced_config(grown)
+        out = self.with_traced_config(grown)
+        out.knn_plans = self.plan_knn(
+            self.spec, catalogues, self.randoms, old=self.knn_plans
+        )
+        return out
 
     # ------------------------------------------------------------ evaluation
 
@@ -469,24 +555,53 @@ class PositionMatcher:
         -------
         MatchState
             Constants (no gradient).
+
+        Raises
+        ------
+        ValueError
+            ``knn_backend="fast"`` without the plans :meth:`build` makes.
         """
         spec = self.spec
         pos = jax.lax.stop_gradient(positions)
         c = spec.num_candidates
-        leaf, box = spec.kdtree_leaf_size, spec.box_size
+        leaf, box, backend = spec.kdtree_leaf_size, spec.box_size, spec.knn_backend
+        fast = spec.knn_backend == "fast"
+        if fast and any(
+            p is None
+            for p, used in zip(self.knn_plans, (spec.use_randoms, spec.use_data))
+            if used
+        ):
+            raise ValueError("knn_backend='fast' needs knn_plans (use build)")
         if spec.use_randoms:
             assert self.randoms is not None
             rq = self.randoms.astype(pos.dtype)
-            rand_c = knn_indices(pos, rq, c, leaf_size=leaf, box_size=box)
+            rand_c = knn_indices(
+                pos,
+                rq,
+                c,
+                backend=backend,
+                leaf_size=leaf,
+                box_size=box,
+                plan=self.knn_plans[0],
+            )
         else:
             rand_c = jnp.zeros((0, c), jnp.int32)
         if spec.use_data:
             data_c = knn_indices(
-                pos, pos, c, exclude_self=True, leaf_size=leaf, box_size=box
+                pos,
+                pos,
+                c,
+                exclude_self=True,
+                backend=backend,
+                leaf_size=leaf,
+                box_size=box,
+                plan=self.knn_plans[1],
             )
         else:
             data_c = jnp.zeros((0, c), jnp.int32)
-        return MatchState(pos, rand_c, data_c)
+        # the fast search writes -1 everywhere when it overflows its plan
+        knn_overflow = jnp.any(rand_c < 0) | jnp.any(data_c < 0)
+        return MatchState(pos, rand_c, data_c, knn_overflow)
 
     def _log_r(self, positions: Array, state: MatchState) -> list[Array]:
         spec = self.spec
@@ -547,7 +662,7 @@ class PositionMatcher:
                 for lr in self._log_r(positions, state)
             ]
         )
-        return MatchStatistics(res.counts, xi, cdf, res.overflow)
+        return MatchStatistics(res.counts, xi, cdf, res.overflow | state.knn_overflow)
 
     def fresh_statistics(self, positions: Array) -> MatchStatistics:
         """Statistics with a state refreshed at ``positions`` (exact kNN).
@@ -661,25 +776,17 @@ class PositionMatcher:
         Returns
         -------
         Array
-            The hard CDFs, randoms first.
+            The hard CDFs, randoms first; NaN if the search overflowed.
         """
-        spec = self.spec
-        r_grid = jnp.asarray(spec.knn_r_grid, positions.dtype)
-        leaf, box = spec.kdtree_leaf_size, spec.box_size
-        out = []
-        queries = []
-        if spec.use_randoms:
-            assert self.randoms is not None
-            queries.append(self.randoms.astype(positions.dtype))
-        if spec.use_data:
-            queries.append(None)
-        for q in queries:
-            out.append(
-                hard_knn_cdf(
-                    positions, q, spec.knn_ks, r_grid, leaf_size=leaf, box_size=box
-                )
-            )
-        return jnp.stack(out)
+        # a fresh search's candidates hold the exact k_max nearest, so their
+        # sorted live distances are the exact r_k (as hard_knn_cdf finds them)
+        state = self.refresh(positions)
+        r_grid = jnp.asarray(self.spec.knn_r_grid, positions.dtype)
+        out = [
+            hard_cdf_from_log_distances(lr, r_grid)
+            for lr in self._log_r(positions, state)
+        ]
+        return jnp.where(state.knn_overflow, jnp.nan, jnp.stack(out))
 
 
 # --------------------------------------------------------------------------

@@ -646,6 +646,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         m.rr,
         m.target,
         m.n_points,
+        m.knn_plans,
     )
     t_init = m.loss_from_statistics(s_init)
     log(f"setup {setup_s:.1f} s; weights xi {w_xi:.3g}, knn {w_knn:.3g}")
