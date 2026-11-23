@@ -1,22 +1,25 @@
-"""Scaling of the differentiable kNN-CDF vs N (stub: CPU now, GPU server later).
+"""Scaling of the differentiable kNN-CDF vs N.
 
 Times, over a sweep of catalogue size ``N`` (with ``Q = --queries-per-point * N``
 volume-filling random queries):
 
-* ``indices`` -- KD-tree build + exact ``k_max``-neighbour search (no gradient);
+* ``indices`` -- exact ``k_max``-neighbour search, build included (no gradient);
+  ``--backend fast`` (default) is :func:`yggdrax.fast_knn.fast_knn`, the GPU
+  kNN, with its plan made once per size outside the timed calls;
 * ``forward`` -- the full :func:`~yggdrax.applications.knn_stats.knn_cdf`
   (search + distance recomputation + smooth step);
 * ``value_and_grad`` -- forward + reverse of a scalar of the CDFs with respect
   to every data coordinate.
 
-All three are jitted and warmed. The dense ``top_k`` reference
+All three are jitted and warmed (``--warmup`` calls, then ``--warmup-s``
+seconds of repeated calls so an idle GPU reaches its boost clock). The dense ``top_k`` reference
 (``brute_force_knn_cdf``, ``O(Q N)`` memory) is timed up to
-``--brute-force-max-n``, and each such record carries the tree path's error
+``--brute-force-max-n``, and each such record carries the search path's error
 against it.
 
 Results -> ``results/knn_stats/scaling.json``.
 
-GPU server (later; ``autocvd`` picks a free GPU before JAX starts):
+GPU server (``autocvd`` picks a free GPU before JAX starts):
 
     python bench/knn_stats/scaling.py --sizes 100000 1000000 10000000 \
         --periodic --gpu-select free
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,10 +71,18 @@ def _parse_args() -> argparse.Namespace:
         help="periodic unit box (minimum-image search and distances)",
     )
     p.add_argument("--leaf-size", type=int, default=32)
-    p.add_argument("--backend", default="tree", choices=("tree", "tiled", "dense"))
+    p.add_argument(
+        "--backend", default="fast", choices=("fast", "tree", "tiled", "dense")
+    )
     p.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
+    p.add_argument(
+        "--warmup-s",
+        type=float,
+        default=1.0,
+        help="seconds of untimed calls before each timing (GPU idle clocks)",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--brute-force-max-n", type=int, default=10000)
     p.add_argument(
@@ -88,6 +100,7 @@ def main() -> None:
         args.runs = 2
         args.warmup = 1
         args.brute_force_max_n = 4000
+        args.warmup_s = 0.0
         args.gpu_select = "none"
 
     select_free_gpu(args.gpu_select, tag="knn-cdf-scaling")
@@ -100,12 +113,21 @@ def main() -> None:
 
     from yggdrax.applications.knn_stats import knn_cdf, knn_indices
     from yggdrax.applications.knn_stats.baselines import brute_force_knn_cdf
+    from yggdrax.fast_knn import plan_fast_knn
 
     dtype = jnp.float64 if args.dtype == "float64" else jnp.float32
     ks = tuple(args.ks)
     box = 1.0 if args.periodic else None
     kw = dict(backend=args.backend, leaf_size=args.leaf_size, box_size=box)
     sharp = args.sharpness
+
+    def _timed(fn):
+        """``time_callable`` after ``--warmup-s`` seconds of untimed calls."""
+        jax.block_until_ready(fn())  # compile outside the clock warm-up
+        t_end = time.perf_counter() + args.warmup_s
+        while time.perf_counter() < t_end:
+            jax.block_until_ready(fn())
+        return time_callable(fn, warmup=args.warmup, runs=args.runs)
 
     def _measure(n: int) -> dict:
         """Measure one size; raises if it does not fit in memory."""
@@ -121,29 +143,45 @@ def main() -> None:
             len(ks), args.num_r
         )
 
-        indices = jax.jit(lambda d, qq: knn_indices(d, qq, max(ks), **kw))
+        kw_n = dict(kw)
+        plan_info = None
+        if args.backend == "fast":
+            # static bucket counts, sized once from these points (eager, untimed)
+            t0 = time.perf_counter()
+            plan = plan_fast_knn(
+                data.astype(jnp.float32),
+                queries.astype(jnp.float32),
+                k=max(ks),
+                leaf_size=args.leaf_size,
+                box_size=box,
+            )
+            plan_info = {
+                "plan_s": time.perf_counter() - t0,
+                "bucket_capacity": plan.bucket_capacity,
+                "query_capacity": plan.query_capacity,
+            }
+            kw_n["plan"] = plan
+        indices = jax.jit(lambda d, qq: knn_indices(d, qq, max(ks), **kw_n))
         forward = jax.jit(
-            lambda d, qq: knn_cdf(d, qq, ks, r_grid, sharpness=sharp, **kw)
+            lambda d, qq: knn_cdf(d, qq, ks, r_grid, sharpness=sharp, **kw_n)
         )
         vgrad = jax.jit(
             jax.value_and_grad(
                 lambda d, qq: jnp.sum(
-                    weights * knn_cdf(d, qq, ks, r_grid, sharpness=sharp, **kw)
+                    weights * knn_cdf(d, qq, ks, r_grid, sharpness=sharp, **kw_n)
                 )
             )
         )
-        idx_t = time_callable(
-            lambda: indices(data, queries), warmup=args.warmup, runs=args.runs
-        )
-        fwd_t = time_callable(
-            lambda: forward(data, queries), warmup=args.warmup, runs=args.runs
-        )
-        vg_t = time_callable(
-            lambda: vgrad(data, queries), warmup=args.warmup, runs=args.runs
-        )
+        # a fast-search overflow poisons the CDFs with NaN: refuse to time it
+        if not bool(jnp.all(jnp.isfinite(forward(data, queries)))):
+            raise RuntimeError(f"n={n}: non-finite kNN-CDF (search overflow?)")
+        idx_t = _timed(lambda: indices(data, queries))
+        fwd_t = _timed(lambda: forward(data, queries))
+        vg_t = _timed(lambda: vgrad(data, queries))
         entry = {
             "n": n,
             "num_queries": q,
+            "fast_plan": plan_info,
             "indices": idx_t.as_dict(),
             "forward": fwd_t.as_dict(),
             "value_and_grad": vg_t.as_dict(),
@@ -166,11 +204,11 @@ def main() -> None:
                     )
                 )
             )
-            entry["brute_force_forward"] = time_callable(
-                lambda: brute(data, queries), warmup=args.warmup, runs=args.runs
+            entry["brute_force_forward"] = _timed(
+                lambda: brute(data, queries)
             ).as_dict()
-            entry["brute_force_value_and_grad"] = time_callable(
-                lambda: brute_vg(data, queries), warmup=args.warmup, runs=args.runs
+            entry["brute_force_value_and_grad"] = _timed(
+                lambda: brute_vg(data, queries)
             ).as_dict()
             _, g_ref = brute_vg(data, queries)
             _, g = vgrad(data, queries)
@@ -209,6 +247,7 @@ def main() -> None:
             "leaf_size": args.leaf_size,
             "box_size": box,
             "backend": args.backend,
+            "warmup_s": args.warmup_s,
             "dtype": args.dtype,
             "brute_force_max_n": args.brute_force_max_n,
             "brute_force": "brute_force_knn_cdf (dense top_k), jitted and warmed",

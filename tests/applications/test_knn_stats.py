@@ -575,3 +575,72 @@ def test_agrees_with_distributed_knn_on_one_device(self_queries):
         gc = jax.grad(lambda d, q: _weighted(c1(d, q)), argnums=(0, 1))(data, queries)
         for a, b in zip(gb, gc):
             np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)
+
+
+# -- backend="fast" (yggdrax.fast_knn) ------------------------------------------
+# On CPU fast_knn's traversal falls back to its exact XLA top-k, so these pin the
+# estimator's plumbing (plan, self-exclusion, box, float32 search, NaN poisoning);
+# the Pallas kernel itself is pinned by tests/test_fast_knn.py and on GPU by B1.
+
+
+@pytest.mark.parametrize("box", [None, 1.0])
+@pytest.mark.parametrize("self_queries", [False, True])
+def test_fast_backend_matches_tree_cdf_and_gradient(box, self_queries):
+    from yggdrax.fast_knn import plan_fast_knn
+
+    data = _points(600, 3)
+    queries = None if self_queries else _points(400, 4)
+    ks = (1, 4, 8)
+    plan = plan_fast_knn(
+        data.astype(jnp.float32),
+        None if queries is None else queries.astype(jnp.float32),
+        k=max(ks),
+        box_size=box,
+    )
+
+    def loss(d, backend, plan=None):
+        cdf = knn_cdf(
+            d,
+            queries,
+            ks,
+            R_GRID[:12],
+            sharpness=20.0,
+            backend=backend,
+            box_size=box,
+            plan=plan,
+        )
+        return _weighted(cdf)
+
+    v_tree, g_tree = jax.value_and_grad(lambda d: loss(d, "tree"))(data)
+    v_fast, g_fast = jax.jit(jax.value_and_grad(lambda d: loss(d, "fast", plan)))(data)
+    np.testing.assert_allclose(float(v_fast), float(v_tree), rtol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(g_fast), np.asarray(g_tree), rtol=1e-9, atol=1e-12
+    )
+    # eager: the plan is made on the spot
+    eager = knn_cdf(
+        data, queries, ks, R_GRID[:12], sharpness=20.0, backend="fast", box_size=box
+    )
+    np.testing.assert_allclose(_weighted(eager), float(v_tree), rtol=1e-12)
+
+
+def test_fast_backend_needs_a_matching_plan():
+    from yggdrax.fast_knn import plan_fast_knn
+
+    data, queries = _points(300, 5), _points(200, 6)
+    with pytest.raises(ValueError, match="needs plan"):
+        jax.jit(lambda d: knn_indices(d, queries, 4, backend="fast"))(data)
+    plan = plan_fast_knn(data, queries, k=4)
+    with pytest.raises(ValueError, match="plan is for"):
+        knn_indices(data, queries, 5, backend="fast", plan=plan)
+    with pytest.raises(ValueError, match="plan is for"):
+        knn_indices(data, queries, 4, backend="fast", plan=plan, box_size=1.0)
+
+
+def test_negative_indices_poison_log_distances():
+    data, queries = _points(50, 7), _points(10, 8)
+    idx = knn_indices(data, queries, 3)
+    bad = idx.at[2].set(-1)
+    logd = knn_log_distances(data, queries, bad, (1, 3))
+    assert np.all(np.isnan(np.asarray(logd[2])))
+    assert np.all(np.isfinite(np.asarray(jnp.delete(logd, 2, axis=0))))

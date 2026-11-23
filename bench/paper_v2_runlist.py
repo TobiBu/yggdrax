@@ -126,9 +126,9 @@ def _rows() -> list[Row]:
         Row(
             "a1_autodiff_overhead",
             "A1",
-            "build_kdtree + query_neighbors(backend='tree'), value vs grad",
+            "fast_knn(differentiable=True), value vs grad",
             ("{py}", f"{diff}/autodiff_overhead.py", "--sizes", "1000", "10000",
-             "100000", "1000000", "--query-backend", "tree", *g, "--output",
+             "100000", "1000000", "--query-backend", "fast", *g, "--output",
              "{case}/autodiff_overhead.json"),
             smoke=("--sizes", "2000", *tiny),
             est_gpu_min=5,
@@ -138,7 +138,7 @@ def _rows() -> list[Row]:
         Row(
             "a5_gradient_accuracy",
             "A5",
-            f"{traced}; window/geometric, hard and smooth; kNN: kdtree tree",
+            f"{traced}; window/geometric, hard and smooth; kNN: fast_knn",
             ("{py}", f"{diff}/gradient_accuracy.py", *a5, "--ns",
              "4000,16000,64000", "--out", "{case}/gradient_accuracy.json", "--fig",
              "{case}/gradient_accuracy.png"),
@@ -170,7 +170,7 @@ def _rows() -> list[Row]:
         Row(
             "b1_knn_cdf_open",
             "B1",
-            "knn_stats.knn_cdf: build_kdtree + query_neighbors(backend='tree')",
+            "knn_stats.knn_cdf(backend='fast'): fast_knn packet traversal",
             ("{py}", f"{knn}/scaling.py", "--sizes", "1000", "10000", "100000",
              "1000000", "10000000", "--brute-force-max-n", "100000", *g,
              "--output", "{case}/knn_cdf_open.json"),
@@ -180,7 +180,7 @@ def _rows() -> list[Row]:
         Row(
             "b1_knn_cdf_periodic",
             "B1",
-            "knn_stats.knn_cdf(box_size=1): kdtree tree search, minimum image",
+            "knn_stats.knn_cdf(backend='fast', box_size=1): fast_knn, minimum image",
             ("{py}", f"{knn}/scaling.py", "--periodic", "--sizes", "1000", "10000",
              "100000", "1000000", "10000000", "--brute-force-max-n", "100000", *g,
              "--output", "{case}/knn_cdf_periodic.json"),
@@ -234,7 +234,7 @@ def _rows() -> list[Row]:
             "b4_positions_1e6",
             "B4",
             "positions.optimise_positions: traced ξ (window rule, membership "
-            "frozen per epoch) + kNN-CDF (kdtree search per epoch), L-BFGS "
+            "frozen per epoch) + kNN-CDF (fast_knn search per epoch), L-BFGS "
             "with a 0.25 l step cap",
             ("{py}", "bench/positions/optimise.py", *a5, "--num-particles",
              "1000000", "--optimizer", "lbfgs", "--lbfgs-max-step", "0.25",
@@ -373,7 +373,7 @@ def _rows() -> list[Row]:
         Row(
             "base_knn_open",
             "baseline",
-            "yggdrax kdtree tree search vs jaxkd, jaxkd-cuda, JZ-Tree, cKDTree",
+            "yggdrax fast_knn vs jaxkd, jaxkd-cuda, JZ-Tree, cKDTree",
             ("{py}", "bench/baselines/knn_forward.py", "--sizes", "10000", "100000",
              "1000000", "10000000", "30000000", "--ks", "8", "32", *g, "--output",
              "{case}/knn_forward_open.json"),
@@ -383,7 +383,7 @@ def _rows() -> list[Row]:
         Row(
             "base_knn_periodic",
             "baseline",
-            "yggdrax kdtree tree search (box) vs JZ-Tree (boxsize), cKDTree",
+            "yggdrax fast_knn (box) vs JZ-Tree (boxsize), cKDTree",
             ("{py}", "bench/baselines/knn_forward.py", "--periodic", "--sizes",
              "10000", "100000", "1000000", "10000000", "30000000", "--ks", "8",
              "32", *g, "--output", "{case}/knn_forward_periodic.json"),

@@ -321,3 +321,34 @@ def test_bench_smoke(tmp_path, monkeypatch):
         png = tmp_path / "smoke.png"
         mod.main(["--replot", str(out), "--fig", str(png)])
         assert png.exists()
+
+
+def test_fast_and_tree_knn_backends_agree(problem):
+    """The fast kNN (default) and the KD-tree walk give the same statistics,
+    and hard_cdf (from a fresh search's candidates) is the exact step CDF."""
+    from yggdrax.applications.knn_stats import hard_knn_cdf
+
+    m, x = problem["m"], problem["mid"]
+    assert m.spec.knn_backend == "fast" and all(p is not None for p in m.knn_plans)
+    tree = PositionMatcher(
+        replace(m.spec, knn_backend="tree"),
+        m.traced_config,
+        m.randoms,
+        m.rr,
+        m.target,
+        m.n_points,
+    )
+    s_fast = jax.jit(m.fresh_statistics)(x)
+    s_tree = jax.jit(tree.fresh_statistics)(x)
+    assert not bool(s_fast.overflow)
+    np.testing.assert_allclose(s_fast.cdf, s_tree.cdf, atol=1e-14)
+    grid = jnp.asarray(m.spec.knn_r_grid)
+    ref = jnp.stack(
+        [hard_knn_cdf(x, q, m.spec.knn_ks, grid, box_size=L) for q in (m.randoms, None)]
+    )
+    np.testing.assert_array_equal(np.asarray(jax.jit(m.hard_cdf)(x)), np.asarray(ref))
+    # a re-plan keeps (or grows) the kNN bucket counts
+    grown = m.replan([x])
+    for old, new in zip(m.knn_plans, grown.knn_plans):
+        assert new.bucket_capacity >= old.bucket_capacity
+        assert new.query_capacity >= old.query_capacity

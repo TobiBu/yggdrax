@@ -195,7 +195,7 @@ The whole CPU smoke takes about 20 min on the laptop (compile-bound; most rows s
 | `b4_*` | `positions_1e{6,7}.json` + `.npz` + `.png` | §5 matching positions to ξ and kNN-CDF (B4) |
 | `c2_*` | `grad_memory_g{1,2,4}.json`, `junit.xml` | §4 gradient memory, the native-exchange check |
 | `c4_*` | `walk_plan_{xi,knn}.json`, `walk_run_{xi,knn}.json` | §4 flagship sizing (C4): whether 2048³ fits on 128 A100s |
-| `base_*` | `knn_forward_*.json`, `kernel_sums_*.json` | §4 "the cost of pure JAX" |
+| `base_*` | `knn_forward_*.json`, `kernel_sums_*.json` | §4 baselines |
 
 ## C4 rows
 
@@ -243,11 +243,8 @@ the row still succeeds.
 positions, tree build included, at matched N, Q = N (independent uniform
 queries, so no self-match conventions), k and dtype (float32).
 
-- **yggdrax**: `build_kdtree` + `query_neighbors(backend="tree")`, the search
-  B1's kNN-CDF uses.
-  It is one traced `while_loop` per query visiting one point per iteration (the
-  CPU KD-tree design), which a GPU runs as divergent serial threads.
-- **yggdrax-fast**: `yggdrax.fast_knn` (the GPU design): the data in Morton
+- **yggdrax**: `yggdrax.fast_knn`, the search B1's kNN-CDF uses
+  (`knn_cdf(..., backend="fast")`): the data in Morton
   count buckets that never cross the parent cell of their adaptive cell leaf,
   under a Morton-prefix radix structure; separate queries in their own blocks.
   One Pallas program per query block merges a window of Morton-neighbour data
@@ -255,7 +252,8 @@ queries, so no self-match conventions), k and dtype (float32).
   k-th ball reaches its box. Per-lane top-k in registers (replace-the-worst,
   or a sorted list for k > 16). Periodic boxes by minimum
   image in the kernel. Exact by construction; its one static size (the bucket
-  counts) is counted in the first, untimed call per size.
+  counts) is counted in the first, untimed call per size. The traced KD-tree
+  walk (`query_neighbors(backend="tree")`, the CPU design) is no longer an arm.
 - **jaxkd** 0.1.2: pure JAX. It breaks under `jax_enable_x64`: its `lax.cond`
   branches mix float32 and float64. The bench therefore traces it inside
   `jax.enable_x64(False)`, which is harmless for float32 inputs. jaxkd has no
@@ -268,9 +266,8 @@ queries, so no self-match conventions), k and dtype (float32).
 
 The reference is a float64 cKDTree on the same rounded positions, for 2048 of
 the queries. An arm must match the sorted distances to 1e-4 relative (float32)
-and the neighbour sets on ≥ 99 % of the checked queries. The paper states the
-gap as the cost of pure JAX, forward only: none of the baselines
-differentiates.
+and the neighbour sets on ≥ 99 % of the checked queries. Forward only: none of
+the baselines differentiates.
 
 **Kernel sums against KeOps** (`bench/baselines/kernel_sums.py`). SVGD left the
 paper (D1), but KeOps still fits the v2 story. The soft pair counts behind ξ,

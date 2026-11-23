@@ -1,4 +1,4 @@
-"""Differentiable k-nearest-neighbour CDFs on the yggdrax KD-tree.
+"""Differentiable k-nearest-neighbour CDFs on the yggdrax kNN searches.
 
 The kNN-CDF of Banerjee & Abel (2021, MNRAS 500, 5479) summarises a point
 catalogue by the distribution of distances from a set of query points to their
@@ -17,11 +17,12 @@ Two things in that definition are not differentiable: *which* point is a
 query's ``k``-th neighbour (a discrete choice), and the indicator. They are
 handled separately, the same way the pair-count estimator handles its tree.
 
-1. **Neighbour identities are constants.** :func:`knn_indices` runs the exact
-   traced KD-tree search (:func:`yggdrax.kdtree.query_neighbors`, ``"tree"``
-   backend by default) on ``stop_gradient`` copies of the positions and returns
-   integer indices. Nothing differentiates through the tree walk -- which is a
-   ``while_loop`` and could not be reverse-differentiated anyway.
+1. **Neighbour identities are constants.** :func:`knn_indices` runs an exact
+   search on ``stop_gradient`` copies of the positions and returns integer
+   indices: ``backend="fast"`` is the GPU kNN of :mod:`yggdrax.fast_knn`
+   (Pallas packet traversal; the one to use at scale), ``"tree"`` (default)
+   the traced KD-tree walk of :func:`yggdrax.kdtree.query_neighbors`, which
+   needs no plan. Nothing differentiates through the search.
 2. **Distances are values.** :func:`knn_distances` recomputes ``r_k(q)`` from
    the *live* positions by gathering the chosen neighbours, so gradients flow
    to every data coordinate (and to the query coordinates, if the caller
@@ -55,6 +56,19 @@ The price of a large ``s`` is in the gradient. Only queries with
 weight scales as ``s``; so the gradient of a grid point rests on about
 ``Q * pdf_k(u) / s`` queries and its variance grows roughly linearly in ``s``.
 The hard limit ``s -> inf`` has an exact zero gradient almost everywhere.
+
+The fast search
+---------------
+``backend="fast"`` sizes its static bucket counts from the points
+(:func:`yggdrax.fast_knn.plan_fast_knn`). Called eagerly, :func:`knn_indices`
+makes that plan itself; under ``jit`` or ``grad`` pass ``plan=`` (made once,
+outside, from representative positions with ``k = max(ks)`` and the same
+``box_size``; ``queries=None`` plans with ``queries=None``). The search runs in
+float32 -- the distances are recomputed from the live positions in their own
+dtype, so only a float32 near-tie (two candidates within ~1e-7 relative) can
+pick the other member of the tie. If the positions have moved so far that the
+plan's buckets overflow, the indices are ``-1`` and every ``log r_k`` (so every
+CDF) is NaN: make a new plan.
 
 Practical choice: make ``1/s`` comparable to, or a little below, the spacing
 of ``log r_grid``. Neighbouring grid points then see overlapping sets of
@@ -104,6 +118,7 @@ import numpy as np
 from jaxtyping import Array
 
 from yggdrax.dtypes import is_traced
+from yggdrax.fast_knn import FastKNNPlan, fast_knn, plan_fast_knn
 from yggdrax.kdtree import build_kdtree, query_neighbors
 from yggdrax.periodic import (
     BoxSize,
@@ -112,7 +127,7 @@ from yggdrax.periodic import (
     wrap_positions,
 )
 
-KnnBackend = Literal["tree", "tiled", "dense", "auto"]
+KnnBackend = Literal["fast", "tree", "tiled", "dense", "auto"]
 
 
 def _check_grid_in_box(r_grid: Array, box: Optional[tuple[float, ...]]) -> None:
@@ -178,13 +193,15 @@ def knn_indices(
     backend: KnnBackend = "tree",
     leaf_size: int = 32,
     box_size: Optional[BoxSize] = None,
+    plan: Optional[FastKNNPlan] = None,
 ) -> Array:
     """Return the ``k_max`` nearest data points of every query, as constants.
 
-    Builds a KD-tree over ``stop_gradient(data)`` and runs the exact traced
-    search on ``stop_gradient(queries)``. The result is an integer array, so
-    it carries no gradient; distances are recomputed from live positions by
-    :func:`knn_distances`. Traceable: callable under ``jit`` and ``vmap``.
+    Runs an exact search over ``stop_gradient(data)`` for
+    ``stop_gradient(queries)``. The result is an integer array, so it carries
+    no gradient; distances are recomputed from live positions by
+    :func:`knn_distances`. Traceable: callable under ``jit`` (``"fast"`` with a
+    ``plan``) and, for the KD-tree backends, ``vmap``.
 
     Parameters
     ----------
@@ -198,27 +215,45 @@ def knn_indices(
     exclude_self
         Skip each query's own index; use when ``queries`` *is* ``data``.
     backend
-        Search backend of :func:`yggdrax.kdtree.query_neighbors`. ``"tree"``
-        (default) is the pruned KD-tree walk; ``"dense"`` and ``"tiled"`` are
-        brute-force references.
+        ``"fast"``: :func:`yggdrax.fast_knn.fast_knn` (3-D points; the GPU
+        search). Otherwise the backend of :func:`yggdrax.kdtree.query_neighbors`:
+        ``"tree"`` (default) is the pruned KD-tree walk; ``"dense"`` and
+        ``"tiled"`` are brute-force references.
     leaf_size
-        Leaf bucket size of the KD-tree.
+        Leaf bucket size of the tree (``"fast"``: of the plan it makes).
     box_size
         Periodic box: a length ``L`` or one per axis (static), or ``None``.
         With a box the search runs on the data wrapped into ``[0, L)`` and
         returns minimum-image neighbours; ``data`` and ``queries`` may lie
         anywhere.
+    plan
+        ``"fast"`` only: static sizes from
+        :func:`~yggdrax.fast_knn.plan_fast_knn` for ``k = k_max``, this
+        ``box_size`` and these shapes (``queries=None`` when
+        ``exclude_self``). Required under ``jit``/``grad``; made here when
+        omitted on concrete points. A missing plan under a trace, or one for
+        another ``k`` or box, raises ``ValueError``.
 
     Returns
     -------
     Array
         Neighbour indices into ``data``, shape ``(q, k_max)``, sorted by
-        increasing distance.
+        increasing distance; ``"fast"`` gives ``-1`` everywhere if the plan's
+        buckets overflowed.
     """
 
     box = normalize_box_size(box_size, int(data.shape[-1]))
     data_c = jax.lax.stop_gradient(data)
     queries_c = jax.lax.stop_gradient(queries)
+    if backend == "fast":
+        return _fast_indices(
+            data_c,
+            None if exclude_self else queries_c,
+            int(k_max),
+            leaf_size,
+            box,
+            plan,
+        )
     if box is not None:
         # The tree must hold points in [0, L); query_neighbors wraps the
         # queries itself. Wrapping moves no rows, so indices still index `data`.
@@ -234,6 +269,60 @@ def knn_indices(
         box_size=box,
     )
     return jax.lax.stop_gradient(indices)
+
+
+def _fast_indices(
+    data: Array,
+    queries: Optional[Array],
+    k_max: int,
+    leaf_size: int,
+    box: Optional[tuple[float, ...]],
+    plan: Optional[FastKNNPlan],
+) -> Array:
+    """:func:`knn_indices` on :func:`~yggdrax.fast_knn.fast_knn` (float32 search).
+
+    Parameters
+    ----------
+    data
+        Data points (gradient already stopped), shape ``(n, 3)``.
+    queries
+        Query points, or ``None`` for the data themselves (self excluded).
+    k_max
+        Neighbours per query.
+    leaf_size
+        Bucket size of a plan made here.
+    box
+        Normalised periodic box, or ``None``.
+    plan
+        Static sizes, or ``None`` to make them from concrete points.
+
+    Returns
+    -------
+    Array
+        Indices, shape ``(q, k_max)``; all ``-1`` on a bucket overflow.
+
+    Raises
+    ------
+    ValueError
+        No plan under a trace, or a plan for another ``k`` or box.
+    """
+
+    d32 = data.astype(jnp.float32)
+    q32 = None if queries is None else queries.astype(jnp.float32)
+    if plan is None:
+        if is_traced(d32) or (q32 is not None and is_traced(q32)):
+            raise ValueError(
+                "backend='fast' under jit/grad needs plan=plan_fast_knn(data, "
+                "queries, k=max(ks), box_size=...) made outside the trace"
+            )
+        plan = plan_fast_knn(d32, q32, k=k_max, leaf_size=leaf_size, box_size=box)
+    if int(plan.k) != k_max or plan.box != box:
+        raise ValueError(
+            f"plan is for k={plan.k}, box={plan.box}; this search needs "
+            f"k={k_max}, box={box}"
+        )
+    res = fast_knn(d32, q32, plan=plan)
+    return jnp.where(res.overflow, -1, res.indices)
 
 
 def knn_log_distances(
@@ -259,7 +348,8 @@ def knn_log_distances(
     queries
         Query points, shape ``(q, dim)``.
     indices
-        Neighbour indices from :func:`knn_indices`, shape ``(q, k_max)``.
+        Neighbour indices from :func:`knn_indices`, shape ``(q, k_max)``;
+        a negative index gives NaN.
     ks
         Neighbour orders to return (1-based, static), each ``<= k_max``.
     box_size
@@ -281,7 +371,8 @@ def knn_log_distances(
     # A coincident pair has log r = -inf; floor it so the value and its
     # (zero) gradient stay finite.
     d2 = jnp.maximum(d2, jnp.finfo(d2.dtype).tiny)
-    return 0.5 * jnp.log(d2)
+    # a failed search (fast backend: -1 on overflow) poisons its row
+    return jnp.where(chosen >= 0, 0.5 * jnp.log(d2), jnp.nan)
 
 
 def knn_distances(
@@ -301,7 +392,8 @@ def knn_distances(
     queries
         Query points, shape ``(q, dim)``.
     indices
-        Neighbour indices from :func:`knn_indices`, shape ``(q, k_max)``.
+        Neighbour indices from :func:`knn_indices`, shape ``(q, k_max)``;
+        a negative index gives NaN.
     ks
         Neighbour orders to return (1-based, static), each ``<= k_max``.
     box_size
@@ -395,6 +487,7 @@ def _search_log_distances(
     backend: KnnBackend,
     leaf_size: int,
     box_size: Optional[BoxSize],
+    plan: Optional[FastKNNPlan] = None,
 ) -> Array:
     """Find the neighbours (constants) and return ``log r_k`` from live positions.
 
@@ -414,6 +507,8 @@ def _search_log_distances(
         KD-tree leaf bucket size.
     box_size
         Periodic box, or ``None``.
+    plan
+        ``"fast"``: static sizes (see :func:`knn_indices`).
 
     Returns
     -------
@@ -432,6 +527,7 @@ def _search_log_distances(
         backend=backend,
         leaf_size=leaf_size,
         box_size=box_size,
+        plan=plan,
     )
     return knn_log_distances(data, queries_arr, indices, ks_tuple, box_size=box_size)
 
@@ -447,6 +543,7 @@ def knn_cdf(
     leaf_size: int = 32,
     return_peaked: bool = False,
     box_size: Optional[BoxSize] = None,
+    plan: Optional[FastKNNPlan] = None,
 ) -> Array | tuple[Array, Array]:
     """Differentiable kNN-CDFs of ``data`` seen from ``queries``.
 
@@ -475,7 +572,9 @@ def knn_cdf(
         to the hard CDF (bias ``O(1/s^2)``) with a noisier, more localised
         gradient.
     backend
-        Neighbour-search backend; ``"tree"`` is the pruned KD-tree walk.
+        Neighbour-search backend: ``"fast"`` (the GPU kNN, needs ``plan``
+        under ``jit``) or ``"tree"`` (the pruned KD-tree walk); see
+        :func:`knn_indices`.
     leaf_size
         KD-tree leaf bucket size.
     return_peaked
@@ -485,6 +584,8 @@ def knn_cdf(
         open boundaries. Distances are minimum-image ones; the positions may
         lie anywhere. ``r_grid`` must stay below ``min(L) / 2`` (a concrete
         grid that reaches it raises ``ValueError``).
+    plan
+        ``backend="fast"``: static sizes (see :func:`knn_indices`).
 
     Returns
     -------
@@ -501,6 +602,7 @@ def knn_cdf(
         backend=backend,
         leaf_size=leaf_size,
         box_size=box_size,
+        plan=plan,
     )
     cdf = soft_cdf_from_log_distances(log_r_k, jnp.asarray(r_grid), sharpness)
     if return_peaked:
@@ -517,6 +619,7 @@ def hard_knn_cdf(
     backend: KnnBackend = "tree",
     leaf_size: int = 32,
     box_size: Optional[BoxSize] = None,
+    plan: Optional[FastKNNPlan] = None,
 ) -> Array:
     """Exact kNN-CDFs (step function), the ``sharpness -> inf`` reference.
 
@@ -537,6 +640,8 @@ def hard_knn_cdf(
         KD-tree leaf bucket size.
     box_size
         Periodic box (static), or ``None``.
+    plan
+        ``backend="fast"``: static sizes (see :func:`knn_indices`).
 
     Returns
     -------
@@ -552,6 +657,7 @@ def hard_knn_cdf(
         backend=backend,
         leaf_size=leaf_size,
         box_size=box_size,
+        plan=plan,
     )
     return hard_cdf_from_log_distances(log_r_k, jnp.asarray(r_grid))
 
@@ -608,6 +714,7 @@ def knn_cdf_loss(
     backend: KnnBackend = "tree",
     leaf_size: int = 32,
     box_size: Optional[BoxSize] = None,
+    plan: Optional[FastKNNPlan] = None,
 ) -> Array:
     """Loss for matching ``data``'s kNN-CDFs to ``target_cdf``.
 
@@ -639,6 +746,8 @@ def knn_cdf_loss(
         KD-tree leaf bucket size.
     box_size
         Periodic box (static), or ``None``.
+    plan
+        ``backend="fast"``: static sizes (see :func:`knn_indices`).
 
     Returns
     -------
@@ -655,6 +764,7 @@ def knn_cdf_loss(
         backend=backend,
         leaf_size=leaf_size,
         box_size=box_size,
+        plan=plan,
     )
     return cdf_distance(cast(Array, cdf), target_cdf, peaked=peaked, weights=weights)
 

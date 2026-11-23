@@ -22,9 +22,9 @@ the brute-force estimator and its autodiff gradient:
     of ``I``, so the bound is a (tight) estimate, not a certificate. Pruned
     pairs of the window rule are not in it (they are not emitted).
 
-It also checks the kNN-CDF gradient: given the neighbour set, the tree search
-returns exactly the dense search's distances, so the gradient is that of the
-dense O(N²) reference to round-off.
+It also checks the kNN-CDF gradient: given the neighbour set, the fast kNN
+(:func:`yggdrax.fast_knn.fast_knn`) returns exactly the dense search's
+distances, so the gradient is that of the dense O(N²) reference to round-off.
 
 Examples::
 
@@ -156,11 +156,11 @@ def _bounds(problem, positions, config, coeff):
 
 
 def _knn_check(n, seed=0):
-    """kNN-CDF gradient: tree search vs dense top_k, both differentiated."""
+    """kNN-CDF gradient: fast_knn search vs dense top_k, both differentiated."""
     import jax
     import jax.numpy as jnp
 
-    from yggdrax.kdtree import build_kdtree, query_neighbors
+    from yggdrax.fast_knn import fast_knn, plan_fast_knn
 
     x = C.clustered(n, seed)
     ks = (1, 2, 4, 8)
@@ -175,11 +175,13 @@ def _knn_check(n, seed=0):
         sel = cdf[jnp.asarray(ks) - 1]
         return jnp.sum((sel - 0.5) ** 2)
 
+    plan = plan_fast_knn(jnp.asarray(x, jnp.float32), None, k=kmax)
+
     def tree_loss(p):
-        tree = build_kdtree(jax.lax.stop_gradient(p), leaf_size=16)
-        idx, _ = query_neighbors(
-            tree, jax.lax.stop_gradient(p), k=kmax, exclude_self=True, backend="tree"
-        )
+        # indices from the frozen positions (float32 search), distances live
+        idx = fast_knn(
+            jax.lax.stop_gradient(p).astype(jnp.float32), None, plan=plan
+        ).indices
         d = jnp.linalg.norm(p[:, None, :] - p[idx], axis=-1)
         return cdf_loss(jnp.log(d)), idx
 
