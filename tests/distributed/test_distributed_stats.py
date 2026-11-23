@@ -21,6 +21,8 @@ Runs on however many devices exist; the multi-device cases skip below their coun
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -431,6 +433,102 @@ def test_knn_reports_inf_beyond_r_max():
     assert np.isinf(d).any() and np.isfinite(d).any()
     assert np.array_equal(np.isinf(d), np.isinf(ref))
     np.testing.assert_allclose(d[np.isfinite(d)], ref[np.isfinite(ref)], rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# knn_search="fast": each pass on yggdrax.fast_knn.masked_knn (on CPU its dense
+# reference; the Pallas traversal is pinned in tests/test_fast_knn.py and on GPU)
+# ---------------------------------------------------------------------------
+
+
+def _fast(cfg, **kw):
+    return dataclasses.replace(cfg, knn_search="fast", **kw)
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+@pytest.mark.parametrize("name", sorted(_KNN_PTS))
+@pytest.mark.parametrize("ndev", _NDEVS)
+def test_fast_search_matches_brute_force_on_every_mesh(name, ndev, adaptive):
+    mesh = _mesh(ndev)
+    pts, ref = _knn_reference(name)
+    res = distributed_knn(
+        pts,
+        k=_K,
+        r_max=_RMAX,
+        box_size=_L,
+        config=_fast(_cfg(len(pts), ndev)),
+        adaptive_reach=adaptive,
+        mesh=mesh,
+    )
+    assert not bool(res.overflow), {k: bool(v) for k, v in res.flags.items()}
+    d = np.asarray(res.distances)
+    assert np.array_equal(np.isinf(d), np.isinf(ref))
+    np.testing.assert_allclose(d[np.isfinite(d)], ref[np.isfinite(ref)], rtol=1e-12)
+
+
+@pytest.mark.parametrize("ndev", [1, 4])
+def test_fast_search_random_queries_cdf_and_r_max(ndev):
+    mesh = _mesh(ndev)
+    pts, _ = _knn_reference("clustered")
+    queries = _faces_and_corners(700, seed=12)
+    ref = _brute_knn(pts, queries, _K, _RMAX, self_exclude=False)
+    grid = np.geomspace(0.005, 0.1, 9)
+    res = distributed_knn(
+        pts,
+        k=_K,
+        r_max=_RMAX,
+        box_size=_L,
+        config=_fast(_cfg(len(pts) + len(queries), ndev)),
+        queries=queries,
+        r_grid=grid,
+        mesh=mesh,
+    )
+    assert not bool(res.overflow)
+    d = np.asarray(res.distances)
+    assert np.array_equal(np.isinf(d), np.isinf(ref))
+    np.testing.assert_allclose(d[np.isfinite(d)], ref[np.isfinite(ref)], rtol=1e-12)
+    cdf_ref = np.mean(ref.T[:, :, None] <= grid[None, None, :], axis=1)
+    np.testing.assert_allclose(np.asarray(res.cdf), cdf_ref, atol=1e-12)
+    # sparse points: neighbours past r_max are inf, as on the walk path
+    sparse = np.random.default_rng(2).uniform(0, 1, (300, 3))
+    ref_s = _brute_knn(sparse, sparse, 8, 0.08, self_exclude=True)
+    res_s = distributed_knn(
+        sparse,
+        k=8,
+        r_max=0.08,
+        box_size=1.0,
+        config=_fast(_cfg(300, ndev)),
+        mesh=mesh,
+    )
+    d = np.asarray(res_s.distances)
+    assert np.isinf(d).any() and np.isfinite(d).any()
+    assert np.array_equal(np.isinf(d), np.isinf(ref_s))
+    np.testing.assert_allclose(d[np.isfinite(d)], ref_s[np.isfinite(ref_s)], rtol=1e-12)
+
+
+def test_fast_search_first_pass_thins_the_halo():
+    mesh = _mesh(min(4, device_count()))
+    if mesh.size < 2:
+        pytest.skip("needs a halo, i.e. >= 2 devices")
+    pts, _ = _knn_reference("clustered")
+    halos = {}
+    for adaptive in (True, False):
+        res = distributed_knn(
+            pts,
+            k=_K,
+            r_max=_RMAX,
+            box_size=_L,
+            config=_fast(_cfg(len(pts), mesh.size)),
+            adaptive_reach=adaptive,
+            mesh=mesh,
+        )
+        halos[adaptive] = int(np.sum(np.asarray(res.stats["halo"])))
+    assert halos[True] < halos[False]
+
+
+def test_knn_search_is_validated():
+    with pytest.raises(ValueError, match="knn_search"):
+        DistributedStatsConfig.for_problem(100, knn_search="tree")
 
 
 # ---------------------------------------------------------------------------

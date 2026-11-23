@@ -320,11 +320,14 @@ def _rows() -> list[Row]:
             Row(
                 f"c4_walk_plan_{payload}",
                 "C4",
-                f"{dist}; streamed walk, {payload}: XLA plan per device on the "
-                "GPU (native exchange), compile only",
+                f"{dist}; streamed walk, xi: XLA plan per device on the GPU "
+                "(native exchange), compile only" if payload == "xi" else
+                f"{dist}; kNN (knn_search fast: masked_knn per pass): XLA plan "
+                "per device on the GPU (native exchange), compile only",
                 ("{py}", "bench/distributed/walk_stream.py", *a5, "--payload",
                  payload, "--n-per-device", "6.7e7", "--ndev", "2",
-                 "--ndev-model", "128", "--chunks", "64,128,256", "--plan-only",
+                 "--ndev-model", "128", "--chunks",
+                 "64,128,256" if payload == "xi" else "1", "--plan-only",
                  "--out", f"{{case}}/walk_plan_{payload}.json"),
                 smoke=("--n-per-device", "8192", "--ndev-model", "16",
                        "--chunks", "1,4"),
@@ -355,19 +358,18 @@ def _rows() -> list[Row]:
         Row(
             "c4_walk_run_knn",
             "C4",
-            f"{dist}; streamed walk, kNN forward at the C4 size",
+            f"{dist}; kNN (knn_search fast) forward at the C4 size",
             ("{py}", "bench/distributed/walk_stream.py", *a5, "--payload", "knn",
              "--modes", "forward", "--n-per-device", "6.7e7", "--ndev", "2",
-             "--ndev-model", "128", "--chunks", "128,256", "--repeats", "3",
-             "--out", "{case}/walk_run_knn.json"),
+             "--ndev-model", "128", "--chunks", "1", "--repeats", "3", "--out",
+             "{case}/walk_run_knn.json"),
             smoke=("--n-per-device", "8192", "--ndev-model", "16", "--chunks",
-                   "1,4", "--repeats", "1"),
+                   "1", "--repeats", "1"),
             ngpu=2,
             optional=True,
             env=(("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95"),),
             est_gpu_min=30,
-            note="kNN value+grad plans at 50 GB on the CPU: c4_walk_plan_knn "
-            "says whether the GPU plan fits",
+            note="c4_walk_plan_knn says whether value+grad fits at this size",
         ),
         # -- competitor baselines (new) -------------------------------------------------
         Row(

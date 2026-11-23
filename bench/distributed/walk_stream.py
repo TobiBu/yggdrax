@@ -1,5 +1,10 @@
 """Memory and time of the streamed walk (``walk_chunks``) against the single walk.
 
+kNN with ``knn_search="fast"`` (the default on Ampere+ GPUs) does not walk: its
+passes run :func:`yggdrax.fast_knn.masked_knn`, so ``walk_chunks`` changes
+nothing there and one entry of ``--chunks`` is enough; ``--knn-search walk``
+times the streamed walk.
+
 For one problem (particles per device, devices, leaf size) and each
 ``walk_chunks`` in ``--chunks``, a payload's per-device body inside a
 ``shard_map`` (ξ: :func:`~yggdrax.distributed.stats.pair_counts_shard`; kNN:
@@ -74,6 +79,13 @@ def _parse(argv=None):
     )
     p.add_argument("--payload", choices=["xi", "knn"], default="xi")
     p.add_argument("--chunks", default="1,4,16,64")
+    p.add_argument(
+        "--knn-search",
+        choices=["auto", "fast", "walk"],
+        default="auto",
+        help="kNN: DistributedStatsConfig.knn_search (the walk_chunks sweep only "
+        "applies to 'walk'; 'auto' is 'fast' on Ampere+ GPUs)",
+    )
     p.add_argument("--leaf-size", type=int, default=64)
     p.add_argument("--sub-block", type=int, default=8)
     p.add_argument("--clustering", type=float, default=1.5)
@@ -246,9 +258,11 @@ def main(argv=None) -> int:
             clustering=args.clustering,
             sub_block=args.sub_block,
             walk_chunks=chunks,
+            knn_search=args.knn_search,
         )
         row = dict(
             walk_chunks=chunks,
+            knn_search=args.knn_search,
             config={
                 k: getattr(cfg, k)
                 for k in (

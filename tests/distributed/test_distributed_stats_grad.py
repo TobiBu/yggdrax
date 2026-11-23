@@ -190,9 +190,9 @@ def _cdf_loss_of(cdf):
     return jnp.sum(jnp.linspace(1.0, 2.0, _K)[:, None] * cdf**2)
 
 
-def _knn_dist(p, ndev, *, queries=None, cdf=False, exchange="auto"):
+def _knn_dist(p, ndev, *, queries=None, cdf=False, exchange="auto", search="auto"):
     n = p.shape[0] + (0 if queries is None else queries.shape[0])
-    cfg = dataclasses.replace(_cfg(n, ndev), exchange=exchange)
+    cfg = dataclasses.replace(_cfg(n, ndev), exchange=exchange, knn_search=search)
     return distributed_knn(
         p,
         k=_K,
@@ -283,6 +283,22 @@ def test_knn_distance_gradient_is_the_single_device_gradient(name, ndev):
     np.testing.assert_allclose(float(v), float(v_b), rtol=1e-12)
     assert _rel(g, g_b) < _TOL
     assert _rel(g, g_1) < _TOL
+
+
+@pytest.mark.parametrize("name", sorted(_PTS))
+@pytest.mark.parametrize("ndev", _NDEVS)
+def test_fast_search_knn_gradient_is_the_brute_force_gradient(name, ndev):
+    """knn_search="fast": the same distances and gradient (the search only
+    picks the neighbours; the distances come from the live positions)."""
+    _mesh(ndev)
+    p, coef, (v_b, g_b), _ = _knn_reference(name)
+    res = _knn_dist(p, ndev, search="fast")
+    assert not bool(res.overflow)
+    v, g = jax.value_and_grad(
+        lambda x: _dist_loss(_knn_dist(x, ndev, search="fast").distances, coef)
+    )(p)
+    np.testing.assert_allclose(float(v), float(v_b), rtol=1e-12)
+    assert _rel(g, g_b) < _TOL
 
 
 def _cdf_case():

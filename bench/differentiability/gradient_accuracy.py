@@ -131,9 +131,21 @@ def _bounds(problem, positions, config, coeff):
     grid = jnp.linspace(0.0, 1.0, 65)
     lo = jnp.maximum(d - s, 1e-6)
     hi = d + s
-    rs = lo[:, None] + (hi - lo)[:, None] * grid[None, :]
-    fps = fp(rs.reshape(-1)).reshape(rs.shape)
-    var = jnp.max(fps, axis=1) - jnp.min(fps, axis=1)
+
+    # max - min of f' over [lo, hi] per far pair, a chunk of pairs at a time:
+    # all at once is (pairs * 65, nbins) float64, 6.6 GB at N = 16000
+    chunk = 8192
+    pad = (-int(lo.shape[0])) % chunk
+    lo_c = jnp.concatenate([lo, jnp.ones((pad,), lo.dtype)]).reshape(-1, chunk)
+    hi_c = jnp.concatenate([hi, jnp.ones((pad,), hi.dtype)]).reshape(-1, chunk)
+
+    def variation(args):
+        lo_k, hi_k = args
+        rs = lo_k[:, None] + (hi_k - lo_k)[:, None] * grid[None, :]
+        fps = fp(rs.reshape(-1)).reshape(rs.shape)
+        return jnp.max(fps, axis=1) - jnp.min(fps, axis=1)
+
+    var = jax.lax.map(variation, (lo_c, hi_c)).reshape(-1)[: lo.shape[0]]
     prefix = jnp.concatenate([jnp.zeros((1, 3)), jnp.cumsum(pos_sorted, axis=0)])
 
     def com(node):

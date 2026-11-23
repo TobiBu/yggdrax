@@ -45,6 +45,7 @@ from jaxtyping import Array
 
 from .._tree_impl import build_static_cells_tree
 from ..dtypes import INDEX_DTYPE, as_index, require_x64
+from ..fast_knn import masked_knn
 from ..geometry import compute_tree_geometry
 from ..interactions import dual_tree_walk_mutual
 from ..periodic import BoxSize, minimum_image, normalize_box_size, wrap_positions
@@ -137,9 +138,28 @@ class DistributedStatsConfig:
         out. It must stay well below the walk's peak wavefront (about half the
         near pairs), or the first walk does most of the work itself.
     first_pass_reach_factor:
-        kNN only: in the local first pass a node looks this many of its own
-        bounding radii beyond its sphere. Larger finds more first-pass bounds
-        (a thinner halo) at more first-pass work; it never affects correctness.
+        kNN with ``knn_search="walk"`` only: in the local first pass a node
+        looks this many of its own bounding radii beyond its sphere. Larger
+        finds more first-pass bounds (a thinner halo) at more first-pass work;
+        it never affects correctness.
+    knn_search:
+        kNN only: how each pass (local, then ``[local ; halo]``) finds the
+        neighbours. ``"fast"``: :func:`yggdrax.fast_knn.masked_knn`, the Pallas
+        packet traversal of the single-device fast kNN (exact; its first pass
+        is the exact local kNN, so the halo is as thin as the local data allow);
+        ``"walk"``: the mutual walk with a ``(leaf, leaf)``-block XLA top-k
+        (``walk_chunks``, ``chunk`` and the walk capacities apply);
+        ``"auto"`` (default): ``"fast"`` where the Pallas kernels run (Ampere
+        or newer GPUs), else ``"walk"``.
+    knn_leaf_size:
+        ``knn_search="fast"``: bucket size of its tree.
+    knn_bucket_factor:
+        ``knn_search="fast"``: static bucket capacity of each pass, as a
+        multiple of ``rows / W`` (``rows`` the pass's buffer length, ``W`` the
+        next power of two of ``knn_leaf_size``). Uniform points fill about
+        ``1 / 1.4`` of their buckets; a shortfall sets ``walk_overflow`` (second
+        pass) or ``local_pass_overflow`` (first pass, harmless: it can only
+        thicken the halo).
     num_samples:
         Partition samples per device (:func:`sfc_partition`).
     chunk:
@@ -210,6 +230,9 @@ class DistributedStatsConfig:
     far_cap: int = 1 << 12
     near_cap: int = 1 << 16
     first_pass_reach_factor: float = 2.0
+    knn_search: str = "auto"
+    knn_leaf_size: int = 32
+    knn_bucket_factor: float = 2.5
     num_samples: int = 64
     chunk: int = 256
     sub_block: Optional[int] = None
@@ -234,6 +257,10 @@ class DistributedStatsConfig:
         if self.exchange not in ("auto", "buf", "native"):
             raise ValueError(
                 f"exchange must be 'auto', 'buf' or 'native'; got {self.exchange!r}"
+            )
+        if self.knn_search not in ("auto", "fast", "walk"):
+            raise ValueError(
+                f"knn_search must be 'auto', 'fast' or 'walk'; got {self.knn_search!r}"
             )
         if self.summary_exchange not in ("neighbors", "all_gather"):
             raise ValueError(
@@ -2642,6 +2669,59 @@ def _knn_on_tree(t: _Tree, xs, fq, fd, live_s, n, k, r_max, box, cfg, node_reach
     return best_i[:n], best_v[:n], diag["overflow"], diag
 
 
+def _knn_fast_search(cfg) -> bool:
+    """Whether a kNN pass runs :func:`~yggdrax.fast_knn.masked_knn`."""
+    if cfg.knn_search == "auto":
+        from ..pallas._compat import pallas_triton_supported
+
+        return bool(pallas_triton_supported())
+    return cfg.knn_search == "fast"
+
+
+def _knn_fast(xs, fq, fd, live_s, k, r_max, box, frame, cfg):
+    """kNN of the query slots among the data slots within ``r_max`` (fast path).
+
+    :func:`~yggdrax.fast_knn.masked_knn` finds the exact ``k`` nearest data
+    slots of every query slot (float32 search); their squared distances are
+    recomputed here from ``xs`` in its own dtype, re-sorted, and cut at
+    ``r_max``, so every reported distance is an exact distance to a data point.
+
+    Returns
+    -------
+    tuple
+        ``(nbr, d2, overflow, diag)`` as :func:`_knn_on_tree`.
+    """
+    n = int(xs.shape[0])
+    dtype = xs.dtype
+    width = 1 << max(0, int(math.ceil(math.log2(max(int(cfg.knn_leaf_size), 1)))))
+    capacity = int(math.ceil(float(cfg.knn_bucket_factor) * n / width)) + 8
+    is_d = live_s & (fd > 0)
+    is_q = live_s & (fq > 0)
+    rows, _d2_32, over = masked_knn(
+        xs,
+        is_d,
+        is_q,
+        k=int(k),
+        bucket_capacity=capacity,
+        leaf_size=int(cfg.knn_leaf_size),
+        box_size=box,
+        bounds=None if box is not None else frame,
+        backend="auto",
+    )
+    has = rows >= 0
+    delta = minimum_image(xs[jnp.where(has, rows, 0)] - xs[:, None, :], box)
+    d2 = jnp.where(has, jnp.sum(delta * delta, axis=-1), jnp.inf)
+    d2 = jnp.where(d2 <= jnp.asarray(r_max, dtype) ** 2, d2, jnp.inf)
+    order = jnp.argsort(d2, axis=-1)
+    d2 = jnp.take_along_axis(d2, order, axis=-1)
+    nbr = jnp.where(
+        jnp.isfinite(d2), jnp.take_along_axis(rows, order, axis=-1), -1
+    ).astype(INDEX_DTYPE)
+    zero = jnp.zeros((), INDEX_DTYPE)
+    diag = dict(near_max=zero, near_total=zero, frontier=zero, peak_max=zero)
+    return nbr, d2, over, diag
+
+
 def _cell_max(t: _Tree, cut, values_sorted, n):
     """Per summary cell, the max of a per-sorted-slot value over the cell's slots."""
     cells = cut.cells
@@ -2659,6 +2739,113 @@ def _cell_max(t: _Tree, cut, values_sorted, n):
     seg = jnp.where(inside, cell_of, as_index(cells.shape[0]))
     m = jax.ops.segment_max(vals, seg, num_segments=int(cells.shape[0]) + 1)
     return jnp.where(live, jnp.maximum(m[:-1], 0.0), 0.0)
+
+
+def _knn_cdf(dist, is_q, r_grid, sharpness, dtype):
+    """The kNN-CDF reduction: the fraction of queries with ``r_k <= r``, psummed."""
+    if r_grid is None:
+        return None
+    rg = jnp.asarray(r_grid, dtype)
+
+    # one radius at a time, rematerialised: a (rows, k, grid) step array is
+    # 37 GB at 6.7e7 rows, k = 8, 16 radii, and reverse mode would hold
+    # several; per radius only (rows, k) arrays are ever live
+    def cdf_numerator(dist, rg, sharpness):
+        safe_d = jnp.where(jnp.isfinite(dist), dist, 2.0 * jnp.max(rg) + 1.0)
+        q = is_q[:, None]
+
+        if sharpness is None:
+
+            def hard(r):
+                hit = jnp.where(q & (safe_d <= r), 1.0, 0.0).astype(dtype)
+                return jnp.sum(hit, axis=0)
+
+            return jax.lax.map(hard, rg).T
+        log_d = jnp.log(safe_d)
+
+        @functools.partial(jax.checkpoint, prevent_cse=False)
+        def soft(r):
+            step = jax.nn.sigmoid(sharpness * (jnp.log(r) - log_d))
+            return jnp.sum(jnp.where(q, step, 0.0), axis=0)
+
+        # (radii, k) -> (k, radii), the rank-by-radius layout of the CDF
+        return jax.lax.map(soft, rg).T
+
+    num = cdf_numerator(dist, rg, sharpness)
+    num = jax.lax.psum(num, AXIS_NAME)
+    nq = jax.lax.psum(jnp.sum(is_q.astype(dtype)), AXIS_NAME)
+    cdf = num / jnp.maximum(nq, 1.0)
+    return cdf
+
+
+def _knn_body_one_device(
+    positions, flags, gid, count, r_grid, sharpness, *, k, r_max, cfg, box, bounds
+):
+    """:func:`_knn_body` on ONE device with the fast search: no partition, halo
+    or first pass (nothing to import; periodic images are the kernel's minimum
+    image), one :func:`~yggdrax.fast_knn.masked_knn` over the input rows. The
+    outputs keep the multi-device layout (``capacity`` rows, every flag and
+    stat), so callers cannot tell the paths apart."""
+    dtype = positions.dtype
+    rows = int(positions.shape[0])
+    cap = int(cfg.capacity)
+    live = jnp.arange(rows, dtype=INDEX_DTYPE) < count
+    fq = jnp.where(live, flags[:, _QUERY], 0)
+    fd = jnp.where(live, flags[:, _DATA], 0)
+    lo_b, hi_b = _morton_box(box, bounds, dtype)
+    nbr, _d2, w_over, _ = _knn_fast(
+        jax.lax.stop_gradient(positions), fq, fd, live, k, r_max, box, (lo_b, hi_b), cfg
+    )
+    # values from the live positions at the frozen neighbour indices
+    has = nbr >= 0
+    delta = minimum_image(
+        positions[jnp.where(has, nbr, 0)] - positions[:, None, :], box
+    )
+    r2 = jnp.where(has, jnp.sum(delta * delta, axis=-1), 1.0)
+    d = jnp.where(has, _distance(r2, has), jnp.inf)
+    is_q_in = live & (fq > 0)
+    d = jnp.where(is_q_in[:, None], d, jnp.inf)
+    # the partitioned layout: ``capacity`` rows (a larger input overflows, as the
+    # partition would)
+    m = min(rows, cap)
+    dist = jnp.full((cap, int(k)), jnp.inf, dtype).at[:m].set(d[:m])
+    out_gid = (
+        jnp.full((cap,), -1, gid.dtype).at[:m].set(jnp.where(is_q_in, gid, -1)[:m])
+    )
+    is_q = jnp.zeros((cap,), bool).at[:m].set(is_q_in[:m])
+    cdf = _knn_cdf(dist, is_q, r_grid, sharpness, dtype)
+    no = jnp.asarray(False)
+    flags_out = dict(
+        partition_overflow=_any(count > cap),
+        leaf_overflow=_any(no),
+        summary_overflow=_any(no),
+        summary_exchange_overflow=_any(no),
+        export_overflow=_any(no),
+        send_overflow=_any(no),
+        halo_overflow=_any(no),
+        walk_overflow=_any(w_over),
+    )
+    overflow = functools.reduce(lambda a, b: a | b, flags_out.values())
+    flags_out["local_pass_overflow"] = _any(no)
+    zero = jnp.zeros((1,), INDEX_DTYPE)
+    stats = dict(
+        particles=jnp.minimum(count, cap).astype(INDEX_DTYPE)[None],
+        halo=zero,
+        export_pairs=zero,
+        export_wavefront=zero,
+        sent=zero,
+        summary_cells=zero,
+        summary_sent=zero,
+        summary_recv=zero,
+        summary_dests=zero,
+        leaves_local=zero,
+        leaves=zero,
+        near_pairs=zero,
+        near_pairs_total=zero,
+        walk_frontier=zero,
+        peak_wavefront=zero,
+    )
+    return dist, out_gid, cdf, overflow, flags_out, stats
 
 
 def _knn_body(
@@ -2679,6 +2866,20 @@ def _knn_body(
 ):
     """Partition, local pass, halo, combined pass, CDF reduction."""
     dtype = positions.dtype
+    if ndev == 1 and _knn_fast_search(cfg):
+        return _knn_body_one_device(
+            positions,
+            flags,
+            gid,
+            count,
+            r_grid,
+            sharpness,
+            k=k,
+            r_max=r_max,
+            cfg=cfg,
+            box=box,
+            bounds=bounds,
+        )
     weights = jnp.ones((positions.shape[0],), dtype)
     p_pos, _p_w, p_flags, p_gid, p_count, part_over = _partition(
         positions, weights, flags, gid, count, ndev, box, bounds, cfg
@@ -2696,7 +2897,23 @@ def _knn_body(
 
     loc_over = jnp.asarray(False)
     bound = jnp.zeros((cap,), dtype)
-    if adaptive_reach:
+    fast = _knn_fast_search(cfg)
+    frame = (lo_b, hi_b)
+    if adaptive_reach and fast:
+        # pass 1: the exact local kNN; its k-th distance (exact, in the input
+        # dtype) bounds each query's true r_k from above. A bucket overflow
+        # leaves rows without neighbours, whose bound falls back to r_max.
+        _nbr1, d2_loc, loc_over, _ = _knn_fast(
+            xs_loc, fq_loc, fd_loc, live_ls, k, r_max, box, frame, cfg
+        )
+        bound = jnp.sqrt(jnp.minimum(d2_loc[:, k - 1], r_max * r_max))
+        bound = jnp.where(fq_loc > 0, bound, 0.0)
+
+        def reach_fast(cut):
+            return _cell_max(t_loc, cut, bound, cap)
+
+        cell_reach: Any = reach_fast
+    elif adaptive_reach:
         # pass 1: local kNN -> an upper bound on each query's true r_k
         # A cheap, density-adaptive candidate set: each node looks a few of its
         # own radii beyond its sphere. Whatever it finds is an upper bound.
@@ -2712,7 +2929,7 @@ def _knn_body(
         def reach(cut):
             return _cell_max(t_loc, cut, bound, cap)
 
-        cell_reach: Any = reach
+        cell_reach = reach
     else:
         cell_reach = jnp.asarray(r_max, dtype)
 
@@ -2731,17 +2948,23 @@ def _knn_body(
     c_pos, _c_w, c_flags, perm, n_live = _combine(
         p_pos, jnp.ones((cap,), dtype), p_flags, p_count, halo
     )
-    t = _cell_tree(
-        c_pos, n_live, box, (lo_b, hi_b), cfg.leaf_size, cfg.halo_leaf_capacity
-    )
     n = c_pos.shape[0]
-    xs = c_pos[t.order]
+    if fast:
+        # the fast search builds its own buckets: no cell tree over [local ; halo]
+        t = None
+        c_order = jnp.arange(n, dtype=INDEX_DTYPE)
+    else:
+        t = _cell_tree(
+            c_pos, n_live, box, (lo_b, hi_b), cfg.leaf_size, cfg.halo_leaf_capacity
+        )
+        c_order = t.order
+    xs = c_pos[c_order]
     live_s = jnp.arange(n, dtype=INDEX_DTYPE) < n_live
-    fq = jnp.where(live_s, c_flags[t.order, _QUERY], 0)
-    fd = jnp.where(live_s, c_flags[t.order, _DATA], 0)
+    fq = jnp.where(live_s, c_flags[c_order, _QUERY], 0)
+    fd = jnp.where(live_s, c_flags[c_order, _DATA], 0)
     # topology from frozen positions; distances recomputed from live ones would be
     # the C2 step (the top-k indices are discrete, the distances are not)
-    if adaptive_reach:
+    if adaptive_reach and t is not None:
         # each local query's first-pass bound, carried to its combined slot
         inv = (
             jnp.zeros((n,), INDEX_DTYPE).at[perm].set(jnp.arange(n, dtype=INDEX_DTYPE))
@@ -2760,16 +2983,32 @@ def _knn_body(
         )
     else:
         node_reach = None
-    nbr, _d2, w_over, wd = _knn_on_tree(
-        t, jax.lax.stop_gradient(xs), fq, fd, live_s, n, k, r_max, box, cfg, node_reach
-    )
+    if fast:
+        nbr, _d2, w_over, wd = _knn_fast(
+            jax.lax.stop_gradient(xs), fq, fd, live_s, k, r_max, box, frame, cfg
+        )
+    else:
+        assert t is not None
+        nbr, _d2, w_over, wd = _knn_on_tree(
+            t,
+            jax.lax.stop_gradient(xs),
+            fq,
+            fd,
+            live_s,
+            n,
+            k,
+            r_max,
+            box,
+            cfg,
+            node_reach,
+        )
     # values from the live positions at the frozen neighbour indices
     has = nbr >= 0
     delta = minimum_image(xs[jnp.where(has, nbr, 0)] - xs[:, None, :], box)
     r2 = jnp.where(has, jnp.sum(delta * delta, axis=-1), 1.0)
     d_sorted = jnp.where(has, _distance(r2, has), jnp.inf)
     # back to partitioned local rows: sorted slot -> combined row -> local row
-    comb_row = perm[t.order]
+    comb_row = perm[c_order]
     local_rows = jnp.where(live_s & (comb_row < cap), comb_row, as_index(cap))
     dist = (
         jnp.full((cap + 1, k), jnp.inf, dtype).at[local_rows].set(d_sorted, mode="drop")
@@ -2778,42 +3017,11 @@ def _knn_body(
     dist = jnp.where(is_q[:, None], dist, jnp.inf)
     out_gid = jnp.where(is_q, p_gid, -1)
 
-    cdf = None
-    if r_grid is not None:
-        rg = jnp.asarray(r_grid, dtype)
-
-        # one radius at a time, rematerialised: a (rows, k, grid) step array is
-        # 37 GB at 6.7e7 rows, k = 8, 16 radii, and reverse mode would hold
-        # several; per radius only (rows, k) arrays are ever live
-        def cdf_numerator(dist, rg, sharpness):
-            safe_d = jnp.where(jnp.isfinite(dist), dist, 2.0 * jnp.max(rg) + 1.0)
-            q = is_q[:, None]
-
-            if sharpness is None:
-
-                def hard(r):
-                    hit = jnp.where(q & (safe_d <= r), 1.0, 0.0).astype(dtype)
-                    return jnp.sum(hit, axis=0)
-
-                return jax.lax.map(hard, rg).T
-            log_d = jnp.log(safe_d)
-
-            @functools.partial(jax.checkpoint, prevent_cse=False)
-            def soft(r):
-                step = jax.nn.sigmoid(sharpness * (jnp.log(r) - log_d))
-                return jnp.sum(jnp.where(q, step, 0.0), axis=0)
-
-            # (radii, k) -> (k, radii), the rank-by-radius layout of the CDF
-            return jax.lax.map(soft, rg).T
-
-        num = cdf_numerator(dist, rg, sharpness)
-        num = jax.lax.psum(num, AXIS_NAME)
-        nq = jax.lax.psum(jnp.sum(is_q.astype(dtype)), AXIS_NAME)
-        cdf = num / jnp.maximum(nq, 1.0)
+    cdf = _knn_cdf(dist, is_q, r_grid, sharpness, dtype)
 
     flags_out = dict(
         partition_overflow=_any(part_over),
-        leaf_overflow=_any(t_loc.overflow | t.overflow),
+        leaf_overflow=_any(t_loc.overflow | (False if t is None else t.overflow)),
         summary_overflow=_any(halo.diag["summary_overflow"]),
         summary_exchange_overflow=_any(halo.diag["summary_exchange_overflow"]),
         export_overflow=_any(halo.diag["export_overflow"]),
@@ -2835,7 +3043,7 @@ def _knn_body(
         summary_recv=halo.diag["summary_recv"][None],
         summary_dests=halo.diag["summary_dests"][None],
         leaves_local=_live_leaves(t_loc)[None],
-        leaves=_live_leaves(t)[None],
+        leaves=(_live_leaves(t) if t is not None else jnp.zeros((), INDEX_DTYPE))[None],
         near_pairs=wd["near_max"][None],
         near_pairs_total=wd["near_total"][None],
         walk_frontier=wd["frontier"][None],
