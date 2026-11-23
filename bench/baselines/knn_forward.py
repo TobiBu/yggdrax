@@ -4,7 +4,16 @@ Times one forward k-nearest-neighbour search, tree build included, at matched
 ``N``, ``Q``, ``k`` and dtype, for every code that is installed:
 
 * ``yggdrax``: ``build_kdtree`` + ``query_neighbors(backend="tree")``, the
-  search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX);
+  search under ``yggdrax.applications.knn_stats`` (jitted, pure JAX). One
+  traced ``while_loop`` per query that visits one point per iteration: the CPU
+  KD-tree design, which a GPU runs as divergent serial threads;
+* ``yggdrax-fast``: :func:`yggdrax.fast_knn.fast_knn`, the fast path the
+  mutual FMM runs on: cell-aligned Morton buckets, the Pallas mutual walk and
+  a Pallas leaf-block top-k (jitted, pure JAX + Pallas). Its static sizes and
+  opening angle come from :func:`~yggdrax.fast_knn.plan_fast_knn` in the first
+  (untimed) call per size, as the fast-path benches size theirs; a row whose
+  certificate or capacities fail is poisoned (NaN) and so fails the check.
+  Periodic boxes by minimum image in the kernel;
 * ``jaxkd``: ``jaxkd.build_and_query`` (pure JAX; Dodge, github.com/dodgebc/jaxkd);
 * ``jaxkd-cuda``: the same with ``cuda=True`` (its optional CUDA extension; GPU);
 * ``jztree``: ``jztree.knn.knn`` (JZ-Tree, Stücker et al., arXiv:2604.05885;
@@ -49,6 +58,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -61,7 +72,7 @@ from bench.differentiability._common import (  # noqa: E402
     time_callable,
 )
 
-ARMS = ("yggdrax", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
+ARMS = ("yggdrax", "yggdrax-fast", "jaxkd", "jaxkd-cuda", "jztree", "ckdtree")
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -74,6 +85,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--box", type=float, default=1.0, help="side L of the cube")
     p.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     p.add_argument("--leaf-size", type=int, default=32, help="yggdrax KD leaf size")
+    p.add_argument(
+        "--fast-leaf-size", type=int, default=32, help="yggdrax-fast bucket size"
+    )
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -86,6 +100,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--check-min-index-agreement", type=float, default=None)
     p.add_argument("--time-anyway", action="store_true")
+    p.add_argument(
+        "--warmup-s",
+        type=float,
+        default=1.0,
+        help="before timing an arm, call it until this many seconds have passed: "
+        "an idle A100 sits at 765 of 1410 MHz and needs ~0.2 s of load to clock "
+        "up (a 20 ms call measured 35 ms on its first 4-6 calls)",
+    )
     p.add_argument("--time-budget-s", type=float, default=120.0)
     p.add_argument(
         "--gpu-select", choices=("free", "least-used", "none"), default="free"
@@ -128,7 +150,6 @@ def _make_arms(
         The runnable arms, and per arm ``{available, reason, version}``.
     """
     import jax
-    import numpy as np
 
     box = args.box if args.periodic else None
     fns: dict[str, Callable] = {}
@@ -151,6 +172,45 @@ def _make_arms(
 
             fns[name] = jax.jit(ygg, static_argnums=2)
             info[name] = {"available": True, "version": _version("yggdrax")}
+        elif name == "yggdrax-fast":
+            import jax.numpy as jnp
+
+            from yggdrax.fast_knn import fast_knn, plan_fast_knn
+
+            cache: dict[tuple, Any] = {}
+
+            def fast(data, queries, k):
+                key = (data.shape, queries.shape, k)
+                if key not in cache:
+                    plan = plan_fast_knn(
+                        data,
+                        queries,
+                        k=k,
+                        leaf_size=args.fast_leaf_size,
+                        box_size=box,
+                    )
+
+                    def run(d, q, _plan=plan):
+                        r = fast_knn(d, q, plan=_plan)
+                        good = r.certified[:, None] & ~r.overflow
+                        return jnp.where(good, r.distances, jnp.nan), r.indices
+
+                    cache[key] = (plan, jax.jit(run))
+                    info[name].setdefault("plans", {})[f"n={key[0][0]},k={k}"] = cache[
+                        key
+                    ][0]._asdict()
+                return cache[key][1](data, queries)
+
+            fns[name] = fast
+            info[name] = {
+                "available": True,
+                "version": _version("yggdrax"),
+                "walk": "fast_knn: cell-aligned buckets + Pallas mutual walk + "
+                "Pallas leaf top-k",
+                "leaf_size": args.fast_leaf_size,
+                "note": "plan (capacities, theta) made in the first, untimed call "
+                "per size; uncertified rows are NaN",
+            }
         elif name in ("jaxkd", "jaxkd-cuda"):
             if args.periodic:
                 skip(name, "jaxkd has no periodic boundaries")
@@ -234,19 +294,29 @@ def _reference(data64, queries64, k: int, box):
     return dist.reshape(q, k), idx.reshape(q, k)
 
 
-def _agreement(dist, idx, ref_dist, ref_idx, args) -> dict[str, Any]:
-    """Compare an arm's neighbours with the reference on the check queries."""
-    import numpy as np
+def _agreement(dist, idx, ref_dist, ref_idx, args, nonfinite=0) -> dict[str, Any]:
+    """Compare an arm's neighbours with the reference on the check queries.
 
+    ``idx`` is ``None`` for an arm that returns distances only; its check is
+    the distances alone. ``nonfinite`` counts non-finite distances over ALL
+    rows (not only the checked ones); any makes the arm fail.
+    """
     dist = np.sort(np.asarray(dist, dtype=np.float64), axis=1)
-    idx = np.asarray(idx)
     rel = np.abs(dist - ref_dist) / np.maximum(ref_dist, 1e-300)
-    same_set = np.all(np.sort(idx, axis=1) == np.sort(ref_idx, axis=1), axis=1)
-    frac = float(np.mean(same_set))
     max_rel = float(np.max(rel))
-    ok = bool(max_rel <= args.check_rtol and frac >= args.check_min_index_agreement)
+    frac = None
+    if idx is not None:
+        idx = np.asarray(idx)
+        same_set = np.all(np.sort(idx, axis=1) == np.sort(ref_idx, axis=1), axis=1)
+        frac = float(np.mean(same_set))
+    ok = bool(
+        max_rel <= args.check_rtol
+        and (frac is None or frac >= args.check_min_index_agreement)
+        and nonfinite == 0
+    )
     return {
         "ok": ok,
+        "nonfinite_distances_all_rows": int(nonfinite),
         "checked_queries": int(len(ref_dist)),
         "max_rel_distance_error": max_rel,
         "index_set_agreement": frac,
@@ -271,7 +341,6 @@ def main(argv=None) -> int:
     # keep --dtype.
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
-    import numpy as np
 
     platform = jax.default_backend()
     fns, arm_info = _make_arms(args, platform)
@@ -281,7 +350,8 @@ def main(argv=None) -> int:
         "metadata": run_metadata(
             {
                 "bench": "baselines/knn_forward",
-                "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree')",
+                "walk": "yggdrax: build_kdtree + query_neighbors(backend='tree'); "
+                "yggdrax-fast: yggdrax.fast_knn",
             }
         ),
         "params": vars(args),
@@ -320,18 +390,22 @@ def main(argv=None) -> int:
                     t0 = time.perf_counter()
                     dist, idx = _block(fn(data, queries, k))
                     row["first_call_s"] = time.perf_counter() - t0
+                    dist_np = np.asarray(dist)
                     agree = _agreement(
-                        np.asarray(dist)[:nc],
-                        np.asarray(idx)[:nc],
+                        dist_np[:nc],
+                        None if idx is None else np.asarray(idx)[:nc],
                         ref_dist,
                         ref_idx,
                         args,
+                        nonfinite=int(np.sum(~np.isfinite(dist_np))),
                     )
                     row["agreement"] = agree
+                    sets = agree["index_set_agreement"]
                     print(
                         f"[knn-forward] n={n} k={k} {name}: agreement ok={agree['ok']} "
                         f"max_rel={agree['max_rel_distance_error']:.2e} "
-                        f"sets={agree['index_set_agreement']:.4f}"
+                        f"sets={'n/a' if sets is None else f'{sets:.4f}'} "
+                        f"nonfinite={agree['nonfinite_distances_all_rows']}"
                     )
                     if not agree["ok"] and not args.time_anyway:
                         row["timing"] = None
@@ -347,6 +421,9 @@ def main(argv=None) -> int:
                             "first_call_s": row["first_call_s"],
                         }
                     else:
+                        t_end = time.perf_counter() + args.warmup_s
+                        while time.perf_counter() < t_end:
+                            _block(fn(data, queries, k))
                         timing = time_callable(
                             lambda: fn(data, queries, k),
                             warmup=args.warmup,

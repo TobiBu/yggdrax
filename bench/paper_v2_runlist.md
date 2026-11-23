@@ -245,6 +245,17 @@ queries, so no self-match conventions), k and dtype (float32).
 
 - **yggdrax**: `build_kdtree` + `query_neighbors(backend="tree")`, the search
   B1's kNN-CDF uses.
+  It is one traced `while_loop` per query visiting one point per iteration (the
+  CPU KD-tree design), which a GPU runs as divergent serial threads.
+- **yggdrax-fast**: `yggdrax.fast_knn` (the GPU design): the data in Morton
+  count buckets that never cross the parent cell of their adaptive cell leaf,
+  under a Morton-prefix radix structure; separate queries in their own blocks.
+  One Pallas program per query block merges a window of Morton-neighbour data
+  leaves, then walks the tree in pre-order, entering a node when any lane's
+  k-th ball reaches its box. Per-lane top-k in registers (replace-the-worst,
+  or a sorted list for k > 16). Periodic boxes by minimum
+  image in the kernel. Exact by construction; its one static size (the bucket
+  counts) is counted in the first, untimed call per size.
 - **jaxkd** 0.1.2: pure JAX. It breaks under `jax_enable_x64`: its `lax.cond`
   branches mix float32 and float64. The bench therefore traces it inside
   `jax.enable_x64(False)`, which is harmless for float32 inputs. jaxkd has no
