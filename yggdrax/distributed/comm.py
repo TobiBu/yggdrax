@@ -192,6 +192,65 @@ def _clamped_transfer(
     )
 
 
+def _install_ragged_feature_batching() -> None:
+    """Batch ``ragged_all_to_all`` along a feature axis when only the rows are batched.
+
+    ``jax.jacfwd`` (``vmap`` of ``jvp``) and ``jax.vmap`` over a distributed statistic
+    batch the exchanged rows -- the operand and its tangent -- while the sizes and
+    offsets, computed from integer counts, stay unbatched. JAX's batching rule for
+    the primitive (jax 0.11.2, ``_ragged_all_to_all_batched_collective``) asserts the
+    offsets are 2-D before it broadcasts them, so that case fails with a bare
+    ``AssertionError`` at trace time (the b3 forecast row on GPU, 2026-11-24). The
+    rows are the ragged axis, so a batch rides through the same exchange as one more
+    feature axis: one collective, the same sizes and offsets. Every other case
+    (batched sizes, the collective's own axis, axis_index_groups) goes to JAX's rule.
+    The primitive's JVP and transpose are untouched, so ``grad`` is unaffected.
+    """
+    try:
+        from jax._src.interpreters import batching
+        from jax._src.lax import parallel as lax_parallel
+
+        prim = lax_parallel.ragged_all_to_all_p
+        jax_rule = batching.fancy_primitive_batchers[prim]
+    except (ImportError, AttributeError, KeyError):  # pragma: no cover - other JAX
+        return
+    if getattr(jax_rule, "_yggdrax_feature_batching", False):
+        return
+
+    def rule(axis_data, vals_in, dims_in, axis_name, axis_index_groups):
+        rows_only = (
+            axis_data.name not in axis_name
+            and not axis_index_groups
+            and all(d is None for d in dims_in[2:])
+            and any(d is not None for d in dims_in[:2])
+        )
+        if not rows_only:
+            return jax_rule(axis_data, vals_in, dims_in, axis_name, axis_index_groups)
+        size = axis_data.size
+
+        def batch_at_one(x, d):
+            if d is None:
+                x = jnp.expand_dims(x, 1)
+                return jnp.broadcast_to(x, (x.shape[0], size, *x.shape[2:]))
+            return jnp.moveaxis(x, d, 1)
+
+        operand, output = (batch_at_one(x, d) for x, d in zip(vals_in[:2], dims_in[:2]))
+        out = prim.bind(
+            operand,
+            output,
+            *vals_in[2:],
+            axis_name=axis_name,
+            axis_index_groups=axis_index_groups,
+        )
+        return out, 1
+
+    rule._yggdrax_feature_batching = True  # type: ignore[attr-defined]
+    batching.fancy_primitive_batchers[prim] = rule
+
+
+_install_ragged_feature_batching()
+
+
 def _ragged_native(operand, full, me, output_capacity, axis_name, fill_value):
     """XLA ``ragged_all_to_all`` path (GPU/TPU).
 
