@@ -100,18 +100,6 @@ def _rows() -> list[Row]:
     rows = [
         # -- A1: tree build + traversal scaling, and the autodiff overhead ----------
         Row(
-            "a1_scaling",
-            "A1",
-            "legacy adaptive build + eager dual walk (radix/octree/kdtree); "
-            f"{fast_walk}; cKDTree CPU anchor",
-            ("{py}", f"{diff}/scaling.py", "--sizes", "1000", "10000", "100000",
-             "1000000", "--walk-backends", "flat", "pallas", "--runs", "5",
-             "--warmup", "2", *g, "--output", "{case}/scaling.json"),
-            smoke=("--sizes", "2000", *tiny),
-            cpu=("--pallas-interpret",),
-            est_gpu_min=25,
-        ),
-        Row(
             "a1_scaling_fast",
             "A1",
             fast_walk,

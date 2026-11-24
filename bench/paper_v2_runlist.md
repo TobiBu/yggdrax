@@ -154,8 +154,7 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 
 | tag | arm | what | est. GPU | smoke (CPU) |
 |---|---|---|---|---|
-| `a1_scaling` | A1 | build + traversal, N = 1e3–1e6: legacy backends, fast path (flat + Pallas), cKDTree anchor | 25 min | 29 s |
-| `a1_scaling_fast` | A1 | fast path alone, N = 2^11–2^26 (every power of two) | 45 min | 41 s |
+| `a1_scaling_fast` | A1 | build + traversal on the fast path (flat + Pallas walk), N = 2^11–2^26 (every power of two). A1 shows the fast path only: the legacy adaptive builds (radix/octree/kdtree + eager dual walk) and their row `a1_scaling` are gone | 45 min | 41 s |
 | `a1_autodiff_overhead` | A1 | kNN value vs value+grad, N = 1e3–1e6 | 5 min | 3 s |
 | `a5_gradient_accuracy` | A5 | gradient vs exact O(N²) autodiff, N = 4000, 16000, 64000 | 40 min | 57 s |
 | `a5_switch_rates` | A5 | MAC switch jumps along GD/HMC paths, N = 16000 | 30 min | 103 s |
@@ -186,7 +185,7 @@ The whole CPU smoke takes about 20 min on the laptop (compile-bound; most rows s
 
 | tag | file under `$OUT/cases/<tag>/` | paper |
 |---|---|---|
-| `a1_scaling`, `a1_scaling_fast` | `scaling.json`, `scaling_fast.json` | §2/§3 scaling, fig_scaling (`results/differentiability/`) |
+| `a1_scaling_fast` | `scaling_fast.json` | §2/§3 scaling, fig_scaling (`results/differentiability/`) |
 | `a1_autodiff_overhead` | `autodiff_overhead.json` | §3 autodiff ratios |
 | `a5_*` | `<name>.json` + `.png` | §3 gradient accuracy, switch rates, HMC (`bench/differentiability/results/`) |
 | `b1_*` | `knn_cdf_{open,periodic}.json` | §5 kNN-CDF showcase |
