@@ -1,9 +1,14 @@
-"""``jacfwd`` / ``vmap`` through the native ragged exchange.
+"""Derivatives and ``vmap`` through the native ragged exchange.
 
 Forward-mode Jacobians and ``vmap`` batch the exchanged rows while the sizes and
 offsets stay unbatched; JAX's own batching rule for ``ragged_all_to_all`` asserts on
 exactly that case (the b3 forecast row on GPU). ``yggdrax.distributed.comm``
 batches it along a feature axis instead.
+
+Reverse mode: JAX types the collective's result like its ``output`` buffer, a
+device-invariant constant, so under ``check_vma=True`` the reverse pass summed every
+device's cotangent before sending it back (``grad`` off by O(1) on 2 GPUs). The
+exchange now casts that buffer to varying.
 
 XLA:CPU has no ``ragged_all_to_all``, so on CPU only the trace is checked; on a GPU
 the native result and its derivatives are compared with the all_gather path.
@@ -23,6 +28,7 @@ except ImportError:  # pragma: no cover - older JAX
     from jax.experimental.shard_map import shard_map
 
 from yggdrax.distributed import device_count, make_mesh, ragged_all_to_all_exchange
+from yggdrax.distributed.comm import varying_axes
 from yggdrax.distributed.sharding import AXIS_NAME
 
 
@@ -38,7 +44,7 @@ def _problem(ndev):
     return full, c_in, cap, ops
 
 
-def _program(ndev, method):
+def _program(ndev, method, check_vma=True):
     """theta -> per-device sum of sin(exchanged rows scaled by theta)."""
     full, c_in, cap, ops = _problem(ndev)
     mesh = make_mesh(ndev)
@@ -56,6 +62,7 @@ def _program(ndev, method):
         mesh=mesh,
         in_specs=(P(AXIS_NAME), P(AXIS_NAME), P()),
         out_specs=P(AXIS_NAME),
+        check_vma=check_vma,
     )
     op, ss = jnp.asarray(ops), jnp.asarray(full.reshape(-1))
 
@@ -67,6 +74,7 @@ def _program(ndev, method):
 
 _THETA = jnp.asarray([1.3, 0.2], jnp.float32)
 _TRANSFORMS = {
+    "grad": lambda f: jax.grad(f)(_THETA),
     "jacfwd": lambda f: jax.jacfwd(f)(_THETA),
     "vmap": lambda f: jax.vmap(f)(jnp.stack([_THETA, _THETA + 0.5, _THETA - 0.25])),
     "jacrev": lambda f: jax.jacrev(f)(_THETA),
@@ -84,12 +92,34 @@ def test_native_exchange_traces_under_batching_transforms(name):
     assert "ragged_all_to_all" in str(jaxpr)
 
 
+def test_native_exchange_result_varies_over_the_mesh_axis():
+    """The result must be typed varying, or the reverse pass psums the cotangents."""
+    ndev = min(2, device_count())
+    full, c_in, cap, ops = _problem(ndev)
+    seen = []
+
+    def body(op, ss):
+        out, _, _ = ragged_all_to_all_exchange(
+            op, ss, output_capacity=cap, method="native"
+        )
+        seen.append(varying_axes(out))
+        return out
+
+    prog = shard_map(
+        body, mesh=make_mesh(ndev), in_specs=(P(AXIS_NAME),) * 2, out_specs=P(AXIS_NAME)
+    )
+    jax.make_jaxpr(prog)(jnp.asarray(ops), jnp.asarray(full.reshape(-1)))
+    assert seen and seen[0] is not None and AXIS_NAME in seen[0]
+
+
 @pytest.mark.skipif(
     jax.default_backend() != "gpu", reason="XLA:CPU has no ragged_all_to_all"
 )
+@pytest.mark.parametrize("check_vma", [True, False])
 @pytest.mark.parametrize("name", sorted(_TRANSFORMS))
-def test_native_exchange_derivatives_match_buf(name):
+def test_native_exchange_derivatives_match_buf(name, check_vma):
+    """On >= 2 GPUs (with the run list's XLA_FLAGS) this crosses devices."""
     ndev = min(2, device_count())
-    got = jax.jit(lambda: _TRANSFORMS[name](_program(ndev, "native")))()
-    ref = jax.jit(lambda: _TRANSFORMS[name](_program(ndev, "buf")))()
+    got = jax.jit(lambda: _TRANSFORMS[name](_program(ndev, "native", check_vma)))()
+    ref = jax.jit(lambda: _TRANSFORMS[name](_program(ndev, "buf", check_vma)))()
     np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-5, atol=1e-5)
