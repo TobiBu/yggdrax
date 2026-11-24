@@ -171,9 +171,9 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
 | `c2_native_ragged_check` | C2 | `YGGDRAX_CHECK_UPSTREAM_RAGGED_FIX=1` test, ≥ 2 GPUs (optional, GPU only) | 3 min | skipped |
 | `c4_walk_plan_xi` | C4 | streamed walk, ξ: XLA plan per device at 6.7e7 per device (2048³ on 128 GPUs), K = 64, 128, 256, compile only, 2 GPUs (optional) | 15 min | 21 s |
-| `c4_walk_plan_knn` | C4 | the same for kNN | 15 min | 28 s |
+| `c4_walk_plan_knn` | C4 | kNN (`knn_search="fast"`: each pass on `masked_knn`, no walk, so one plan) at the same size, compile only, 2 GPUs (optional) | 15 min | 28 s |
 | `c4_walk_run_xi` | C4 | ξ forward and value+grad at that size on 2 GPUs: time, runtime peak, K = 256 vs 128 (optional) | 30 min | 23 s |
-| `c4_walk_run_knn` | C4 | kNN forward at that size on 2 GPUs (optional) | 30 min | 20 s |
+| `c4_walk_run_knn` | C4 | kNN forward (fast search) at that size on 2 GPUs (optional) | 30 min | 20 s |
 | `base_knn_open` | baseline | kNN forward: yggdrax vs jaxkd, jaxkd-cuda, JZ-Tree, cKDTree; N = 1e4–3e7, k = 8, 32 | 30 min | 3 s |
 | `base_knn_periodic` | baseline | the same in a periodic box (yggdrax, JZ-Tree, cKDTree) | 30 min | 8 s |
 | `base_kernel_sums_uniform` | baseline | soft pair counts: yggdrax traced vs KeOps vs dense JAX, N = 1e4–1e6 | 25 min | 26 s |

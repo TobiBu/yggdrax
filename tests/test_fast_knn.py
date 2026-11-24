@@ -244,3 +244,67 @@ def test_periodic_xla_reference_and_walk_rejection():
     np.testing.assert_allclose(np.asarray(res.distances), ref_d[:, 1:], rtol=1e-5)
     with pytest.raises(ValueError, match="periodic"):
         plan_fast_knn(data, None, k=6, box_size=1.0, method="walk")
+
+
+@pytest.mark.parametrize("box", [None, 1.0])
+@pytest.mark.parametrize("k", [4, 16])
+def test_masked_knn_padding_and_roles_match_brute_force(box, k):
+    # one padded buffer: rows that are data only, query only, both, and padding
+    # (garbage coordinates far outside the box); the Pallas traversal (interpret)
+    # must match the dense reference and give padding / non-query rows nothing
+    from yggdrax.fast_knn import masked_knn
+
+    rng = np.random.default_rng(100 + k + (box is not None))
+    n = 1100
+    pts = _clustered(rng, n).astype(np.float64)
+    role = rng.integers(0, 4, n)  # 0 pad, 1 data, 2 query, 3 both
+    pts[role == 0] = 1e6 * rng.standard_normal((int(np.sum(role == 0)), 3))
+    is_d = jnp.asarray((role == 1) | (role == 3))
+    is_q = jnp.asarray((role == 2) | (role == 3))
+    lo, hi = jnp.zeros(3), jnp.ones(3)
+    cap = int(2.5 * n / 32) + 8
+    rows, d2, over = jax.jit(
+        lambda p: masked_knn(
+            p,
+            is_d,
+            is_q,
+            k=k,
+            bucket_capacity=cap,
+            box_size=box,
+            bounds=None if box else (lo - 0.5, hi + 0.5),
+            backend="pallas",
+            interpret=True,
+        )
+    )(jnp.asarray(pts))
+    ref_r, ref_d2, _ = masked_knn(
+        jnp.asarray(pts),
+        is_d,
+        is_q,
+        k=k,
+        bucket_capacity=cap,
+        box_size=box,
+        backend="xla",
+    )
+    assert not bool(over)
+    rows, ref_r = np.asarray(rows), np.asarray(ref_r)
+    q = np.asarray(is_q)
+    assert np.all(rows[~q] == -1)
+    np.testing.assert_allclose(np.asarray(d2)[q], np.asarray(ref_d2)[q], rtol=1e-5)
+    same = np.all(np.sort(rows[q], 1) == np.sort(ref_r[q], 1), axis=1)
+    assert same.mean() >= 0.999
+    # every neighbour is a data row and never the query itself
+    nb = rows[q]
+    assert np.all(np.asarray(is_d)[nb[nb >= 0]])
+    assert not np.any(nb == np.nonzero(q)[0][:, None])
+
+
+def test_masked_knn_reports_a_bucket_overflow():
+    from yggdrax.fast_knn import masked_knn
+
+    rng = np.random.default_rng(1)
+    pts = jnp.asarray(_uniform(rng, 600))
+    ones = jnp.ones((600,), bool)
+    _, _, over = masked_knn(
+        pts, ones, ones, k=4, bucket_capacity=4, backend="pallas", interpret=True
+    )
+    assert bool(over)

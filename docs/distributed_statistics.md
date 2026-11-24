@@ -311,6 +311,48 @@ the correct `1[r_k ≤ r] = 0` for every `r ≤ r_max`.
 - **Values:** the search returns neighbour *indices* (topology). The distances
   are then recomputed from the live positions by a gather and the minimum image.
 
+**The search in each pass: `knn_search`.** The passes above describe the
+`"walk"` search. With `knn_search="fast"` (the default, `"auto"`, wherever the
+Pallas kernels run: Ampere or newer GPUs) both passes run
+`yggdrax.fast_knn.masked_knn` instead, the packet traversal of the single-device
+fast kNN on one padded buffer:
+
+- the buffer's rows carry traced data / query masks (randoms are queries only,
+  padding rows neither); padding rows get the reserved Morton code, sort to the
+  end and start no bucket, non-data source lanes sit at `+inf` and the node boxes
+  cover data lanes only, so the kernel needs no data mask;
+- the kernel searches float32 copies; the `k` found neighbours' squared
+  distances are recomputed from the positions in their own dtype, re-sorted and
+  cut at `r_max`, so pass 1's `b_i` is an exact distance to a real data point
+  (an upper bound on `r_k`, as above) and pass 2's distances are exact;
+- pass 1 is the exact local kNN (no `first_pass_reach_factor`), so the halo is
+  as thin as the local data allow; pass 2 needs no walk and no reach, and the
+  `[local ; halo]` buffer gets no cell tree;
+- the one static size is each pass's bucket count, `knn_bucket_factor * rows /
+  W` (W the next power of two of `knn_leaf_size`, default 32); a shortfall sets
+  `walk_overflow` in pass 2 and `local_pass_overflow` in pass 1 (harmless: lost
+  points only raise a bound).
+
+On ONE device the fast search skips the partition, the first pass and the halo
+altogether (there is nothing to import, and periodic images are the kernel's
+minimum image): one `masked_knn` over the input rows, the same output layout,
+flags and statistics.
+
+One A100 (uniform, periodic, Q = N randoms, k = 8, `r_max` 3 spacings, exact
+against `fast_knn`):
+
+| N | `knn_search="walk"` | `"fast"` | `fast_knn` alone |
+|---|---|---|---|
+| 1e5 | 2.35 s | 3.1 ms | |
+| 1e6 | 21.8 s | 18.0 ms | 9.3 ms |
+| 4e6 | 95.1 s | 80.1 ms | 28.5 ms |
+| 1.6e7 | | 317 ms | |
+
+The remaining factor to `fast_knn` is the shared tree: data and queries share
+one set of buckets here, where `fast_knn` gives separate queries their own. The
+walk search stays for CPUs (where the Pallas kernels do not run) and for the
+streamed-walk study (C4).
+
 A plain radius-bounded halo (reach `r_max` everywhere) would also be exact. The
 first pass makes both the import and the pass-2 walk adapt to density: in
 clustered regions `r_k ≪ r_max` and the halo shell thins accordingly. In voids

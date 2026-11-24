@@ -75,7 +75,7 @@ from .pallas.knn_topk import (
 )
 from .periodic import BoxSize, minimum_image, normalize_box_size, wrap_positions
 
-__all__ = ["FastKNN", "FastKNNPlan", "fast_knn", "plan_fast_knn"]
+__all__ = ["FastKNN", "FastKNNPlan", "fast_knn", "masked_knn", "plan_fast_knn"]
 
 #: Relative and absolute pad on the bounding radii the certificate uses: the
 #: geometry's radii are the max point distance up to float32 rounding (1e-6).
@@ -308,7 +308,11 @@ def _build(pts: Any, leaf_size: int, capacity: int, geometry: bool = True) -> _B
 
 
 def _build_radix(
-    pts: Any, leaf_size: int, capacity: int, bounds: Optional[tuple] = None
+    pts: Any,
+    leaf_size: int,
+    capacity: int,
+    bounds: Optional[tuple] = None,
+    live: Optional[Any] = None,
 ) -> _Built:
     """Cell-aligned buckets under a Morton-prefix (Karras) radix structure.
 
@@ -317,19 +321,28 @@ def _build_radix(
     compact (its points share a Morton cell). The packet traversal tests 2.5x
     fewer nodes on it (1e6 uniform: 502 -> 193 at k = 8). Padding buckets get
     the largest code, so they sit in one subtree at the right end.
+
+    ``live`` (optional ``(n,)`` bool, traced) marks the points that exist: the
+    others get the padding code, sort to the end and start no bucket, so they
+    cost no bucket capacity (the caller masks them out of the lanes).
     """
     n = int(pts.shape[0])
     width = next_pow2(int(leaf_size))
     if bounds is None:
         bounds = _bounds(pts)
     codes = morton_encode(pts, bounds)
+    sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
+    if live is not None:
+        codes = jnp.where(live, codes.astype(jnp.uint64), sentinel)
     perm, scodes = _morton_sort(codes)
     flag, nb = _aligned_buckets(scodes, width, leaf_size)
+    if live is not None:
+        flag = flag & live[perm]
+        nb = jnp.sum(flag.astype(jnp.int32))
     starts = jnp.nonzero(flag, size=capacity, fill_value=n)[0].astype(INDEX_DTYPE)
     ends = jnp.concatenate([starts[1:], jnp.full((1,), n, INDEX_DTYPE)])
-    live = starts < n
-    sentinel = jnp.asarray(np.uint64(2**63 - 1), dtype=jnp.uint64)
-    leaf_codes = jnp.where(live, scodes[jnp.minimum(starts, n - 1)], sentinel)
+    live_b = starts < n
+    leaf_codes = jnp.where(live_b, scodes[jnp.minimum(starts, n - 1)], sentinel)
     topo = _build_tree_from_leaf_partitions(
         pts,
         jnp.ones((n,), pts.dtype),
@@ -558,7 +571,7 @@ class _Tables(NamedTuple):
     cr: Any
 
 
-def _tables(b: _Built, is_data: np.ndarray, is_query: np.ndarray) -> _Tables:
+def _tables(b: _Built, is_data: Any, is_query: Any) -> _Tables:
     ni, nl, width = b.num_internal, b.num_leaves, b.width
     npts = int(b.ps.shape[0])
     rng = b.topo.node_ranges[ni:]
@@ -567,6 +580,10 @@ def _tables(b: _Built, is_data: np.ndarray, is_query: np.ndarray) -> _Tables:
     lane = jnp.arange(width)
     valid = (lane[None, :] < cnt[:, None]) & (start[:, None] < npts)
     slot = jnp.where(valid, start[:, None] + lane[None, :], 0).astype(jnp.int32)
+    # a point that is neither data nor query (padding) is an empty lane
+    live = jnp.asarray(is_data) | jnp.asarray(is_query)
+    valid = valid & live[b.topo.particle_indices[slot]]
+    slot = jnp.where(valid, slot, 0)
     # empty lanes sit at +inf: their distances are inf, so a kernel needs no
     # data mask for them (one load less per candidate)
     p = jnp.where(valid[..., None], b.ps[slot], jnp.inf)
@@ -920,6 +937,170 @@ def _run_walk(
         "max_sources": max_src,
     }
     return d2q, sq, certified, overflow, stats
+
+
+def masked_knn(
+    points: Any,
+    is_data: Any,
+    is_query: Any,
+    *,
+    k: int,
+    bucket_capacity: int,
+    leaf_size: int = 32,
+    box_size: Optional[BoxSize] = None,
+    bounds: Optional[tuple[Any, Any]] = None,
+    backend: str = "auto",
+    interpret: bool = False,
+    num_warps: Optional[int] = None,
+    seed: int = 8,
+    merge_impl: str = "auto",
+) -> tuple[Any, Any, Any]:
+    """Exact kNN of the query rows among the data rows of ONE padded point set.
+
+    The building block for callers whose point set is a traced, padded buffer
+    (a device's ``[local ; halo]`` rows in
+    :func:`yggdrax.distributed.stats.distributed_knn`): ``is_data`` and
+    ``is_query`` are traced masks, a row that is neither is padding and costs
+    no bucket, and a row that is both never finds itself. The packet traversal
+    of :func:`fast_knn` (one tree, method ``"traverse"``) runs on float32
+    copies of the points; callers that need the distances in another dtype
+    recompute them at the returned indices.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` points (any float dtype).
+    is_data
+        ``(n,)`` bool: rows that can be neighbours.
+    is_query
+        ``(n,)`` bool: rows that get neighbours.
+    k
+        Neighbours per query.
+    bucket_capacity
+        Static bucket count of the tree: about ``1.4 n_live / W`` for uniform
+        points (``W`` the next power of two of ``leaf_size``), more when
+        clustered; the overflow flag reports a shortfall.
+    leaf_size
+        Bucket size.
+    box_size
+        Periodic box (minimum image), or ``None``.
+    bounds
+        Morton frame ``(lo, hi)`` of an open run; default the live points'
+        padded box. Ignored with ``box_size``.
+    backend
+        ``"pallas"``, ``"xla"`` (exact dense reference, ``O(n^2)``: tests and
+        small sets only) or ``"auto"`` (Pallas on Ampere+).
+    interpret
+        Run the Pallas kernels in interpret mode (CPU tests).
+    num_warps
+        As :func:`fast_knn`.
+    seed
+        As :func:`fast_knn`.
+    merge_impl
+        As :func:`fast_knn`.
+
+    Returns
+    -------
+    tuple
+        ``(rows, d2, overflow)``: ``(n, k)`` int32 neighbour rows into
+        ``points`` sorted by float32 distance (``-1`` past the last data row,
+        and on every non-query row), their float32 squared distances (``inf``
+        there) and a scalar bool, the bucket count exceeded ``bucket_capacity``
+        (then nothing is trusted).
+
+    Raises
+    ------
+    ValueError
+        If the points are not ``(n, 3)``.
+    """
+    pts = jnp.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must be (n, 3), got {pts.shape}")
+    n = int(pts.shape[0])
+    box = normalize_box_size(box_size, 3)
+    is_d = jnp.asarray(is_data, bool)
+    is_q = jnp.asarray(is_query, bool)
+    p32 = _wrap(jax.lax.stop_gradient(pts).astype(jnp.float32), box)
+    kb = _resolve_backend(backend, interpret)
+    if kb == "xla":
+        delta = minimum_image(p32[:, None, :] - p32[None, :, :], box)
+        d2 = jnp.sum(delta * delta, axis=-1)
+        ok = is_d[None, :] & is_q[:, None] & ~jnp.eye(n, dtype=bool)
+        neg, j = lax.top_k(-jnp.where(ok, d2, jnp.inf), int(k))
+        d2k = -neg
+        rows = jnp.where(jnp.isfinite(d2k), j, -1).astype(jnp.int32)
+        return rows, d2k, jnp.asarray(False)
+    live = is_d | is_q
+    if box is not None:
+        frame = _frame(p32, box)
+    elif bounds is not None:
+        frame = (
+            jnp.asarray(bounds[0], jnp.float32),
+            jnp.asarray(bounds[1], jnp.float32),
+        )
+    else:
+        big = jnp.asarray(jnp.inf, jnp.float32)
+        lo = jnp.min(jnp.where(live[:, None], p32, big), axis=0)
+        hi = jnp.max(jnp.where(live[:, None], p32, -big), axis=0)
+        pad = 1e-4 * jnp.maximum(jnp.max(hi - lo), 1e-30)
+        frame = (lo - pad, hi + pad)
+    plan = FastKNNPlan(
+        num_data=n,
+        num_queries=0,
+        k=int(k),
+        leaf_size=int(leaf_size),
+        theta=0.0,
+        max_pair_queue=0,
+        far_cap=0,
+        near_cap=0,
+        max_sources=0,
+        bucket_capacity=int(bucket_capacity),
+        box=box,
+    )
+    if merge_impl == "auto":
+        merge_impl = _auto_merge(int(k), n)
+    b = _build_radix(p32, int(leaf_size), int(bucket_capacity), bounds=frame, live=live)
+    t = _tables(b, is_d, is_q)
+    # The pre-order kernel reads no data mask: a source lane that is not data
+    # must sit at +inf (as empty lanes do), and the node boxes must cover the
+    # data lanes alone. The query lanes keep their coordinates as targets. The
+    # slots stay as they are: the kernel names candidate j of a leaf
+    # slot[leaf, 0] + j.
+    inf = jnp.asarray(jnp.inf, t.x.dtype)
+    src = t._replace(
+        x=jnp.where(t.dmask, t.x, inf),
+        y=jnp.where(t.dmask, t.y, inf),
+        z=jnp.where(t.dmask, t.z, inf),
+    )
+    pre, leaves = _radix_layout(b, src._replace(slot=jnp.where(t.dmask, t.slot, -1)))
+    orig = b.topo.particle_indices[jnp.clip(t.slot, 0)]
+    qid = jnp.where(t.qmask, orig, -1).astype(jnp.int32)
+    nl = int(t.x.shape[0])
+    d2q, sq = leaf_topk_preorder_pallas(
+        src.x,
+        src.y,
+        src.z,
+        t.dmask,
+        t.qmask,
+        src.slot,
+        leaves,
+        pre,
+        qid,
+        targets=(t.x, t.y, t.z, t.qmask, t.slot, jnp.arange(nl, dtype=jnp.int32)),
+        num_queries=n,
+        k=int(k),
+        exclude_self=True,
+        seed=int(seed),
+        interpret=bool(interpret),
+        num_warps=num_warps,
+        merge_impl=merge_impl,
+        box=box,
+    )
+    overflow = b.overflow
+    rows = jnp.where(sq >= 0, b.topo.particle_indices[jnp.clip(sq, 0)], -1)
+    rows = jnp.where(is_q[:, None], rows, -1).astype(jnp.int32)
+    d2q = jnp.where(rows >= 0, d2q, jnp.inf)
+    return rows, d2q, overflow
 
 
 def _brute_topk(
