@@ -237,20 +237,23 @@ def _rows() -> list[Row]:
             "evaluations per step, 2.6 s each at N = 3e4)",
         ),
         Row(
-            "b4_positions_1e7",
+            "b4_positions_7e6",
             "B4",
-            "the same at N = 1e7 (L = 6.9 at fixed density): cost per step and "
+            "the same at N = 7e6 (L = 6.2 at fixed density): cost per step and "
             "the start of the loss trajectory",
             ("{py}", "bench/positions/optimise.py", *a5, "--num-particles",
-             "10000000", "--optimizer", "lbfgs", "--lbfgs-max-step", "0.25",
+             "7000000", "--optimizer", "lbfgs", "--lbfgs-max-step", "0.25",
              "--num-steps", "100", "--rebuild-every", "10",
-             "--timing-reps", "2", "--out", "{case}/positions_1e7.json",
-             "--fig", "{case}/positions_1e7.png"),
+             "--timing-reps", "2", "--out", "{case}/positions_7e6.json",
+             "--fig", "{case}/positions_7e6.png"),
             smoke=("--num-particles", "4096", "--num-steps", "10",
                    "--rebuild-every", "5", "--timing-reps", "1"),
             requires="bench/positions/optimise.py",
+            env=(("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95"),),
             est_gpu_min=50,
-            note="float64 memory at 1e7 untested, may OOM on 40 GB",
+            note="largest N that fits float64 on an A100-40GB with headroom: "
+            "20 steps peak 18.6 GiB at 5e6, 25.7 GiB at 7e6; 1e7 needs 38 GiB "
+            "for the fresh statistics alone (traced-xi caps double to 2^28)",
         ),
         # -- C2: gradient memory of the distributed statistics, 1/2/4 GPUs ------------
         Row(

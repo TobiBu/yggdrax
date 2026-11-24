@@ -165,7 +165,7 @@ as "overnight". "Smoke" is the measured CPU smoke time on an M-series laptop.
 | `b2_acceptance_rules` | B2 | window ε vs geometric θ at matched accuracy | 15 min | 286 s |
 | `b3_forecast` | B3 | point-process Fisher forecast + recovery, N = 32768 (GPU command of `docs/point_process.md`) | 60 min | 117 s |
 | `b4_positions_1e6` | B4 | move N = 1e6 particles until ξ and kNN-CDF match a Thomas target, 600 L-BFGS steps (step cap 0.25 l), + gradient check | 50 min (guess) | 111 s |
-| `b4_positions_1e7` | B4 | the same at N = 1e7, 100 steps (cost per step) | 50 min (guess) | 44 s |
+| `b4_positions_7e6` | B4 | the same at N = 7e6, 100 steps (cost per step); 1e7 does not fit float64 on 40 GB | 50 min (guess) | 44 s |
 | `c2_grad_memory_g1` | C2 | distributed ξ/kNN forward vs value+grad memory and time, N = 2^20, 1 GPU | 10 min | 56 s |
 | `c2_grad_memory_g2` | C2 | the same on 2 GPUs (optional) | 10 min | 76 s |
 | `c2_grad_memory_g4` | C2 | the same on 4 GPUs (optional) | 10 min | 88 s |
@@ -299,9 +299,13 @@ The CPU reference results are in `bench/corrfunc/results/xi_box_cpu.json` and
 ## B4 rows
 
 The B4 bench (`bench/positions/optimise.py`) came in with #127.
-The box grows with N at fixed density (L = 3.2 at 1e6, 6.9 at 1e7), so the
-cost per particle per step is fixed. The 1e7 row runs 100 steps only: it
-measures the cost per step and memory, not convergence.
+The box grows with N at fixed density (L = 3.2 at 1e6, 6.2 at 7e6). The 7e6
+row runs 100 steps only: it measures the cost per step and memory, not
+convergence. It was 1e7 until the 2026-11-24 shakedown: in float64 the fresh
+statistics alone need 38 GiB there (the traced-ξ near and sub-block lists are
+sized at 2^28 pairs), so it cannot fit an A100-40GB. A 20-step run peaked at
+18.6 GiB at 5e6 and 25.7 GiB at 7e6 (memory fraction 0.95), leaving headroom
+for the re-plans of a 100-step run.
 
 Both rows use L-BFGS with every particle's step capped at 0.25 l (the bench
 default since #127). On the CPU comparison at N = 3e4
