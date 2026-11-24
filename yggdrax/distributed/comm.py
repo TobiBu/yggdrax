@@ -209,7 +209,9 @@ def _vary_like_exchange(output: Array, operand: Array, axis_name) -> Array:
     if pcast is None or have is None or op_vma is None:  # pragma: no cover - old JAX
         return output
     names = (axis_name,) if isinstance(axis_name, str) else tuple(axis_name)
-    missing = tuple(dict.fromkeys(n for n in (*names, *sorted(op_vma)) if n not in have))
+    missing = tuple(
+        dict.fromkeys(n for n in (*names, *sorted(op_vma)) if n not in have)
+    )
     return pcast(output, missing, to="varying") if missing else output
 
 
