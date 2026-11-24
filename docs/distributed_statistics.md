@@ -328,6 +328,15 @@ fast kNN on one padded buffer:
 - pass 1 is the exact local kNN (no `first_pass_reach_factor`), so the halo is
   as thin as the local data allow; pass 2 needs no walk and no reach, and the
   `[local ; halo]` buffer gets no cell tree;
+- pass 1's answer is FINAL for every query whose ball of radius `b_i` holds no
+  other device's data point, and pass 2 searches only the rest (the
+  `second_pass_queries` statistic): another device's point within `b_i` lies
+  within the query's cell reach, so (a) the cell was shipped to that device in
+  the summary exchange, and (b) the point lies in one of that device's coarse
+  particle boxes, the ones the exchange already gathered. A query failing
+  either test (minimum image, with the exchange's rounding slack) keeps its
+  pass-1 neighbours; a pass-1 overflow sends every query to pass 2. Uniform,
+  1e6 + 1e6 randoms on 2 devices: 5 % of the queries; clustered: 10-30 %;
 - the one static size is each pass's bucket count, `knn_bucket_factor * rows /
   W` (W the next power of two of `knn_leaf_size`, default 32); a shortfall sets
   `walk_overflow` in pass 2 and `local_pass_overflow` in pass 1 (harmless: lost
@@ -349,7 +358,42 @@ against `fast_knn`):
 | 1.6e7 | | 317 ms | |
 
 The remaining factor to `fast_knn` is the shared tree: data and queries share
-one set of buckets here, where `fast_knn` gives separate queries their own. The
+one set of buckets here, where `fast_knn` gives separate queries their own.
+
+**Several devices: the halo machinery scales with what is live.** Every static
+buffer of the halo import is sized for the worst case (`for_problem` sizes the
+export lists `8 x (capacity + halo)`, 2^25 at 1e6 particles per device, for
+1.3e5 live (cell, leaf) pairs), so every stage whose cost followed its buffer
+rather than its contents dominated. Per device, 1e6 data + 1e6 randoms on 2
+devices, k = 8, uniform (device 0's stages timed one at a time on its own
+captured inputs; contended A100):
+
+| stage | `for_problem` before | after | `for_box` before | after |
+|---|---|---|---|---|
+| send buffers (sort of the export list) | 51.5 ms | 3.4 ms | 11.8 ms | 1.4 ms |
+| export walk | 34.1 ms | 4.3 ms | 5.5 ms | 3.4 ms |
+| kNN pass 2 | 18.6 ms | 13.5 ms | 14.2 ms | 6.4 ms |
+| kNN pass 1 | 11.9 ms | 11.7 ms | 9.9 ms | 8.6 ms |
+
+- **send buffers:** `build_send_buffers` sorts only the live prefix of the export
+  list (`prefix_argsort`: the narrowest of a ladder of static widths, x4 apart,
+  that holds it), with 32-bit keys where they fit;
+- **export walk:** seeded with the received cells only (`seed_count`; it used to
+  start from every slot of the receive buffer), and the mutual walk writes each
+  round's pushes into its carried queue instead of a fresh full-capacity buffer
+  (two broadcasts and four copies of the whole queue per round, for every walk
+  user);
+- **pass 2:** only the edge queries (above); the per-row re-sort of the
+  recomputed distances is an early-exit odd-even transposition (the rows arrive
+  sorted in float32: usually no swap at all) instead of a general sort of every
+  short row; `masked_knn`'s bucket starts are a cumsum and a plain scatter
+  instead of `jnp.nonzero(size=)`'s scatter-add;
+- **partition:** per-destination counts from the run boundaries of the sorted
+  destinations, not an atomic histogram.
+
+The local cell tree costs what its `leaf_capacity` says (13.7 ms at
+`for_problem`'s default `capacity`, 5.1 ms at `for_box`'s): size it from the
+geometry when it matters. The
 walk search stays for CPUs (where the Pallas kernels do not run) and for the
 streamed-walk study (C4).
 
