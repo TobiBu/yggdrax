@@ -464,6 +464,15 @@ def test_fast_search_matches_brute_force_on_every_mesh(name, ndev, adaptive):
     d = np.asarray(res.distances)
     assert np.array_equal(np.isinf(d), np.isinf(ref))
     np.testing.assert_allclose(d[np.isfinite(d)], ref[np.isfinite(ref)], rtol=1e-12)
+    second = int(np.sum(np.asarray(res.stats["second_pass_queries"])))
+    if ndev == 1:
+        assert second == 0  # one device: no halo, no second pass
+    elif adaptive:
+        # only the queries near another device's data are searched again; the
+        # exact match above is what shows that none of the others needed it
+        assert 0 < second < len(pts), second
+    else:
+        assert second == len(pts)
 
 
 @pytest.mark.parametrize("ndev", [1, 4])

@@ -5900,24 +5900,16 @@ def _dual_tree_walk_mutual_flat(
             safe_slot = jnp.where(push_ok, push_prefix, ix(max_pair_queue))
             lo = jnp.minimum(push_a, push_b)
             hi = jnp.maximum(push_a, push_b)
-            new_a = (
-                jnp.full((max_pair_queue,), -1, dtype=idx)
-                .at[safe_slot]
-                .set(
-                    jnp.where(push_ok, lo, index_neg1),
-                    mode="drop",
-                    unique_indices=True,
-                )
-            )
-            new_b = (
-                jnp.full((max_pair_queue,), -1, dtype=idx)
-                .at[safe_slot]
-                .set(
-                    jnp.where(push_ok, hi, index_neg1),
-                    mode="drop",
-                    unique_indices=True,
-                )
-            )
+            # Written INTO the carried queue, not into a fresh full-width -1
+            # buffer: the pushes fill exactly the slots ``[0, push_total)``, and
+            # nothing reads a slot at or past the queue size (every reader masks
+            # with ``arange < size``), so stale pairs there are inert. A fresh
+            # buffer cost two full-capacity broadcasts and four full-capacity
+            # copies per round -- the walk's whole cost when the queue is sized
+            # far above its live wavefront (an export walk at 1e6 particles per
+            # device: 20 of 20 ms at a 2^25 queue).
+            new_a = state[0].at[safe_slot].set(lo, mode="drop", unique_indices=True)
+            new_b = state[1].at[safe_slot].set(hi, mode="drop", unique_indices=True)
             base = (
                 new_a,
                 new_b,

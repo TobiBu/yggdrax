@@ -1268,6 +1268,25 @@ class _Halo(NamedTuple):
     gid: Array
     num: Array  # live halo rows (not ``count``: that shadows ``tuple.count``)
     diag: dict
+    cut: Any = None  # the summary cut the halo was imported for
+    edge: Any = None  # ``_Edge`` of the "neighbors" exchange, else ``None``
+
+
+class _Edge(NamedTuple):
+    """What a device knows, after the halo, about where other devices' data are.
+
+    ``sent`` marks the summary cells shipped to at least one other device: a cell
+    that went nowhere has no other device's data point within its reach. The
+    boxes are the coarse particle boxes (:func:`_coarse_cut`) of the devices the
+    cells went to; every data point of another device within a cell's reach lies
+    in one of them.
+    """
+
+    sent: Array  # (S,) per summary cell
+    box_center: Array  # (K, B, 3)
+    box_half: Array  # (K, B, 3)
+    box_live: Array  # (K, B)
+    num_dest: Array  # destinations actually used (<= K)
 
 
 #: Relative slack on the neighbour tests. They decide which cells a sender gets;
@@ -1304,6 +1323,8 @@ class _Cells(NamedTuple):
     radius: Array  # (R,) bounding radius + reach
     live: Array  # (R,)
     owner: Array  # (R,) the device the cell belongs to
+    num: Array  # live cells, a prefix of the R rows
+    edge: _Edge
     diag: dict
 
 
@@ -1430,7 +1451,7 @@ def _neighbor_cells(t: _Tree, cut, c_center, c_radius, live_cell, ndev, box, cfg
     rows = jax.lax.stop_gradient(rows)
 
     def per_dest(i, state):
-        buf, sizes, used = state
+        buf, sizes, used, sent = state
         d = dests[i]
         valid = d < ndev
         ds = jnp.where(valid, d, 0)
@@ -1452,13 +1473,25 @@ def _neighbor_cells(t: _Tree, cut, c_center, c_radius, live_cell, ndev, box, cfg
         slot = used + jnp.cumsum(hit.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
         buf = buf.at[jnp.where(hit, slot, as_index(Cs))].set(rows, mode="drop")
         sizes = sizes.at[ds].add(jnp.where(valid, cnt, 0))
-        return buf, sizes, used + cnt
+        return buf, sizes, used + cnt, sent | hit
 
     n_loop = jnp.minimum(n_dest, as_index(K))
     buf0 = jnp.zeros((Cs, 4), dtype)
     sizes0 = jnp.zeros((ndev,), INDEX_DTYPE)
-    buf, send_sizes, n_sent = jax.lax.fori_loop(
-        as_index(0), n_loop, per_dest, (buf0, sizes0, as_index(0))
+    buf, send_sizes, n_sent, sent = jax.lax.fori_loop(
+        as_index(0),
+        n_loop,
+        per_dest,
+        (buf0, sizes0, as_index(0), jnp.zeros((S,), bool)),
+    )
+    d_ok = dests < ndev
+    d_safe = jnp.where(d_ok, dests, 0)
+    edge = _Edge(
+        sent=sent,
+        box_center=all_co_center[d_safe],
+        box_half=all_co_half[d_safe],
+        box_live=all_co_live[d_safe] & d_ok[:, None],
+        num_dest=n_loop,
     )
     recv, recv_sizes, _ = ragged_all_to_all_exchange(
         buf, send_sizes, output_capacity=R, method=cfg.exchange
@@ -1474,6 +1507,8 @@ def _neighbor_cells(t: _Tree, cut, c_center, c_radius, live_cell, ndev, box, cfg
         radius=jnp.where(live, recv[:, 3], 0.0),
         live=live,
         owner=owner.astype(INDEX_DTYPE),
+        num=jnp.minimum(n_recv, as_index(R)),
+        edge=edge,
         diag=dict(
             summary_exchange_overflow=overflow,
             summary_sent=n_sent,
@@ -1549,6 +1584,7 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
             ),
             summary_dests=jnp.asarray(ndev - 1, INDEX_DTYPE),
         )
+        edge = None
     else:
         nb = _neighbor_cells(t, cut, c_center, c_radius, live_cell, ndev, box, cfg)
         # the received cells are one block of one pseudo-device; ``my_device = 1``
@@ -1564,6 +1600,8 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
             nb.live[None],
             0.0,
             as_index(1),
+            # the received cells are a prefix of the buffer: seed only those
+            seed_count=nb.num,
             **walk_kw,
         )
         has = ex.near_cell >= 0
@@ -1572,6 +1610,7 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
         near_dest = jnp.where(has, nb.owner[jnp.where(has, ex.near_cell, 0)], -1)
         dest_block = 1
         sx = nb.diag
+        edge = nb.edge
     num_nodes = int(t.ranges.shape[0])
     sb = build_send_buffers(
         near_dest,
@@ -1653,6 +1692,8 @@ def _import_halo(t, pos, weights, flags, gid, count, cell_reach, ndev, box, cfg)
         gid=jnp.where(live, recv_gid[:, 0], -1),
         num=n_halo,
         diag=diag,
+        cut=cut,
+        edge=edge,
     )
 
 
@@ -2678,6 +2719,39 @@ def _knn_fast_search(cfg) -> bool:
     return cfg.knn_search == "fast"
 
 
+def _sort_nearly_sorted_rows(d: Array, i: Array) -> tuple[Array, Array]:
+    """Sort each row of ``d`` ascending (stable), carrying ``i`` along.
+
+    For rows that are already nearly sorted: the fast search's rows are in
+    float32 distance order, and recomputing the distances in the input dtype
+    can only swap near-ties. Odd-even transposition rounds (compare-exchange of
+    adjacent columns, strict ``<``, hence stable) run until no row has an
+    inversion -- usually zero rounds, one check -- instead of a general sort of
+    every short row (``jnp.argsort(axis=-1)``: 2 ms for ``2e6 x 8`` on an A100).
+    The result equals ``argsort(d, axis=-1, stable=True)`` applied to both.
+    """
+    k = int(d.shape[1])
+    if k < 2:
+        return d, i
+
+    def unsorted(st):
+        dd = st[0]
+        return jnp.any(dd[:, 1:] < dd[:, :-1])
+
+    def rounds(st):
+        cd = [st[0][:, c] for c in range(k)]
+        ci = [st[1][:, c] for c in range(k)]
+        for start in (0, 1):
+            for a in range(start, k - 1, 2):
+                b = a + 1
+                sw = cd[b] < cd[a]
+                cd[a], cd[b] = jnp.where(sw, cd[b], cd[a]), jnp.where(sw, cd[a], cd[b])
+                ci[a], ci[b] = jnp.where(sw, ci[b], ci[a]), jnp.where(sw, ci[a], ci[b])
+        return jnp.stack(cd, axis=1), jnp.stack(ci, axis=1)
+
+    return jax.lax.while_loop(unsorted, rounds, (d, i))
+
+
 def _knn_fast(xs, fq, fd, live_s, k, r_max, box, frame, cfg):
     """kNN of the query slots among the data slots within ``r_max`` (fast path).
 
@@ -2691,6 +2765,7 @@ def _knn_fast(xs, fq, fd, live_s, k, r_max, box, frame, cfg):
     tuple
         ``(nbr, d2, overflow, diag)`` as :func:`_knn_on_tree`.
     """
+    xs = jax.lax.stop_gradient(xs)  # topology: the search carries no cotangent
     n = int(xs.shape[0])
     dtype = xs.dtype
     width = 1 << max(0, int(math.ceil(math.log2(max(int(cfg.knn_leaf_size), 1)))))
@@ -2712,18 +2787,22 @@ def _knn_fast(xs, fq, fd, live_s, k, r_max, box, frame, cfg):
     delta = minimum_image(xs[jnp.where(has, rows, 0)] - xs[:, None, :], box)
     d2 = jnp.where(has, jnp.sum(delta * delta, axis=-1), jnp.inf)
     d2 = jnp.where(d2 <= jnp.asarray(r_max, dtype) ** 2, d2, jnp.inf)
-    order = jnp.argsort(d2, axis=-1)
-    d2 = jnp.take_along_axis(d2, order, axis=-1)
-    nbr = jnp.where(
-        jnp.isfinite(d2), jnp.take_along_axis(rows, order, axis=-1), -1
-    ).astype(INDEX_DTYPE)
+    d2, rows = _sort_nearly_sorted_rows(d2, rows)
+    nbr = jnp.where(jnp.isfinite(d2), rows, -1).astype(INDEX_DTYPE)
     zero = jnp.zeros((), INDEX_DTYPE)
     diag = dict(near_max=zero, near_total=zero, frontier=zero, peak_max=zero)
     return nbr, d2, over, diag
 
 
-def _cell_max(t: _Tree, cut, values_sorted, n):
-    """Per summary cell, the max of a per-sorted-slot value over the cell's slots."""
+def _slot_cells(t: _Tree, cut, n):
+    """Per sorted slot of ``t``, its summary cell and whether it lies in one.
+
+    Returns
+    -------
+    tuple
+        ``(cell_of, inside)``, both ``(n,)``: the index into ``cut.cells`` of the
+        cell whose slot range holds the slot, valid where ``inside``.
+    """
     cells = cut.cells
     live = cells >= 0
     big = as_index(n + 1)
@@ -2735,6 +2814,68 @@ def _cell_max(t: _Tree, cut, values_sorted, n):
     cell_of = order[pos_]
     ends = jnp.where(live, t.ranges[jnp.where(live, cells, 0), 1], -1)
     inside = (slot >= s_sorted[pos_]) & (slot <= ends[cell_of])
+    return cell_of, inside
+
+
+def _knn_edge_queries(t: _Tree, cut, edge: _Edge, xs, bound, is_q, box):
+    """The local queries whose first-pass ball may hold another device's data.
+
+    A query's first pass found its exact ``k`` nearest LOCAL data points; the
+    ``k``-th distance (``r_max`` when it found fewer) is ``bound``. Another
+    device's data point can only change that answer if it lies within
+    ``bound``. Every such point lies within its cell's reach, so (a) the query's
+    summary cell was shipped to its device (``edge.sent``), and (b) it lies in
+    one of that device's coarse particle boxes (``edge.box_*``). A query failing
+    either test has its final answer from the first pass; only the rest need the
+    second pass over ``[local ; halo]``. Both tests are conservative
+    (:func:`_reaches_box` adds slack), so no query that needs the second pass is
+    dropped.
+
+    Returns
+    -------
+    Array
+        ``(n,)`` bool over the sorted slots of ``t``.
+    """
+    n = int(xs.shape[0])
+    cell_of, inside = _slot_cells(t, cut, n)
+    # a live slot outside every cell cannot happen (the cut covers every live
+    # leaf); treat it as an edge query all the same
+    cand = is_q & ((inside & edge.sent[cell_of]) | ~inside)
+    boxa = None if box is None else tuple(float(b) for b in box)
+    dtype = xs.dtype
+    if boxa is not None:
+        scale = max(boxa)
+    else:
+        scale = jnp.max(jnp.where(is_q[:, None], jnp.abs(xs), 0.0))
+    tol = 16.0 * float(jnp.finfo(dtype).eps) * scale
+    B = int(edge.box_center.shape[1])
+
+    def one_dest(i, hit):
+        for b in range(B):  # B is small and static: one fused pass
+            hit = hit | (
+                edge.box_live[i, b]
+                & _reaches_box(
+                    xs,
+                    bound,
+                    edge.box_center[i, b].astype(dtype),
+                    edge.box_half[i, b].astype(dtype),
+                    boxa,
+                    tol,
+                )
+            )
+        return hit
+
+    touch = jax.lax.fori_loop(
+        as_index(0), edge.num_dest, one_dest, jnp.zeros((n,), bool)
+    )
+    return cand & touch
+
+
+def _cell_max(t: _Tree, cut, values_sorted, n):
+    """Per summary cell, the max of a per-sorted-slot value over the cell's slots."""
+    cells = cut.cells
+    live = cells >= 0
+    cell_of, inside = _slot_cells(t, cut, n)
     vals = jnp.where(inside, values_sorted, 0.0)
     seg = jnp.where(inside, cell_of, as_index(cells.shape[0]))
     m = jax.ops.segment_max(vals, seg, num_segments=int(cells.shape[0]) + 1)
@@ -2844,6 +2985,7 @@ def _knn_body_one_device(
         near_pairs_total=zero,
         walk_frontier=zero,
         peak_wavefront=zero,
+        second_pass_queries=zero,
     )
     return dist, out_gid, cdf, overflow, flags_out, stats
 
@@ -2897,13 +3039,14 @@ def _knn_body(
 
     loc_over = jnp.asarray(False)
     bound = jnp.zeros((cap,), dtype)
+    nbr1 = None  # the fast first pass's neighbours (local sorted slots)
     fast = _knn_fast_search(cfg)
     frame = (lo_b, hi_b)
     if adaptive_reach and fast:
         # pass 1: the exact local kNN; its k-th distance (exact, in the input
         # dtype) bounds each query's true r_k from above. A bucket overflow
         # leaves rows without neighbours, whose bound falls back to r_max.
-        _nbr1, d2_loc, loc_over, _ = _knn_fast(
+        nbr1, d2_loc, loc_over, _ = _knn_fast(
             xs_loc, fq_loc, fd_loc, live_ls, k, r_max, box, frame, cfg
         )
         bound = jnp.sqrt(jnp.minimum(d2_loc[:, k - 1], r_max * r_max))
@@ -2983,7 +3126,42 @@ def _knn_body(
         )
     else:
         node_reach = None
-    if fast:
+    n_edge = jnp.sum((fq > 0).astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+    if fast and adaptive_reach and halo.edge is not None and nbr1 is not None:
+        # Only the queries near another device's data need the second pass; every
+        # other query's first-pass answer is final (:func:`_knn_edge_queries`).
+        # A first-pass overflow leaves rows incomplete: then every query is redone.
+        q_loc = fq_loc > 0
+        edge_s = _knn_edge_queries(
+            t_loc, halo.cut, halo.edge, xs_loc, bound, q_loc, box
+        ) | (q_loc & loc_over)
+        n_edge = jnp.sum(edge_s.astype(INDEX_DTYPE), dtype=INDEX_DTYPE)
+        # local sorted slot -> partitioned row -> combined slot (c_order is the
+        # identity on the fast path)
+        inv = (
+            jnp.zeros((n,), INDEX_DTYPE).at[perm].set(jnp.arange(n, dtype=INDEX_DTYPE))
+        )
+        to_comb = inv[t_loc.order]
+        edge_c = jnp.zeros((n,), bool).at[to_comb].set(edge_s)
+        nbr_c1 = jnp.where(nbr1 >= 0, to_comb[jnp.where(nbr1 >= 0, nbr1, 0)], -1)
+        nbr_from1 = (
+            jnp.full((n, int(k)), -1, INDEX_DTYPE)
+            .at[to_comb]
+            .set(nbr_c1.astype(INDEX_DTYPE))
+        )
+        nbr2, _d2, w_over, wd = _knn_fast(
+            jax.lax.stop_gradient(xs),
+            jnp.where(edge_c, fq, 0),
+            fd,
+            live_s,
+            k,
+            r_max,
+            box,
+            frame,
+            cfg,
+        )
+        nbr = jnp.where(edge_c[:, None], nbr2, nbr_from1)
+    elif fast:
         nbr, _d2, w_over, wd = _knn_fast(
             jax.lax.stop_gradient(xs), fq, fd, live_s, k, r_max, box, frame, cfg
         )
@@ -3048,6 +3226,7 @@ def _knn_body(
         near_pairs_total=wd["near_total"][None],
         walk_frontier=wd["frontier"][None],
         peak_wavefront=wd["peak_max"][None],
+        second_pass_queries=n_edge[None],
     )
     return dist, out_gid, cdf, overflow, flags_out, stats
 

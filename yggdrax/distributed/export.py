@@ -104,6 +104,7 @@ def export_walk(
     mac_type: str = "dehnen",
     node_active: Optional[Array] = None,
     walk_fn: Optional[Callable[..., Any]] = None,
+    seed_count: Optional[Array] = None,
 ) -> ExportLists:
     """Walk this device's tree against every other device's summary cells.
 
@@ -140,6 +141,11 @@ def export_walk(
         signature and result fields; ``None`` runs that one. Lets a caller plug in
         a faster implementation of the same contract (jaccpot passes its one-launch-
         per-round Pallas walk) without this module depending on it.
+    seed_count:
+        Optional number of LIVE cells when they are a prefix of the flattened
+        ``(ndev * max_cells)`` cells (a ragged-exchange receive buffer). The walk
+        then starts from those seeds only, instead of from every padded slot:
+        its first round no longer runs at the width of the whole buffer.
 
     Returns
     -------
@@ -194,6 +200,8 @@ def export_walk(
     active = jnp.concatenate([ca.reshape(n_cells), local_active])
 
     root_shifted = (jnp.asarray(root, idx) + shift).astype(idx)
+    # only when given: a plugged-in ``walk_fn`` need not know the keyword
+    seed_kw: dict[str, Any] = {} if seed_count is None else {"seed_count": seed_count}
     res = (walk_fn or dual_tree_walk_mutual)(
         left,
         right,
@@ -208,6 +216,7 @@ def export_walk(
         node_active=active,
         seed_a=jnp.arange(n_cells, dtype=idx),
         seed_b=jnp.full((n_cells,), root_shifted, dtype=idx),
+        **seed_kw,
     )
 
     return _export_lists(res, shift)
@@ -457,6 +466,60 @@ class SendBuffers(NamedTuple):
     csr_overflow: Array
 
 
+#: Rungs of :func:`prefix_argsort`: the narrowest sort is this wide, and each
+#: rung is this many times the one below (so a sort is at most that factor over
+#: the live prefix).
+_PREFIX_SORT_FLOOR = 4096
+_PREFIX_SORT_STEP = 4
+
+
+def prefix_argsort(key: Array, count: Array) -> Array:
+    """Stable ``argsort(key)`` when only a prefix of ``key`` can be live.
+
+    Rows at and past ``count`` must hold the largest key, all equal (the dead
+    rows of a capacity-padded list). The full stable sort then leaves them in
+    index order behind every live row, so sorting only a prefix that covers
+    ``count`` and appending the identity gives the same permutation. The prefix
+    is the narrowest of a ladder of static widths (a ``lax.switch``): the cost
+    follows the live rows, not the capacity -- the export near list is sized
+    for the worst case, typically 50-250x its live length.
+
+    Parameters
+    ----------
+    key:
+        ``(P,)`` sort keys.
+    count:
+        Rows that may be live (a prefix); clipped to ``[0, P]``.
+
+    Returns
+    -------
+    Array
+        ``(P,)`` permutation, equal to ``jnp.argsort(key, stable=True)``.
+    """
+    P = int(key.shape[0])
+    widths = []
+    w = _PREFIX_SORT_FLOOR
+    while w < P:
+        widths.append(w)
+        w *= _PREFIX_SORT_STEP
+    widths.append(P)
+    if len(widths) == 1:
+        return jnp.argsort(key, stable=True).astype(INDEX_DTYPE)
+
+    def branch(w):
+        def run(k):
+            head = jnp.argsort(k[:w], stable=True).astype(INDEX_DTYPE)
+            if w == P:
+                return head
+            return jnp.concatenate([head, jnp.arange(w, P, dtype=INDEX_DTYPE)])
+
+        return run
+
+    n = jnp.clip(jnp.asarray(count, INDEX_DTYPE), 0, P)
+    rung = jnp.searchsorted(jnp.asarray(widths[:-1], INDEX_DTYPE), n, side="left")
+    return jax.lax.switch(rung, [branch(w) for w in widths], key)
+
+
 def build_send_buffers(
     cell: Array,
     node: Array,
@@ -508,11 +571,13 @@ def build_send_buffers(
     # dead rows sort last, so the live prefix is contiguous and grouped by device.
     # The key is ndev * num_nodes wide: past 2^31 (11 devices of 2e8 nodes) int32
     # wraps and the grouping breaks, so it is int64 whenever x64 is on.
-    kdt = jnp.int64 if jax.config.read("jax_enable_x64") else INDEX_DTYPE
+    # A narrower key sorts faster: int32 whenever the product fits.
+    wide = (ndev + 1) * (num_nodes + 1) >= 2**31 - 1
+    kdt = jnp.int64 if wide and jax.config.read("jax_enable_x64") else INDEX_DTYPE
     key = dev.astype(kdt) * jnp.asarray(num_nodes + 1, kdt) + jnp.where(
         live, as_index(node), as_index(num_nodes)
     ).astype(kdt)
-    order = jnp.argsort(key, stable=True)
+    order = prefix_argsort(key, as_index(count))
     s_dev, s_node, s_cell = dev[order], jnp.asarray(node)[order], as_index(cell)[order]
     s_live = s_dev < ndev_i
 

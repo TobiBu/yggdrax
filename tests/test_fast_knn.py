@@ -308,3 +308,61 @@ def test_masked_knn_reports_a_bucket_overflow():
         pts, ones, ones, k=4, bucket_capacity=4, backend="pallas", interpret=True
     )
     assert bool(over)
+
+
+def _layout_boxes_cover_their_leaves(pts, is_data, is_query, cap, box):
+    import yggdrax.fast_knn as F
+
+    p32 = F._wrap(jnp.asarray(pts, jnp.float32), box)
+    frame = F._frame(p32, box) if box is not None else F._bounds(p32)
+    b = F._build_radix(p32, 32, cap, bounds=frame, live=jnp.asarray(is_data | is_query))
+    t = F._tables(b, jnp.asarray(is_data), jnp.asarray(is_query))
+    inf = jnp.asarray(jnp.inf, t.x.dtype)
+    src = t._replace(
+        x=jnp.where(t.dmask, t.x, inf),
+        y=jnp.where(t.dmask, t.y, inf),
+        z=jnp.where(t.dmask, t.z, inf),
+    )
+    pre, leaves = F._radix_layout(b, src._replace(slot=jnp.where(t.dmask, t.slot, -1)))
+    lo = np.stack([np.asarray(a) for a in pre[0:3]], 1)
+    hi = np.stack([np.asarray(a) for a in pre[3:6]], 1)
+    nlo, nhi = np.asarray(pre[8]), np.asarray(pre[9])
+    llo = np.stack([np.asarray(a) for a in leaves[0:3]], 1)
+    lhi = np.stack([np.asarray(a) for a in leaves[3:6]], 1)
+    # per pre-order node, the union of its leaves' boxes (empty leaves: +-inf)
+    ok = True
+    for i in range(len(nlo)):
+        if nhi[i] < nlo[i]:
+            continue
+        ulo = llo[nlo[i] : nhi[i] + 1].min(0)
+        uhi = lhi[nlo[i] : nhi[i] + 1].max(0)
+        ok &= bool(np.all(lo[i] <= ulo) and np.all(hi[i] >= uhi))
+    return ok
+
+
+@pytest.mark.parametrize("cap", [1400, 2938, 4096])
+def test_radix_layout_node_boxes_cover_every_leaf(cap):
+    # One device's local buffer of an 8-device distributed kNN: an eighth of a
+    # uniform periodic box by Morton range (what the partition gives a device),
+    # half data, half queries, a third of the rows padding. The bottom-up box
+    # relaxation once stopped when the leaf RANGES had settled, leaving boxes
+    # that missed deep leaves (the root missed a whole y-z slab), and
+    # masked_knn dropped true neighbours of 3002 of 12624 queries (cap 2938).
+    from yggdrax.morton import morton_encode
+
+    rng = np.random.default_rng(1)
+    pts_all = rng.uniform(0, 1, (200_000, 3)).astype(np.float32)
+    codes = np.asarray(morton_encode(jnp.asarray(pts_all), (jnp.zeros(3), jnp.ones(3))))
+    mine = np.argsort(codes, kind="stable")[3 * 25_000 : 4 * 25_000]
+    n = 37_500
+    pts = np.zeros((n, 3), np.float32)
+    pts[:25_000] = pts_all[mine]
+    is_data = np.zeros(n, bool)
+    is_query = np.zeros(n, bool)
+    role = rng.uniform(size=25_000) < 0.5
+    is_data[:25_000] = role
+    is_query[:25_000] = ~role
+    perm = rng.permutation(n)
+    assert _layout_boxes_cover_their_leaves(
+        pts[perm], is_data[perm], is_query[perm], cap, (1.0, 1.0, 1.0)
+    )

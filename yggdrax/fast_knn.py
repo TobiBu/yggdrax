@@ -215,6 +215,25 @@ class _Built(NamedTuple):
     overflow: Any
 
 
+def _true_rows(flag: Any, size: int, fill: int) -> Any:
+    """``jnp.nonzero(flag, size=size, fill_value=fill)[0]`` without atomics.
+
+    The first ``size`` true rows of ``flag`` in order, ``fill``-padded. XLA
+    lowers ``jnp.nonzero(size=)`` to a cumsum and a scatter-ADD (2.4 ms for 2e6
+    flags into 1.6e5 slots on an A100); the rows' slots are an exclusive prefix
+    of the flags, hence unique, so a plain scatter writes them.
+    """
+    n = int(flag.shape[0])
+    f = jnp.asarray(flag, bool)
+    pos = jnp.cumsum(f.astype(INDEX_DTYPE), dtype=INDEX_DTYPE) - 1
+    tgt = jnp.where(f & (pos < size), pos, as_index(size))
+    return (
+        jnp.full((int(size),), fill, INDEX_DTYPE)
+        .at[tgt]
+        .set(jnp.arange(n, dtype=INDEX_DTYPE), mode="drop", unique_indices=True)
+    )
+
+
 @functools.lru_cache(maxsize=32)
 def _bucket_structure(capacity: int) -> tuple:
     """Balanced static structure over ``capacity`` buckets (host, cached).
@@ -260,7 +279,7 @@ def _build(pts: Any, leaf_size: int, capacity: int, geometry: bool = True) -> _B
     codes = morton_encode(pts, _bounds(pts))
     perm, scodes = _morton_sort(codes)
     flag, nb = _aligned_buckets(scodes, width, leaf_size)
-    starts = jnp.nonzero(flag, size=capacity, fill_value=n)[0].astype(INDEX_DTYPE)
+    starts = _true_rows(flag, capacity, n)
     ends = jnp.concatenate([starts[1:], jnp.full((1,), n, INDEX_DTYPE)])
     (
         parent_np,
@@ -339,7 +358,7 @@ def _build_radix(
     if live is not None:
         flag = flag & live[perm]
         nb = jnp.sum(flag.astype(jnp.int32))
-    starts = jnp.nonzero(flag, size=capacity, fill_value=n)[0].astype(INDEX_DTYPE)
+    starts = _true_rows(flag, capacity, n)
     ends = jnp.concatenate([starts[1:], jnp.full((1,), n, INDEX_DTYPE)])
     live_b = starts < n
     leaf_codes = jnp.where(live_b, scodes[jnp.minimum(starts, n - 1)], sentinel)
@@ -387,7 +406,7 @@ def _query_blocks(
     codes = morton_encode(qpts, bounds)
     perm, scodes = _morton_sort(codes)
     flag, nb = _aligned_buckets(scodes, width, leaf_size)
-    starts = jnp.nonzero(flag, size=capacity, fill_value=nq)[0].astype(INDEX_DTYPE)
+    starts = _true_rows(flag, capacity, nq)
     ends = jnp.concatenate([starts[1:], jnp.full((1,), nq, INDEX_DTYPE)])
     lane = jnp.arange(width)
     valid = lane[None, :] < (ends - starts)[:, None]
@@ -484,7 +503,18 @@ def _radix_layout(b: _Built, t: "_Tables") -> tuple[tuple, tuple]:
         nhi_ = jnp.maximum(hi[left], hi[right])
         na = jnp.minimum(a[left], a[right])
         nz = jnp.maximum(z[left], z[right])
-        changed = jnp.any(na != a[:ni]) | jnp.any(nz != z[:ni])
+        # Converged when nothing moves -- the boxes included. The leaf ranges
+        # alone settle as soon as each node's leftmost and rightmost leaves have
+        # reported, which can be long before a deep leaf in between has: a
+        # range-only test stopped with boxes that did not cover their subtrees
+        # (a root box missing a deep leaf's points), and the traversal pruned
+        # true neighbours (masked_knn, periodic, 2026-11-24).
+        changed = (
+            jnp.any(na != a[:ni])
+            | jnp.any(nz != z[:ni])
+            | jnp.any(nlo_ != lo[:ni])
+            | jnp.any(nhi_ != hi[:ni])
+        )
         return (
             lo.at[:ni].set(nlo_),
             hi.at[:ni].set(nhi_),
