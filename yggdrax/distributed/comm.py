@@ -192,6 +192,101 @@ def _clamped_transfer(
     )
 
 
+def _vary_like_exchange(output: Array, operand: Array, axis_name) -> Array:
+    """``output`` cast to vary over ``axis_name`` and every axis ``operand`` varies over.
+
+    JAX (0.11.2, ``_ragged_all_to_all_effectful_abstract_eval``) gives the collective's
+    result the varying-manual-axes type of its ``output`` buffer alone. Our buffer is
+    a ``jnp.full`` constant, invariant across devices, so under a ``shard_map`` with
+    ``check_vma=True`` (JAX's default) the result was typed invariant and the reverse
+    pass ``psum``-ed every device's cotangent before sending it back: each sender got
+    the sum of all receivers' cotangents (measured 2026-11-24, 2x A100: ``grad`` off by
+    O(1), forward and ``jacfwd`` exact). Under ``check_vma=False`` no ``psum`` is
+    inserted, which is why the statistics (all ``check_vma=False``) were unaffected.
+    """
+    pcast = getattr(jax.lax, "pcast", None)
+    have, op_vma = varying_axes(output), varying_axes(operand)
+    if pcast is None or have is None or op_vma is None:  # pragma: no cover - old JAX
+        return output
+    names = (axis_name,) if isinstance(axis_name, str) else tuple(axis_name)
+    missing = tuple(
+        dict.fromkeys(n for n in (*names, *sorted(op_vma)) if n not in have)
+    )
+    return pcast(output, missing, to="varying") if missing else output
+
+
+def varying_axes(x) -> frozenset | None:
+    """The manual mesh axes ``x`` is typed as varying over (``None``: no vma typing).
+
+    ``jax.typeof(x).vma`` on most JAX versions, ``.mat.varying`` on 0.11.
+    """
+    aval = jax.typeof(x)
+    vma = getattr(aval, "vma", None)
+    if vma is None:
+        vma = getattr(getattr(aval, "mat", None), "varying", None)
+    return None if vma is None else frozenset(vma)
+
+
+def _install_ragged_feature_batching() -> None:
+    """Batch ``ragged_all_to_all`` along a feature axis when only the rows are batched.
+
+    ``jax.jacfwd`` (``vmap`` of ``jvp``) and ``jax.vmap`` over a distributed statistic
+    batch the exchanged rows -- the operand and its tangent -- while the sizes and
+    offsets, computed from integer counts, stay unbatched. JAX's batching rule for
+    the primitive (jax 0.11.2, ``_ragged_all_to_all_batched_collective``) asserts the
+    offsets are 2-D before it broadcasts them, so that case fails with a bare
+    ``AssertionError`` at trace time (the b3 forecast row on GPU, 2026-11-24). The
+    rows are the ragged axis, so a batch rides through the same exchange as one more
+    feature axis: one collective, the same sizes and offsets. Every other case
+    (batched sizes, the collective's own axis, axis_index_groups) goes to JAX's rule.
+    The primitive's JVP and transpose are untouched (for ``grad`` see
+    :func:`_vary_like_exchange`).
+    """
+    try:
+        from jax._src.interpreters import batching
+        from jax._src.lax import parallel as lax_parallel
+
+        prim = lax_parallel.ragged_all_to_all_p
+        jax_rule = batching.fancy_primitive_batchers[prim]
+    except (ImportError, AttributeError, KeyError):  # pragma: no cover - other JAX
+        return
+    if getattr(jax_rule, "_yggdrax_feature_batching", False):
+        return
+
+    def rule(axis_data, vals_in, dims_in, axis_name, axis_index_groups):
+        rows_only = (
+            axis_data.name not in axis_name
+            and not axis_index_groups
+            and all(d is None for d in dims_in[2:])
+            and any(d is not None for d in dims_in[:2])
+        )
+        if not rows_only:
+            return jax_rule(axis_data, vals_in, dims_in, axis_name, axis_index_groups)
+        size = axis_data.size
+
+        def batch_at_one(x, d):
+            if d is None:
+                x = jnp.expand_dims(x, 1)
+                return jnp.broadcast_to(x, (x.shape[0], size, *x.shape[2:]))
+            return jnp.moveaxis(x, d, 1)
+
+        operand, output = (batch_at_one(x, d) for x, d in zip(vals_in[:2], dims_in[:2]))
+        out = prim.bind(
+            operand,
+            output,
+            *vals_in[2:],
+            axis_name=axis_name,
+            axis_index_groups=axis_index_groups,
+        )
+        return out, 1
+
+    rule._yggdrax_feature_batching = True  # type: ignore[attr-defined]
+    batching.fancy_primitive_batchers[prim] = rule
+
+
+_install_ragged_feature_batching()
+
+
 def _ragged_native(operand, full, me, output_capacity, axis_name, fill_value):
     """XLA ``ragged_all_to_all`` path (GPU/TPU).
 
@@ -203,6 +298,7 @@ def _ragged_native(operand, full, me, output_capacity, axis_name, fill_value):
     moved, in_off, out_off = _clamped_transfer(full, operand.shape[0], output_capacity)
     feat = operand.shape[1:]
     output = jnp.full((output_capacity, *feat), fill_value, dtype=operand.dtype)
+    output = _vary_like_exchange(output, operand, axis_name)
     # output_offsets[i] = row of device i's output our block lands at.
     output = jax.lax.ragged_all_to_all(
         operand,
